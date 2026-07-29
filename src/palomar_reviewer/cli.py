@@ -662,6 +662,29 @@ def authors_from_metadata(data: dict[str, Any], submitter: str) -> list[dict[str
     return result or [{"name": submitter, "github": submitter}]
 
 
+def registry_title(metadata: dict[str, Any], issue_title: str) -> str:
+    explicit = metadata_value(
+        metadata,
+        [
+            ("project", "title"),
+            ("result", "title"),
+        ],
+    )
+    if explicit:
+        return str(explicit)
+    submitted = issue_title.removeprefix("[submission] ").strip()
+    if submitted:
+        return submitted
+    fallback = metadata_value(
+        metadata,
+        [
+            ("project", "name"),
+            ("result", "name"),
+        ],
+    )
+    return str(fallback or "Untitled Palomar submission")
+
+
 def registry_record(
     *,
     issue: dict[str, Any],
@@ -672,17 +695,7 @@ def registry_record(
     review_url: str,
 ) -> dict[str, Any]:
     permanent_id = review.get("existing_id") or f"PALOMAR-{int(issue['number']):06d}"
-    title = (
-        metadata_value(
-            metadata,
-            [
-                ("project", "title"),
-                ("project", "name"),
-                ("result", "name"),
-            ],
-        )
-        or issue["title"].removeprefix("[submission] ").strip()
-    )
+    title = registry_title(metadata, issue["title"])
     abstract = (
         metadata_value(
             metadata,

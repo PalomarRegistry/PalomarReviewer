@@ -8,6 +8,7 @@ from palomar_reviewer.cli import (
     authors_from_metadata,
     has_proof_account,
     parse_engine_json,
+    registry_title,
     reviewer_model,
 )
 
@@ -32,6 +33,18 @@ class ReviewerTests(unittest.TestCase):
 
     def test_model_id(self):
         self.assertEqual(reviewer_model("codex", "gpt-test", None), "codex:gpt-test")
+
+    def test_registry_title_prefers_human_text(self):
+        metadata = {"result": {"name": "machine_readable_name"}}
+        self.assertEqual(
+            registry_title(metadata, "[submission] A human-readable result"),
+            "A human-readable result",
+        )
+        metadata["result"]["title"] = "Explicit metadata title"
+        self.assertEqual(
+            registry_title(metadata, "[submission] A human-readable result"),
+            "Explicit metadata title",
+        )
 
     def test_engine_schemas_are_strict(self):
         def assert_strict(schema):
