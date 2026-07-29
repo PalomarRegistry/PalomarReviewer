@@ -20,10 +20,13 @@ DATABASE_REPO = "kim-em/PalomarDatabase"
 MECHANICAL_MARKER = "<!-- palomar-mechanical-report -->"
 REVIEW_MARKER = "<!-- palomar-editorial-review -->"
 CLAIM_MARKER = "<!-- palomar-review-claim -->"
+PUBLICATION_MARKER = "<!-- palomar-publication -->"
+WEB_URL = "https://kim-em.github.io/PalomarWeb"
 STATUS_LABELS = (
     "status:awaiting-review",
     "status:review-in-progress",
     "status:accepted",
+    "status:published",
     "status:changes-requested",
     "status:rejected",
     "status:escalated",
@@ -915,6 +918,121 @@ def publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def publication_entry_path(pr: dict[str, Any]) -> str:
+    paths = [
+        item["path"]
+        for item in pr.get("files", [])
+        if re.fullmatch(r"entries/PALOMAR-\d{6}-v\d+\.json", item.get("path", ""))
+    ]
+    if len(paths) != 1:
+        raise ReviewerError("publication PR must contain exactly one Palomar entry file")
+    return paths[0]
+
+
+def finalize(args: argparse.Namespace) -> int:
+    pr = json.loads(
+        gh(
+            [
+                "pr",
+                "view",
+                str(args.pr),
+                "--repo",
+                DATABASE_REPO,
+                "--json",
+                "state,mergedAt,mergeCommit,files,url",
+            ]
+        )
+    )
+    if pr["state"] != "MERGED" or not pr.get("mergeCommit", {}).get("oid"):
+        raise ReviewerError("database publication PR is not merged")
+    merge_commit = pr["mergeCommit"]["oid"]
+    entry_path = publication_entry_path(pr)
+    record = json.loads(
+        gh(
+            [
+                "api",
+                "-H",
+                "Accept: application/vnd.github.raw+json",
+                f"repos/{DATABASE_REPO}/contents/{entry_path}?ref={merge_commit}",
+            ]
+        )
+    )
+    if int(record["submission"]["issue"]) != args.issue:
+        raise ReviewerError("published record points to a different submission issue")
+    expected = f"entries/{record['id']}-v{record['version']}.json"
+    if entry_path != expected or record["status"] != "accepted":
+        raise ReviewerError("published record has an inconsistent path or status")
+
+    database_url = f"https://github.com/{DATABASE_REPO}/blob/{merge_commit}/{entry_path}"
+    website_url = f"{WEB_URL}/entry.html?id={record['id']}&version={record['version']}"
+    print(f"Verified {record['id']} v{record['version']} at {merge_commit}")
+    print(website_url)
+    if args.dry_run:
+        return 0
+
+    gh(
+        [
+            "label",
+            "create",
+            "status:published",
+            "--repo",
+            SUBMISSION_REPO,
+            "--description",
+            "Accepted and published in the Palomar database",
+            "--color",
+            "006B75",
+            "--force",
+        ]
+    )
+    for label in STATUS_LABELS:
+        gh(
+            [
+                "issue",
+                "edit",
+                str(args.issue),
+                "--repo",
+                SUBMISSION_REPO,
+                "--remove-label",
+                label,
+            ],
+            check=False,
+        )
+    gh(
+        [
+            "issue",
+            "edit",
+            str(args.issue),
+            "--repo",
+            SUBMISSION_REPO,
+            "--add-label",
+            "status:published",
+        ]
+    )
+    issue = issue_data(args.issue)
+    if not any(PUBLICATION_MARKER in comment.get("body", "") for comment in issue.get("comments", [])):
+        body = (
+            f"{PUBLICATION_MARKER}\n"
+            f"## 🔭 Published as `{record['id']}` v{record['version']}\n\n"
+            f"- [View the live Palomar entry]({website_url})\n"
+            f"- [Canonical database record]({database_url})\n"
+            f"- Database PR: {pr['url']}\n"
+        )
+        gh(["issue", "comment", str(args.issue), "--repo", SUBMISSION_REPO, "--body", body])
+    if issue["state"] != "CLOSED":
+        gh(
+            [
+                "issue",
+                "close",
+                str(args.issue),
+                "--repo",
+                SUBMISSION_REPO,
+                "--reason",
+                "completed",
+            ]
+        )
+    return 0
+
+
 def doctor(_: argparse.Namespace) -> int:
     failed = False
     for tool in ("gh", "git"):
@@ -963,6 +1081,14 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--issue", type=int, required=True)
     publish_parser.add_argument("--dry-run", action="store_true")
     publish_parser.set_defaults(func=publish)
+    finalize_parser = commands.add_parser(
+        "finalize",
+        help="verify a merged database PR and complete the submission issue",
+    )
+    finalize_parser.add_argument("--issue", type=int, required=True)
+    finalize_parser.add_argument("--pr", type=int, required=True)
+    finalize_parser.add_argument("--dry-run", action="store_true")
+    finalize_parser.set_defaults(func=finalize)
     return parser
 
 

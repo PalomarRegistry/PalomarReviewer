@@ -8,6 +8,7 @@ from palomar_reviewer.cli import (
     authors_from_metadata,
     has_proof_account,
     parse_engine_json,
+    publication_entry_path,
     registry_title,
     reviewer_model,
 )
@@ -45,6 +46,15 @@ class ReviewerTests(unittest.TestCase):
             registry_title(metadata, "[submission] A human-readable result"),
             "Explicit metadata title",
         )
+
+    def test_publication_entry_path(self):
+        pr = {
+            "files": [
+                {"path": "entries/PALOMAR-000012-v2.json"},
+                {"path": "index.json"},
+            ]
+        }
+        self.assertEqual(publication_entry_path(pr), "entries/PALOMAR-000012-v2.json")
 
     def test_engine_schemas_are_strict(self):
         def assert_strict(schema):

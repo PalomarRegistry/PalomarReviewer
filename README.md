@@ -60,6 +60,16 @@ palomar-review publish --issue 12
 issue-specific branch to `kim-em/PalomarDatabase`, and opens a PR. It refuses
 non-accept decisions and existing entry filenames.
 
+After inspecting and merging that PR, verify the immutable database record,
+link the live website entry, label the submission as published, and close it:
+
+```bash
+palomar-review finalize --issue 12 --pr 34
+```
+
+`finalize` refuses an unmerged PR, a PR without exactly one Palomar entry, or a
+record that points to a different submission issue.
+
 ## Engines
 
 - `--engine codex`: runs `codex exec` ephemerally with a read-only sandbox and a
