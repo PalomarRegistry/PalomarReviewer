@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 
 from palomar_reviewer.cli import (
+    STEP_SCHEMA,
+    SYNTHESIS_SCHEMA,
     authors_from_metadata,
     has_proof_account,
     parse_engine_json,
@@ -30,6 +32,22 @@ class ReviewerTests(unittest.TestCase):
 
     def test_model_id(self):
         self.assertEqual(reviewer_model("codex", "gpt-test", None), "codex:gpt-test")
+
+    def test_engine_schemas_are_strict(self):
+        def assert_strict(schema):
+            if schema.get("type") == "object":
+                self.assertFalse(schema["additionalProperties"])
+                self.assertEqual(set(schema["required"]), set(schema["properties"]))
+            for value in schema.values():
+                if isinstance(value, dict):
+                    assert_strict(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            assert_strict(item)
+
+        assert_strict(STEP_SCHEMA)
+        assert_strict(SYNTHESIS_SCHEMA)
 
 
 if __name__ == "__main__":

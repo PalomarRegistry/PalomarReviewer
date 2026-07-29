@@ -29,15 +29,81 @@ STATUS_LABELS = (
     "status:escalated",
 )
 MAX_CONTEXT_BYTES = 300_000
+SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
+STEP_SCORE_KEYS = (
+    "clarity",
+    "provenance",
+    "statement_alignment",
+    "definition_fidelity",
+    "auditability",
+    "notability",
+    "literature",
+    "proof_alignment",
+)
 STEP_SCHEMA = {
     "type": "object",
-    "required": ["step", "verdict", "summary", "findings", "scores"],
+    "additionalProperties": False,
+    "required": [
+        "step",
+        "verdict",
+        "summary",
+        "findings",
+        "scores",
+        "trust_level",
+        "sources_checked",
+    ],
     "properties": {
         "step": {"type": "string"},
         "verdict": {"enum": ["pass", "warn", "fail", "escalate"]},
         "summary": {"type": "string"},
-        "findings": {"type": "array"},
-        "scores": {"type": "object"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["severity", "evidence", "message"],
+                "properties": {
+                    "severity": {"enum": ["info", "warning", "error"]},
+                    "evidence": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+        },
+        "scores": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(STEP_SCORE_KEYS),
+            "properties": {key: SCORE_SCHEMA for key in STEP_SCORE_KEYS},
+        },
+        "trust_level": {"enum": ["high", "qualified", None]},
+        "sources_checked": {"type": "array", "items": {"type": "string"}},
+    },
+}
+SYNTHESIS_SCORE_KEYS = (
+    "statement_alignment",
+    "definition_fidelity",
+    "notability",
+    "literature",
+    "clarity",
+)
+SYNTHESIS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "summary", "scores", "warnings", "requested_changes"],
+    "properties": {
+        "decision": {"enum": ["accept", "revise", "reject", "escalate"]},
+        "summary": {"type": "string", "minLength": 1},
+        "scores": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(SYNTHESIS_SCORE_KEYS),
+            "properties": {
+                key: {"type": "integer", "minimum": 1, "maximum": 5}
+                for key in SYNTHESIS_SCORE_KEYS
+            },
+        },
+        "warnings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "requested_changes": {"type": "array", "items": {"type": "string", "minLength": 1}},
     },
 }
 JSON_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
@@ -491,11 +557,7 @@ def run_review(args: argparse.Namespace) -> int:
             prompt_path = work / "prompts" / f"{step['id']}.md"
             prompt_path.parent.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(prompt, encoding="utf-8")
-            schema = (
-                load_json(work / "policy" / "schemas" / "review.schema.json")
-                if step["id"] == "synthesis"
-                else STEP_SCHEMA
-            )
+            schema = SYNTHESIS_SCHEMA if step["id"] == "synthesis" else STEP_SCHEMA
             result = engine_result(
                 prompt,
                 engine=args.engine,
