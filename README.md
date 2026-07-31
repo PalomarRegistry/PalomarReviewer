@@ -56,9 +56,14 @@ If the decision is `accept`, prepare the append-only database PR:
 palomar-review publish --issue 12
 ```
 
-`publish` validates the generated record against the database schema, pushes an
-issue-specific branch to `kim-em/PalomarDatabase`, and opens a PR. It refuses
-non-accept decisions and existing entry filenames.
+`publish` first dispatches the pinned Challenge renderer and checks that the
+downloaded result matches the accepted source, Challenge hash, workflow run,
+and renderer commit. It then validates the generated record and immutable
+render bundle against the database schema, pushes an issue-specific branch to
+`kim-em/PalomarDatabase`, and opens a PR. It refuses non-accept decisions and
+existing entry filenames. A renderer or infrastructure failure does not undo
+acceptance: rerun `publish`, or pass a previously downloaded trusted result with
+`--render-result PATH`.
 
 After inspecting and merging that PR, verify the immutable database record,
 link the live website entry, label the submission as published, and close it:
@@ -96,6 +101,7 @@ prompts/                 # fully rendered prompts
 raw/                     # exact engine final messages
 passes/                  # normalized per-pass JSON
 review.json              # schema-validated final report
+render-result/            # validated immutable Challenge render and provenance
 ```
 
 Raw session histories remain controlled by the chosen engine. Palomar records

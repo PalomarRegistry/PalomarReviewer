@@ -1,16 +1,22 @@
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from palomar_reviewer.cli import (
+    ReviewerError,
     STEP_SCHEMA,
     SYNTHESIS_SCHEMA,
     authors_from_metadata,
     has_proof_account,
     parse_engine_json,
     publication_entry_path,
+    render_bundle_manifest,
     registry_title,
     reviewer_model,
+    validate_render_result,
 )
 
 
@@ -71,6 +77,68 @@ class ReviewerTests(unittest.TestCase):
 
         assert_strict(STEP_SCHEMA)
         assert_strict(SYNTHESIS_SCHEMA)
+
+    def test_render_result_is_bound_to_source_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory)
+            bundle = result / "bundle"
+            entrypoint = bundle / "Challenge" / "index.html"
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.write_text("<html>safe</html>", encoding="utf-8")
+            files, tree_hash = render_bundle_manifest(bundle)
+            (bundle / "artifact-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "artifact_tree_sha256": tree_hash,
+                        "files": files,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = {
+                "repository": "example/challenge",
+                "repository_url": "https://github.com/example/challenge",
+                "commit": "1" * 40,
+                "challenge_sha256": hashlib.sha256(b"Challenge").hexdigest(),
+            }
+            report = {
+                "status": "pass",
+                "source": source,
+                "format": "verso-html",
+                "entrypoint": "Challenge/index.html",
+                "artifact_tree_sha256": tree_hash,
+                "verso_commit": "2" * 40,
+                "renderer_commit": "3" * 40,
+                "landrun_commit": "4" * 40,
+                "rendered_at": "2026-07-31T00:00:00Z",
+            }
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            mechanical = {
+                "source": {
+                    "repository": source["repository"],
+                    "repository_url": source["repository_url"],
+                    "commit": source["commit"],
+                },
+                "challenge": {"sha256": source["challenge_sha256"]},
+            }
+            validated, validated_bundle = validate_render_result(result, mechanical)
+            self.assertEqual(validated["artifact_tree_sha256"], tree_hash)
+            self.assertEqual(validated_bundle, bundle)
+
+            with mock.patch("palomar_reviewer.cli.MAX_RENDER_FILE_BYTES", 1):
+                with self.assertRaisesRegex(ReviewerError, "size cap"):
+                    validate_render_result(result, mechanical)
+
+            report["source"]["commit"] = "9" * 40
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "does not match"):
+                validate_render_result(result, mechanical)
+
+    def test_missing_render_report_is_a_reviewer_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ReviewerError, "no valid challenge-render.json"):
+                validate_render_result(Path(directory), {})
 
 
 if __name__ == "__main__":
