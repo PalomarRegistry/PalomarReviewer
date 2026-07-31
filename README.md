@@ -44,11 +44,17 @@ palomar-review run --issue 12 --engine codex --model gpt-5.6-sol
 The second command writes a complete packet and report under
 `.palomar-reviews/12/`, but does not alter labels or comments.
 
-After inspecting that output, run and publish the editorial result:
+After inspecting `review.json`, post that exact editorial result:
 
 ```bash
 palomar-review run --issue 12 --engine codex --model gpt-5.6-sol --apply
 ```
+
+`--apply` never reruns the model. It loads the existing dry-run `review.json`,
+validates it again, and requires its issue, source commit, mechanical-report URL,
+and policy commit to match the current trusted inputs before changing GitHub.
+This separation is a security boundary: model output and repository prose are
+untrusted evidence until an operator has inspected the stored report.
 
 If the decision is `accept`, prepare the append-only database PR:
 
@@ -107,3 +113,11 @@ render-result/            # validated immutable Challenge render and provenance
 Raw session histories remain controlled by the chosen engine. Palomar records
 the final messages, model identifier, policy commit, source commit, and public
 issue report.
+
+Submission metadata, Lean source/comments/identifiers, README text, issue text,
+and prior model results may contain prompt-injection attempts. The reviewer puts
+them in hashed JSON evidence envelopes, repeats the binding instruction after
+all evidence, runs engines without write/shell tools, validates strict output
+schemas, and renders model-authored public prose inertly. These controls reduce
+accidental instruction following; operator inspection of the dry-run report is
+the final backstop.
