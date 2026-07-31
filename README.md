@@ -44,6 +44,18 @@ palomar-review run --issue 12 --engine codex --model gpt-5.6-sol
 The second command writes a complete packet and report under
 `.palomar-reviews/12/`, but does not alter labels or comments.
 
+For version 2 policies, the runner rejects an internally inconsistent positive
+review: synthesis must reproduce the evidence-pass scores exactly, acceptance
+cannot override a failed or escalated pass, and every completed evidence score
+must meet the policy's acceptance minimum. Version 1 remains supported for
+historical policy commits. The operator should still inspect whether the cited
+evidence supports the model's substantive judgments.
+
+The policy may also designate a low score as a fundamental editorial failure.
+Currently, notability below the minimum requires `reject` or, when the reviewer
+cannot responsibly settle the question, `escalate`; it cannot be softened to a
+request for revisions.
+
 After inspecting `review.json`, post that exact editorial result:
 
 ```bash
@@ -90,9 +102,19 @@ record that points to a different submission issue.
 - `--engine command --command 'program ...'`: sends the prompt on stdin and
   expects one JSON object on stdout.
 
+An acceptance-capable literature pass must be able to verify important sources
+and search for obvious prior formalizations. The configured Claude engine has
+explicit web tools; Codex may use the read-only tools available to its ephemeral
+session. A custom command without equivalent research access should not award a
+literature score above the policy's verification ceiling.
+
 Use `--policy-ref <40-char-sha>` to review against a specific policy commit.
 Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparation
 time.
+
+Deploy reviewer support for a new rubric schema before merging a policy that
+uses it. The reviewer accepts historical version 1 policies and the current
+version 2 contract, and refuses unknown versions.
 
 ## Audit trail
 
