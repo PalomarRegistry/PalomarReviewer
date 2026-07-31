@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +21,11 @@ import yaml
 SUBMISSION_REPO = "kim-em/PalomarSubmission"
 POLICY_REPO = "kim-em/PalomarPolicy"
 DATABASE_REPO = "kim-em/PalomarDatabase"
+RENDER_WORKFLOW = "render-challenge.yml"
+MAX_RENDER_FILES = 2_000
+MAX_RENDER_NODES = 4_000
+MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
+MAX_RENDER_BYTES = 25 * 1024 * 1024
 MECHANICAL_MARKER = "<!-- palomar-mechanical-report -->"
 REVIEW_MARKER = "<!-- palomar-editorial-review -->"
 CLAIM_MARKER = "<!-- palomar-review-claim -->"
@@ -153,6 +162,198 @@ def write_json(path: Path, value: Any) -> None:
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def render_bundle_manifest(bundle: Path) -> tuple[list[dict[str, Any]], str]:
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise ReviewerError("render bundle is missing or symbolic")
+    files: list[dict[str, Any]] = []
+    total_bytes = 0
+    paths: list[Path] = []
+    for path in bundle.rglob("*"):
+        paths.append(path)
+        if len(paths) > MAX_RENDER_NODES:
+            raise ReviewerError("render artifact exceeds the filesystem-node cap")
+    for path in sorted(paths):
+        relative = path.relative_to(bundle).as_posix()
+        if path.is_symlink():
+            raise ReviewerError(f"render bundle contains a symbolic link: {relative}")
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ReviewerError(f"render bundle contains a non-regular file: {relative}")
+        if relative == "artifact-manifest.json":
+            if path.stat().st_size > MAX_RENDER_FILE_BYTES:
+                raise ReviewerError("render artifact manifest exceeds the file-size cap")
+            continue
+        size = path.stat().st_size
+        if size > MAX_RENDER_FILE_BYTES:
+            raise ReviewerError(f"render artifact file exceeds the size cap: {relative}")
+        total_bytes += size
+        files.append(
+            {"path": relative, "bytes": size, "sha256": sha256_file(path)}
+        )
+        if len(files) > MAX_RENDER_FILES:
+            raise ReviewerError("render artifact exceeds the file-count cap")
+        if total_bytes > MAX_RENDER_BYTES:
+            raise ReviewerError("render artifact exceeds the total-size cap")
+    if not files:
+        raise ReviewerError("render bundle is empty")
+    canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return files, hashlib.sha256(canonical).hexdigest()
+
+
+def validate_render_result(
+    result: Path, mechanical: dict[str, Any]
+) -> tuple[dict[str, Any], Path]:
+    if not (result / "challenge-render.json").is_file() and (result / "result").is_dir():
+        result = result / "result"
+    try:
+        report = load_json(result / "challenge-render.json")
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReviewerError(f"render result has no valid challenge-render.json: {error}") from error
+    if not isinstance(report, dict):
+        raise ReviewerError("render result report must be a JSON object")
+    if report.get("status") != "pass":
+        errors = report.get("errors") or ["unknown renderer failure"]
+        raise ReviewerError(
+            "Challenge rendering failed; the acceptance remains valid and publication may be retried: "
+            + "; ".join(str(error) for error in errors)
+        )
+    challenge = mechanical["challenge"]
+    expected_source = {
+        "repository": mechanical["source"]["repository"],
+        "repository_url": mechanical["source"]["repository_url"],
+        "commit": mechanical["source"]["commit"],
+        "challenge_sha256": challenge["sha256"],
+    }
+    if report.get("source") != expected_source:
+        raise ReviewerError("render result does not match the accepted source and Challenge hash")
+    for key in ("verso_commit", "renderer_commit", "landrun_commit"):
+        if not isinstance(report.get(key), str) or not re.fullmatch(r"[0-9a-f]{40}", report[key]):
+            raise ReviewerError(f"render result has an invalid {key}")
+    if report.get("format") != "verso-html" or report.get("entrypoint") != "Challenge/index.html":
+        raise ReviewerError("render result has an unsupported format or entrypoint")
+    bundle = result / "bundle"
+    files, tree_hash = render_bundle_manifest(bundle)
+    try:
+        manifest = load_json(bundle / "artifact-manifest.json")
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReviewerError(f"render result has no valid artifact manifest: {error}") from error
+    expected_manifest = {
+        "schema_version": 1,
+        "artifact_tree_sha256": tree_hash,
+        "files": files,
+    }
+    if manifest != expected_manifest or report.get("artifact_tree_sha256") != tree_hash:
+        raise ReviewerError("render result manifest or content address is inconsistent")
+    if not (bundle / report["entrypoint"]).is_file():
+        raise ReviewerError("render result entrypoint is missing")
+    rendered_at = report.get("rendered_at")
+    if not isinstance(rendered_at, str):
+        raise ReviewerError("render result has no rendered_at timestamp")
+    return report, bundle
+
+
+def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
+    request_id = uuid.uuid4().hex
+    challenge = mechanical["challenge"]
+    gh(
+        [
+            "workflow",
+            "run",
+            RENDER_WORKFLOW,
+            "--repo",
+            SUBMISSION_REPO,
+            "-f",
+            f"repository={mechanical['source']['repository']}",
+            "-f",
+            f"commit={mechanical['source']['commit']}",
+            "-f",
+            f"challenge_sha256={challenge['sha256']}",
+            "-f",
+            f"request_id={request_id}",
+        ]
+    )
+    expected_title = (
+        f"Render {mechanical['source']['repository']}@{mechanical['source']['commit']} [{request_id}]"
+    )
+    run_data: dict[str, Any] | None = None
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        runs = json.loads(
+            gh(
+                [
+                    "run",
+                    "list",
+                    "--repo",
+                    SUBMISSION_REPO,
+                    "--workflow",
+                    RENDER_WORKFLOW,
+                    "--event",
+                    "workflow_dispatch",
+                    "--limit",
+                    "30",
+                    "--json",
+                    "databaseId,displayTitle,status,conclusion,url,headSha",
+                ]
+            )
+        )
+        run_data = next((item for item in runs if item.get("displayTitle") == expected_title), None)
+        if run_data is not None:
+            break
+        time.sleep(5)
+    if run_data is None:
+        raise ReviewerError("render workflow dispatch was not visible after five minutes; retry publish")
+    run_id = str(run_data["databaseId"])
+    watched = run(
+        ["gh", "run", "watch", run_id, "--repo", SUBMISSION_REPO, "--exit-status"],
+        check=False,
+        timeout=6000,
+    )
+    if watched.returncode:
+        raise ReviewerError(
+            "Challenge rendering failed as infrastructure; the acceptance remains valid and "
+            f"publication may be retried: {run_data['url']}"
+        )
+    download = work / "render-download"
+    if download.exists():
+        shutil.rmtree(download)
+    download.mkdir()
+    gh(
+        [
+            "run",
+            "download",
+            run_id,
+            "--repo",
+            SUBMISSION_REPO,
+            "--name",
+            f"challenge-render-{request_id}",
+            "--dir",
+            str(download),
+        ]
+    )
+    report_root = download / "result" if (download / "result").is_dir() else download
+    try:
+        report = load_json(report_root / "challenge-render.json")
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReviewerError(f"downloaded render result is invalid: {error}") from error
+    if not isinstance(report, dict):
+        raise ReviewerError("downloaded render report must be a JSON object")
+    if report.get("renderer_commit") != run_data.get("headSha"):
+        raise ReviewerError("downloaded render result does not match its workflow commit")
+    if report.get("workflow_url") != run_data.get("url"):
+        raise ReviewerError("downloaded render result does not match its workflow run")
+    return download
 
 
 def queue() -> list[dict[str, Any]]:
@@ -696,6 +897,7 @@ def registry_record(
     metadata: dict[str, Any],
     version: int,
     review_url: str,
+    challenge_render: dict[str, Any],
 ) -> dict[str, Any]:
     permanent_id = review.get("existing_id") or f"PALOMAR-{int(issue['number']):06d}"
     title = registry_title(metadata, issue["title"])
@@ -769,6 +971,7 @@ def registry_record(
             "challenge_sha256": challenge["sha256"],
             "solution_sha256": mechanical["solution"]["sha256"],
         },
+        "challenge_render": challenge_render,
         "review": {
             "reviewed_at": review["reviewed_at"],
             "policy_commit": review["policy_commit"],
@@ -817,6 +1020,37 @@ def publish(args: argparse.Namespace) -> int:
         version = max(versions) + 1
     else:
         version = 1
+    permanent_id = existing_id or f"PALOMAR-{int(issue['number']):06d}"
+    if args.render_result:
+        render_candidate = Path(args.render_result).expanduser().resolve()
+    elif (work / "render-result").is_dir():
+        render_candidate = work / "render-result"
+    elif args.dry_run:
+        raise ReviewerError(
+            "dry-run publication does not dispatch workflows; pass --render-result or reuse "
+            f"{work / 'render-result'}"
+        )
+    else:
+        render_candidate = request_render(work, mechanical)
+    render_report, render_bundle = validate_render_result(render_candidate, mechanical)
+    cached_render = work / "render-result"
+    if render_bundle.parent != cached_render:
+        if cached_render.exists():
+            shutil.rmtree(cached_render)
+        shutil.copytree(render_bundle.parent, cached_render)
+        render_bundle = cached_render / "bundle"
+    tree_hash = render_report["artifact_tree_sha256"]
+    artifact_path = f"renders/{permanent_id}-v{version}/{tree_hash}/"
+    challenge_render = {
+        "format": "verso-html",
+        "artifact_path": artifact_path,
+        "entrypoint": "Challenge/index.html",
+        "artifact_tree_sha256": tree_hash,
+        "verso_commit": render_report["verso_commit"],
+        "renderer_commit": render_report["renderer_commit"],
+        "landrun_commit": render_report["landrun_commit"],
+        "rendered_at": render_report["rendered_at"],
+    }
     # Preserve the update ID through deterministic local context.
     review["existing_id"] = existing_id
     record = registry_record(
@@ -825,6 +1059,7 @@ def publish(args: argparse.Namespace) -> int:
         review=review,
         metadata=metadata,
         version=version,
+        challenge_render=challenge_render,
         review_url=(
             (work / "review-url").read_text().strip() if (work / "review-url").is_file() else issue["url"]
         ),
@@ -833,6 +1068,11 @@ def publish(args: argparse.Namespace) -> int:
     destination = database / "entries" / filename
     if destination.exists():
         raise ReviewerError(f"database entry already exists: {filename}")
+    artifact_destination = database / artifact_path
+    if artifact_destination.exists():
+        raise ReviewerError(f"database render artifact already exists: {artifact_path}")
+    artifact_destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(render_bundle, artifact_destination)
     write_json(destination, record)
 
     entries = []
@@ -851,11 +1091,15 @@ def publish(args: argparse.Namespace) -> int:
         database / "index.json",
         {"schema_version": 1, "generated_at": utc_now(), "entries": entries},
     )
-    schema = load_json(database / "schema.json")
+    schema = load_json(database / "schema-v1.json")
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
+    run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.issue}-v{version}"
     run(["git", "checkout", "-b", branch], cwd=database)
-    run(["git", "add", f"entries/{filename}", "index.json"], cwd=database)
+    run(
+        ["git", "add", f"entries/{filename}", "index.json", artifact_path.rstrip("/")],
+        cwd=database,
+    )
     run(
         [
             "git",
@@ -898,6 +1142,7 @@ def publish(args: argparse.Namespace) -> int:
                 f"Publishes accepted submission {SUBMISSION_REPO}#{args.issue}.\n\n"
                 f"- Source: `{record['source']['repository']}@{record['source']['commit']}`\n"
                 f"- Mechanical run: {record['verification']['workflow_url']}\n"
+                f"- Render run: {render_report['workflow_url']}\n"
                 f"- Policy: `{record['review']['policy_commit']}`\n\n"
                 "This PR was prepared by PalomarReviewer. Merging is the publication event."
             ),
@@ -1079,6 +1324,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(func=run_review)
     publish_parser = commands.add_parser("publish", help="prepare a database PR from an accepted report")
     publish_parser.add_argument("--issue", type=int, required=True)
+    publish_parser.add_argument(
+        "--render-result",
+        help="use an extracted trusted renderer result instead of dispatching a workflow",
+    )
     publish_parser.add_argument("--dry-run", action="store_true")
     publish_parser.set_defaults(func=publish)
     finalize_parser = commands.add_parser(
