@@ -56,6 +56,7 @@ MAX_CHALLENGE_REVIEW_BYTES = 500 * 1024 * 1024
 MAX_CHALLENGE_PROMPT_BYTES = 8 * 1024 * 1024
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
+    "classification",
     "clarity",
     "provenance",
     "statement_alignment",
@@ -354,6 +355,9 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         raise ReviewerError(
             "rubric mandatory_reject_below_minimum must contain unique registry score names"
         )
+    allowed_step_scores = set(STEP_SCORE_KEYS)
+    if version < 3:
+        allowed_step_scores.remove("classification")
     owned: list[str] = []
     owners: dict[str, dict[str, Any]] = {}
     for step in steps:
@@ -363,7 +367,7 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         if (
             not isinstance(score_keys, list)
             or not score_keys
-            or any(key not in STEP_SCORE_KEYS for key in score_keys)
+            or any(key not in allowed_step_scores for key in score_keys)
             or len(score_keys) != len(set(score_keys))
         ):
             raise ReviewerError(f"rubric step {step.get('id')!r} has invalid score_keys")
@@ -378,6 +382,9 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
 
 def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[str, Any]:
     schema = copy.deepcopy(STEP_SCHEMA)
+    if rubric_version < 3:
+        schema["properties"]["scores"]["required"].remove("classification")
+        schema["properties"]["scores"]["properties"].pop("classification")
     if rubric_version == 1:
         schema["properties"]["summary"].pop("minLength", None)
         findings = schema["properties"]["findings"]
@@ -389,7 +396,7 @@ def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[st
 
     owned = set(step["score_keys"])
     score_properties = schema["properties"]["scores"]["properties"]
-    for key in STEP_SCORE_KEYS:
+    for key in schema["properties"]["scores"]["properties"]:
         score_properties[key] = (
             {"type": "integer", "minimum": 1, "maximum": 5}
             if key in owned
@@ -2007,30 +2014,43 @@ def registry_title(metadata: dict[str, Any], issue_title: str) -> str:
     return str(fallback or "Untitled Palomar submission")
 
 
+def validated_classification(
+    mechanical: dict[str, Any], metadata: dict[str, Any]
+) -> dict[str, list[str]]:
+    try:
+        result = {
+            "arxiv": [item["code"] for item in mechanical["classification"]["arxiv"]],
+            "msc2020": [item["code"] for item in mechanical["classification"]["msc2020"]],
+        }
+    except (KeyError, TypeError) as error:
+        raise ReviewerError("mechanical report has no valid classification") from error
+    submitted = metadata.get("classification")
+    if not isinstance(submitted, dict) or any(
+        not isinstance(submitted.get(key), list) for key in result
+    ):
+        raise ReviewerError("formalization.yaml has no valid classification")
+    if result != {key: submitted[key] for key in result}:
+        raise ReviewerError("formalization.yaml classification disagrees with the mechanical report")
+    return result
+
+
 def registry_record(
     *,
     issue: dict[str, Any],
     mechanical: dict[str, Any],
     review: dict[str, Any],
     metadata: dict[str, Any],
+    accepted_at: str,
     version: int,
     review_url: str,
     challenge_render: dict[str, Any],
 ) -> dict[str, Any]:
-    existing_id = review.get("existing_id")
-    if existing_id:
-        match = PALOMAR_ID_RE.fullmatch(str(existing_id))
-        if not match:
-            raise ReviewerError(f"existing Palomar ID is invalid: {existing_id!r}")
-        permanent_id = str(existing_id)
-        accepted_at = match.group("date")
-    else:
-        reviewed_at = str(review.get("reviewed_at", ""))
-        try:
-            accepted_at = dt.date.fromisoformat(reviewed_at[:10]).isoformat()
-        except ValueError as error:
-            raise ReviewerError("accepted review has no valid review date") from error
-        permanent_id = f"PALOMAR-{accepted_at}-{int(issue['number']):06d}"
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", accepted_at):
+        raise ReviewerError("review has no valid acceptance date")
+    permanent_id = (
+        review.get("existing_id")
+        or f"PALOMAR-{accepted_at}-{int(issue['number']):06d}"
+    )
     title = registry_title(metadata, issue["title"])
     abstract = (
         metadata_value(
@@ -2082,7 +2102,7 @@ def registry_record(
     if challenge["lines"] > 300 or challenge["bytes"] > 32 * 1024:
         reasons.append("Challenge exceeds the preferred audit surface")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "id": permanent_id,
         "accepted_at": accepted_at,
         "version": version,
@@ -2090,6 +2110,7 @@ def registry_record(
         "title": str(title),
         "abstract": str(abstract),
         "authors": authors_from_metadata(metadata, mechanical["issue"]["submitter"]),
+        "classification": validated_classification(mechanical, metadata),
         "source": {
             "repository": mechanical["source"]["repository"],
             "repository_url": mechanical["source"]["repository_url"],
@@ -2150,23 +2171,30 @@ def publication_identity(
     issue_number: int,
     existing_id: object,
     reviewed_at: object,
-) -> tuple[str, int]:
+    mechanical: dict[str, Any],
+) -> tuple[str, str, int]:
     """Resolve one issue to one permanent ID and its next append-only version."""
     if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
 
     by_issue: set[str] = set()
-    by_id: dict[str, list[tuple[int, int]]] = {}
+    by_id: dict[str, list[tuple[int, int, str, str]]] = {}
     for path in (database / "entries").glob("*.json"):
         prior = load_json(path)
         identifier = str(prior.get("id", ""))
         version = prior.get("version")
         prior_issue = prior.get("submission", {}).get("issue")
+        accepted_at = prior.get("accepted_at")
+        repository = prior.get("source", {}).get("repository")
         if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
             raise ReviewerError(f"database entry has invalid publication identity: {path.name}")
         if not isinstance(prior_issue, int):
             raise ReviewerError(f"database entry has no submission issue: {path.name}")
-        by_id.setdefault(identifier, []).append((version, prior_issue))
+        if not isinstance(accepted_at, str) or not isinstance(repository, str):
+            raise ReviewerError(f"database entry has incomplete publication identity: {path.name}")
+        by_id.setdefault(identifier, []).append(
+            (version, prior_issue, accepted_at, repository)
+        )
         if prior_issue == issue_number:
             by_issue.add(identifier)
 
@@ -2175,11 +2203,17 @@ def publication_identity(
         records = by_id.get(identifier, [])
         if not records:
             raise ReviewerError(f"requested existing ID is not in the database: {identifier}")
-        if {prior_issue for _version, prior_issue in records} != {issue_number}:
+        if {prior_issue for _version, prior_issue, _date, _repo in records} != {issue_number}:
             raise ReviewerError("requested existing ID belongs to another submission issue")
         if by_issue - {identifier}:
             raise ReviewerError("submission issue is already associated with another permanent ID")
-        return identifier, max(version for version, _prior_issue in records) + 1
+        current = max(records, key=lambda record: record[0])
+        submitted_repository = mechanical["source"]["repository"]
+        if current[3].casefold() != submitted_repository.casefold():
+            raise ReviewerError(
+                f"update to {identifier} comes from {submitted_repository}, not {current[3]}"
+            )
+        return identifier, current[2], current[0] + 1
 
     if by_issue:
         identifiers = ", ".join(sorted(by_issue))
@@ -2193,7 +2227,7 @@ def publication_identity(
     identifier = f"PALOMAR-{accepted_at}-{issue_number:06d}"
     if identifier in by_id:
         raise ReviewerError("new permanent ID collides with an existing database record")
-    return identifier, 1
+    return identifier, accepted_at, 1
 
 
 def publish(args: argparse.Namespace) -> int:
@@ -2272,17 +2306,24 @@ def publish(args: argparse.Namespace) -> int:
     require_complete_indexed_context(work, mechanical, str(review.get("decision")))
     if review["decision"] != "accept":
         raise ReviewerError("only an accepted review can be published")
-    metadata = yaml.safe_load((work / "source" / "formalization.yaml").read_text()) or {}
+    source = work / "source"
+    metadata = yaml.safe_load((source / "formalization.yaml").read_text()) or {}
+    source_commit = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+    if source_commit != mechanical["source"]["commit"]:
+        raise ReviewerError("review workspace source no longer matches the mechanical report")
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
+    if not (database / "schema-v3.json").is_file():
+        raise ReviewerError("PalomarDatabase main does not publish schema-v3.json")
 
     existing_id = mechanical.get("existing_id")
-    permanent_id, version = publication_identity(
+    permanent_id, accepted_at, version = publication_identity(
         database,
-        issue_number=int(args.issue),
         existing_id=existing_id,
-        reviewed_at=review.get("reviewed_at"),
+        mechanical=mechanical,
+        reviewed_at=str(review["reviewed_at"]),
+        issue_number=int(issue["number"]),
     )
     if args.render_result:
         render_candidate = Path(args.render_result).expanduser().resolve()
@@ -2321,6 +2362,7 @@ def publish(args: argparse.Namespace) -> int:
         mechanical=mechanical,
         review=review,
         metadata=metadata,
+        accepted_at=accepted_at,
         version=version,
         challenge_render=challenge_render,
         review_url=review_url,
@@ -2352,7 +2394,7 @@ def publish(args: argparse.Namespace) -> int:
         database / "index.json",
         {"schema_version": 2, "generated_at": utc_now(), "entries": entries},
     )
-    schema = load_json(database / "schema-v2.json")
+    schema = load_json(database / "schema-v3.json")
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
     run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.issue}-v{version}"
@@ -2609,7 +2651,7 @@ def main() -> int:
     try:
         args = build_parser().parse_args()
         return args.func(args)
-    except (ReviewerError, jsonschema.ValidationError, KeyError, ValueError) as error:
+    except (ReviewerError, jsonschema.ValidationError, KeyError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

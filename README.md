@@ -135,6 +135,10 @@ Deploy reviewer support for a new rubric schema before merging a policy that
 uses it. The reviewer accepts historical versions 1 and 2 plus the current
 version 3 contract, and refuses unknown versions.
 
+Release database schema support before using a policy or reviewer version that
+publishes that schema. For this contract, `PalomarDatabase/schema-v3.json` must
+be present on `main` before `palomar-review publish` can prepare a database PR.
+
 ## Audit trail
 
 Each review directory retains:
