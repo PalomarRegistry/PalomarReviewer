@@ -742,6 +742,54 @@ class ReviewerTests(unittest.TestCase):
                 check=True,
             )
             mechanical = self.mechanical_fixture()
+            indexed_source = "def Indexed.statementMeaning : Nat := 42\n"
+            indexed_digest = hashlib.sha256(indexed_source.encode()).hexdigest()
+            indexed_repository = sample_record["source"]["repository"]
+            indexed_revision = sample_record["source"]["commit"]
+            mechanical["challenge"].update(
+                {
+                    "direct_imports": ["Indexed"],
+                    "dependencies": [
+                        {
+                            "repository": indexed_repository,
+                            "provenance": "palomar-indexed",
+                            "palomar_id": sample_record["id"],
+                            "palomar_version": sample_record["version"],
+                            "revision": indexed_revision,
+                        }
+                    ],
+                    "review_source_files": [
+                        {
+                            "repository": indexed_repository,
+                            "revision": indexed_revision,
+                            "palomar_id": sample_record["id"],
+                            "palomar_version": sample_record["version"],
+                            "path": "Indexed/StatementMeaning.lean",
+                            "sha256": indexed_digest,
+                        }
+                    ],
+                    "trust_level": "qualified",
+                }
+            )
+            mechanical["project_dependencies"].append(
+                {
+                    "name": "indexed-fixture",
+                    "repository": indexed_repository,
+                    "url": sample_record["source"]["repository_url"],
+                    "revision": indexed_revision,
+                }
+            )
+
+            def clone_indexed_source(_url, requested, destination):
+                indexed_file = destination / "Indexed" / "StatementMeaning.lean"
+                indexed_file.parent.mkdir(parents=True)
+                indexed_file.write_text(indexed_source)
+                return requested
+
+            with mock.patch(
+                "palomar_reviewer.cli.clone_at", side_effect=clone_indexed_source
+            ):
+                prepare_challenge_review_sources(work, mechanical)
             review = {
                 "schema_version": 1,
                 "submission_issue": 12,
@@ -764,7 +812,7 @@ class ReviewerTests(unittest.TestCase):
                 },
                 "warnings": [],
                 "requested_changes": [],
-                "passes": [{}, {}, {}, {}],
+                "passes": [{"step": "definition_fidelity"}, {}, {}, {}],
             }
             issue = {
                 "number": 12,
@@ -830,6 +878,20 @@ class ReviewerTests(unittest.TestCase):
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
             self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(
+                record["trust"]["challenge_dependencies"],
+                [
+                    {
+                        "repository": indexed_repository,
+                        "provenance": "palomar-indexed",
+                        "palomar_id": sample_record["id"],
+                    }
+                ],
+            )
+            self.assertIn(
+                f"{sample_record['id']}-v{sample_record['version']}",
+                "\n".join(record["trust"]["reasons"]),
+            )
             self.assertEqual(json.loads((database / "index.json").read_text())["schema_version"], 2)
             self.assertTrue((database / record["challenge_render"]["artifact_path"]).is_dir())
 
