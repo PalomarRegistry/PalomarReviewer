@@ -323,6 +323,56 @@ class ReviewerError(RuntimeError):
     pass
 
 
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous mappings before publication."""
+
+
+def _construct_unique_mapping(
+    loader: UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            raise ReviewerError("formalization.yaml must not use YAML merge keys")
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as error:
+            raise ReviewerError("formalization.yaml contains an invalid mapping key") from error
+        if duplicate:
+            raise ReviewerError(f"formalization.yaml contains a duplicate key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def load_formalization_metadata(path: Path) -> dict[str, Any]:
+    try:
+        value = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeySafeLoader)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ReviewerError(f"formalization.yaml is not valid YAML: {error}") from error
+    if not isinstance(value, dict):
+        raise ReviewerError("formalization.yaml must contain one top-level mapping")
+    return value
+
+
+def review_digest(report: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        report,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4}:
@@ -1802,7 +1852,7 @@ def matching_review_comment(issue: dict[str, Any], report: dict[str, Any]) -> st
         except json.JSONDecodeError:
             continue
         if posted == report:
-            return comment.get("url") or issue.get("url")
+            return comment.get("url") or None
     return None
 
 
@@ -1860,6 +1910,7 @@ def run_review(args: argparse.Namespace) -> int:
         if existing_url:
             set_review_status(args.issue, stored["decision"])
             (work / "review-url").write_text(existing_url + "\n")
+            (work / "review-sha256").write_text(review_digest(stored) + "\n")
             print(f"Review was already posted: {existing_url}")
             return 0
         try:
@@ -1873,6 +1924,7 @@ def run_review(args: argparse.Namespace) -> int:
             restore_awaiting_review(args.issue)
             raise
         (work / "review-url").write_text(url + "\n")
+        (work / "review-sha256").write_text(review_digest(stored) + "\n")
         print(f"Posted inspected review: {url}")
         return 0
 
@@ -1950,6 +2002,8 @@ def run_review(args: argparse.Namespace) -> int:
     )
     schema = load_json(work / "policy" / "schemas" / "review.schema.json")
     jsonschema.validate(final, schema, format_checker=jsonschema.FormatChecker())
+    (work / "review-url").unlink(missing_ok=True)
+    (work / "review-sha256").unlink(missing_ok=True)
     write_json(work / "review.json", final)
     print(json.dumps(final, indent=2))
     print("\nDry run: GitHub was not changed. Inspect review.json, then re-run with --apply.")
@@ -2244,15 +2298,20 @@ def publish(args: argparse.Namespace) -> int:
     )
     mechanical_url_path = work / "mechanical-report-url"
     review_url_path = work / "review-url"
+    review_digest_path = work / "review-sha256"
     if (
         mechanical_url_path.is_symlink()
         or not mechanical_url_path.is_file()
         or review_url_path.is_symlink()
         or not review_url_path.is_file()
+        or review_digest_path.is_symlink()
+        or not review_digest_path.is_file()
     ):
-        raise ReviewerError("publication requires posted review and mechanical-report URLs")
+        raise ReviewerError("publication requires a posted review bound to the mechanical report")
     mechanical_url = mechanical_url_path.read_text().strip()
     review_url = review_url_path.read_text().strip()
+    if review_digest_path.read_text().strip() != review_digest(review):
+        raise ReviewerError("posted review does not match the current inspected review")
     policy = work / "policy"
     review_schema = policy / "schemas" / "review.schema.json"
     if review_schema.is_symlink() or not review_schema.is_file():
@@ -2279,35 +2338,26 @@ def publish(args: argparse.Namespace) -> int:
     ).stdout.strip()
     if policy_head != review.get("policy_commit"):
         raise ReviewerError("publication policy checkout does not match the inspected review")
-    jsonschema.validate(
+    validate_stored_review(
         review,
-        load_json(review_schema),
-        format_checker=jsonschema.FormatChecker(),
+        work=work,
+        issue=issue,
+        mechanical=mechanical,
+        mechanical_url=mechanical_url,
+        policy_commit=policy_head,
     )
-    publication_rubric = load_json(policy / "rubric.json")
-    validate_rubric(publication_rubric)
-    require_indexed_source_review_pass(
-        mechanical,
-        publication_rubric,
-        review.get("passes", []),
-        str(review.get("decision")),
-    )
-    if (
-        review.get("submission_issue") != int(issue["number"])
-        or review.get("source")
-        != {
-            "repository": mechanical["source"]["repository"],
-            "commit": mechanical["source"]["commit"],
-        }
-        or review.get("mechanical_report") != mechanical_url
-        or not re.fullmatch(r"[0-9a-f]{40}", str(review.get("policy_commit", "")))
-    ):
-        raise ReviewerError("publication inputs do not match the inspected review")
-    require_complete_indexed_context(work, mechanical, str(review.get("decision")))
     if review["decision"] != "accept":
         raise ReviewerError("only an accepted review can be published")
     source = work / "source"
-    metadata = yaml.safe_load((source / "formalization.yaml").read_text()) or {}
+    formalization_path = source / "formalization.yaml"
+    expected_formalization_sha256 = mechanical.get("formalization_sha256")
+    if not isinstance(expected_formalization_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_formalization_sha256
+    ):
+        raise ReviewerError("mechanical report has no valid formalization.yaml digest")
+    if hashlib.sha256(formalization_path.read_bytes()).hexdigest() != expected_formalization_sha256:
+        raise ReviewerError("formalization.yaml no longer matches the mechanical report")
+    metadata = load_formalization_metadata(formalization_path)
     source_commit = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
     if source_commit != mechanical["source"]["commit"]:
         raise ReviewerError("review workspace source no longer matches the mechanical report")

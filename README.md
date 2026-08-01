@@ -72,7 +72,9 @@ palomar-review run --issue 12 --engine codex --model gpt-5.6-sol --apply
 
 `--apply` never reruns the model. It loads the existing dry-run `review.json`,
 validates it again, and requires its issue, source commit, mechanical-report URL,
-and policy commit to match the current trusted inputs before changing GitHub.
+and policy commit to match the current trusted inputs before changing GitHub. It
+stores the resulting comment URL together with a digest of that exact report;
+starting another dry run clears both bindings.
 This separation is a security boundary: model output and repository prose are
 untrusted evidence until an operator has inspected the stored report.
 
@@ -84,7 +86,10 @@ palomar-review publish --issue 12
 
 `publish` first dispatches the pinned Challenge renderer and checks that the
 downloaded result matches the accepted source, Challenge hash, workflow run,
-and renderer commit. It then validates the generated record and immutable
+and renderer commit. It revalidates every stored evidence pass and the
+score-to-decision policy, requires the applied-review digest to match, and binds
+published metadata to the mechanically recorded `formalization.yaml` digest.
+It then validates the generated record and immutable
 render bundle against the database schema, pushes an issue-specific branch to
 `kim-em/PalomarDatabase`, and opens a PR. It refuses non-accept decisions and
 existing entry filenames. A renderer or infrastructure failure does not undo
@@ -160,6 +165,8 @@ prompts/                 # fully rendered prompts
 raw/                     # exact engine final messages
 passes/                  # normalized per-pass JSON
 review.json              # schema-validated final report
+review-url               # exact posted review comment
+review-sha256            # digest binding review-url to review.json
 render-result/            # validated immutable Challenge render and provenance
 ```
 
