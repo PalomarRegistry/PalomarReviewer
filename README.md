@@ -16,6 +16,14 @@ validates the final report, and optionally:
 The operator remains responsible for inspecting the report and merging the
 database PR. The tool never merges.
 
+The reviewer resolves the exact successful `PalomarSubmission` workflow run
+and uses its downloaded `mechanical-report.json` artifact as the sole mechanical
+authority. It binds the artifact to the current issue repository/commit, run
+URL, and a trusted workflow revision; fenced JSON in issue comments is never a
+certificate input. For indexed Challenge imports it independently checks out
+each recorded repository/commit and verifies every source hash before adding
+the actual imported files to definition-fidelity evidence.
+
 ## Install
 
 ```bash
@@ -108,6 +116,15 @@ explicit web tools; Codex may use the read-only tools available to its ephemeral
 session. A custom command without equivalent research access should not award a
 literature score above the policy's verification ceiling.
 
+Every engine is additionally launched inside a fail-closed Bubblewrap
+namespace. The namespace exposes the submission at `/workspace`, a dedicated
+output directory, an empty scratch home, and only the selected engine's model
+authentication file. It does not expose the operator's GitHub CLI
+configuration, publication credentials, unrelated home files, or other
+workspaces. Network access is absent for repository, statement, definition,
+proof, and synthesis passes; it is enabled only for the literature/notability
+pass. `palomar-review doctor` refuses an installation without `bwrap`.
+
 Use `--policy-ref <40-char-sha>` to review against a specific policy commit.
 Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparation
 time.
@@ -124,6 +141,8 @@ Each review directory retains:
 issue.json
 mechanical-report.json
 source/                  # detached source commit
+challenge-dependencies/  # detached indexed commits used by Challenge
+challenge-review-sources.json # exact paths, versions, and hashes reviewed
 policy/                  # detached policy commit
 prompts/                 # fully rendered prompts
 raw/                     # exact engine final messages
