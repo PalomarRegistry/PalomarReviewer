@@ -752,9 +752,11 @@ class ReviewerTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
         def commit_source(path, mechanical):
-            mechanical["formalization_sha256"] = hashlib.sha256(
+            formalization_sha256 = hashlib.sha256(
                 (path / "formalization.yaml").read_bytes()
             ).hexdigest()
+            mechanical["formalization_sha256"] = formalization_sha256
+            mechanical["formalization"] = {"sha256": formalization_sha256}
             subprocess.run(["git", "init", "--quiet", str(path)], check=True)
             subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
             subprocess.run(
@@ -921,6 +923,7 @@ class ReviewerTests(unittest.TestCase):
             commit_source(source, mechanical)
             review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
+            (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             (work / "review.json").write_text(json.dumps(review))
             (work / "issue.json").write_text(json.dumps(issue))
             (work / "review-url").write_text(
@@ -972,10 +975,18 @@ class ReviewerTests(unittest.TestCase):
             (work / "review-sha256").write_text("0" * 64 + "\n")
             with self.assertRaisesRegex(ReviewerError, "posted review does not match"):
                 publish(args)
+            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            (work / "mechanical-report-sha256").write_text("0" * 64 + "\n")
+            with self.assertRaisesRegex(ReviewerError, "mechanical report no longer matches"):
+                publish(args)
+            (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             classification_pass = next(
                 item for item in review["passes"] if item["step"] == "classification"
             )
             classification_pass["scores"]["classification"] = 2
+            dirty_rubric = json.loads((work / "policy" / "rubric.json").read_text())
+            dirty_rubric["minimum_accept_score"] = 1
+            (work / "policy" / "rubric.json").write_text(json.dumps(dirty_rubric))
             (work / "review.json").write_text(json.dumps(review))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
             with self.assertRaisesRegex(ReviewerError, "scores below"):
@@ -983,6 +994,12 @@ class ReviewerTests(unittest.TestCase):
             classification_pass["scores"]["classification"] = 4
             (work / "review.json").write_text(json.dumps(review))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
+            formalization_path = source / "formalization.yaml"
+            formalization_bytes = formalization_path.read_bytes()
+            formalization_path.write_bytes(formalization_bytes + b"# changed\n")
+            with self.assertRaisesRegex(ReviewerError, "no longer matches the mechanical report"):
+                publish(args)
+            formalization_path.write_bytes(formalization_bytes)
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
@@ -1089,6 +1106,9 @@ class ReviewerTests(unittest.TestCase):
             )
             commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
+            (update_work / "mechanical-report-sha256").write_text(
+                review_digest(update_mechanical) + "\n"
+            )
             update_mechanical_url = update_mechanical["workflow_url"]
             update_review = {
                 **review,
@@ -1494,7 +1514,8 @@ class ReviewerTests(unittest.TestCase):
             "https://example.test/issues/7#review",
         )
         del issue["comments"][1]["url"]
-        self.assertIsNone(matching_review_comment(issue, report))
+        with self.assertRaisesRegex(ReviewerError, "has no comment URL"):
+            matching_review_comment(issue, report)
         changed = {**report, "summary": "A later, different report"}
         self.assertIsNone(matching_review_comment(issue, changed))
 

@@ -75,6 +75,12 @@ validates it again, and requires its issue, source commit, mechanical-report URL
 and policy commit to match the current trusted inputs before changing GitHub. It
 stores the resulting comment URL together with a digest of that exact report;
 starting another dry run clears both bindings.
+
+Workspaces applied by an older reviewer may have `review-url` but no
+`review-sha256`; rerun the same `--apply` command to verify the existing comment
+and create the binding. Mechanical reports without a formalization digest must
+be re-verified before they can be published.
+
 This separation is a security boundary: model output and repository prose are
 untrusted evidence until an operator has inspected the stored report.
 
@@ -157,6 +163,7 @@ Each review directory retains:
 ```text
 issue.json
 mechanical-report.json
+mechanical-report-sha256 # detects drift from the downloaded workflow artifact
 source/                  # detached source commit
 challenge-dependencies/  # detached indexed commits used by Challenge
 challenge-review-sources.json # exact paths, versions, and hashes reviewed
