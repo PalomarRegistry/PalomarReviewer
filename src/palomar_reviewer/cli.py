@@ -296,6 +296,10 @@ MECHANICAL_REPORT_SCHEMA = {
         "landrun_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "checked_at": {"type": "string", "format": "date-time"},
         "workflow_url": {"type": "string", "pattern": r"^https://github\.com/kim-em/PalomarSubmission/actions/runs/[1-9][0-9]*$"},
+        "existing_id": {
+            "type": ["string", "null"],
+            "pattern": r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$",
+        },
         "project_dependencies": {
             "type": "array",
             "items": {
@@ -320,7 +324,7 @@ class ReviewerError(RuntimeError):
 
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2}:
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3}:
         raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -701,7 +705,7 @@ def trusted_verification_runs(
     expected_title = f"Verify submission #{issue_number}"
     exact = [item for item in eligible if item.get("displayTitle") == expected_title]
     legacy = [item for item in eligible if item.get("displayTitle") == issue_title]
-    return (exact or legacy or eligible), bool(exact)
+    return (exact or legacy), bool(exact)
 
 
 def download_mechanical_artifact(
@@ -892,6 +896,7 @@ def prepare_challenge_review_sources(work: Path, mechanical: dict[str, Any]) -> 
         shutil.rmtree(checkouts)
     checkouts.mkdir()
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    covered_dependencies: set[tuple[str, str, str, int | None]] = set()
     for item in records:
         if not isinstance(item, dict):
             raise ReviewerError("mechanical Challenge review-source record is malformed")
@@ -905,7 +910,17 @@ def prepare_challenge_review_sources(work: Path, mechanical: dict[str, Any]) -> 
             raise ReviewerError(
                 "Challenge review-source file is not bound to a versioned indexed dependency"
             )
+        covered_dependencies.add(key)
         grouped.setdefault((str(item["repository"]), str(item["revision"])), []).append(item)
+    missing_dependencies = dependencies - covered_dependencies
+    if missing_dependencies:
+        missing = ", ".join(
+            f"{repository}@{revision} ({palomar_id}-v{version})"
+            for repository, revision, palomar_id, version in sorted(missing_dependencies)
+        )
+        raise ReviewerError(
+            f"indexed Challenge dependencies lack source-closure evidence: {missing}"
+        )
 
     manifest: list[dict[str, Any]] = []
     total_bytes = 0
@@ -990,6 +1005,59 @@ def challenge_review_source_context(work: Path) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def require_complete_indexed_context(
+    work: Path, mechanical: dict[str, Any], decision: str
+) -> None:
+    """Prevent acceptance when the model packet omitted indexed source bytes."""
+    if decision != "accept" or not any(
+        isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
+        for item in mechanical.get("challenge", {}).get("dependencies", [])
+    ):
+        return
+    manifest_path = work / "challenge-review-sources.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ReviewerError("acceptance lacks indexed Challenge source evidence")
+    manifest = load_json(manifest_path)
+    files = manifest.get("files", []) if isinstance(manifest, dict) else []
+    if not isinstance(files, list) or not files:
+        raise ReviewerError("acceptance lacks indexed Challenge source files")
+    total = sum(
+        item.get("bytes", MAX_CHALLENGE_PROMPT_BYTES + 1)
+        for item in files
+        if isinstance(item, dict)
+    )
+    if len(files) > MAX_CHALLENGE_REVIEW_FILES or total > MAX_CHALLENGE_PROMPT_BYTES:
+        raise ReviewerError(
+            "acceptance is forbidden because indexed Challenge source evidence was truncated"
+        )
+
+
+def require_indexed_source_review_pass(
+    mechanical: dict[str, Any],
+    rubric: dict[str, Any],
+    passes: list[dict[str, Any]],
+    decision: str,
+) -> None:
+    """Require an executed acceptance pass to receive exact indexed sources."""
+    if decision != "accept" or not any(
+        isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
+        for item in mechanical.get("challenge", {}).get("dependencies", [])
+    ):
+        return
+    executed = {
+        result.get("step") for result in passes if isinstance(result, dict)
+    }
+    if not any(
+        step.get("id") in executed
+        and "challenge_review_sources" in step.get("inputs", [])
+        for step in rubric.get("steps", [])
+        if isinstance(step, dict) and step.get("id") != "synthesis"
+    ):
+        raise ReviewerError(
+            "acceptance requires an executed review pass over indexed Challenge sources"
+        )
 
 
 def prepare_workspace(
@@ -1169,7 +1237,6 @@ def isolated_engine_command(
     *,
     cwd: Path,
     output_dir: Path,
-    allow_network: bool = False,
 ) -> list[str]:
     """Build a fail-closed Linux namespace with no ambient operator home."""
     bwrap = shutil.which("bwrap")
@@ -1184,6 +1251,10 @@ def isolated_engine_command(
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
+        # The CLI transport must reach its model API. Per-pass browsing is
+        # controlled by the engine tool list; a private netns would also cut
+        # the transport and make every non-literature pass non-functional.
+        "--share-net",
         "--clearenv",
         "--tmpfs",
         "/home",
@@ -1222,8 +1293,6 @@ def isolated_engine_command(
         "--chdir",
         "/workspace",
     ]
-    if allow_network:
-        command.insert(command.index("--clearenv"), "--share-net")
     for path in (
         Path("/nix/store"),
         Path("/run/current-system/sw"),
@@ -1318,9 +1387,17 @@ def engine_result(
     allow_network: bool = False,
 ) -> dict[str, Any]:
     raw_path.parent.mkdir(parents=True, exist_ok=True)
+    if raw_path.is_symlink() or (raw_path.exists() and not raw_path.is_file()):
+        raise ReviewerError("review raw-output path is not a regular file")
+    engine_output = raw_path.parent / f".{raw_path.name}.engine-output"
+    if engine_output.is_symlink() or (engine_output.exists() and not engine_output.is_dir()):
+        raise ReviewerError("review engine-output path is not a real directory")
+    if engine_output.is_dir():
+        shutil.rmtree(engine_output)
+    engine_output.mkdir()
     if engine == "codex":
-        schema_path = raw_path.with_suffix(".schema.json")
-        output_path = raw_path.with_suffix(".message")
+        schema_path = engine_output / "schema.json"
+        output_path = engine_output / "message.txt"
         write_json(schema_path, schema)
         argv = [
             "codex",
@@ -1339,18 +1416,19 @@ def engine_result(
         if model:
             argv.extend(["--model", model])
         argv.append("-")
-        proc = run(
+        run(
             isolated_engine_command(
                 "codex",
                 argv,
                 cwd=cwd,
-                output_dir=raw_path.parent,
-                allow_network=allow_network,
+                output_dir=engine_output,
             ),
             input_text=prompt,
             timeout=7200,
         )
-        text = output_path.read_text(encoding="utf-8") if output_path.is_file() else proc.stdout
+        if output_path.is_symlink() or not output_path.is_file():
+            raise ReviewerError("Codex did not create a regular final-message file")
+        text = output_path.read_text(encoding="utf-8")
     elif engine == "claude":
         argv = [
             "claude",
@@ -1373,8 +1451,7 @@ def engine_result(
                 "claude",
                 argv,
                 cwd=cwd,
-                output_dir=raw_path.parent,
-                allow_network=allow_network,
+                output_dir=engine_output,
             ),
             input_text=prompt,
             timeout=7200,
@@ -1388,14 +1465,15 @@ def engine_result(
                 "command",
                 argv,
                 cwd=cwd,
-                output_dir=raw_path.parent,
-                allow_network=allow_network,
+                output_dir=engine_output,
             ),
             input_text=prompt,
             timeout=7200,
         ).stdout
     else:
         raise ReviewerError(f"unsupported engine: {engine}")
+    if raw_path.is_symlink():
+        raise ReviewerError("review raw-output path became symbolic")
     raw_path.write_text(text, encoding="utf-8")
     result = parse_engine_json(text)
     jsonschema.validate(result, schema)
@@ -1486,6 +1564,7 @@ def validate_stored_review(
         raise ReviewerError("stored review names another mechanical report")
     if report.get("policy_commit") != policy_commit:
         raise ReviewerError("stored review was produced under another policy commit")
+    require_complete_indexed_context(work, mechanical, str(report.get("decision")))
 
     rubric = load_json(work / "policy" / "rubric.json")
     rubric_version = validate_rubric(rubric)
@@ -1497,6 +1576,12 @@ def validate_stored_review(
             raise ReviewerError(f"stored review has an unknown or duplicate pass: {step_id!r}")
         jsonschema.validate(result, step_schema_for_rubric(steps[step_id], rubric_version))
         seen.add(step_id)
+    require_indexed_source_review_pass(
+        mechanical,
+        rubric,
+        report["passes"],
+        str(report.get("decision")),
+    )
     if rubric_version >= 2:
         synthesis = {
             "decision": report["decision"],
@@ -1832,6 +1917,13 @@ def run_review(args: argparse.Namespace) -> int:
             write_json(work / "passes" / f"{step['id']}.json", result)
     if synthesis is None:
         raise ReviewerError("rubric did not produce a synthesis result")
+    require_complete_indexed_context(work, mechanical, str(synthesis.get("decision")))
+    require_indexed_source_review_pass(
+        mechanical,
+        rubric,
+        passes,
+        str(synthesis.get("decision")),
+    )
     if rubric_version >= 2:
         validate_synthesis_policy(
             synthesis,
@@ -2052,39 +2144,146 @@ def registry_record(
     }
 
 
+def publication_identity(
+    database: Path,
+    *,
+    issue_number: int,
+    existing_id: object,
+    reviewed_at: object,
+) -> tuple[str, int]:
+    """Resolve one issue to one permanent ID and its next append-only version."""
+    if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
+        raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
+
+    by_issue: set[str] = set()
+    by_id: dict[str, list[tuple[int, int]]] = {}
+    for path in (database / "entries").glob("*.json"):
+        prior = load_json(path)
+        identifier = str(prior.get("id", ""))
+        version = prior.get("version")
+        prior_issue = prior.get("submission", {}).get("issue")
+        if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
+            raise ReviewerError(f"database entry has invalid publication identity: {path.name}")
+        if not isinstance(prior_issue, int):
+            raise ReviewerError(f"database entry has no submission issue: {path.name}")
+        by_id.setdefault(identifier, []).append((version, prior_issue))
+        if prior_issue == issue_number:
+            by_issue.add(identifier)
+
+    if existing_id:
+        identifier = str(existing_id)
+        records = by_id.get(identifier, [])
+        if not records:
+            raise ReviewerError(f"requested existing ID is not in the database: {identifier}")
+        if {prior_issue for _version, prior_issue in records} != {issue_number}:
+            raise ReviewerError("requested existing ID belongs to another submission issue")
+        if by_issue - {identifier}:
+            raise ReviewerError("submission issue is already associated with another permanent ID")
+        return identifier, max(version for version, _prior_issue in records) + 1
+
+    if by_issue:
+        identifiers = ", ".join(sorted(by_issue))
+        raise ReviewerError(
+            f"submission issue already has a permanent ID; publish an update to: {identifiers}"
+        )
+    try:
+        accepted_at = dt.date.fromisoformat(str(reviewed_at)[:10]).isoformat()
+    except ValueError as error:
+        raise ReviewerError("accepted review has no valid review date") from error
+    identifier = f"PALOMAR-{accepted_at}-{issue_number:06d}"
+    if identifier in by_id:
+        raise ReviewerError("new permanent ID collides with an existing database record")
+    return identifier, 1
+
+
 def publish(args: argparse.Namespace) -> int:
     work = Path(args.work_dir).expanduser().resolve() / str(args.issue)
     review = load_json(work / "review.json")
-    if review["decision"] != "accept":
-        raise ReviewerError("only an accepted review can be published")
     issue = load_json(work / "issue.json")
     mechanical = load_json(work / "mechanical-report.json")
+    if int(issue.get("number", 0)) != int(args.issue):
+        raise ReviewerError("publication issue file does not match the requested submission")
+    jsonschema.validate(
+        mechanical,
+        MECHANICAL_REPORT_SCHEMA,
+        format_checker=jsonschema.FormatChecker(),
+    )
+    mechanical_url_path = work / "mechanical-report-url"
+    review_url_path = work / "review-url"
+    if (
+        mechanical_url_path.is_symlink()
+        or not mechanical_url_path.is_file()
+        or review_url_path.is_symlink()
+        or not review_url_path.is_file()
+    ):
+        raise ReviewerError("publication requires posted review and mechanical-report URLs")
+    mechanical_url = mechanical_url_path.read_text().strip()
+    review_url = review_url_path.read_text().strip()
+    policy = work / "policy"
+    review_schema = policy / "schemas" / "review.schema.json"
+    if review_schema.is_symlink() or not review_schema.is_file():
+        raise ReviewerError("publication requires the exact reviewed policy checkout")
+    git_env = os.environ.copy()
+    git_env.update(
+        {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    policy_head = run(
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(policy),
+            "rev-parse",
+            "HEAD",
+        ],
+        env=git_env,
+    ).stdout.strip()
+    if policy_head != review.get("policy_commit"):
+        raise ReviewerError("publication policy checkout does not match the inspected review")
+    jsonschema.validate(
+        review,
+        load_json(review_schema),
+        format_checker=jsonschema.FormatChecker(),
+    )
+    publication_rubric = load_json(policy / "rubric.json")
+    validate_rubric(publication_rubric)
+    require_indexed_source_review_pass(
+        mechanical,
+        publication_rubric,
+        review.get("passes", []),
+        str(review.get("decision")),
+    )
+    if (
+        review.get("submission_issue") != int(issue["number"])
+        or review.get("source")
+        != {
+            "repository": mechanical["source"]["repository"],
+            "commit": mechanical["source"]["commit"],
+        }
+        or review.get("mechanical_report") != mechanical_url
+        or not re.fullmatch(r"[0-9a-f]{40}", str(review.get("policy_commit", "")))
+    ):
+        raise ReviewerError("publication inputs do not match the inspected review")
+    require_complete_indexed_context(work, mechanical, str(review.get("decision")))
+    if review["decision"] != "accept":
+        raise ReviewerError("only an accepted review can be published")
     metadata = yaml.safe_load((work / "source" / "formalization.yaml").read_text()) or {}
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
 
     existing_id = mechanical.get("existing_id")
-    versions = []
-    if existing_id:
-        for path in (database / "entries").glob(f"{existing_id}-v*.json"):
-            versions.append(int(re.search(r"-v(\d+)\.json$", path.name).group(1)))
-        if not versions:
-            raise ReviewerError(f"requested existing ID is not in the database: {existing_id}")
-        version = max(versions) + 1
-    else:
-        version = 1
-    if existing_id:
-        if not PALOMAR_ID_RE.fullmatch(str(existing_id)):
-            raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
-        permanent_id = str(existing_id)
-    else:
-        reviewed_at = str(review.get("reviewed_at", ""))
-        try:
-            accepted_at = dt.date.fromisoformat(reviewed_at[:10]).isoformat()
-        except ValueError as error:
-            raise ReviewerError("accepted review has no valid review date") from error
-        permanent_id = f"PALOMAR-{accepted_at}-{int(issue['number']):06d}"
+    permanent_id, version = publication_identity(
+        database,
+        issue_number=int(args.issue),
+        existing_id=existing_id,
+        reviewed_at=review.get("reviewed_at"),
+    )
     if args.render_result:
         render_candidate = Path(args.render_result).expanduser().resolve()
     elif (work / "render-result").is_dir():
@@ -2124,9 +2323,7 @@ def publish(args: argparse.Namespace) -> int:
         metadata=metadata,
         version=version,
         challenge_render=challenge_render,
-        review_url=(
-            (work / "review-url").read_text().strip() if (work / "review-url").is_file() else issue["url"]
-        ),
+        review_url=review_url,
     )
     filename = f"{record['id']}-v{version}.json"
     destination = database / "entries" / filename

@@ -121,17 +121,19 @@ namespace. The namespace exposes the submission at `/workspace`, a dedicated
 output directory, an empty scratch home, and only the selected engine's model
 authentication file. It does not expose the operator's GitHub CLI
 configuration, publication credentials, unrelated home files, or other
-workspaces. Network access is absent for repository, statement, definition,
-proof, and synthesis passes; it is enabled only for the literature/notability
-pass. `palomar-review doctor` refuses an installation without `bwrap`.
+workspaces. The engine transport can reach its model API in every pass. Claude
+web tools are disabled, and Codex search is not enabled, outside the
+literature/notability pass; general host-level egress filtering would require a
+separate API-aware proxy. `palomar-review doctor` refuses an installation
+without `bwrap`.
 
 Use `--policy-ref <40-char-sha>` to review against a specific policy commit.
 Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparation
 time.
 
 Deploy reviewer support for a new rubric schema before merging a policy that
-uses it. The reviewer accepts historical version 1 policies and the current
-version 2 contract, and refuses unknown versions.
+uses it. The reviewer accepts historical versions 1 and 2 plus the current
+version 3 contract, and refuses unknown versions.
 
 ## Audit trail
 

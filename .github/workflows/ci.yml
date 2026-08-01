@@ -21,6 +21,11 @@ jobs:
           repository: kim-em/PalomarDatabase
           persist-credentials: false
           path: palomar-database
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kim-em/PalomarPolicy
+          persist-credentials: false
+          path: palomar-policy
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.11.10"
@@ -38,6 +43,7 @@ jobs:
         working-directory: reviewer
         env:
           PALOMAR_DATABASE_CHECKOUT: ${{ github.workspace }}/palomar-database
+          PALOMAR_POLICY_CHECKOUT: ${{ github.workspace }}/palomar-policy
         run: |
           python -m compileall -q src tests
           python -m unittest discover -s tests -v
