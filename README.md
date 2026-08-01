@@ -132,8 +132,18 @@ Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparati
 time.
 
 Deploy reviewer support for a new rubric schema before merging a policy that
-uses it. The reviewer accepts historical versions 1 and 2 plus the current
-version 3 contract, and refuses unknown versions.
+uses it. The reviewer accepts historical versions 1, 2, and 3 plus the current
+version 4 contract, and refuses unknown versions.
+
+Release database schema support before using a policy or reviewer version that
+publishes that schema. For this contract, `PalomarDatabase/schema-v3.json` must
+be present on `main` before `palomar-review publish` can prepare a database PR.
+Deploy the web release that accepts entry schema v3 before publishing the first
+schema-v3 record, or that record will make the registry fail closed for all
+visitors. Merge the rollout in this order: Database, Submission, Web, Reviewer,
+then Policy. A submission mechanically verified before the Submission release
+has no trusted classification evidence and must be re-verified before review or
+publication.
 
 ## Audit trail
 
