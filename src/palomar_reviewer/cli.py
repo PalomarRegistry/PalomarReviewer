@@ -2590,6 +2590,15 @@ def publication_entry_path(pr: dict[str, Any]) -> str:
     return paths[0]
 
 
+def has_publication_comment(issue: dict[str, Any], record: dict[str, Any]) -> bool:
+    heading = f"## 🔭 Published as `{record['id']}` v{record['version']}"
+    return any(
+        PUBLICATION_MARKER in comment.get("body", "")
+        and heading in comment.get("body", "")
+        for comment in issue.get("comments", [])
+    )
+
+
 def finalize(args: argparse.Namespace) -> int:
     pr = json.loads(
         gh(
@@ -2670,7 +2679,7 @@ def finalize(args: argparse.Namespace) -> int:
         ]
     )
     issue = issue_data(args.issue)
-    if not any(PUBLICATION_MARKER in comment.get("body", "") for comment in issue.get("comments", [])):
+    if not has_publication_comment(issue, record):
         body = (
             f"{PUBLICATION_MARKER}\n"
             f"## 🔭 Published as `{record['id']}` v{record['version']}\n\n"

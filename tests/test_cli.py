@@ -21,6 +21,7 @@ from palomar_reviewer.cli import (
     engine_result,
     finalize,
     has_proof_account,
+    has_publication_comment,
     isolated_engine_command,
     load_formalization_metadata,
     markdown_text,
@@ -1220,6 +1221,29 @@ class ReviewerTests(unittest.TestCase):
             publication_entry_path(pr),
             "entries/PALOMAR-2026-08-01-000012-v2.json",
         )
+
+    def test_publication_comment_is_idempotent_per_version(self):
+        record = {"id": "PALOMAR-2026-08-01-000012", "version": 2}
+        issue = {
+            "comments": [
+                {
+                    "body": (
+                        "<!-- palomar-publication -->\n"
+                        "## 🔭 Published as `PALOMAR-2026-08-01-000012` v1"
+                    )
+                }
+            ]
+        }
+        self.assertFalse(has_publication_comment(issue, record))
+        issue["comments"].append(
+            {
+                "body": (
+                    "<!-- palomar-publication -->\n"
+                    "## 🔭 Published as `PALOMAR-2026-08-01-000012` v2"
+                )
+            }
+        )
+        self.assertTrue(has_publication_comment(issue, record))
 
     def test_publication_identity_is_one_to_one_with_submission_issue(self):
         with tempfile.TemporaryDirectory() as directory:
