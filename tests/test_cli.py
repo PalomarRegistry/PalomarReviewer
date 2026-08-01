@@ -42,6 +42,7 @@ from palomar_reviewer.cli import (
     validate_rubric,
     validate_stored_review,
     validate_synthesis_policy,
+    validated_classification,
 )
 
 
@@ -63,6 +64,10 @@ class ReviewerTests(unittest.TestCase):
                 "repository_url": "https://github.com/example/project",
                 "commit": "1" * 40,
                 "tree_url": "https://github.com/example/project/tree/" + "1" * 40,
+            },
+            "classification": {
+                "arxiv": [{"code": "math.CO", "name": "Combinatorics"}],
+                "msc2020": [{"code": "05C10", "name": "Topological graph theory"}],
             },
             "challenge": {
                 "sha256": "2" * 64,
@@ -135,7 +140,7 @@ class ReviewerTests(unittest.TestCase):
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
         ]
         rubric = {
-            "schema_version": 2,
+            "schema_version": 4,
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
@@ -576,7 +581,7 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_is_schema_v2_with_dated_identity(self):
+    def test_registry_record_is_schema_v3_with_dated_identity(self):
         record = registry_record(
             issue={
                 "number": 12,
@@ -598,7 +603,11 @@ class ReviewerTests(unittest.TestCase):
                 },
                 "warnings": [],
             },
-            metadata={"project": {"license": "MIT"}},
+            metadata={
+                "project": {"license": "MIT"},
+                "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            },
+            accepted_at="2026-08-01",
             version=1,
             review_url=(
                 "https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1"
@@ -616,12 +625,12 @@ class ReviewerTests(unittest.TestCase):
                 "rendered_at": "2026-08-01T12:35:00Z",
             },
         )
-        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["schema_version"], 3)
         self.assertEqual(record["id"], "PALOMAR-2026-08-01-000012")
         self.assertEqual(record["accepted_at"], "2026-08-01")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v2.json").read_text())
+            schema = json.loads((Path(database) / "schema-v3.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -674,7 +683,11 @@ class ReviewerTests(unittest.TestCase):
                 },
                 "warnings": [],
             },
-            metadata={"project": {"license": "MIT"}},
+            metadata={
+                "project": {"license": "MIT"},
+                "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            },
+            accepted_at="2026-08-01",
             version=1,
             review_url=(
                 "https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1"
@@ -725,6 +738,28 @@ class ReviewerTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
+        def commit_source(path, mechanical):
+            subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+            subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+            subprocess.run(
+                ["git", "-C", str(path), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(path), "add", "formalization.yaml"], check=True)
+            subprocess.run(
+                ["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"], check=True
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            mechanical["source"]["commit"] = commit
+            mechanical["source"]["tree_url"] = (
+                f"{mechanical['source']['repository_url']}/tree/{commit}"
+            )
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             work = root / "12"
@@ -844,14 +879,19 @@ class ReviewerTests(unittest.TestCase):
                 },
                 "warnings": [],
                 "requested_changes": [],
-                "passes": [{"step": "definition_fidelity"}, {}, {}, {}],
+                "passes": [{"step": "definition_fidelity"}, {}, {}, {}, {}],
             }
             issue = {
                 "number": 12,
                 "title": "[submission] Example result",
                 "url": "https://github.com/kim-em/PalomarSubmission/issues/12",
             }
-            (source / "formalization.yaml").write_text("project:\n  license: MIT\n")
+            (source / "formalization.yaml").write_text(
+                "project:\n  license: MIT\n"
+                "classification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+            )
+            commit_source(source, mechanical)
+            review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
             (work / "review.json").write_text(json.dumps(review))
             (work / "issue.json").write_text(json.dumps(issue))
@@ -909,7 +949,7 @@ class ReviewerTests(unittest.TestCase):
             database = work / "database"
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
-            self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(record["schema_version"], 3)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -1000,7 +1040,11 @@ class ReviewerTests(unittest.TestCase):
                     f"{update_issue_number}"
                 ),
             }
-            (update_source / "formalization.yaml").write_text("project:\n  license: MIT\n")
+            (update_source / "formalization.yaml").write_text(
+                "project:\n  license: MIT\n"
+                "classification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+            )
+            commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
             update_mechanical_url = update_mechanical["workflow_url"]
             update_review = {
@@ -1087,15 +1131,19 @@ class ReviewerTests(unittest.TestCase):
             prior = {
                 "id": "PALOMAR-2026-07-31-000012",
                 "version": 1,
+                "accepted_at": "2026-07-31",
                 "submission": {"issue": 12},
+                "source": {"repository": "example/result"},
             }
             (database / "entries" / "prior.json").write_text(json.dumps(prior))
+            mechanical = {"source": {"repository": "Example/Result"}}
             with self.assertRaisesRegex(ReviewerError, "already has a permanent ID"):
                 publication_identity(
                     database,
                     issue_number=12,
                     existing_id=None,
                     reviewed_at="2026-08-01T00:00:00Z",
+                    mechanical=mechanical,
                 )
             self.assertEqual(
                 publication_identity(
@@ -1103,8 +1151,9 @@ class ReviewerTests(unittest.TestCase):
                     issue_number=12,
                     existing_id=prior["id"],
                     reviewed_at="2026-08-01T00:00:00Z",
+                    mechanical=mechanical,
                 ),
-                (prior["id"], 2),
+                (prior["id"], "2026-07-31", 2),
             )
             with self.assertRaisesRegex(ReviewerError, "another submission issue"):
                 publication_identity(
@@ -1112,7 +1161,38 @@ class ReviewerTests(unittest.TestCase):
                     issue_number=13,
                     existing_id=prior["id"],
                     reviewed_at="2026-08-01T00:00:00Z",
+                    mechanical=mechanical,
                 )
+            mechanical["source"]["repository"] = "attacker/other"
+            with self.assertRaisesRegex(ReviewerError, "not example/result"):
+                publication_identity(
+                    database,
+                    issue_number=12,
+                    existing_id=prior["id"],
+                    reviewed_at="2026-08-01T00:00:00Z",
+                    mechanical=mechanical,
+                )
+            with self.assertRaisesRegex(ReviewerError, "existing ID is invalid"):
+                publication_identity(
+                    database,
+                    issue_number=12,
+                    existing_id="../PALOMAR-2026-07-31-000012",
+                    reviewed_at="2026-08-01T00:00:00Z",
+                    mechanical=mechanical,
+                )
+
+    def test_validated_classification_is_bound_to_the_mechanical_report(self):
+        mechanical = {
+            "classification": {
+                "arxiv": [{"code": "math.CO", "name": "Combinatorics"}],
+                "msc2020": [{"code": "05C10", "name": "Topological graph theory"}],
+            }
+        }
+        metadata = {"classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]}}
+        self.assertEqual(validated_classification(mechanical, metadata), metadata["classification"])
+        metadata["classification"]["arxiv"] = ["math.NT"]
+        with self.assertRaisesRegex(ReviewerError, "disagrees with the mechanical report"):
+            validated_classification(mechanical, metadata)
 
     def test_engine_schemas_are_strict(self):
         def assert_strict(schema):
@@ -1144,6 +1224,7 @@ class ReviewerTests(unittest.TestCase):
         rubric = {"schema_version": 1, "steps": [{"id": "synthesis"}]}
         self.assertEqual(validate_rubric(rubric), 1)
         result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
+        result["scores"].pop("classification")
         result["summary"] = ""
         result["findings"] = []
         jsonschema.validate(result, step_schema_for_rubric({"id": "metadata"}, 1))
@@ -1152,8 +1233,15 @@ class ReviewerTests(unittest.TestCase):
         _, _, rubric = self.review_policy_fixture()
         rubric["schema_version"] = 3
         self.assertEqual(validate_rubric(rubric), 3)
-        with self.assertRaises(ReviewerError):
-            validate_rubric({**rubric, "schema_version": 4})
+
+    def test_version_two_schema_does_not_retroactively_require_classification(self):
+        schema = step_schema_for_rubric(
+            {"id": "metadata", "score_keys": ["clarity", "provenance"]},
+            2,
+        )
+        scores = schema["properties"]["scores"]
+        self.assertNotIn("classification", scores["required"])
+        self.assertNotIn("classification", scores["properties"])
 
     def test_acceptance_is_bound_to_evidence_pass_scores(self):
         synthesis, passes, rubric = self.review_policy_fixture()
