@@ -29,6 +29,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+          # Ubuntu 24.04 AppArmor blocks unprivileged user namespaces by
+          # default even on the disposable hosted runner. Enable them here so
+          # the fail-closed namespace integration test exercises real bwrap.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           python -m pip install --disable-pip-version-check -e .
       - name: Compile and test
         working-directory: reviewer
