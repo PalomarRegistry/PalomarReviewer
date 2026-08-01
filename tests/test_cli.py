@@ -21,6 +21,7 @@ from palomar_reviewer.cli import (
     finalize,
     has_proof_account,
     isolated_engine_command,
+    load_formalization_metadata,
     markdown_text,
     matching_review_comment,
     mechanical_report,
@@ -33,8 +34,10 @@ from palomar_reviewer.cli import (
     registry_title,
     render_bundle_manifest,
     render_prompt,
+    request_render,
     require_complete_indexed_context,
     require_indexed_source_review_pass,
+    review_digest,
     reviewer_model,
     run_review,
     step_schema_for_rubric,
@@ -189,6 +192,16 @@ class ReviewerTests(unittest.TestCase):
             authors_from_metadata(data, "fallback"),
             [{"name": "Ada"}, {"name": "Emmy", "github": "emmy"}],
         )
+
+    def test_formalization_metadata_rejects_ambiguous_yaml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            path.write_text("project:\n  name: first\n  name: second\n")
+            with self.assertRaisesRegex(ReviewerError, "duplicate key"):
+                load_formalization_metadata(path)
+            path.write_text("base: &base {name: value}\nproject: {<<: *base}\n")
+            with self.assertRaisesRegex(ReviewerError, "must not use YAML merge keys"):
+                load_formalization_metadata(path)
 
     def test_proof_account_detection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -739,6 +752,11 @@ class ReviewerTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
         def commit_source(path, mechanical):
+            formalization_sha256 = hashlib.sha256(
+                (path / "formalization.yaml").read_bytes()
+            ).hexdigest()
+            mechanical["formalization_sha256"] = formalization_sha256
+            mechanical["formalization"] = {"sha256": formalization_sha256}
             subprocess.run(["git", "init", "--quiet", str(path)], check=True)
             subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
             subprocess.run(
@@ -879,7 +897,19 @@ class ReviewerTests(unittest.TestCase):
                 },
                 "warnings": [],
                 "requested_changes": [],
-                "passes": [{"step": "definition_fidelity"}, {}, {}, {}, {}],
+                "passes": [
+                    self.step_result("classification", {"classification": 4}),
+                    self.step_result("metadata", {"clarity": 4, "provenance": 4}),
+                    self.step_result("statement_alignment", {"statement_alignment": 4}),
+                    self.step_result(
+                        "definition_fidelity",
+                        {"definition_fidelity": 4, "auditability": 4},
+                    ),
+                    self.step_result(
+                        "literature_notability",
+                        {"notability": 4, "literature": 4},
+                    ),
+                ],
             }
             issue = {
                 "number": 12,
@@ -893,11 +923,13 @@ class ReviewerTests(unittest.TestCase):
             commit_source(source, mechanical)
             review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
+            (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             (work / "review.json").write_text(json.dumps(review))
             (work / "issue.json").write_text(json.dumps(issue))
             (work / "review-url").write_text(
                 "https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1\n"
             )
+            (work / "review-sha256").write_text(review_digest(review) + "\n")
             (work / "mechanical-report-url").write_text(mechanical["workflow_url"] + "\n")
 
             render_result = root / "render-result"
@@ -940,6 +972,34 @@ class ReviewerTests(unittest.TestCase):
                 render_result=str(render_result),
                 dry_run=True,
             )
+            (work / "review-sha256").write_text("0" * 64 + "\n")
+            with self.assertRaisesRegex(ReviewerError, "posted review does not match"):
+                publish(args)
+            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            (work / "mechanical-report-sha256").write_text("0" * 64 + "\n")
+            with self.assertRaisesRegex(ReviewerError, "mechanical report no longer matches"):
+                publish(args)
+            (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
+            classification_pass = next(
+                item for item in review["passes"] if item["step"] == "classification"
+            )
+            classification_pass["scores"]["classification"] = 2
+            dirty_rubric = json.loads((work / "policy" / "rubric.json").read_text())
+            dirty_rubric["minimum_accept_score"] = 1
+            (work / "policy" / "rubric.json").write_text(json.dumps(dirty_rubric))
+            (work / "review.json").write_text(json.dumps(review))
+            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            with self.assertRaisesRegex(ReviewerError, "scores below"):
+                publish(args)
+            classification_pass["scores"]["classification"] = 4
+            (work / "review.json").write_text(json.dumps(review))
+            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            formalization_path = source / "formalization.yaml"
+            formalization_bytes = formalization_path.read_bytes()
+            formalization_path.write_bytes(formalization_bytes + b"# changed\n")
+            with self.assertRaisesRegex(ReviewerError, "no longer matches the mechanical report"):
+                publish(args)
+            formalization_path.write_bytes(formalization_bytes)
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
@@ -1046,6 +1106,9 @@ class ReviewerTests(unittest.TestCase):
             )
             commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
+            (update_work / "mechanical-report-sha256").write_text(
+                review_digest(update_mechanical) + "\n"
+            )
             update_mechanical_url = update_mechanical["workflow_url"]
             update_review = {
                 **review,
@@ -1063,6 +1126,7 @@ class ReviewerTests(unittest.TestCase):
                 "https://github.com/kim-em/PalomarSubmission/issues/"
                 f"{update_issue_number}#issuecomment-2\n"
             )
+            (update_work / "review-sha256").write_text(review_digest(update_review) + "\n")
             update_render = root / "update-render-result"
             shutil.copytree(sample_bundle, update_render / "bundle")
             update_report = json.loads((render_result / "challenge-render.json").read_text())
@@ -1449,6 +1513,9 @@ class ReviewerTests(unittest.TestCase):
             matching_review_comment(issue, report),
             "https://example.test/issues/7#review",
         )
+        del issue["comments"][1]["url"]
+        with self.assertRaisesRegex(ReviewerError, "has no comment URL"):
+            matching_review_comment(issue, report)
         changed = {**report, "summary": "A later, different report"}
         self.assertIsNone(matching_review_comment(issue, changed))
 
@@ -1485,6 +1552,7 @@ class ReviewerTests(unittest.TestCase):
             engine.assert_not_called()
             restore.assert_not_called()
             self.assertEqual((work / "review-url").read_text(), "https://example.test/review\n")
+            self.assertEqual((work / "review-sha256").read_text(), review_digest(stored) + "\n")
 
     def test_apply_rolls_back_status_when_posting_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1579,6 +1647,64 @@ class ReviewerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ReviewerError, "no valid challenge-render.json"):
                 validate_render_result(Path(directory), {})
+
+    def test_render_dispatch_is_bound_to_the_exact_workflow_run(self):
+        request_id = "a" * 32
+        run_url = "https://github.com/kim-em/PalomarSubmission/actions/runs/123"
+        renderer_commit = "b" * 40
+        mechanical = self.mechanical_fixture()
+        calls = []
+
+        def fake_gh(arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ["run", "list"]:
+                title = (
+                    f"Render {mechanical['source']['repository']}@"
+                    f"{mechanical['source']['commit']} [{request_id}]"
+                )
+                return json.dumps(
+                    [
+                        {
+                            "databaseId": 123,
+                            "displayTitle": title,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "url": run_url,
+                            "headSha": renderer_commit,
+                        }
+                    ]
+                )
+            if arguments[:2] == ["run", "download"]:
+                destination = Path(arguments[arguments.index("--dir") + 1]) / "result"
+                destination.mkdir(parents=True)
+                (destination / "challenge-render.json").write_text(
+                    json.dumps(
+                        {
+                            "renderer_commit": renderer_commit,
+                            "workflow_url": run_url,
+                        }
+                    )
+                )
+            return ""
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("palomar_reviewer.cli.uuid.uuid4", return_value=SimpleNamespace(hex=request_id)),
+            mock.patch("palomar_reviewer.cli.gh", side_effect=fake_gh),
+            mock.patch(
+                "palomar_reviewer.cli.run",
+                return_value=subprocess.CompletedProcess(["gh"], 0, "", ""),
+            ) as watched,
+        ):
+            result = request_render(Path(directory), mechanical)
+
+        self.assertEqual(result.name, "render-download")
+        workflow_call = next(arguments for arguments in calls if arguments[:2] == ["workflow", "run"])
+        self.assertIn(f"request_id={request_id}", workflow_call)
+        self.assertIn(f"challenge_sha256={mechanical['challenge']['sha256']}", workflow_call)
+        download_call = next(arguments for arguments in calls if arguments[:2] == ["run", "download"])
+        self.assertIn(f"challenge-render-{request_id}", download_call)
+        watched.assert_called_once()
 
 
 if __name__ == "__main__":
