@@ -1297,6 +1297,9 @@ def isolated_engine_command(
         else:
             root = resolved.parent.parent if resolved.parent.name == "bin" else resolved.parent
             _bind_if_present(command, root, "/engine/custom-root")
+            library_dir = root / "lib"
+            if library_dir.is_dir():
+                command.extend(["--setenv", "LD_LIBRARY_PATH", "/engine/custom-root/lib"])
             argv[0] = f"/engine/custom-root/{resolved.relative_to(root)}"
     else:
         raise ReviewerError(f"unsupported isolated review engine: {engine}")
