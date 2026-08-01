@@ -738,6 +738,28 @@ class ReviewerTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
+        def commit_source(path, mechanical):
+            subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+            subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+            subprocess.run(
+                ["git", "-C", str(path), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(path), "add", "formalization.yaml"], check=True)
+            subprocess.run(
+                ["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"], check=True
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            mechanical["source"]["commit"] = commit
+            mechanical["source"]["tree_url"] = (
+                f"{mechanical['source']['repository_url']}/tree/{commit}"
+            )
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             work = root / "12"
@@ -864,7 +886,12 @@ class ReviewerTests(unittest.TestCase):
                 "title": "[submission] Example result",
                 "url": "https://github.com/kim-em/PalomarSubmission/issues/12",
             }
-            (source / "formalization.yaml").write_text("project:\n  license: MIT\n")
+            (source / "formalization.yaml").write_text(
+                "project:\n  license: MIT\n"
+                "classification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+            )
+            commit_source(source, mechanical)
+            review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
             (work / "review.json").write_text(json.dumps(review))
             (work / "issue.json").write_text(json.dumps(issue))
@@ -922,7 +949,7 @@ class ReviewerTests(unittest.TestCase):
             database = work / "database"
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
-            self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(record["schema_version"], 3)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -1013,7 +1040,11 @@ class ReviewerTests(unittest.TestCase):
                     f"{update_issue_number}"
                 ),
             }
-            (update_source / "formalization.yaml").write_text("project:\n  license: MIT\n")
+            (update_source / "formalization.yaml").write_text(
+                "project:\n  license: MIT\n"
+                "classification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+            )
+            commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
             update_mechanical_url = update_mechanical["workflow_url"]
             update_review = {
