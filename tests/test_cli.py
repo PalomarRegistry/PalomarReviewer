@@ -725,13 +725,6 @@ class ReviewerTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
-        policy_head = subprocess.run(
-            ["git", "-C", str(policy_source), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             work = root / "12"
@@ -741,6 +734,45 @@ class ReviewerTests(unittest.TestCase):
                 ["git", "clone", "--quiet", str(policy_source), str(work / "policy")],
                 check=True,
             )
+            policy_rubric_path = work / "policy" / "rubric.json"
+            policy_rubric = json.loads(policy_rubric_path.read_text())
+            definition_step = next(
+                step
+                for step in policy_rubric["steps"]
+                if step["id"] == "definition_fidelity"
+            )
+            if "challenge_review_sources" not in definition_step["inputs"]:
+                # Reviewer support must land before the v3 policy rollout. Build
+                # the exact future input contract as a committed policy fixture
+                # while Policy main still carries v2.
+                definition_step["inputs"].append("challenge_review_sources")
+                policy_rubric["schema_version"] = 3
+                policy_rubric_path.write_text(json.dumps(policy_rubric, indent=2) + "\n")
+                subprocess.run(
+                    ["git", "-C", str(work / "policy"), "add", "rubric.json"],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(work / "policy"),
+                        "-c",
+                        "user.name=Palomar test",
+                        "-c",
+                        "user.email=test@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture: indexed review input",
+                    ],
+                    check=True,
+                )
+            policy_head = subprocess.run(
+                ["git", "-C", str(work / "policy"), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             mechanical = self.mechanical_fixture()
             indexed_source = "def Indexed.statementMeaning : Nat := 42\n"
             indexed_digest = hashlib.sha256(indexed_source.encode()).hexdigest()
@@ -921,7 +953,7 @@ class ReviewerTests(unittest.TestCase):
             update_source = update_work / "source"
             update_source.mkdir(parents=True)
             subprocess.run(
-                ["git", "clone", "--quiet", str(policy_source), str(update_work / "policy")],
+                ["git", "clone", "--quiet", str(work / "policy"), str(update_work / "policy")],
                 check=True,
             )
             update_mechanical = self.mechanical_fixture(issue=update_issue_number, run_id=103)
