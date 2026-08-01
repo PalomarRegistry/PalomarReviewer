@@ -1523,7 +1523,7 @@ def engine_result(
             "--safe-mode",
             "--no-session-persistence",
             "--permission-mode",
-            "dontAsk",
+            "auto",
             "--tools",
             "WebSearch,WebFetch" if allow_network else "",
             "--output-format",

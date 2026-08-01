@@ -18,6 +18,7 @@ from palomar_reviewer.cli import (
     SYNTHESIS_SCHEMA,
     ReviewerError,
     authors_from_metadata,
+    engine_result,
     finalize,
     has_proof_account,
     isolated_engine_command,
@@ -211,6 +212,38 @@ class ReviewerTests(unittest.TestCase):
 
     def test_model_id(self):
         self.assertEqual(reviewer_model("codex", "gpt-test", None), "codex:gpt-test")
+
+    def test_claude_network_pass_uses_current_automatic_permission_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "raw" / "literature.txt"
+            source.mkdir()
+            completed = SimpleNamespace(stdout="{}")
+            with (
+                mock.patch(
+                    "palomar_reviewer.cli.isolated_engine_command",
+                    side_effect=lambda _engine, argv, **_kwargs: argv,
+                ),
+                mock.patch("palomar_reviewer.cli.run", return_value=completed) as runner,
+            ):
+                self.assertEqual(
+                    engine_result(
+                        "review",
+                        engine="claude",
+                        command=None,
+                        model=None,
+                        cwd=source,
+                        schema={"type": "object"},
+                        raw_path=output,
+                        allow_network=True,
+                    ),
+                    {},
+                )
+
+            argv = runner.call_args.args[0]
+            self.assertEqual(argv[argv.index("--permission-mode") + 1], "auto")
+            self.assertEqual(argv[argv.index("--tools") + 1], "WebSearch,WebFetch")
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is required")
     def test_engine_namespace_hides_operator_filesystem(self):
