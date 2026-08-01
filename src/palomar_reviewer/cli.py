@@ -325,7 +325,7 @@ class ReviewerError(RuntimeError):
 
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3}:
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4}:
         raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -356,7 +356,7 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
             "rubric mandatory_reject_below_minimum must contain unique registry score names"
         )
     allowed_step_scores = set(STEP_SCORE_KEYS)
-    if version < 3:
+    if version < 4:
         allowed_step_scores.remove("classification")
     owned: list[str] = []
     owners: dict[str, dict[str, Any]] = {}
@@ -382,7 +382,7 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
 
 def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[str, Any]:
     schema = copy.deepcopy(STEP_SCHEMA)
-    if rubric_version < 3:
+    if rubric_version < 4:
         schema["properties"]["scores"]["required"].remove("classification")
         schema["properties"]["scores"]["properties"].pop("classification")
     if rubric_version == 1:

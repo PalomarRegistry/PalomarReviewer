@@ -140,7 +140,7 @@ class ReviewerTests(unittest.TestCase):
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
         ]
         rubric = {
-            "schema_version": 3,
+            "schema_version": 4,
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
@@ -879,7 +879,7 @@ class ReviewerTests(unittest.TestCase):
                 },
                 "warnings": [],
                 "requested_changes": [],
-                "passes": [{"step": "definition_fidelity"}, {}, {}, {}],
+                "passes": [{"step": "definition_fidelity"}, {}, {}, {}, {}],
             }
             issue = {
                 "number": 12,

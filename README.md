@@ -132,8 +132,8 @@ Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparati
 time.
 
 Deploy reviewer support for a new rubric schema before merging a policy that
-uses it. The reviewer accepts historical versions 1 and 2 plus the current
-version 3 contract, and refuses unknown versions.
+uses it. The reviewer accepts historical versions 1, 2, and 3 plus the current
+version 4 contract, and refuses unknown versions.
 
 Release database schema support before using a policy or reviewer version that
 publishes that schema. For this contract, `PalomarDatabase/schema-v3.json` must
