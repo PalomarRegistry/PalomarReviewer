@@ -97,7 +97,9 @@ and renderer commit. It revalidates every stored evidence pass and the
 score-to-decision policy, requires the applied-review digest to match, and binds
 published metadata to the mechanically recorded `formalization.yaml` digest.
 It then validates the generated record and immutable
-render bundle against the database schema, pushes an issue-specific branch to
+render bundle against the database schema. It also archives the exact
+mechanical-report bytes and normalized run/job provenance in a content-addressed
+evidence bundle; raw Actions logs are deliberately not retained. It pushes an issue-specific branch to
 `kim-em/PalomarDatabase`, and opens a PR. It refuses non-accept decisions and
 existing entry filenames. A renderer or infrastructure failure does not undo
 acceptance: rerun `publish`, or pass a previously downloaded trusted result with
@@ -148,14 +150,11 @@ uses it. The reviewer accepts historical versions 1, 2, and 3 plus the current
 version 4 contract, and refuses unknown versions.
 
 Release database schema support before using a policy or reviewer version that
-publishes that schema. For this contract, `PalomarDatabase/schema-v3.json` must
+publishes that schema. For this contract, `PalomarDatabase/schema-v5.json` must
 be present on `main` before `palomar-review publish` can prepare a database PR.
-Deploy the web release that accepts entry schema v3 before publishing the first
-schema-v3 record, or that record will make the registry fail closed for all
-visitors. Merge the rollout in this order: Database, Submission, Web, Reviewer,
-then Policy. A submission mechanically verified before the Submission release
-has no trusted classification evidence and must be re-verified before review or
-publication.
+Deploy the web release that accepts entry schema v5 before publishing the first
+schema-v5 record, or that record will make the registry fail closed for all
+visitors. Merge the rollout in this order: Database, Web, Reviewer, then Policy.
 
 ## Audit trail
 
@@ -164,7 +163,10 @@ Each review directory retains:
 ```text
 issue.json
 mechanical-report.json
-mechanical-report-sha256 # detects drift from the downloaded workflow artifact
+mechanical-report-sha256 # binds the normalized report used by editorial review
+mechanical-report-bytes-sha256 # binds the exact artifact bytes archived at publication
+workflow-run.json         # normalized run identity, workflow commit, and job conclusions
+workflow-run-sha256       # detects provenance drift before publication
 source/                  # detached source commit
 challenge-dependencies/  # detached indexed commits used by Challenge
 challenge-review-sources.json # exact paths, versions, and hashes reviewed
