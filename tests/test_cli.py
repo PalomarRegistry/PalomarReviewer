@@ -13,6 +13,7 @@ from unittest import mock
 import jsonschema
 
 from palomar_reviewer.cli import (
+    MECHANICAL_REPORT_SCHEMA,
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
@@ -128,6 +129,22 @@ class ReviewerTests(unittest.TestCase):
                 }
             ],
         }
+
+    def test_mechanical_schema_accepts_explicitly_unspecified_provenance(self):
+        mechanical = self.mechanical_fixture()
+        mechanical["provenance"] = {
+            "result_origin": "unspecified",
+            "repository_role": "unspecified",
+            "responsible_maintainers": [],
+            "mathematical_sources": [],
+            "related_formalizations": [],
+            "declared": {
+                "result_origin": False,
+                "repository_role": False,
+                "responsible_maintainers": False,
+            },
+        }
+        jsonschema.validate(mechanical, MECHANICAL_REPORT_SCHEMA)
 
     def step_result(self, step, scores, verdict="pass"):
         all_scores = {key: None for key in STEP_SCORE_KEYS}

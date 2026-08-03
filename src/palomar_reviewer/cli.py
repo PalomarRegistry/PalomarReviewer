@@ -191,12 +191,28 @@ MECHANICAL_REPORT_SCHEMA = {
                 "related_formalizations",
             ],
             "properties": {
-                "result_origin": {"enum": ["original", "source-based"]},
-                "repository_role": {"enum": ["substantive-development", "thin-wrapper"]},
-                "responsible_maintainers": {"type": "array", "minItems": 1},
+                "result_origin": {"enum": ["original", "source-based", "unspecified"]},
+                "repository_role": {
+                    "enum": ["substantive-development", "thin-wrapper", "unspecified"]
+                },
+                "responsible_maintainers": {"type": "array"},
                 "mathematical_sources": {"type": "array"},
                 "related_formalizations": {"type": "array"},
                 "substantive_formalization": {"type": "object"},
+                "declared": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "result_origin",
+                        "repository_role",
+                        "responsible_maintainers",
+                    ],
+                    "properties": {
+                        "result_origin": {"type": "boolean"},
+                        "repository_role": {"type": "boolean"},
+                        "responsible_maintainers": {"type": "boolean"},
+                    },
+                },
             },
         },
         "source": {
