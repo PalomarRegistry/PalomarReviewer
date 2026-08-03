@@ -19,8 +19,9 @@ database PR. The tool never merges.
 The reviewer resolves the exact successful `PalomarSubmission` workflow run
 and uses its downloaded `mechanical-report.json` artifact as the sole mechanical
 authority. It binds the artifact to the current issue repository/commit, run
-URL, and a trusted workflow revision; fenced JSON in issue comments is never a
-certificate input. For indexed Challenge imports it independently checks out
+URL, pinned Comparator/Lean-export/Landrun/NanoDa revisions, and a trusted
+workflow revision; fenced JSON in issue comments is never a certificate input.
+For indexed Challenge imports it independently checks out
 each recorded repository/commit and verifies every source hash before adding
 the actual imported files to definition-fidelity evidence.
 

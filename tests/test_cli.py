@@ -109,6 +109,7 @@ class ReviewerTests(unittest.TestCase):
             "comparator_commit": "4" * 40,
             "lean4export_commit": "5" * 40,
             "landrun_commit": "6" * 40,
+            "nanoda_commit": "8" * 40,
             "checked_at": "2026-08-01T00:00:00Z",
             "workflow_url": workflow_url,
             "project_dependencies": [
