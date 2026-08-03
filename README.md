@@ -80,7 +80,10 @@ starting another dry run clears both bindings.
 Workspaces applied by an older reviewer may have `review-url` but no
 `review-sha256`; rerun the same `--apply` command to verify the existing comment
 and create the binding. Mechanical reports without a formalization digest must
-be re-verified before they can be published.
+be re-verified before they can be published. The current mechanical-report
+schema is version 2 and also binds one root licence file, its SHA-256, and the
+agreeing declared and detected SPDX identifiers; older reports must likewise be
+re-verified.
 
 This separation is a security boundary: model output and repository prose are
 untrusted evidence until an operator has inspected the stored report.
@@ -151,10 +154,13 @@ version 4 contract, and refuses unknown versions.
 
 Release database schema support before using a policy or reviewer version that
 publishes that schema. For this contract, `PalomarDatabase/schema-v5.json` must
-be present on `main` before `palomar-review publish` can prepare a database PR.
-Deploy the web release that accepts entry schema v5 before publishing the first
-schema-v5 record, or that record will make the registry fail closed for all
-visitors. Merge the rollout in this order: Database, Web, Reviewer, then Policy.
+be present on `main`, and Web must understand its structured licence evidence,
+before the first schema-v5 record is published. Land Database and Web support
+first, then Submission enforcement and Reviewer consumption; Policy and Template
+guidance may land at any point. Do not publish between the Database and Reviewer
+releases, because the earlier Reviewer emits the historical string licence field.
+Any submission mechanically verified before report schema v2 must be re-verified
+before review or publication.
 
 ## Audit trail
 

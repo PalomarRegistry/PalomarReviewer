@@ -50,6 +50,8 @@ from palomar_reviewer.cli import (
     validate_synthesis_policy,
     validated_classification,
     verification_run_provenance,
+    validated_repository_license,
+    verify_repository_license,
 )
 
 
@@ -60,6 +62,7 @@ class ReviewerTests(unittest.TestCase):
     def mechanical_fixture(self, issue=12, run_id=101):
         workflow_url = f"https://github.com/kim-em/PalomarSubmission/actions/runs/{run_id}"
         return {
+            "schema_version": 2,
             "status": "pass",
             "stage": "complete",
             "issue": {
@@ -72,6 +75,12 @@ class ReviewerTests(unittest.TestCase):
                 "repository_url": "https://github.com/example/project",
                 "commit": "1" * 40,
                 "tree_url": "https://github.com/example/project/tree/" + "1" * 40,
+            },
+            "license": {
+                "path": "LICENSE",
+                "sha256": "a" * 64,
+                "declared_identifier": "MIT",
+                "detected_identifier": "MIT",
             },
             "classification": {
                 "arxiv": [{"code": "math.CO", "name": "Combinatorics"}],
@@ -783,6 +792,7 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         self.assertEqual(record["id"], "PALOMAR-2026-08-01-000012")
         self.assertEqual(record["accepted_at"], "2026-08-01")
+        self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
             schema = json.loads((Path(database) / "schema-v5.json").read_text())
@@ -791,6 +801,28 @@ class ReviewerTests(unittest.TestCase):
                 schema,
                 format_checker=jsonschema.FormatChecker(),
             )
+
+    def test_repository_license_is_bound_to_metadata_and_file_bytes(self):
+        mechanical = self.mechanical_fixture()
+        metadata = {"project": {"license": "MIT"}}
+        self.assertEqual(
+            validated_repository_license(mechanical, metadata)["path"], "LICENSE"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            path = source / "LICENSE"
+            path.write_bytes(b"terms\n")
+            mechanical["license"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(
+                verify_repository_license(source, mechanical, metadata)["path"], "LICENSE"
+            )
+            path.write_text("changed\n")
+            with self.assertRaisesRegex(ReviewerError, "no longer matches"):
+                verify_repository_license(source, mechanical, metadata)
+
+        mechanical["license"]["detected_identifier"] = "Apache-2.0"
+        with self.assertRaisesRegex(ReviewerError, "disagrees"):
+            validated_repository_license(mechanical, metadata)
 
     def test_registry_record_preserves_versioned_indexed_provenance(self):
         mechanical = self.mechanical_fixture()
@@ -906,8 +938,20 @@ class ReviewerTests(unittest.TestCase):
                 ["git", "-C", str(path), "config", "user.email", "test@example.invalid"],
                 check=True,
             )
-            subprocess.run(["git", "-C", str(path), "add", "formalization.yaml"], check=True)
-            subprocess.run(["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(path),
+                    "add",
+                    "formalization.yaml",
+                    mechanical["license"]["path"],
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"], check=True
+            )
             commit = subprocess.run(
                 ["git", "-C", str(path), "rev-parse", "HEAD"],
                 check=True,
@@ -1089,6 +1133,10 @@ class ReviewerTests(unittest.TestCase):
             (source / "formalization.yaml").write_text(
                 "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
             )
+            (source / "LICENSE").write_text("fixture licence terms\n")
+            mechanical["license"]["sha256"] = hashlib.sha256(
+                (source / "LICENSE").read_bytes()
+            ).hexdigest()
             commit_source(source, mechanical)
             review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
@@ -1263,6 +1311,10 @@ class ReviewerTests(unittest.TestCase):
             (update_source / "formalization.yaml").write_text(
                 "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
             )
+            (update_source / "LICENSE").write_text("fixture licence terms\n")
+            update_mechanical["license"]["sha256"] = hashlib.sha256(
+                (update_source / "LICENSE").read_bytes()
+            ).hexdigest()
             commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
             (update_work / "mechanical-report-sha256").write_text(review_digest(update_mechanical) + "\n")

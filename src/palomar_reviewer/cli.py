@@ -141,6 +141,7 @@ REVIEW_DETAILS_RE = re.compile(
 MECHANICAL_REPORT_SCHEMA = {
     "type": "object",
     "required": [
+        "schema_version",
         "status",
         "stage",
         "issue",
@@ -157,8 +158,10 @@ MECHANICAL_REPORT_SCHEMA = {
         "workflow_url",
         "project_dependencies",
         "provenance",
+        "license",
     ],
     "properties": {
+        "schema_version": {"const": 2},
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
         "issue": {
@@ -204,6 +207,25 @@ MECHANICAL_REPORT_SCHEMA = {
                 "repository_url": {"type": "string", "pattern": r"^https://github\.com/"},
                 "commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
                 "tree_url": {"type": "string", "pattern": r"^https://github\.com/.+/tree/[0-9a-f]{40}$"},
+            },
+        },
+        "license": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "path",
+                "sha256",
+                "declared_identifier",
+                "detected_identifier",
+            ],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "pattern": r"(?i)^(?:licen[cs]e|copying|unlicense|ofl)(?:\.(?:md|markdown|txt))?$",
+                },
+                "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                "declared_identifier": {"type": "string", "minLength": 1},
+                "detected_identifier": {"type": "string", "minLength": 1},
             },
         },
         "challenge": {
@@ -398,6 +420,51 @@ def load_formalization_metadata(path: Path) -> dict[str, Any]:
     except OSError as error:
         raise ReviewerError(f"formalization.yaml cannot be read: {error}") from error
     return parse_formalization_metadata(raw)
+
+
+def validated_repository_license(
+    mechanical: dict[str, Any], metadata: dict[str, Any]
+) -> dict[str, str]:
+    record = mechanical.get("license")
+    if not isinstance(record, dict):
+        raise ReviewerError("mechanical report has no valid repository licence evidence")
+    expected_fields = {
+        "path",
+        "sha256",
+        "declared_identifier",
+        "detected_identifier",
+    }
+    if set(record) != expected_fields or any(
+        not isinstance(record.get(field), str) or not record[field]
+        for field in expected_fields
+    ):
+        raise ReviewerError("mechanical report has malformed repository licence evidence")
+    if record["declared_identifier"] != record["detected_identifier"]:
+        raise ReviewerError("declared repository licence disagrees with mechanical detection")
+    project = metadata.get("project")
+    declared = project.get("license") if isinstance(project, dict) else None
+    if not isinstance(declared, str) or declared.strip() != record["declared_identifier"]:
+        raise ReviewerError("formalization.yaml project.license disagrees with the mechanical report")
+    return {field: record[field] for field in sorted(expected_fields)}
+
+
+def verify_repository_license(
+    source: Path, mechanical: dict[str, Any], metadata: dict[str, Any]
+) -> dict[str, str]:
+    record = validated_repository_license(mechanical, metadata)
+    relative = record["path"]
+    if not re.fullmatch(
+        r"(?:licen[cs]e|copying|unlicense|ofl)(?:\.(?:md|markdown|txt))?",
+        relative,
+        re.IGNORECASE,
+    ):
+        raise ReviewerError("mechanical report repository licence path is not conventional")
+    path = source / relative
+    if path.is_symlink() or not path.is_file() or path.parent.resolve() != source.resolve():
+        raise ReviewerError("repository licence evidence does not name a regular root file")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+        raise ReviewerError("repository licence file no longer matches the mechanical report")
+    return record
 
 
 def review_digest(report: dict[str, Any]) -> str:
@@ -1289,6 +1356,12 @@ def prepare_workspace(
     source_commit = clone_at(source_info["repository_url"], source_info["commit"], work / "source")
     if source_commit != source_info["commit"]:
         raise ReviewerError("source checkout does not match mechanical report")
+    source = work / "source"
+    verify_repository_license(
+        source,
+        mechanical,
+        load_formalization_metadata(source / "formalization.yaml"),
+    )
     prepare_challenge_review_sources(work, mechanical)
     resolved_policy = resolve_remote_commit(POLICY_REPO, policy_ref)
     policy_commit = clone_at(
@@ -2254,16 +2327,7 @@ def registry_record(
         )
         or review["summary"]
     )
-    license_name = (
-        metadata_value(
-            metadata,
-            [
-                ("project", "license"),
-                ("license",),
-            ],
-        )
-        or "NOASSERTION"
-    )
+    license_record = validated_repository_license(mechanical, metadata)
     challenge = mechanical["challenge"]
     dependencies = [
         {
@@ -2308,7 +2372,7 @@ def registry_record(
             "repository_url": mechanical["source"]["repository_url"],
             "commit": mechanical["source"]["commit"],
             "tree_url": mechanical["source"]["tree_url"],
-            "license": str(license_name),
+            "license": license_record,
         },
         "formalization": {
             "lean_toolchain": mechanical["lean_toolchain"],
@@ -2533,6 +2597,7 @@ def publish(args: argparse.Namespace) -> int:
     if hashlib.sha256(formalization_bytes).hexdigest() != expected_formalization_sha256:
         raise ReviewerError("formalization.yaml no longer matches the mechanical report")
     metadata = parse_formalization_metadata(formalization_bytes)
+    verify_repository_license(source, mechanical, metadata)
     source_commit = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
     if source_commit != mechanical["source"]["commit"]:
         raise ReviewerError("review workspace source no longer matches the mechanical report")
