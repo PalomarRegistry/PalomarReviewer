@@ -64,7 +64,11 @@ class ReviewerTests(unittest.TestCase):
         return {
             "status": "pass",
             "stage": "complete",
-            "issue": {"number": issue, "submitter": "submitter"},
+            "issue": {
+                "number": issue,
+                "submitter": "submitter",
+                "authorization": {"relationship": "maintainer"},
+            },
             "source": {
                 "repository": "example/project",
                 "repository_url": "https://github.com/example/project",
@@ -74,6 +78,13 @@ class ReviewerTests(unittest.TestCase):
             "classification": {
                 "arxiv": [{"code": "math.CO", "name": "Combinatorics"}],
                 "msc2020": [{"code": "05C10", "name": "Topological graph theory"}],
+            },
+            "provenance": {
+                "result_origin": "original",
+                "repository_role": "substantive-development",
+                "responsible_maintainers": [{"name": "Example Maintainer"}],
+                "mathematical_sources": [],
+                "related_formalizations": [],
             },
             "challenge": {
                 "sha256": "2" * 64,
@@ -671,7 +682,7 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_is_schema_v3_with_dated_identity(self):
+    def test_registry_record_is_schema_v4_with_dated_identity(self):
         record = registry_record(
             issue={
                 "number": 12,
@@ -715,12 +726,14 @@ class ReviewerTests(unittest.TestCase):
                 "rendered_at": "2026-08-01T12:35:00Z",
             },
         )
-        self.assertEqual(record["schema_version"], 3)
+        self.assertEqual(record["schema_version"], 4)
+        self.assertEqual(record["provenance"]["result_origin"], "original")
+        self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         self.assertEqual(record["id"], "PALOMAR-2026-08-01-000012")
         self.assertEqual(record["accepted_at"], "2026-08-01")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v3.json").read_text())
+            schema = json.loads((Path(database) / "schema-v4.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -1086,7 +1099,7 @@ class ReviewerTests(unittest.TestCase):
             database = work / "database"
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
-            self.assertEqual(record["schema_version"], 3)
+            self.assertEqual(record["schema_version"], 4)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
