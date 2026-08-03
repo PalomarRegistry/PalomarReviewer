@@ -1313,6 +1313,22 @@ def parse_engine_json(text: str) -> dict[str, Any]:
         raise ReviewerError("review engine did not return a JSON object") from None
 
 
+SYSTEM_RESOLUTION_PATHS = (
+    Path("/etc/ssl/certs"),
+    # NixOS keeps the certificate bundle behind absolute symlinks through
+    # /etc/static. Binding /etc/ssl/certs alone leaves those links dangling
+    # inside the namespace even though the final Nix store is available.
+    Path("/etc/static/ssl/certs"),
+    Path("/etc/pki"),
+    Path("/etc/resolv.conf"),
+    Path("/etc/hosts"),
+    Path("/etc/nsswitch.conf"),
+    Path("/etc/gai.conf"),
+    Path("/etc/host.conf"),
+    Path("/etc/ld.so.cache"),
+)
+
+
 def _bind_if_present(command: list[str], source: Path, destination: str) -> None:
     if source.exists():
         command.extend(["--ro-bind", str(source), destination])
@@ -1389,16 +1405,7 @@ def isolated_engine_command(
         Path("/lib64"),
     ):
         _bind_if_present(command, path, str(path))
-    for path in (
-        Path("/etc/ssl/certs"),
-        Path("/etc/pki"),
-        Path("/etc/resolv.conf"),
-        Path("/etc/hosts"),
-        Path("/etc/nsswitch.conf"),
-        Path("/etc/gai.conf"),
-        Path("/etc/host.conf"),
-        Path("/etc/ld.so.cache"),
-    ):
+    for path in SYSTEM_RESOLUTION_PATHS:
         _bind_if_present(command, path, str(path))
 
     if engine == "codex":

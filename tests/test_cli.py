@@ -16,6 +16,7 @@ from palomar_reviewer.cli import (
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
+    SYSTEM_RESOLUTION_PATHS,
     ReviewerError,
     authors_from_metadata,
     engine_result,
@@ -270,6 +271,48 @@ class ReviewerTests(unittest.TestCase):
             )
             proc = subprocess.run(command, check=True, capture_output=True, text=True)
             self.assertEqual(proc.stdout.splitlines(), ["visible evidence", "HIDDEN"])
+
+    def test_engine_namespace_binds_the_nixos_certificate_indirection(self):
+        # The behavioural test below cannot notice this path going missing on a
+        # non-NixOS runner, where /etc/ssl/certs already holds the real bundle.
+        self.assertIn(Path("/etc/static/ssl/certs"), SYSTEM_RESOLUTION_PATHS)
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is required")
+    def test_engine_namespace_reads_the_system_trust_bundle(self):
+        bundles = [
+            path
+            for path in (
+                Path("/etc/ssl/certs/ca-bundle.crt"),
+                Path("/etc/ssl/certs/ca-certificates.crt"),
+            )
+            if path.is_file()
+        ]
+        if not bundles:
+            self.skipTest("this host has no system trust bundle")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            # A bundle whose symlink chain leaves the namespace reads as MISSING, which is
+            # how NixOS's /etc/static indirection used to break the engine transports.
+            script = (
+                "from pathlib import Path; import sys; "
+                "print(*(Path(name).read_text(encoding='utf-8').count('BEGIN CERTIFICATE') "
+                "if Path(name).is_file() else 'MISSING' for name in sys.argv[1:]))"
+            )
+            command = isolated_engine_command(
+                "command",
+                [sys.executable, "-c", script, *(str(path) for path in bundles)],
+                cwd=source,
+                output_dir=output,
+            )
+            proc = subprocess.run(command, check=True, capture_output=True, text=True)
+            found = proc.stdout.split()
+            self.assertEqual(len(found), len(bundles))
+            for path, certificates in zip(bundles, found, strict=True):
+                self.assertNotEqual(certificates, "MISSING", f"{path} is unreadable inside the namespace")
+                self.assertGreater(int(certificates), 0, f"{path} is empty inside the namespace")
 
     def test_mechanical_report_comes_from_workflow_artifact_not_comment_text(self):
         report = self.mechanical_fixture()
