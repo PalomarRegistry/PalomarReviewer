@@ -155,16 +155,48 @@ MECHANICAL_REPORT_SCHEMA = {
         "checked_at",
         "workflow_url",
         "project_dependencies",
+        "provenance",
     ],
     "properties": {
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
         "issue": {
             "type": "object",
-            "required": ["number", "submitter"],
+            "required": ["number", "submitter", "authorization"],
             "properties": {
                 "number": {"type": "integer", "minimum": 1},
                 "submitter": {"type": "string", "minLength": 1},
+                "authorization": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["relationship"],
+                    "properties": {
+                        "relationship": {
+                            "enum": ["maintainer", "approved", "legacy-unspecified"]
+                        },
+                        "evidence": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    },
+                },
+            },
+        },
+        "provenance": {
+            "type": "object",
+            "required": [
+                "result_origin",
+                "repository_role",
+                "responsible_maintainers",
+                "mathematical_sources",
+                "related_formalizations",
+            ],
+            "properties": {
+                "result_origin": {"enum": ["original", "source-based"]},
+                "repository_role": {
+                    "enum": ["substantive-development", "thin-wrapper"]
+                },
+                "responsible_maintainers": {"type": "array", "minItems": 1},
+                "mathematical_sources": {"type": "array"},
+                "related_formalizations": {"type": "array"},
+                "substantive_formalization": {"type": "object"},
             },
         },
         "source": {
@@ -2202,7 +2234,7 @@ def registry_record(
     if challenge["lines"] > 300 or challenge["bytes"] > 32 * 1024:
         reasons.append("Challenge exceeds the preferred audit surface")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "id": permanent_id,
         "accepted_at": accepted_at,
         "version": version,
@@ -2211,6 +2243,7 @@ def registry_record(
         "abstract": str(abstract),
         "authors": authors_from_metadata(metadata, mechanical["issue"]["submitter"]),
         "classification": validated_classification(mechanical, metadata),
+        "provenance": copy.deepcopy(mechanical["provenance"]),
         "source": {
             "repository": mechanical["source"]["repository"],
             "repository_url": mechanical["source"]["repository_url"],
@@ -2261,6 +2294,7 @@ def registry_record(
             "issue": int(issue["number"]),
             "url": issue["url"],
             "submitter": mechanical["issue"]["submitter"],
+            "authorization": copy.deepcopy(mechanical["issue"]["authorization"]),
         },
     }
 
@@ -2431,8 +2465,8 @@ def publish(args: argparse.Namespace) -> int:
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
-    if not (database / "schema-v3.json").is_file():
-        raise ReviewerError("PalomarDatabase main does not publish schema-v3.json")
+    if not (database / "schema-v4.json").is_file():
+        raise ReviewerError("PalomarDatabase main does not publish schema-v4.json")
 
     existing_id = mechanical.get("existing_id")
     permanent_id, accepted_at, version = publication_identity(
@@ -2511,7 +2545,7 @@ def publish(args: argparse.Namespace) -> int:
         database / "index.json",
         {"schema_version": 2, "generated_at": utc_now(), "entries": entries},
     )
-    schema = load_json(database / "schema-v3.json")
+    schema = load_json(database / "schema-v4.json")
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
     run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.issue}-v{version}"
