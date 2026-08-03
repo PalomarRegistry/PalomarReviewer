@@ -16,6 +16,7 @@ from palomar_reviewer.cli import (
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
+    SYSTEM_RESOLUTION_PATHS,
     ReviewerError,
     authors_from_metadata,
     engine_result,
@@ -270,6 +271,11 @@ class ReviewerTests(unittest.TestCase):
             )
             proc = subprocess.run(command, check=True, capture_output=True, text=True)
             self.assertEqual(proc.stdout.splitlines(), ["visible evidence", "HIDDEN"])
+
+    def test_engine_namespace_binds_the_nixos_certificate_indirection(self):
+        # The behavioural test below cannot notice this path going missing on a
+        # non-NixOS runner, where /etc/ssl/certs already holds the real bundle.
+        self.assertIn(Path("/etc/static/ssl/certs"), SYSTEM_RESOLUTION_PATHS)
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is required")
     def test_engine_namespace_reads_the_system_trust_bundle(self):
