@@ -1391,6 +1391,10 @@ def isolated_engine_command(
         _bind_if_present(command, path, str(path))
     for path in (
         Path("/etc/ssl/certs"),
+        # NixOS keeps the certificate bundle behind absolute symlinks through
+        # /etc/static. Binding /etc/ssl/certs alone leaves those links dangling
+        # inside the namespace even though the final Nix store is available.
+        Path("/etc/static/ssl/certs"),
         Path("/etc/pki"),
         Path("/etc/resolv.conf"),
         Path("/etc/hosts"),

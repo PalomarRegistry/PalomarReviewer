@@ -271,6 +271,27 @@ class ReviewerTests(unittest.TestCase):
             proc = subprocess.run(command, check=True, capture_output=True, text=True)
             self.assertEqual(proc.stdout.splitlines(), ["visible evidence", "HIDDEN"])
 
+    @unittest.skipUnless(
+        Path("/etc/static/ssl/certs").is_dir(),
+        "NixOS certificate indirection is not present",
+    )
+    def test_engine_namespace_exposes_nixos_certificate_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            command = isolated_engine_command(
+                "command",
+                [sys.executable, "-c", "pass"],
+                cwd=source,
+                output_dir=output,
+            )
+            self.assertIn(
+                ["--ro-bind", "/etc/static/ssl/certs", "/etc/static/ssl/certs"],
+                [command[index : index + 3] for index in range(len(command) - 2)],
+            )
+
     def test_mechanical_report_comes_from_workflow_artifact_not_comment_text(self):
         report = self.mechanical_fixture()
         run_data = {
