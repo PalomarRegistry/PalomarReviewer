@@ -152,6 +152,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "comparator_commit",
         "lean4export_commit",
         "landrun_commit",
+        "nanoda_commit",
         "checked_at",
         "workflow_url",
         "project_dependencies",
@@ -327,6 +328,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "comparator_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "lean4export_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "landrun_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        "nanoda_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "checked_at": {"type": "string", "format": "date-time"},
         "workflow_url": {"type": "string", "pattern": r"^https://github\.com/kim-em/PalomarSubmission/actions/runs/[1-9][0-9]*$"},
         "existing_id": {
@@ -2268,6 +2270,7 @@ def registry_record(
             "comparator_commit": mechanical["comparator_commit"],
             "lean4export_commit": mechanical["lean4export_commit"],
             "landrun_commit": mechanical["landrun_commit"],
+            "nanoda_commit": mechanical["nanoda_commit"],
             "challenge_sha256": challenge["sha256"],
             "solution_sha256": mechanical["solution"]["sha256"],
         },
