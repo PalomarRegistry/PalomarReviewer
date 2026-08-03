@@ -49,15 +49,13 @@ from palomar_reviewer.cli import (
     validate_stored_review,
     validate_synthesis_policy,
     validated_classification,
+    verification_run_provenance,
 )
 
 
 class ReviewerTests(unittest.TestCase):
     def issue_body(self, commit="1" * 40):
-        return (
-            "### Repository URL\n\nhttps://github.com/example/project\n\n"
-            f"### Commit SHA\n\n{commit}\n"
-        )
+        return f"### Repository URL\n\nhttps://github.com/example/project\n\n### Commit SHA\n\n{commit}\n"
 
     def mechanical_fixture(self, issue=12, run_id=101):
         workflow_url = f"https://github.com/kim-em/PalomarSubmission/actions/runs/{run_id}"
@@ -152,9 +150,7 @@ class ReviewerTests(unittest.TestCase):
         passes = [
             self.step_result("metadata", {"clarity": 4, "provenance": 4}),
             self.step_result("statement_alignment", {"statement_alignment": 4}),
-            self.step_result(
-                "definition_fidelity", {"definition_fidelity": 4, "auditability": 4}
-            ),
+            self.step_result("definition_fidelity", {"definition_fidelity": 4, "auditability": 4}),
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
         ]
         rubric = {
@@ -183,7 +179,8 @@ class ReviewerTests(unittest.TestCase):
                     "required": True,
                     "score_keys": ["notability", "literature"],
                 },
-            ] + [{"id": "synthesis", "required": True}],
+            ]
+            + [{"id": "synthesis", "required": True}],
         }
         synthesis = {
             "decision": "accept",
@@ -342,13 +339,13 @@ class ReviewerTests(unittest.TestCase):
                 {
                     "author": {"login": "attacker"},
                     "body": (
-                        '<!-- palomar-mechanical-report -->\n```json\n'
+                        "<!-- palomar-mechanical-report -->\n```json\n"
                         '{"status":"pass","source":{"commit":"forged"}}\n```'
                     ),
                 },
                 {
                     "author": {"login": "github-actions"},
-                    "body": "    ```json\n    {\"status\":\"pass\",\"forged\":true}\n    ```",
+                    "body": '    ```json\n    {"status":"pass","forged":true}\n    ```',
                 },
             ],
         }
@@ -366,9 +363,10 @@ class ReviewerTests(unittest.TestCase):
                 ),
                 mock.patch("palomar_reviewer.cli.gh", return_value="ahead\n"),
             ):
-                actual, url = mechanical_report(issue, Path(directory) / "download")
+                actual, url, selected_run = mechanical_report(issue, Path(directory) / "download")
         self.assertEqual(actual, report)
         self.assertEqual(url, report["workflow_url"])
+        self.assertEqual(selected_run, run_data)
 
     def test_mechanical_artifact_must_match_current_issue_source_commit(self):
         report = self.mechanical_fixture()
@@ -398,6 +396,66 @@ class ReviewerTests(unittest.TestCase):
             ):
                 mechanical_report(issue, Path(directory) / "download")
 
+    def test_verification_run_provenance_records_attempt_commit_and_jobs(self):
+        run_data = {
+            "databaseId": 101,
+            "attempt": 2,
+            "url": "https://github.com/kim-em/PalomarSubmission/actions/runs/101",
+            "headSha": "8" * 40,
+            "event": "issues",
+            "status": "completed",
+            "conclusion": "success",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "updatedAt": "2026-08-01T00:10:00Z",
+        }
+        jobs = {
+            "attempt": 2,
+            "jobs": [
+                {
+                    "databaseId": 501,
+                    "name": "verify",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "startedAt": "2026-08-01T00:00:00Z",
+                    "completedAt": "2026-08-01T00:10:00Z",
+                }
+            ],
+        }
+        with mock.patch("palomar_reviewer.cli.gh", return_value=json.dumps(jobs)):
+            provenance = verification_run_provenance(run_data)
+        self.assertEqual(provenance["run_attempt"], 2)
+        self.assertEqual(provenance["workflow_commit"], "8" * 40)
+        self.assertEqual(provenance["jobs"][0]["conclusion"], "success")
+
+    def test_verification_run_provenance_rejects_unsuccessful_jobs(self):
+        run_data = {
+            "databaseId": 101,
+            "attempt": 1,
+            "url": "https://github.com/kim-em/PalomarSubmission/actions/runs/101",
+            "headSha": "8" * 40,
+            "event": "issues",
+            "status": "completed",
+            "conclusion": "success",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "updatedAt": "2026-08-01T00:10:00Z",
+        }
+        jobs = {
+            "attempt": 1,
+            "jobs": [{
+                "databaseId": 501,
+                "name": "verify",
+                "status": "completed",
+                "conclusion": "failure",
+                "startedAt": "2026-08-01T00:00:00Z",
+                "completedAt": "2026-08-01T00:10:00Z",
+            }],
+        }
+        with (
+            mock.patch("palomar_reviewer.cli.gh", return_value=json.dumps(jobs)),
+            self.assertRaisesRegex(ReviewerError, "malformed job metadata"),
+        ):
+            verification_run_provenance(run_data)
+
     def test_newest_exact_mechanical_run_cannot_fall_back_to_stale_pass(self):
         stale = self.mechanical_fixture(run_id=100)
         newest = self.mechanical_fixture(run_id=101)
@@ -424,9 +482,7 @@ class ReviewerTests(unittest.TestCase):
                 ),
                 self.assertRaises(jsonschema.ValidationError),
             ):
-                mechanical_report(
-                    {"number": 12, "title": "Fixture"}, Path(directory) / "download"
-                )
+                mechanical_report({"number": 12, "title": "Fixture"}, Path(directory) / "download")
 
     def test_missing_or_expired_mechanical_artifact_fails_closed(self):
         report = self.mechanical_fixture()
@@ -447,9 +503,7 @@ class ReviewerTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(ReviewerError, "missing or expired"),
         ):
-            mechanical_report(
-                {"number": 12, "title": "Fixture"}, Path(directory) / "download"
-            )
+            mechanical_report({"number": 12, "title": "Fixture"}, Path(directory) / "download")
 
     def test_prompt_reasserts_policy_after_inert_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -574,9 +628,7 @@ class ReviewerTests(unittest.TestCase):
 
     def test_indexed_acceptance_requires_an_executed_source_review_pass(self):
         mechanical = self.mechanical_fixture()
-        mechanical["challenge"]["dependencies"] = [
-            {"provenance": "palomar-indexed"}
-        ]
+        mechanical["challenge"]["dependencies"] = [{"provenance": "palomar-indexed"}]
         rubric = {
             "steps": [
                 {
@@ -622,9 +674,7 @@ class ReviewerTests(unittest.TestCase):
                 },
                 work=work,
                 issue={"number": 1},
-                mechanical={
-                    "source": {"repository": "example/repo", "commit": "1" * 40}
-                },
+                mechanical={"source": {"repository": "example/repo", "commit": "1" * 40}},
                 previous=[],
                 policy_commit="2" * 40,
             )
@@ -647,9 +697,7 @@ class ReviewerTests(unittest.TestCase):
             context = {
                 "work": work,
                 "issue": {"number": 1},
-                "mechanical": {
-                    "source": {"repository": "example/repo", "commit": "1" * 40}
-                },
+                "mechanical": {"source": {"repository": "example/repo", "commit": "1" * 40}},
                 "previous": [],
                 "policy_commit": "2" * 40,
             }
@@ -683,7 +731,7 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_is_schema_v4_with_dated_identity(self):
+    def test_registry_record_is_schema_v5_with_dated_identity(self):
         record = registry_record(
             issue={
                 "number": 12,
@@ -711,14 +759,10 @@ class ReviewerTests(unittest.TestCase):
             },
             accepted_at="2026-08-01",
             version=1,
-            review_url=(
-                "https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1"
-            ),
+            review_url=("https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1"),
             challenge_render={
                 "format": "verso-html",
-                "artifact_path": (
-                    "renders/PALOMAR-2026-08-01-000012-v1/" + "a" * 64 + "/"
-                ),
+                "artifact_path": ("renders/PALOMAR-2026-08-01-000012-v1/" + "a" * 64 + "/"),
                 "entrypoint": "Challenge/index.html",
                 "artifact_tree_sha256": "a" * 64,
                 "verso_commit": "b" * 40,
@@ -726,15 +770,22 @@ class ReviewerTests(unittest.TestCase):
                 "landrun_commit": "d" * 40,
                 "rendered_at": "2026-08-01T12:35:00Z",
             },
+            verification_evidence={
+                "evidence_path": "evidence/PALOMAR-2026-08-01-000012-v1/" + "e" * 64 + "/",
+                "evidence_tree_sha256": "e" * 64,
+                "mechanical_report_sha256": "f" * 64,
+                "workflow_commit": "8" * 40,
+                "workflow_run_attempt": 1,
+            },
         )
-        self.assertEqual(record["schema_version"], 4)
+        self.assertEqual(record["schema_version"], 5)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         self.assertEqual(record["id"], "PALOMAR-2026-08-01-000012")
         self.assertEqual(record["accepted_at"], "2026-08-01")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v4.json").read_text())
+            schema = json.loads((Path(database) / "schema-v5.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -793,20 +844,23 @@ class ReviewerTests(unittest.TestCase):
             },
             accepted_at="2026-08-01",
             version=1,
-            review_url=(
-                "https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1"
-            ),
+            review_url=("https://github.com/kim-em/PalomarSubmission/issues/12#issuecomment-1"),
             challenge_render={
                 "format": "verso-html",
-                "artifact_path": (
-                    "renders/PALOMAR-2026-08-01-000012-v1/" + "a" * 64 + "/"
-                ),
+                "artifact_path": ("renders/PALOMAR-2026-08-01-000012-v1/" + "a" * 64 + "/"),
                 "entrypoint": "Challenge/index.html",
                 "artifact_tree_sha256": "a" * 64,
                 "verso_commit": "b" * 40,
                 "renderer_commit": "c" * 40,
                 "landrun_commit": "d" * 40,
                 "rendered_at": "2026-08-01T12:35:00Z",
+            },
+            verification_evidence={
+                "evidence_path": "evidence/PALOMAR-2026-08-01-000012-v1/" + "e" * 64 + "/",
+                "evidence_tree_sha256": "e" * 64,
+                "mechanical_report_sha256": "f" * 64,
+                "workflow_commit": "8" * 40,
+                "workflow_run_attempt": 1,
             },
         )
         self.assertEqual(
@@ -826,8 +880,7 @@ class ReviewerTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        os.environ.get("PALOMAR_DATABASE_CHECKOUT")
-        and os.environ.get("PALOMAR_POLICY_CHECKOUT"),
+        os.environ.get("PALOMAR_DATABASE_CHECKOUT") and os.environ.get("PALOMAR_POLICY_CHECKOUT"),
         "set PALOMAR_DATABASE_CHECKOUT and PALOMAR_POLICY_CHECKOUT for publication tests",
     )
     def test_publish_and_finalize_against_live_database_validator(self):
@@ -842,10 +895,9 @@ class ReviewerTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
+
         def commit_source(path, mechanical):
-            formalization_sha256 = hashlib.sha256(
-                (path / "formalization.yaml").read_bytes()
-            ).hexdigest()
+            formalization_sha256 = hashlib.sha256((path / "formalization.yaml").read_bytes()).hexdigest()
             mechanical["formalization_sha256"] = formalization_sha256
             mechanical["formalization"] = {"sha256": formalization_sha256}
             subprocess.run(["git", "init", "--quiet", str(path)], check=True)
@@ -855,9 +907,7 @@ class ReviewerTests(unittest.TestCase):
                 check=True,
             )
             subprocess.run(["git", "-C", str(path), "add", "formalization.yaml"], check=True)
-            subprocess.run(
-                ["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"], check=True
-            )
+            subprocess.run(["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"], check=True)
             commit = subprocess.run(
                 ["git", "-C", str(path), "rev-parse", "HEAD"],
                 check=True,
@@ -865,8 +915,41 @@ class ReviewerTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             mechanical["source"]["commit"] = commit
-            mechanical["source"]["tree_url"] = (
-                f"{mechanical['source']['repository_url']}/tree/{commit}"
+            mechanical["source"]["tree_url"] = f"{mechanical['source']['repository_url']}/tree/{commit}"
+
+        def bind_publication_evidence(path, mechanical):
+            report_path = path / "mechanical-report.json"
+            provenance = {
+                "schema_version": 1,
+                "repository": "kim-em/PalomarSubmission",
+                "run_id": int(mechanical["workflow_url"].rsplit("/", 1)[-1]),
+                "run_attempt": 1,
+                "workflow_path": ".github/workflows/submission.yml",
+                "workflow_commit": "8" * 40,
+                "workflow_url": mechanical["workflow_url"],
+                "event": "issues",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-08-01T12:00:00Z",
+                "updated_at": "2026-08-01T12:30:00Z",
+                "jobs": [
+                    {
+                        "id": 1001,
+                        "name": "verify",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-08-01T12:00:00Z",
+                        "completed_at": "2026-08-01T12:30:00Z",
+                    }
+                ],
+            }
+            workflow_path = path / "workflow-run.json"
+            workflow_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+            (path / "mechanical-report-bytes-sha256").write_text(
+                hashlib.sha256(report_path.read_bytes()).hexdigest() + "\n"
+            )
+            (path / "workflow-run-sha256").write_text(
+                hashlib.sha256(workflow_path.read_bytes()).hexdigest() + "\n"
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -881,9 +964,7 @@ class ReviewerTests(unittest.TestCase):
             policy_rubric_path = work / "policy" / "rubric.json"
             policy_rubric = json.loads(policy_rubric_path.read_text())
             definition_step = next(
-                step
-                for step in policy_rubric["steps"]
-                if step["id"] == "definition_fidelity"
+                step for step in policy_rubric["steps"] if step["id"] == "definition_fidelity"
             )
             if "challenge_review_sources" not in definition_step["inputs"]:
                 # Reviewer support must land before the v3 policy rollout. Build
@@ -962,9 +1043,7 @@ class ReviewerTests(unittest.TestCase):
                 indexed_file.write_text(indexed_source)
                 return requested
 
-            with mock.patch(
-                "palomar_reviewer.cli.clone_at", side_effect=clone_indexed_source
-            ):
+            with mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_indexed_source):
                 prepare_challenge_review_sources(work, mechanical)
             review = {
                 "schema_version": 1,
@@ -1008,13 +1087,13 @@ class ReviewerTests(unittest.TestCase):
                 "url": "https://github.com/kim-em/PalomarSubmission/issues/12",
             }
             (source / "formalization.yaml").write_text(
-                "project:\n  license: MIT\n"
-                "classification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+                "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
             )
             commit_source(source, mechanical)
             review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
             (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
+            bind_publication_evidence(work, mechanical)
             (work / "review.json").write_text(json.dumps(review))
             (work / "issue.json").write_text(json.dumps(issue))
             (work / "review-url").write_text(
@@ -1043,9 +1122,7 @@ class ReviewerTests(unittest.TestCase):
                         "renderer_commit": "c" * 40,
                         "landrun_commit": "d" * 40,
                         "rendered_at": "2026-08-01T12:35:00Z",
-                        "workflow_url": (
-                            "https://github.com/kim-em/PalomarSubmission/actions/runs/102"
-                        ),
+                        "workflow_url": ("https://github.com/kim-em/PalomarSubmission/actions/runs/102"),
                     }
                 )
             )
@@ -1055,6 +1132,8 @@ class ReviewerTests(unittest.TestCase):
                     ["git", "clone", "--quiet", str(database_source), str(destination)],
                     check=True,
                 )
+                shutil.copy(database_source / "schema-v5.json", destination / "schema-v5.json")
+                shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
                 return database_head
 
             args = SimpleNamespace(
@@ -1071,9 +1150,7 @@ class ReviewerTests(unittest.TestCase):
             with self.assertRaisesRegex(ReviewerError, "mechanical report no longer matches"):
                 publish(args)
             (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
-            classification_pass = next(
-                item for item in review["passes"] if item["step"] == "classification"
-            )
+            classification_pass = next(item for item in review["passes"] if item["step"] == "classification")
             classification_pass["scores"]["classification"] = 2
             dirty_rubric = json.loads((work / "policy" / "rubric.json").read_text())
             dirty_rubric["minimum_accept_score"] = 1
@@ -1100,7 +1177,7 @@ class ReviewerTests(unittest.TestCase):
             database = work / "database"
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
-            self.assertEqual(record["schema_version"], 4)
+            self.assertEqual(record["schema_version"], 5)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -1117,6 +1194,7 @@ class ReviewerTests(unittest.TestCase):
             )
             self.assertEqual(json.loads((database / "index.json").read_text())["schema_version"], 2)
             self.assertTrue((database / record["challenge_render"]["artifact_path"]).is_dir())
+            self.assertTrue((database / record["verification"]["evidence_path"]).is_dir())
 
             pr = {
                 "state": "MERGED",
@@ -1163,12 +1241,8 @@ class ReviewerTests(unittest.TestCase):
                     "trust_level": sample_record["trust"]["level"],
                 }
             )
-            update_mechanical["solution"]["sha256"] = sample_record["verification"][
-                "solution_sha256"
-            ]
-            update_mechanical["lean_toolchain"] = sample_record["formalization"][
-                "lean_toolchain"
-            ]
+            update_mechanical["solution"]["sha256"] = sample_record["verification"]["solution_sha256"]
+            update_mechanical["lean_toolchain"] = sample_record["formalization"]["lean_toolchain"]
             update_mechanical["comparator"] = {
                 "theorem_names": sample_record["formalization"]["theorem_names"],
                 "definition_names": sample_record["formalization"]["definition_names"],
@@ -1177,29 +1251,22 @@ class ReviewerTests(unittest.TestCase):
             update_mechanical["project_dependencies"] = [
                 {
                     **dependency,
-                    "url": dependency.get(
-                        "url", f"https://github.com/{dependency['repository']}"
-                    ),
+                    "url": dependency.get("url", f"https://github.com/{dependency['repository']}"),
                 }
                 for dependency in sample_record["formalization"]["project_dependencies"]
             ]
             update_issue = {
                 "number": update_issue_number,
                 "title": "[submission] Updated example result",
-                "url": (
-                    "https://github.com/kim-em/PalomarSubmission/issues/"
-                    f"{update_issue_number}"
-                ),
+                "url": (f"https://github.com/kim-em/PalomarSubmission/issues/{update_issue_number}"),
             }
             (update_source / "formalization.yaml").write_text(
-                "project:\n  license: MIT\n"
-                "classification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+                "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
             )
             commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
-            (update_work / "mechanical-report-sha256").write_text(
-                review_digest(update_mechanical) + "\n"
-            )
+            (update_work / "mechanical-report-sha256").write_text(review_digest(update_mechanical) + "\n")
+            bind_publication_evidence(update_work, update_mechanical)
             update_mechanical_url = update_mechanical["workflow_url"]
             update_review = {
                 **review,
@@ -1214,8 +1281,7 @@ class ReviewerTests(unittest.TestCase):
             (update_work / "issue.json").write_text(json.dumps(update_issue))
             (update_work / "mechanical-report-url").write_text(update_mechanical_url + "\n")
             (update_work / "review-url").write_text(
-                "https://github.com/kim-em/PalomarSubmission/issues/"
-                f"{update_issue_number}#issuecomment-2\n"
+                f"https://github.com/kim-em/PalomarSubmission/issues/{update_issue_number}#issuecomment-2\n"
             )
             (update_work / "review-sha256").write_text(review_digest(update_review) + "\n")
             update_render = root / "update-render-result"
@@ -1241,9 +1307,7 @@ class ReviewerTests(unittest.TestCase):
                 self.assertEqual(publish(update_args), 0)
 
             update_database = update_work / "database"
-            update_entry = (
-                update_database / "entries" / f"{sample_record['id']}-v2.json"
-            )
+            update_entry = update_database / "entries" / f"{sample_record['id']}-v2.json"
             update_record = json.loads(update_entry.read_text())
             self.assertEqual(update_record["version"], 2)
             self.assertEqual(update_record["accepted_at"], sample_record["accepted_at"])
@@ -1261,9 +1325,7 @@ class ReviewerTests(unittest.TestCase):
 
             with mock.patch("palomar_reviewer.cli.gh", side_effect=finalize_update_gh):
                 self.assertEqual(
-                    finalize(
-                        SimpleNamespace(issue=update_issue_number, pr=100, dry_run=True)
-                    ),
+                    finalize(SimpleNamespace(issue=update_issue_number, pr=100, dry_run=True)),
                     0,
                 )
 
@@ -1283,22 +1345,12 @@ class ReviewerTests(unittest.TestCase):
         record = {"id": "PALOMAR-2026-08-01-000012", "version": 2}
         issue = {
             "comments": [
-                {
-                    "body": (
-                        "<!-- palomar-publication -->\n"
-                        "## 🔭 Published as `PALOMAR-2026-08-01-000012` v1"
-                    )
-                }
+                {"body": ("<!-- palomar-publication -->\n## 🔭 Published as `PALOMAR-2026-08-01-000012` v1")}
             ]
         }
         self.assertFalse(has_publication_comment(issue, record))
         issue["comments"].append(
-            {
-                "body": (
-                    "<!-- palomar-publication -->\n"
-                    "## 🔭 Published as `PALOMAR-2026-08-01-000012` v2"
-                )
-            }
+            {"body": ("<!-- palomar-publication -->\n## 🔭 Published as `PALOMAR-2026-08-01-000012` v2")}
         )
         self.assertTrue(has_publication_comment(issue, record))
 
@@ -1552,9 +1604,7 @@ class ReviewerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "policy" / "schemas").mkdir(parents=True)
-            (work / "policy" / "schemas" / "review.schema.json").write_text(
-                json.dumps({"type": "object"})
-            )
+            (work / "policy" / "schemas" / "review.schema.json").write_text(json.dumps({"type": "object"}))
             (work / "policy" / "rubric.json").write_text(json.dumps(rubric))
             issue = {"number": 7}
             mechanical = {
@@ -1605,9 +1655,7 @@ class ReviewerTests(unittest.TestCase):
                     "body": (
                         "<!-- palomar-editorial-review -->\n"
                         "<details><summary>Machine-readable editorial report</summary>\n\n"
-                        "```json\n"
-                        + json.dumps(report)
-                        + "\n```\n</details>"
+                        "```json\n" + json.dumps(report) + "\n```\n</details>"
                     ),
                 },
                 {
@@ -1616,11 +1664,9 @@ class ReviewerTests(unittest.TestCase):
                     "body": (
                         "<!-- palomar-editorial-review -->\n"
                         "<details><summary>Machine-readable editorial report</summary>\n\n"
-                        "```json\n"
-                        + json.dumps(report)
-                        + "\n```\n</details>"
+                        "```json\n" + json.dumps(report) + "\n```\n</details>"
                     ),
-                }
+                },
             ],
         }
         self.assertEqual(

@@ -29,14 +29,14 @@ MAX_RENDER_FILES = 2_000
 MAX_RENDER_NODES = 4_000
 MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
 MAX_RENDER_BYTES = 25 * 1024 * 1024
+MAX_EVIDENCE_FILE_BYTES = 16 * 1024 * 1024
+MAX_EVIDENCE_BYTES = 24 * 1024 * 1024
 MECHANICAL_MARKER = "<!-- palomar-mechanical-report -->"
 REVIEW_MARKER = "<!-- palomar-editorial-review -->"
 CLAIM_MARKER = "<!-- palomar-review-claim -->"
 PUBLICATION_MARKER = "<!-- palomar-publication -->"
 WEB_URL = "https://kim-em.github.io/PalomarWeb"
-PALOMAR_ID_RE = re.compile(
-    r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<issue>[0-9]{6})"
-)
+PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<issue>[0-9]{6})")
 ISSUE_HEADING_RE = re.compile(r"(?m)^### (?P<heading>[^\n]+)\s*$")
 ISSUE_SOURCE_RE = re.compile(
     r"^https://github\.com/(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -172,9 +172,7 @@ MECHANICAL_REPORT_SCHEMA = {
                     "additionalProperties": False,
                     "required": ["relationship"],
                     "properties": {
-                        "relationship": {
-                            "enum": ["maintainer", "approved", "legacy-unspecified"]
-                        },
+                        "relationship": {"enum": ["maintainer", "approved", "legacy-unspecified"]},
                         "evidence": {"type": "string", "minLength": 1, "maxLength": 4000},
                     },
                 },
@@ -191,9 +189,7 @@ MECHANICAL_REPORT_SCHEMA = {
             ],
             "properties": {
                 "result_origin": {"enum": ["original", "source-based"]},
-                "repository_role": {
-                    "enum": ["substantive-development", "thin-wrapper"]
-                },
+                "repository_role": {"enum": ["substantive-development", "thin-wrapper"]},
                 "responsible_maintainers": {"type": "array", "minItems": 1},
                 "mathematical_sources": {"type": "array"},
                 "related_formalizations": {"type": "array"},
@@ -259,9 +255,7 @@ MECHANICAL_REPORT_SCHEMA = {
                                     "provenance": {"const": "palomar-indexed"},
                                     "palomar_id": {
                                         "type": "string",
-                                        "pattern": (
-                                            r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$"
-                                        ),
+                                        "pattern": (r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$"),
                                     },
                                     "palomar_version": {"type": "integer", "minimum": 1},
                                     "revision": {
@@ -295,9 +289,7 @@ MECHANICAL_REPORT_SCHEMA = {
                             "revision": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
                             "palomar_id": {
                                 "type": "string",
-                                "pattern": (
-                                    r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$"
-                                ),
+                                "pattern": (r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$"),
                             },
                             "palomar_version": {"type": "integer", "minimum": 1},
                             "path": {"type": "string", "minLength": 1},
@@ -330,7 +322,10 @@ MECHANICAL_REPORT_SCHEMA = {
         "landrun_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "nanoda_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "checked_at": {"type": "string", "format": "date-time"},
-        "workflow_url": {"type": "string", "pattern": r"^https://github\.com/kim-em/PalomarSubmission/actions/runs/[1-9][0-9]*$"},
+        "workflow_url": {
+            "type": "string",
+            "pattern": r"^https://github\.com/kim-em/PalomarSubmission/actions/runs/[1-9][0-9]*$",
+        },
         "existing_id": {
             "type": ["string", "null"],
             "pattern": r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$",
@@ -444,9 +439,7 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         or any(key not in SYNTHESIS_SCORE_KEYS for key in mandatory_reject)
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
-        raise ReviewerError(
-            "rubric mandatory_reject_below_minimum must contain unique registry score names"
-        )
+        raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
     allowed_step_scores = set(STEP_SCORE_KEYS)
     if version < 4:
         allowed_step_scores.remove("classification")
@@ -490,9 +483,7 @@ def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[st
     score_properties = schema["properties"]["scores"]["properties"]
     for key in schema["properties"]["scores"]["properties"]:
         score_properties[key] = (
-            {"type": "integer", "minimum": 1, "maximum": 5}
-            if key in owned
-            else {"type": "null"}
+            {"type": "integer", "minimum": 1, "maximum": 5} if key in owned else {"type": "null"}
         )
     return schema
 
@@ -602,6 +593,46 @@ def render_bundle_manifest(bundle: Path) -> tuple[list[dict[str, Any]], str]:
         raise ReviewerError("render bundle is empty")
     canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return files, hashlib.sha256(canonical).hexdigest()
+
+
+def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
+    """Build the small content-addressed evidence bundle committed at publication."""
+    bundle = work / "verification-evidence"
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    bundle.mkdir()
+    for name in ("mechanical-report.json", "workflow-run.json"):
+        source = work / name
+        if source.is_symlink() or not source.is_file():
+            raise ReviewerError(f"publication requires a regular {name}")
+        size = source.stat().st_size
+        if size > MAX_EVIDENCE_FILE_BYTES:
+            raise ReviewerError(f"verification evidence file exceeds the size cap: {name}")
+        shutil.copyfile(source, bundle / name)
+    files = [
+        {
+            "path": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(bundle.iterdir())
+    ]
+    if sum(int(item["bytes"]) for item in files) > MAX_EVIDENCE_BYTES:
+        raise ReviewerError("verification evidence exceeds the total-size cap")
+    canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    tree_hash = hashlib.sha256(canonical).hexdigest()
+    write_json(
+        bundle / "evidence-manifest.json",
+        {"schema_version": 1, "evidence_tree_sha256": tree_hash, "files": files},
+    )
+    report = next(item for item in files if item["path"] == "mechanical-report.json")
+    provenance = load_json(bundle / "workflow-run.json")
+    return bundle, {
+        "evidence_tree_sha256": tree_hash,
+        "mechanical_report_sha256": report["sha256"],
+        "workflow_commit": provenance["workflow_commit"],
+        "workflow_run_attempt": provenance["run_attempt"],
+    }
 
 
 def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[dict[str, Any], Path]:
@@ -783,9 +814,7 @@ def issue_data(number: int) -> dict[str, Any]:
     )
 
 
-def trusted_verification_runs(
-    issue_number: int, issue_title: str
-) -> tuple[list[dict[str, Any]], bool]:
+def trusted_verification_runs(issue_number: int, issue_title: str) -> tuple[list[dict[str, Any]], bool]:
     runs = json.loads(
         gh(
             [
@@ -802,7 +831,7 @@ def trusted_verification_runs(
                 "--json",
                 (
                     "databaseId,displayTitle,status,conclusion,url,headSha,headBranch,"
-                    "event,createdAt,workflowName"
+                    "event,createdAt,updatedAt,attempt,workflowName"
                 ),
             ]
         )
@@ -906,10 +935,7 @@ def validate_mechanical_artifact(
     if source["tree_url"] != f"{source['repository_url']}/tree/{source['commit']}":
         raise ReviewerError("mechanical report source tree URL is inconsistent")
     expected_repository, expected_commit = expected_issue_source(issue)
-    if (
-        source["repository"].lower() != expected_repository.lower()
-        or source["commit"] != expected_commit
-    ):
+    if source["repository"].lower() != expected_repository.lower() or source["commit"] != expected_commit:
         raise ReviewerError("mechanical report source does not match the current submission issue")
     head_sha = run_data.get("headSha")
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
@@ -928,15 +954,13 @@ def validate_mechanical_artifact(
 
 def mechanical_report(
     issue: dict[str, Any], download_root: Path
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     issue_number = int(issue["number"])
     runs, exact_titles = trusted_verification_runs(issue_number, str(issue.get("title", "")))
     if not runs:
         raise ReviewerError("no completed trusted verification workflow run found")
     for index, run_data in enumerate(runs):
-        report_path = download_mechanical_artifact(
-            run_data["databaseId"], issue_number, download_root
-        )
+        report_path = download_mechanical_artifact(run_data["databaseId"], issue_number, download_root)
         try:
             report = load_json(report_path)
         except (OSError, json.JSONDecodeError) as error:
@@ -948,8 +972,92 @@ def mechanical_report(
         if index > 0 and exact_titles:
             raise ReviewerError("newer exact verification runs were unexpectedly skipped")
         validate_mechanical_artifact(report, issue, run_data)
-        return report, str(run_data["url"])
+        return report, str(run_data["url"]), run_data
     raise ReviewerError("no trusted mechanical report artifact belongs to this issue")
+
+
+def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
+    """Capture stable run and job metadata while GitHub still retains the run."""
+    run_id = run_data.get("databaseId")
+    attempt = run_data.get("attempt")
+    if (
+        not isinstance(run_id, int)
+        or isinstance(run_id, bool)
+        or run_id < 1
+        or not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or attempt < 1
+    ):
+        raise ReviewerError("trusted verification run has invalid identity metadata")
+    try:
+        details = json.loads(
+            gh(
+                [
+                    "run",
+                    "view",
+                    str(run_id),
+                    "--repo",
+                    SUBMISSION_REPO,
+                    "--json",
+                    "attempt,jobs",
+                ]
+            )
+        )
+    except json.JSONDecodeError as error:
+        raise ReviewerError("GitHub returned malformed verification job metadata") from error
+    if not isinstance(details, dict) or details.get("attempt") != attempt:
+        raise ReviewerError("verification job metadata belongs to another run attempt")
+    raw_jobs = details.get("jobs")
+    if not isinstance(raw_jobs, list) or not raw_jobs:
+        raise ReviewerError("trusted verification run has no recorded jobs")
+    jobs: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for job in raw_jobs:
+        if not isinstance(job, dict):
+            raise ReviewerError("trusted verification run has malformed job metadata")
+        job_id = job.get("databaseId")
+        if (
+            not isinstance(job_id, int)
+            or isinstance(job_id, bool)
+            or job_id < 1
+            or job_id in seen
+            or job.get("status") != "completed"
+            or job.get("conclusion") not in {"success", "skipped"}
+            or not all(
+                isinstance(job.get(field), str) and bool(job[field])
+                for field in ("name", "startedAt", "completedAt")
+            )
+        ):
+            raise ReviewerError("trusted verification run has malformed job metadata")
+        seen.add(job_id)
+        jobs.append(
+            {
+                "id": job_id,
+                "name": job["name"],
+                "status": job["status"],
+                "conclusion": job["conclusion"],
+                "started_at": job["startedAt"],
+                "completed_at": job["completedAt"],
+            }
+        )
+    head_sha = run_data.get("headSha")
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise ReviewerError("trusted verification run has no full workflow commit")
+    return {
+        "schema_version": 1,
+        "repository": SUBMISSION_REPO,
+        "run_id": run_id,
+        "run_attempt": attempt,
+        "workflow_path": f".github/workflows/{VERIFY_WORKFLOW}",
+        "workflow_commit": head_sha,
+        "workflow_url": run_data["url"],
+        "event": run_data["event"],
+        "status": run_data["status"],
+        "conclusion": run_data["conclusion"],
+        "created_at": run_data["createdAt"],
+        "updated_at": run_data["updatedAt"],
+        "jobs": jobs,
+    }
 
 
 def clone_at(repository_url: str, revision: str, destination: Path) -> str:
@@ -1008,9 +1116,7 @@ def prepare_challenge_review_sources(work: Path, mechanical: dict[str, Any]) -> 
         if isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
     }
     if dependencies and not records:
-        raise ReviewerError(
-            "versioned indexed Challenge dependency is missing its source-closure evidence"
-        )
+        raise ReviewerError("versioned indexed Challenge dependency is missing its source-closure evidence")
     checkouts = work / "challenge-dependencies"
     if checkouts.exists():
         shutil.rmtree(checkouts)
@@ -1027,9 +1133,7 @@ def prepare_challenge_review_sources(work: Path, mechanical: dict[str, Any]) -> 
             item.get("palomar_version"),
         )
         if key not in dependencies:
-            raise ReviewerError(
-                "Challenge review-source file is not bound to a versioned indexed dependency"
-            )
+            raise ReviewerError("Challenge review-source file is not bound to a versioned indexed dependency")
         covered_dependencies.add(key)
         grouped.setdefault((str(item["repository"]), str(item["revision"])), []).append(item)
     missing_dependencies = dependencies - covered_dependencies
@@ -1038,9 +1142,7 @@ def prepare_challenge_review_sources(work: Path, mechanical: dict[str, Any]) -> 
             f"{repository}@{revision} ({palomar_id}-v{version})"
             for repository, revision, palomar_id, version in sorted(missing_dependencies)
         )
-        raise ReviewerError(
-            f"indexed Challenge dependencies lack source-closure evidence: {missing}"
-        )
+        raise ReviewerError(f"indexed Challenge dependencies lack source-closure evidence: {missing}")
 
     manifest: list[dict[str, Any]] = []
     total_bytes = 0
@@ -1127,9 +1229,7 @@ def challenge_review_source_context(work: Path) -> str:
     )
 
 
-def require_complete_indexed_context(
-    work: Path, mechanical: dict[str, Any], decision: str
-) -> None:
+def require_complete_indexed_context(work: Path, mechanical: dict[str, Any], decision: str) -> None:
     """Prevent acceptance when the model packet omitted indexed source bytes."""
     if decision != "accept" or not any(
         isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
@@ -1143,15 +1243,9 @@ def require_complete_indexed_context(
     files = manifest.get("files", []) if isinstance(manifest, dict) else []
     if not isinstance(files, list) or not files:
         raise ReviewerError("acceptance lacks indexed Challenge source files")
-    total = sum(
-        item.get("bytes", MAX_CHALLENGE_PROMPT_BYTES + 1)
-        for item in files
-        if isinstance(item, dict)
-    )
+    total = sum(item.get("bytes", MAX_CHALLENGE_PROMPT_BYTES + 1) for item in files if isinstance(item, dict))
     if len(files) > MAX_CHALLENGE_REVIEW_FILES or total > MAX_CHALLENGE_PROMPT_BYTES:
-        raise ReviewerError(
-            "acceptance is forbidden because indexed Challenge source evidence was truncated"
-        )
+        raise ReviewerError("acceptance is forbidden because indexed Challenge source evidence was truncated")
 
 
 def require_indexed_source_review_pass(
@@ -1166,18 +1260,13 @@ def require_indexed_source_review_pass(
         for item in mechanical.get("challenge", {}).get("dependencies", [])
     ):
         return
-    executed = {
-        result.get("step") for result in passes if isinstance(result, dict)
-    }
+    executed = {result.get("step") for result in passes if isinstance(result, dict)}
     if not any(
-        step.get("id") in executed
-        and "challenge_review_sources" in step.get("inputs", [])
+        step.get("id") in executed and "challenge_review_sources" in step.get("inputs", [])
         for step in rubric.get("steps", [])
         if isinstance(step, dict) and step.get("id") != "synthesis"
     ):
-        raise ReviewerError(
-            "acceptance requires an executed review pass over indexed Challenge sources"
-        )
+        raise ReviewerError("acceptance requires an executed review pass over indexed Challenge sources")
 
 
 def prepare_workspace(
@@ -1192,7 +1281,8 @@ def prepare_workspace(
         raise ReviewerError(f"issue #{issue_number} is not awaiting or undergoing review")
     work = root / str(issue_number)
     work.mkdir(parents=True, exist_ok=True)
-    mechanical, report_url = mechanical_report(issue, work / "mechanical-download")
+    download_root = work / "mechanical-download"
+    mechanical, report_url, run_data = mechanical_report(issue, download_root)
     source_info = mechanical["source"]
     if int(mechanical["issue"]["number"]) != issue_number:
         raise ReviewerError("mechanical report issue number mismatch")
@@ -1209,9 +1299,12 @@ def prepare_workspace(
     if policy_commit != resolved_policy:
         raise ReviewerError("policy checkout mismatch")
     write_json(work / "issue.json", issue)
-    write_json(work / "mechanical-report.json", mechanical)
+    shutil.copyfile(download_root / "mechanical-report.json", work / "mechanical-report.json")
+    write_json(work / "workflow-run.json", verification_run_provenance(run_data))
     (work / "mechanical-report-url").write_text(report_url + "\n")
     (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
+    (work / "mechanical-report-bytes-sha256").write_text(sha256_file(work / "mechanical-report.json") + "\n")
+    (work / "workflow-run-sha256").write_text(sha256_file(work / "workflow-run.json") + "\n")
     return work, issue, mechanical, policy_commit
 
 
@@ -1449,11 +1542,7 @@ def isolated_engine_command(
             raise ReviewerError("codex and node are required for the codex review engine")
         codex_entry = Path(codex).resolve(strict=True)
         try:
-            codex_root = next(
-                parent
-                for parent in codex_entry.parents
-                if parent.name == "@openai"
-            ) / "codex"
+            codex_root = next(parent for parent in codex_entry.parents if parent.name == "@openai") / "codex"
         except StopIteration as error:
             raise ReviewerError("could not locate the installed Codex package") from error
         _bind_if_present(command, codex_root, "/engine/codex")
@@ -1735,10 +1824,7 @@ def validate_stored_review(
 def pass_scores(passes: list[dict[str, Any]], rubric: dict[str, Any]) -> dict[str, int]:
     by_step = {result["step"]: result for result in passes}
     owners = {
-        key: step["id"]
-        for step in rubric["steps"]
-        if step["id"] != "synthesis"
-        for key in step["score_keys"]
+        key: step["id"] for step in rubric["steps"] if step["id"] != "synthesis" for key in step["score_keys"]
     }
     return {key: by_step[owners[key]]["scores"][key] for key in SYNTHESIS_SCORE_KEYS}
 
@@ -1751,22 +1837,16 @@ def validate_synthesis_policy(
     mechanical: dict[str, Any],
 ) -> None:
     required_steps = {
-        step["id"]
-        for step in rubric["steps"]
-        if step.get("required") and step["id"] != "synthesis"
+        step["id"] for step in rubric["steps"] if step.get("required") and step["id"] != "synthesis"
     }
     by_step = {result["step"]: result for result in passes}
     missing = required_steps - by_step.keys()
     if missing:
-        raise ReviewerError(
-            f"review is missing required passes: {', '.join(sorted(missing))}"
-        )
+        raise ReviewerError(f"review is missing required passes: {', '.join(sorted(missing))}")
 
     evidence_scores = pass_scores(passes, rubric)
     if synthesis["scores"] != evidence_scores:
-        raise ReviewerError(
-            "synthesis scores must reproduce the evidence-pass scores without inflating them"
-        )
+        raise ReviewerError("synthesis scores must reproduce the evidence-pass scores without inflating them")
 
     minimum = rubric.get("minimum_accept_score")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
@@ -1777,25 +1857,18 @@ def validate_synthesis_policy(
         or any(key not in SYNTHESIS_SCORE_KEYS for key in mandatory_reject)
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
-        raise ReviewerError(
-            "rubric mandatory_reject_below_minimum must contain unique registry score names"
-        )
-    escalated = sorted(
-        result["step"] for result in passes if result["verdict"] == "escalate"
-    )
+        raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
+    escalated = sorted(result["step"] for result in passes if result["verdict"] == "escalate")
     if escalated and synthesis["decision"] != "escalate":
         raise ReviewerError(
-            f"escalated passes require escalate, not {synthesis['decision']}: "
-            + ", ".join(escalated)
+            f"escalated passes require escalate, not {synthesis['decision']}: " + ", ".join(escalated)
         )
     fundamental: list[tuple[str, int, str]] = []
     for key in mandatory_reject:
         if evidence_scores[key] >= minimum:
             continue
         owner = next(
-            step["id"]
-            for step in rubric["steps"]
-            if step["id"] != "synthesis" and key in step["score_keys"]
+            step["id"] for step in rubric["steps"] if step["id"] != "synthesis" and key in step["score_keys"]
         )
         provider = by_step[owner]
         verdict = provider["verdict"]
@@ -1809,23 +1882,16 @@ def validate_synthesis_policy(
         if synthesis["decision"] != expected:
             details = ", ".join(f"{key}={score}" for key, score, _verdict in fundamental)
             raise ReviewerError(
-                f"fundamental editorial failures require {expected}, not "
-                f"{synthesis['decision']}: {details}"
+                f"fundamental editorial failures require {expected}, not {synthesis['decision']}: {details}"
             )
 
     if synthesis["decision"] != "accept":
         return
     if mechanical.get("status") != "pass":
         raise ReviewerError("an acceptance requires a passing mechanical report")
-    blocking = sorted(
-        result["step"]
-        for result in passes
-        if result["verdict"] in {"fail", "escalate"}
-    )
+    blocking = sorted(result["step"] for result in passes if result["verdict"] in {"fail", "escalate"})
     if blocking:
-        raise ReviewerError(
-            f"an acceptance cannot override blocking passes: {', '.join(blocking)}"
-        )
+        raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
     below_minimum = []
     for result in passes:
         for key, score in result["scores"].items():
@@ -1833,8 +1899,7 @@ def validate_synthesis_policy(
                 below_minimum.append(f"{result['step']}.{key}={score}")
     if below_minimum:
         raise ReviewerError(
-            "an acceptance cannot use scores below the rubric minimum: "
-            + ", ".join(below_minimum)
+            "an acceptance cannot use scores below the rubric minimum: " + ", ".join(below_minimum)
         )
 
 
@@ -2033,9 +2098,7 @@ def run_review(args: argparse.Namespace) -> int:
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(prompt, encoding="utf-8")
         schema = (
-            SYNTHESIS_SCHEMA
-            if step["id"] == "synthesis"
-            else step_schema_for_rubric(step, rubric_version)
+            SYNTHESIS_SCHEMA if step["id"] == "synthesis" else step_schema_for_rubric(step, rubric_version)
         )
         result = engine_result(
             prompt,
@@ -2148,9 +2211,7 @@ def registry_title(metadata: dict[str, Any], issue_title: str) -> str:
     return str(fallback or "Untitled Palomar submission")
 
 
-def validated_classification(
-    mechanical: dict[str, Any], metadata: dict[str, Any]
-) -> dict[str, list[str]]:
+def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any]) -> dict[str, list[str]]:
     try:
         result = {
             "arxiv": [item["code"] for item in mechanical["classification"]["arxiv"]],
@@ -2159,9 +2220,7 @@ def validated_classification(
     except (KeyError, TypeError) as error:
         raise ReviewerError("mechanical report has no valid classification") from error
     submitted = metadata.get("classification")
-    if not isinstance(submitted, dict) or any(
-        not isinstance(submitted.get(key), list) for key in result
-    ):
+    if not isinstance(submitted, dict) or any(not isinstance(submitted.get(key), list) for key in result):
         raise ReviewerError("formalization.yaml has no valid classification")
     if result != {key: submitted[key] for key in result}:
         raise ReviewerError("formalization.yaml classification disagrees with the mechanical report")
@@ -2178,13 +2237,11 @@ def registry_record(
     version: int,
     review_url: str,
     challenge_render: dict[str, Any],
+    verification_evidence: dict[str, Any],
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", accepted_at):
         raise ReviewerError("review has no valid acceptance date")
-    permanent_id = (
-        review.get("existing_id")
-        or f"PALOMAR-{accepted_at}-{int(issue['number']):06d}"
-    )
+    permanent_id = review.get("existing_id") or f"PALOMAR-{accepted_at}-{int(issue['number']):06d}"
     title = registry_title(metadata, issue["title"])
     abstract = (
         metadata_value(
@@ -2236,7 +2293,7 @@ def registry_record(
     if challenge["lines"] > 300 or challenge["bytes"] > 32 * 1024:
         reasons.append("Challenge exceeds the preferred audit surface")
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "id": permanent_id,
         "accepted_at": accepted_at,
         "version": version,
@@ -2267,6 +2324,11 @@ def registry_record(
         "verification": {
             "verified_at": mechanical["checked_at"],
             "workflow_url": mechanical["workflow_url"],
+            "workflow_commit": verification_evidence["workflow_commit"],
+            "workflow_run_attempt": verification_evidence["workflow_run_attempt"],
+            "evidence_path": verification_evidence["evidence_path"],
+            "evidence_tree_sha256": verification_evidence["evidence_tree_sha256"],
+            "mechanical_report_sha256": verification_evidence["mechanical_report_sha256"],
             "comparator_commit": mechanical["comparator_commit"],
             "lean4export_commit": mechanical["lean4export_commit"],
             "landrun_commit": mechanical["landrun_commit"],
@@ -2329,9 +2391,7 @@ def publication_identity(
             raise ReviewerError(f"database entry has no submission issue: {path.name}")
         if not isinstance(accepted_at, str) or not isinstance(repository, str):
             raise ReviewerError(f"database entry has incomplete publication identity: {path.name}")
-        by_id.setdefault(identifier, []).append(
-            (version, prior_issue, accepted_at, repository)
-        )
+        by_id.setdefault(identifier, []).append((version, prior_issue, accepted_at, repository))
         if prior_issue == issue_number:
             by_issue.add(identifier)
 
@@ -2347,9 +2407,7 @@ def publication_identity(
         current = max(records, key=lambda record: record[0])
         submitted_repository = mechanical["source"]["repository"]
         if current[3].casefold() != submitted_repository.casefold():
-            raise ReviewerError(
-                f"update to {identifier} comes from {submitted_repository}, not {current[3]}"
-            )
+            raise ReviewerError(f"update to {identifier} comes from {submitted_repository}, not {current[3]}")
         return identifier, current[2], current[0] + 1
 
     if by_issue:
@@ -2381,6 +2439,9 @@ def publish(args: argparse.Namespace) -> int:
     )
     mechanical_url_path = work / "mechanical-report-url"
     mechanical_digest_path = work / "mechanical-report-sha256"
+    mechanical_bytes_digest_path = work / "mechanical-report-bytes-sha256"
+    workflow_run_path = work / "workflow-run.json"
+    workflow_run_digest_path = work / "workflow-run-sha256"
     review_url_path = work / "review-url"
     review_digest_path = work / "review-sha256"
     if (
@@ -2388,6 +2449,12 @@ def publish(args: argparse.Namespace) -> int:
         or not mechanical_url_path.is_file()
         or mechanical_digest_path.is_symlink()
         or not mechanical_digest_path.is_file()
+        or mechanical_bytes_digest_path.is_symlink()
+        or not mechanical_bytes_digest_path.is_file()
+        or workflow_run_path.is_symlink()
+        or not workflow_run_path.is_file()
+        or workflow_run_digest_path.is_symlink()
+        or not workflow_run_digest_path.is_file()
         or review_url_path.is_symlink()
         or not review_url_path.is_file()
         or review_digest_path.is_symlink()
@@ -2397,6 +2464,10 @@ def publish(args: argparse.Namespace) -> int:
     mechanical_url = mechanical_url_path.read_text().strip()
     if mechanical_digest_path.read_text().strip() != review_digest(mechanical):
         raise ReviewerError("mechanical report no longer matches the reviewed artifact")
+    if mechanical_bytes_digest_path.read_text().strip() != sha256_file(work / "mechanical-report.json"):
+        raise ReviewerError("mechanical report bytes no longer match the downloaded artifact")
+    if workflow_run_digest_path.read_text().strip() != sha256_file(workflow_run_path):
+        raise ReviewerError("verification run provenance changed after review")
     review_url = review_url_path.read_text().strip()
     if review_digest_path.read_text().strip() != review_digest(review):
         raise ReviewerError("posted review does not match the current inspected review")
@@ -2468,8 +2539,8 @@ def publish(args: argparse.Namespace) -> int:
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
-    if not (database / "schema-v4.json").is_file():
-        raise ReviewerError("PalomarDatabase main does not publish schema-v4.json")
+    if not (database / "schema-v5.json").is_file():
+        raise ReviewerError("PalomarDatabase main does not publish schema-v5.json")
 
     existing_id = mechanical.get("existing_id")
     permanent_id, accepted_at, version = publication_identity(
@@ -2509,6 +2580,10 @@ def publish(args: argparse.Namespace) -> int:
         "landrun_commit": render_report["landrun_commit"],
         "rendered_at": render_report["rendered_at"],
     }
+    evidence_bundle, verification_evidence = build_verification_evidence(work)
+    evidence_hash = verification_evidence["evidence_tree_sha256"]
+    evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
+    verification_evidence["evidence_path"] = evidence_path
     # Preserve the update ID through deterministic local context.
     review["existing_id"] = existing_id
     record = registry_record(
@@ -2519,6 +2594,7 @@ def publish(args: argparse.Namespace) -> int:
         accepted_at=accepted_at,
         version=version,
         challenge_render=challenge_render,
+        verification_evidence=verification_evidence,
         review_url=review_url,
     )
     filename = f"{record['id']}-v{version}.json"
@@ -2530,6 +2606,11 @@ def publish(args: argparse.Namespace) -> int:
         raise ReviewerError(f"database render artifact already exists: {artifact_path}")
     artifact_destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(render_bundle, artifact_destination)
+    evidence_destination = database / evidence_path
+    if evidence_destination.exists():
+        raise ReviewerError(f"database verification evidence already exists: {evidence_path}")
+    evidence_destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(evidence_bundle, evidence_destination)
     write_json(destination, record)
 
     entries = []
@@ -2548,13 +2629,20 @@ def publish(args: argparse.Namespace) -> int:
         database / "index.json",
         {"schema_version": 2, "generated_at": utc_now(), "entries": entries},
     )
-    schema = load_json(database / "schema-v4.json")
+    schema = load_json(database / "schema-v5.json")
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
     run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.issue}-v{version}"
     run(["git", "checkout", "-b", branch], cwd=database)
     run(
-        ["git", "add", f"entries/{filename}", "index.json", artifact_path.rstrip("/")],
+        [
+            "git",
+            "add",
+            f"entries/{filename}",
+            "index.json",
+            artifact_path.rstrip("/"),
+            evidence_path.rstrip("/"),
+        ],
         cwd=database,
     )
     run(
@@ -2637,8 +2725,7 @@ def publication_entry_path(pr: dict[str, Any]) -> str:
 def has_publication_comment(issue: dict[str, Any], record: dict[str, Any]) -> bool:
     heading = f"## 🔭 Published as `{record['id']}` v{record['version']}"
     return any(
-        PUBLICATION_MARKER in comment.get("body", "")
-        and heading in comment.get("body", "")
+        PUBLICATION_MARKER in comment.get("body", "") and heading in comment.get("body", "")
         for comment in issue.get("comments", [])
     )
 
