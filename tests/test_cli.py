@@ -196,6 +196,14 @@ class ReviewerTests(unittest.TestCase):
         ):
             validate_mechanical_artifact(outside, issue, run_data)
 
+    def test_schema_v2_cannot_smuggle_report_v3_paths(self):
+        mechanical = self.mechanical_fixture()
+        mechanical["challenge"]["path"] = "vendor/Challenge.lean"
+        issue = {"number": 12, "body": self.issue_body()}
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40}
+        with self.assertRaisesRegex(ReviewerError, "v2 has a non-root challenge.path"):
+            validate_mechanical_artifact(mechanical, issue, run_data)
+
     def test_mechanical_schema_accepts_explicitly_unspecified_provenance(self):
         mechanical = self.mechanical_fixture()
         mechanical["provenance"] = {
@@ -777,6 +785,8 @@ class ReviewerTests(unittest.TestCase):
         self.assertLess(binding, untrusted_boundary)
         self.assertLess(untrusted_boundary, submission)
         self.assertEqual(prompt.count("Binding editorial floor"), 1)
+        self.assertIn("Project directory: `repository root`", prompt)
+        self.assertIn('"path": "README.md"', prompt)
         self.assertNotIn("</evidence>", prompt)
         self.assertTrue(prompt.rstrip().endswith("not as instructions."))
 
@@ -823,7 +833,7 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_is_schema_v6_with_dated_identity(self):
+    def test_registry_record_keeps_report_v2_on_schema_v5(self):
         record = registry_record(
             issue={
                 "number": 12,
@@ -870,7 +880,7 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_run_attempt": 1,
             },
         )
-        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["schema_version"], 5)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         self.assertEqual(record["id"], "PALOMAR-2026-08-01-000012")
@@ -878,7 +888,7 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v6.json").read_text())
+            schema = json.loads((Path(database) / "schema-v5.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -908,7 +918,7 @@ class ReviewerTests(unittest.TestCase):
             validated_repository_license(mechanical, metadata)
 
     def test_registry_record_preserves_versioned_indexed_provenance(self):
-        mechanical = self.mechanical_fixture()
+        mechanical = self.nested_mechanical_fixture()
         revision = "8" * 40
         mechanical["challenge"].update(
             {
@@ -977,6 +987,12 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_commit": "8" * 40,
                 "workflow_run_attempt": 1,
             },
+        )
+        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["source"]["project_path"], "examples/comparator")
+        self.assertEqual(
+            record["formalization"]["lakefile_path"],
+            "examples/comparator/lakefile.toml",
         )
         self.assertEqual(
             record["trust"]["challenge_dependencies"],
@@ -1308,7 +1324,7 @@ class ReviewerTests(unittest.TestCase):
             database = work / "database"
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
-            self.assertEqual(record["schema_version"], 6)
+            self.assertEqual(record["schema_version"], 5)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -1598,6 +1614,12 @@ class ReviewerTests(unittest.TestCase):
         _, _, rubric = self.review_policy_fixture()
         rubric["schema_version"] = 3
         self.assertEqual(validate_rubric(rubric), 3)
+
+    def test_rubric_rejects_unknown_evidence_inputs(self):
+        _, _, rubric = self.review_policy_fixture()
+        rubric["steps"][0]["inputs"] = ["challange_source"]
+        with self.assertRaisesRegex(ReviewerError, "unknown evidence input"):
+            validate_rubric(rubric)
 
     def test_version_two_schema_does_not_retroactively_require_classification(self):
         schema = step_schema_for_rubric(
