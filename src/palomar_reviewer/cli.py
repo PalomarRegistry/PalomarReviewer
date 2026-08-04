@@ -52,8 +52,6 @@ STATUS_LABELS = (
     "status:escalated",
 )
 MAX_CONTEXT_BYTES = 300_000
-MAX_CHALLENGE_REVIEW_FILES = 10_000
-MAX_CHALLENGE_REVIEW_BYTES = 500 * 1024 * 1024
 MAX_CHALLENGE_PROMPT_BYTES = 8 * 1024 * 1024
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
@@ -72,7 +70,6 @@ RUBRIC_EVIDENCE_INPUTS = {
     "Challenge.lean",
     "Solution.lean",
     "all_previous_results",
-    "challenge_review_sources",
     "challenge_source",
     "comparator.json",
     "comparator_config",
@@ -288,76 +285,15 @@ MECHANICAL_REPORT_SCHEMA = {
                 "dependencies": {
                     "type": "array",
                     "items": {
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": ["repository", "provenance"],
-                                "properties": {
-                                    "repository": {
-                                        "type": "string",
-                                        "pattern": r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
-                                    },
-                                    "provenance": {"const": "allowlisted"},
-                                },
-                            },
-                            {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": [
-                                    "repository",
-                                    "provenance",
-                                    "palomar_id",
-                                    "palomar_version",
-                                    "revision",
-                                ],
-                                "properties": {
-                                    "repository": {
-                                        "type": "string",
-                                        "pattern": r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
-                                    },
-                                    "provenance": {"const": "palomar-indexed"},
-                                    "palomar_id": {
-                                        "type": "string",
-                                        "pattern": (r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$"),
-                                    },
-                                    "palomar_version": {"type": "integer", "minimum": 1},
-                                    "revision": {
-                                        "type": "string",
-                                        "pattern": r"^[0-9a-f]{40}$",
-                                    },
-                                },
-                            },
-                        ]
-                    },
-                },
-                "review_source_files": {
-                    "type": "array",
-                    "maxItems": MAX_CHALLENGE_REVIEW_FILES,
-                    "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": [
-                            "repository",
-                            "revision",
-                            "palomar_id",
-                            "palomar_version",
-                            "path",
-                            "sha256",
-                        ],
+                        "required": ["repository", "provenance"],
                         "properties": {
                             "repository": {
                                 "type": "string",
                                 "pattern": r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
                             },
-                            "revision": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
-                            "palomar_id": {
-                                "type": "string",
-                                "pattern": (r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$"),
-                            },
-                            "palomar_version": {"type": "integer", "minimum": 1},
-                            "path": {"type": "string", "minLength": 1},
-                            "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                            "provenance": {"const": "allowlisted"},
                         },
                     },
                 },
@@ -1454,175 +1390,6 @@ def resolve_remote_commit(repository: str, revision: str) -> str:
     return output
 
 
-def prepare_challenge_review_sources(work: Path, mechanical: dict[str, Any]) -> None:
-    """Reconstruct and hash the exact indexed files in the Challenge closure."""
-    records = mechanical.get("challenge", {}).get("review_source_files", [])
-    if not isinstance(records, list):
-        raise ReviewerError("mechanical Challenge review-source evidence is malformed")
-    dependencies = {
-        (
-            str(item.get("repository", "")).lower(),
-            str(item.get("revision", "")),
-            str(item.get("palomar_id", "")),
-            item.get("palomar_version"),
-        )
-        for item in mechanical.get("challenge", {}).get("dependencies", [])
-        if isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
-    }
-    if dependencies and not records:
-        raise ReviewerError("versioned indexed Challenge dependency is missing its source-closure evidence")
-    checkouts = work / "challenge-dependencies"
-    if checkouts.exists():
-        shutil.rmtree(checkouts)
-    checkouts.mkdir()
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    covered_dependencies: set[tuple[str, str, str, int | None]] = set()
-    for item in records:
-        if not isinstance(item, dict):
-            raise ReviewerError("mechanical Challenge review-source record is malformed")
-        key = (
-            str(item.get("repository", "")).lower(),
-            str(item.get("revision", "")),
-            str(item.get("palomar_id", "")),
-            item.get("palomar_version"),
-        )
-        if key not in dependencies:
-            raise ReviewerError("Challenge review-source file is not bound to a versioned indexed dependency")
-        covered_dependencies.add(key)
-        grouped.setdefault((str(item["repository"]), str(item["revision"])), []).append(item)
-    missing_dependencies = dependencies - covered_dependencies
-    if missing_dependencies:
-        missing = ", ".join(
-            f"{repository}@{revision} ({palomar_id}-v{version})"
-            for repository, revision, palomar_id, version in sorted(missing_dependencies)
-        )
-        raise ReviewerError(f"indexed Challenge dependencies lack source-closure evidence: {missing}")
-
-    manifest: list[dict[str, Any]] = []
-    total_bytes = 0
-    seen: set[tuple[str, str, str]] = set()
-    for (repository, revision), files in sorted(grouped.items()):
-        checkout_name = hashlib.sha256(f"{repository.lower()}@{revision}".encode()).hexdigest()[:20]
-        checkout = checkouts / checkout_name
-        resolved = clone_at(f"https://github.com/{repository}", revision, checkout)
-        if resolved != revision:
-            raise ReviewerError(f"indexed Challenge checkout mismatch for {repository}@{revision}")
-        checkout_root = checkout.resolve()
-        for item in sorted(files, key=lambda value: str(value["path"])):
-            relative = PurePosixPath(str(item["path"]))
-            if relative.is_absolute() or not relative.parts or ".." in relative.parts:
-                raise ReviewerError("indexed Challenge source path is not a safe relative path")
-            identity = (repository.lower(), revision, relative.as_posix())
-            if identity in seen:
-                raise ReviewerError("indexed Challenge review-source file is duplicated")
-            seen.add(identity)
-            path = checkout.joinpath(*relative.parts)
-            if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(checkout_root):
-                raise ReviewerError("indexed Challenge source is missing, symbolic, or escapes checkout")
-            data = path.read_bytes()
-            total_bytes += len(data)
-            if total_bytes > MAX_CHALLENGE_REVIEW_BYTES:
-                raise ReviewerError("indexed Challenge review-source closure is too large")
-            digest = hashlib.sha256(data).hexdigest()
-            if digest != item["sha256"]:
-                raise ReviewerError(
-                    f"indexed Challenge source-byte mismatch: {repository}@{revision}:{relative}"
-                )
-            manifest.append(
-                {
-                    **item,
-                    "bytes": len(data),
-                    "checkout": checkout_name,
-                }
-            )
-    write_json(
-        work / "challenge-review-sources.json",
-        {"schema_version": 1, "files": manifest},
-    )
-
-
-def challenge_review_source_context(work: Path) -> str:
-    """Serialize the independently reconstructed source closure for one review pass."""
-    path = work / "challenge-review-sources.json"
-    if not path.is_file() or path.is_symlink():
-        raise ReviewerError("indexed Challenge review-source manifest is missing")
-    manifest = load_json(path)
-    files = manifest.get("files", [])
-    if not isinstance(files, list):
-        raise ReviewerError("indexed Challenge review-source manifest is malformed")
-    evidence: list[dict[str, Any]] = []
-    used = 0
-    for item in files:
-        checkout = str(item.get("checkout", ""))
-        relative = PurePosixPath(str(item.get("path", "")))
-        source = (work / "challenge-dependencies" / checkout).joinpath(*relative.parts)
-        data = source.read_bytes()
-        if hashlib.sha256(data).hexdigest() != item.get("sha256"):
-            raise ReviewerError("indexed Challenge source changed after preparation")
-        remaining = MAX_CHALLENGE_PROMPT_BYTES - used
-        truncated = len(data) > remaining
-        selected = data[: max(remaining, 0)]
-        used += len(selected)
-        evidence.append(
-            {
-                **{key: value for key, value in item.items() if key != "checkout"},
-                "untrusted_source": selected.decode("utf-8", errors="replace"),
-                "truncated_for_model_context": truncated,
-            }
-        )
-    return json.dumps(
-        {
-            "notice": (
-                "These are the exact independently reconstructed files in the transitive "
-                "Palomar-indexed Challenge source closure. Any truncation makes definition "
-                "fidelity unauditable and requires escalation rather than acceptance."
-            ),
-            "files": evidence,
-        },
-        ensure_ascii=False,
-    )
-
-
-def require_complete_indexed_context(work: Path, mechanical: dict[str, Any], decision: str) -> None:
-    """Prevent acceptance when the model packet omitted indexed source bytes."""
-    if decision != "accept" or not any(
-        isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
-        for item in mechanical.get("challenge", {}).get("dependencies", [])
-    ):
-        return
-    manifest_path = work / "challenge-review-sources.json"
-    if not manifest_path.is_file() or manifest_path.is_symlink():
-        raise ReviewerError("acceptance lacks indexed Challenge source evidence")
-    manifest = load_json(manifest_path)
-    files = manifest.get("files", []) if isinstance(manifest, dict) else []
-    if not isinstance(files, list) or not files:
-        raise ReviewerError("acceptance lacks indexed Challenge source files")
-    total = sum(item.get("bytes", MAX_CHALLENGE_PROMPT_BYTES + 1) for item in files if isinstance(item, dict))
-    if len(files) > MAX_CHALLENGE_REVIEW_FILES or total > MAX_CHALLENGE_PROMPT_BYTES:
-        raise ReviewerError("acceptance is forbidden because indexed Challenge source evidence was truncated")
-
-
-def require_indexed_source_review_pass(
-    mechanical: dict[str, Any],
-    rubric: dict[str, Any],
-    passes: list[dict[str, Any]],
-    decision: str,
-) -> None:
-    """Require an executed acceptance pass to receive exact indexed sources."""
-    if decision != "accept" or not any(
-        isinstance(item, dict) and item.get("provenance") == "palomar-indexed"
-        for item in mechanical.get("challenge", {}).get("dependencies", [])
-    ):
-        return
-    executed = {result.get("step") for result in passes if isinstance(result, dict)}
-    if not any(
-        step.get("id") in executed and "challenge_review_sources" in step.get("inputs", [])
-        for step in rubric.get("steps", [])
-        if isinstance(step, dict) and step.get("id") != "synthesis"
-    ):
-        raise ReviewerError("acceptance requires an executed review pass over indexed Challenge sources")
-
-
 def prepare_workspace(
     issue_number: int,
     *,
@@ -1654,7 +1421,6 @@ def prepare_workspace(
         mechanical,
         load_formalization_metadata(formalization_path),
     )
-    prepare_challenge_review_sources(work, mechanical)
     resolved_policy = resolve_remote_commit(POLICY_REPO, policy_ref)
     policy_commit = clone_at(
         f"https://github.com/{POLICY_REPO}",
@@ -1768,8 +1534,6 @@ def render_prompt(
             content = json.dumps(mechanical, indent=2)
         elif name == "all_previous_results":
             content = json.dumps(previous, indent=2)
-        elif name == "challenge_review_sources":
-            content = challenge_review_source_context(work)
         elif name in {"README.md", "repository_readme", "project_readme"}:
             evidence_path = project_readme_relative(mechanical, source)
             content = context_file(source, evidence_path)
@@ -2187,7 +1951,6 @@ def validate_stored_review(
         raise ReviewerError("stored review names another mechanical report")
     if report.get("policy_commit") != policy_commit:
         raise ReviewerError("stored review was produced under another policy commit")
-    require_complete_indexed_context(work, mechanical, str(report.get("decision")))
 
     rubric_data = rubric if rubric is not None else load_json(work / "policy" / "rubric.json")
     rubric_version = validate_rubric(rubric_data)
@@ -2199,12 +1962,6 @@ def validate_stored_review(
             raise ReviewerError(f"stored review has an unknown or duplicate pass: {step_id!r}")
         jsonschema.validate(result, step_schema_for_rubric(steps[step_id], rubric_version))
         seen.add(step_id)
-    require_indexed_source_review_pass(
-        mechanical,
-        rubric_data,
-        report["passes"],
-        str(report.get("decision")),
-    )
     if rubric_version >= 2:
         synthesis = {
             "decision": report["decision"],
@@ -2519,13 +2276,6 @@ def run_review(args: argparse.Namespace) -> int:
             write_json(work / "passes" / f"{step['id']}.json", result)
     if synthesis is None:
         raise ReviewerError("rubric did not produce a synthesis result")
-    require_complete_indexed_context(work, mechanical, str(synthesis.get("decision")))
-    require_indexed_source_review_pass(
-        mechanical,
-        rubric,
-        passes,
-        str(synthesis.get("decision")),
-    )
     if rubric_version >= 2:
         validate_synthesis_policy(
             synthesis,
@@ -2670,20 +2420,13 @@ def registry_record(
             )
     reasons = []
     if challenge["trust_level"] == "qualified":
-        reasons.append("Challenge imports Tau Ceti or a Palomar-indexed project")
+        reasons.append("Challenge imports Tau Ceti")
     database_challenge_dependencies = []
     for item in challenge["dependencies"]:
         database_dependency = {
             "repository": item["repository"],
             "provenance": item["provenance"],
         }
-        if item["provenance"] == "palomar-indexed":
-            database_dependency["palomar_id"] = item["palomar_id"]
-            reasons.append(
-                "Palomar-indexed Challenge dependency "
-                f"{item['palomar_id']}-v{item['palomar_version']} reconstructs "
-                f"{item['repository']}@{item['revision']}"
-            )
         database_challenge_dependencies.append(database_dependency)
     if challenge["lines"] > 300 or challenge["bytes"] > 32 * 1024:
         reasons.append("Challenge exceeds the preferred audit surface")
