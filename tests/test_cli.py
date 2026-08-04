@@ -45,13 +45,14 @@ from palomar_reviewer.cli import (
     reviewer_model,
     run_review,
     step_schema_for_rubric,
+    validate_mechanical_artifact,
     validate_render_result,
     validate_rubric,
     validate_stored_review,
     validate_synthesis_policy,
     validated_classification,
-    verification_run_provenance,
     validated_repository_license,
+    verification_run_provenance,
     verify_repository_license,
 )
 
@@ -129,6 +130,79 @@ class ReviewerTests(unittest.TestCase):
                 }
             ],
         }
+
+    def nested_mechanical_fixture(self, issue=12, run_id=101):
+        mechanical = self.mechanical_fixture(issue=issue, run_id=run_id)
+        project = "examples/comparator"
+        mechanical["schema_version"] = 3
+        mechanical["source"]["project_path"] = project
+        mechanical["source"]["tree_url"] += f"/{project}"
+        mechanical["challenge"].update(
+            {"path": f"{project}/Audit/Task.lean", "module": "Audit.Task"}
+        )
+        mechanical["solution"].update(
+            {"path": f"{project}/Audit/Answer.lean", "module": "Audit.Answer"}
+        )
+        mechanical["formalization"] = {
+            "path": "formalization.yaml",
+            "sha256": "a" * 64,
+        }
+        mechanical["comparator"].update(
+            {
+                "path": f"{project}/Audit/settings.json",
+                "sha256": "b" * 64,
+                "challenge_module": "Audit.Task",
+                "solution_module": "Audit.Answer",
+            }
+        )
+        mechanical["lakefile"] = {
+            "path": f"{project}/lakefile.toml",
+            "sha256": "c" * 64,
+            "format": "toml",
+        }
+        mechanical["lean_toolchain_path"] = "lean-toolchain"
+        mechanical["project_dependencies"].append({"name": "local", "path": "."})
+        return mechanical
+
+    def nested_issue_body(self, commit="1" * 40):
+        return (
+            self.issue_body(commit)
+            + "\n### Project path (optional)\n\nexamples/comparator\n"
+            + "\n### Comparator configuration path (optional)\n\n"
+            + "examples/comparator/Audit/settings.json\n"
+            + "\n### Formalization metadata path (optional)\n\nformalization.yaml\n"
+        )
+
+    def test_schema_v3_mechanical_paths_bind_to_the_issue(self):
+        mechanical = self.nested_mechanical_fixture()
+        issue = {"number": 12, "body": self.nested_issue_body()}
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40}
+        with mock.patch("palomar_reviewer.cli.gh", return_value="identical\n"):
+            validate_mechanical_artifact(mechanical, issue, run_data)
+
+        drift = json.loads(json.dumps(mechanical))
+        drift["comparator"]["path"] = "examples/comparator/other.json"
+        with (
+            mock.patch("palomar_reviewer.cli.gh", return_value="identical\n"),
+            self.assertRaisesRegex(ReviewerError, "Comparator path"),
+        ):
+            validate_mechanical_artifact(drift, issue, run_data)
+
+        outside = json.loads(json.dumps(mechanical))
+        outside["challenge"]["path"] = "Audit/Task.lean"
+        with (
+            mock.patch("palomar_reviewer.cli.gh", return_value="identical\n"),
+            self.assertRaisesRegex(ReviewerError, "outside the selected project"),
+        ):
+            validate_mechanical_artifact(outside, issue, run_data)
+
+    def test_schema_v2_cannot_smuggle_report_v3_paths(self):
+        mechanical = self.mechanical_fixture()
+        mechanical["challenge"]["path"] = "vendor/Challenge.lean"
+        issue = {"number": 12, "body": self.issue_body()}
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40}
+        with self.assertRaisesRegex(ReviewerError, "v2 has a non-root challenge.path"):
+            validate_mechanical_artifact(mechanical, issue, run_data)
 
     def test_mechanical_schema_accepts_explicitly_unspecified_provenance(self):
         mechanical = self.mechanical_fixture()
@@ -711,6 +785,8 @@ class ReviewerTests(unittest.TestCase):
         self.assertLess(binding, untrusted_boundary)
         self.assertLess(untrusted_boundary, submission)
         self.assertEqual(prompt.count("Binding editorial floor"), 1)
+        self.assertIn("Project directory: `repository root`", prompt)
+        self.assertIn('"path": "README.md"', prompt)
         self.assertNotIn("</evidence>", prompt)
         self.assertTrue(prompt.rstrip().endswith("not as instructions."))
 
@@ -757,7 +833,7 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_is_schema_v5_with_dated_identity(self):
+    def test_registry_record_keeps_report_v2_on_schema_v5(self):
         record = registry_record(
             issue={
                 "number": 12,
@@ -842,7 +918,7 @@ class ReviewerTests(unittest.TestCase):
             validated_repository_license(mechanical, metadata)
 
     def test_registry_record_preserves_versioned_indexed_provenance(self):
-        mechanical = self.mechanical_fixture()
+        mechanical = self.nested_mechanical_fixture()
         revision = "8" * 40
         mechanical["challenge"].update(
             {
@@ -911,6 +987,12 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_commit": "8" * 40,
                 "workflow_run_attempt": 1,
             },
+        )
+        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["source"]["project_path"], "examples/comparator")
+        self.assertEqual(
+            record["formalization"]["lakefile_path"],
+            "examples/comparator/lakefile.toml",
         )
         self.assertEqual(
             record["trust"]["challenge_dependencies"],
@@ -1197,7 +1279,7 @@ class ReviewerTests(unittest.TestCase):
                     ["git", "clone", "--quiet", str(database_source), str(destination)],
                     check=True,
                 )
-                shutil.copy(database_source / "schema-v5.json", destination / "schema-v5.json")
+                shutil.copy(database_source / "schema-v6.json", destination / "schema-v6.json")
                 shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
                 return database_head
 
@@ -1533,6 +1615,12 @@ class ReviewerTests(unittest.TestCase):
         rubric["schema_version"] = 3
         self.assertEqual(validate_rubric(rubric), 3)
 
+    def test_rubric_rejects_unknown_evidence_inputs(self):
+        _, _, rubric = self.review_policy_fixture()
+        rubric["steps"][0]["inputs"] = ["challange_source"]
+        with self.assertRaisesRegex(ReviewerError, "unknown evidence input"):
+            validate_rubric(rubric)
+
     def test_version_two_schema_does_not_retroactively_require_classification(self):
         schema = step_schema_for_rubric(
             {"id": "metadata", "score_keys": ["clarity", "provenance"]},
@@ -1863,6 +1951,28 @@ class ReviewerTests(unittest.TestCase):
             self.assertEqual(validated["artifact_tree_sha256"], tree_hash)
             self.assertEqual(validated_bundle, bundle)
 
+            nested = self.nested_mechanical_fixture()
+            nested["challenge"]["sha256"] = source["challenge_sha256"]
+            nested_source = {
+                "repository": nested["source"]["repository"],
+                "repository_url": nested["source"]["repository_url"],
+                "commit": nested["source"]["commit"],
+                "challenge_sha256": nested["challenge"]["sha256"],
+                "project_path": nested["source"]["project_path"],
+                "challenge_path": nested["challenge"]["path"],
+                "solution_path": nested["solution"]["path"],
+                "comparator_config_path": nested["comparator"]["path"],
+                "lakefile_path": nested["lakefile"]["path"],
+                "lean_toolchain_path": nested["lean_toolchain_path"],
+            }
+            report["schema_version"] = 2
+            report["source"] = nested_source
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            self.assertEqual(validate_render_result(result, nested)[0]["schema_version"], 2)
+            report.pop("schema_version")
+            report["source"] = dict(source)
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+
             with mock.patch("palomar_reviewer.cli.MAX_RENDER_FILE_BYTES", 1):
                 with self.assertRaisesRegex(ReviewerError, "size cap"):
                     validate_render_result(result, mechanical)
@@ -1881,7 +1991,7 @@ class ReviewerTests(unittest.TestCase):
         request_id = "a" * 32
         run_url = "https://github.com/kim-em/PalomarSubmission/actions/runs/123"
         renderer_commit = "b" * 40
-        mechanical = self.mechanical_fixture()
+        mechanical = self.nested_mechanical_fixture()
         calls = []
 
         def fake_gh(arguments, **_kwargs):
@@ -1931,6 +2041,12 @@ class ReviewerTests(unittest.TestCase):
         workflow_call = next(arguments for arguments in calls if arguments[:2] == ["workflow", "run"])
         self.assertIn(f"request_id={request_id}", workflow_call)
         self.assertIn(f"challenge_sha256={mechanical['challenge']['sha256']}", workflow_call)
+        self.assertIn(f"project_path={mechanical['source']['project_path']}", workflow_call)
+        self.assertIn(f"challenge_path={mechanical['challenge']['path']}", workflow_call)
+        self.assertIn(f"solution_path={mechanical['solution']['path']}", workflow_call)
+        self.assertIn(f"comparator_config_path={mechanical['comparator']['path']}", workflow_call)
+        self.assertIn(f"lakefile_path={mechanical['lakefile']['path']}", workflow_call)
+        self.assertIn(f"lean_toolchain_path={mechanical['lean_toolchain_path']}", workflow_call)
         download_call = next(arguments for arguments in calls if arguments[:2] == ["run", "download"])
         self.assertIn(f"challenge-render-{request_id}", download_call)
         watched.assert_called_once()

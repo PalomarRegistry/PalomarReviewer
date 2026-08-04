@@ -149,18 +149,26 @@ Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparati
 time.
 
 Deploy reviewer support for a new rubric schema before merging a policy that
-uses it. The reviewer accepts historical versions 1, 2, and 3 plus the current
-version 4 contract, and refuses unknown versions.
+uses it. The reviewer accepts historical rubric versions 1 through 4 plus the
+current version 5 contract, and refuses unknown versions and unknown evidence
+input roles.
 
 Release database schema support before using a policy or reviewer version that
-publishes that schema. For this contract, `PalomarDatabase/schema-v5.json` must
-be present on `main`, and Web must understand its structured licence evidence,
-before the first schema-v5 record is published. Land Database and Web support
-first, then Submission enforcement and Reviewer consumption; Policy and Template
-guidance may land at any point. Do not publish between the Database and Reviewer
-releases, because the earlier Reviewer emits the historical string licence field.
-Any submission mechanically verified before report schema v2 must be re-verified
-before review or publication.
+publishes that schema. Nested-project rollout is consumer-first: Database schema
+v6 and Web support land first, then Reviewer support, Policy rubric v5, and
+finally Submission mechanical-report v3. The Reviewer continues to publish
+schema-v5 records for report-v2 evidence and publishes schema-v6 only for
+report-v3 evidence. Report v3 binds an optional repository-relative project
+directory plus repository-relative Challenge, Solution, Comparator configuration,
+metadata, Lakefile, and toolchain paths. Its tree URL encodes the selected project
+path one segment at a time using RFC 3986 percent encoding. Render dispatch adds
+the six corresponding optional path inputs; report-v2 dispatch retains render
+schema 1, while report v3 requires render schema 2 with the exact path bindings.
+
+Project dependency paths in schema v6 are normalized repository-root-relative
+directories; `.` names the repository root. Formalization metadata may remain at
+repository root for a nested Comparator project, and repository licence evidence
+always names the single conventional repository-root licence file.
 
 ## Audit trail
 

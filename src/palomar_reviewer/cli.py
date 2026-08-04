@@ -16,6 +16,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 import jsonschema
 import yaml
@@ -66,6 +67,28 @@ STEP_SCORE_KEYS = (
     "literature",
     "proof_alignment",
 )
+RUBRIC_EVIDENCE_INPUTS = {
+    "README.md",
+    "Challenge.lean",
+    "Solution.lean",
+    "all_previous_results",
+    "challenge_review_sources",
+    "challenge_source",
+    "comparator.json",
+    "comparator_config",
+    "formalization.yaml",
+    "formalization_metadata",
+    "issue",
+    "lakefile",
+    "lakefile.lean",
+    "lakefile.toml",
+    "lean-toolchain",
+    "lean_toolchain",
+    "mechanical_report",
+    "project_readme",
+    "repository_readme",
+    "solution_source",
+}
 STEP_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -161,7 +184,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "license",
     ],
     "properties": {
-        "schema_version": {"const": 2},
+        "schema_version": {"enum": [2, 3]},
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
         "issue": {
@@ -222,7 +245,8 @@ MECHANICAL_REPORT_SCHEMA = {
                 "repository": {"type": "string", "pattern": r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
                 "repository_url": {"type": "string", "pattern": r"^https://github\.com/"},
                 "commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
-                "tree_url": {"type": "string", "pattern": r"^https://github\.com/.+/tree/[0-9a-f]{40}$"},
+                "tree_url": {"type": "string", "pattern": r"^https://github\.com/.+/tree/[0-9a-f]{40}(?:/.+)?$"},
+                "project_path": {"type": "string", "minLength": 1},
             },
         },
         "license": {
@@ -256,6 +280,8 @@ MECHANICAL_REPORT_SCHEMA = {
             ],
             "properties": {
                 "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                "path": {"type": "string", "minLength": 1},
+                "module": {"type": "string", "minLength": 1},
                 "lines": {"type": "integer", "minimum": 1},
                 "bytes": {"type": "integer", "minimum": 1},
                 "direct_imports": {"type": "array", "items": {"type": "string"}},
@@ -343,6 +369,8 @@ MECHANICAL_REPORT_SCHEMA = {
             "required": ["sha256"],
             "properties": {
                 "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                "path": {"type": "string", "minLength": 1},
+                "module": {"type": "string", "minLength": 1},
             },
         },
         "lean_toolchain": {"type": "string", "pattern": r"^leanprover/lean4:"},
@@ -353,6 +381,10 @@ MECHANICAL_REPORT_SCHEMA = {
                 "theorem_names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                 "definition_names": {"type": "array", "items": {"type": "string"}},
                 "permitted_axioms": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                "challenge_module": {"type": "string", "minLength": 1},
+                "solution_module": {"type": "string", "minLength": 1},
             },
         },
         "comparator_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
@@ -371,15 +403,46 @@ MECHANICAL_REPORT_SCHEMA = {
         "project_dependencies": {
             "type": "array",
             "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["name", "repository", "url", "revision"],
-                "properties": {
-                    "name": {"type": "string", "minLength": 1},
-                    "repository": {"type": "string", "minLength": 1},
-                    "url": {"type": "string", "minLength": 1},
-                    "revision": {"type": "string", "minLength": 1},
-                },
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["name", "repository", "url", "revision"],
+                        "properties": {
+                            "name": {"type": "string", "minLength": 1},
+                            "repository": {"type": "string", "minLength": 1},
+                            "url": {"type": "string", "minLength": 1},
+                            "revision": {"type": "string", "minLength": 1},
+                        },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["name", "path"],
+                        "properties": {
+                            "name": {"type": "string", "minLength": 1},
+                            "path": {"type": "string", "minLength": 1},
+                        },
+                    },
+                ]
+            },
+        },
+        "lean_toolchain_path": {"type": "string", "minLength": 1},
+        "lakefile": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["path", "sha256", "format"],
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                "format": {"enum": ["toml", "lean"]},
+            },
+        },
+        "formalization": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
             },
         },
     },
@@ -388,6 +451,81 @@ MECHANICAL_REPORT_SCHEMA = {
 
 class ReviewerError(RuntimeError):
     pass
+
+
+def safe_repository_path(value: str, field: str) -> str:
+    if not isinstance(value, str):
+        raise ReviewerError(f"{field} must be a repository-relative POSIX path")
+    segments = value.split("/")
+    if (
+        not value
+        or value.startswith("/")
+        or "\\" in value
+        or "?" in value
+        or "#" in value
+        or any(not segment or segment in {".", ".."} for segment in segments)
+        or ":" in segments[0]
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ReviewerError(f"{field} must be a safe repository-relative POSIX path")
+    return value
+
+
+def source_tree_url(source: dict[str, Any]) -> str:
+    base = f"{source['repository_url']}/tree/{source['commit']}"
+    project_path = source.get("project_path")
+    if not project_path:
+        return base
+    safe_repository_path(project_path, "source.project_path")
+    encoded = "/".join(quote(segment, safe="") for segment in project_path.split("/"))
+    return f"{base}/{encoded}"
+
+
+def mechanical_source_path(source: Path, value: str, field: str) -> Path:
+    relative = safe_repository_path(value, field)
+    candidate = source
+    for segment in relative.split("/"):
+        candidate /= segment
+        if candidate.is_symlink():
+            raise ReviewerError(f"{field} contains a symlinked component")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(source.resolve()) or not resolved.is_file():
+        raise ReviewerError(f"{field} is missing or escapes the source checkout")
+    return resolved
+
+
+def mechanical_relative_path(mechanical: dict[str, Any], name: str) -> str:
+    if mechanical.get("schema_version") != 3:
+        legacy = {
+            "challenge_source": "Challenge.lean",
+            "solution_source": "Solution.lean",
+            "comparator_config": "comparator.json",
+            "formalization_metadata": "formalization.yaml",
+            "lakefile": "lakefile.toml",
+            "lean_toolchain": "lean-toolchain",
+        }
+        return legacy[name]
+    mapping = {
+        "challenge_source": mechanical["challenge"].get("path", "Challenge.lean"),
+        "solution_source": mechanical["solution"].get("path", "Solution.lean"),
+        "comparator_config": mechanical["comparator"].get("path", "comparator.json"),
+        "formalization_metadata": mechanical.get("formalization", {}).get(
+            "path", "formalization.yaml"
+        ),
+        "lakefile": mechanical.get("lakefile", {}).get("path", "lakefile.toml"),
+        "lean_toolchain": mechanical.get("lean_toolchain_path", "lean-toolchain"),
+    }
+    return safe_repository_path(mapping[name], name)
+
+
+def project_readme_relative(mechanical: dict[str, Any], source: Path) -> str:
+    project_path = mechanical["source"].get("project_path")
+    if project_path:
+        candidate = f"{safe_repository_path(project_path, 'source.project_path')}/README.md"
+        path = source / candidate
+        if path.is_file() and not path.is_symlink():
+            return candidate
+    return "README.md"
 
 
 class UniqueKeySafeLoader(yaml.SafeLoader):
@@ -495,7 +633,7 @@ def review_digest(report: dict[str, Any]) -> str:
 
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4}:
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5}:
         raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -529,6 +667,13 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
     owned: list[str] = []
     owners: dict[str, dict[str, Any]] = {}
     for step in steps:
+        inputs = step.get("inputs", [])
+        if not isinstance(inputs, list) or any(
+            not isinstance(name, str)
+            or (not name.startswith("policy:") and name not in RUBRIC_EVIDENCE_INPUTS)
+            for name in inputs
+        ):
+            raise ReviewerError(f"rubric step {step.get('id')!r} has an unknown evidence input")
         if step.get("id") == "synthesis":
             continue
         score_keys = step.get("score_keys")
@@ -740,6 +885,21 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
         "commit": mechanical["source"]["commit"],
         "challenge_sha256": challenge["sha256"],
     }
+    expected_render_version = 1
+    if mechanical.get("schema_version") == 3:
+        expected_render_version = 2
+        expected_source.update(
+            {
+                "project_path": mechanical["source"].get("project_path", ""),
+                "challenge_path": mechanical["challenge"]["path"],
+                "solution_path": mechanical["solution"]["path"],
+                "comparator_config_path": mechanical["comparator"]["path"],
+                "lakefile_path": mechanical["lakefile"]["path"],
+                "lean_toolchain_path": mechanical["lean_toolchain_path"],
+            }
+        )
+    if report.get("schema_version", 1) != expected_render_version:
+        raise ReviewerError("render result has an incompatible schema version")
     if report.get("source") != expected_source:
         raise ReviewerError("render result does not match the accepted source and Challenge hash")
     for key in ("verso_commit", "renderer_commit", "landrun_commit"):
@@ -771,23 +931,39 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
 def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
     request_id = uuid.uuid4().hex
     challenge = mechanical["challenge"]
-    gh(
-        [
-            "workflow",
-            "run",
-            RENDER_WORKFLOW,
-            "--repo",
-            SUBMISSION_REPO,
-            "-f",
-            f"repository={mechanical['source']['repository']}",
-            "-f",
-            f"commit={mechanical['source']['commit']}",
-            "-f",
-            f"challenge_sha256={challenge['sha256']}",
-            "-f",
-            f"request_id={request_id}",
-        ]
-    )
+    dispatch = [
+        "workflow",
+        "run",
+        RENDER_WORKFLOW,
+        "--repo",
+        SUBMISSION_REPO,
+        "-f",
+        f"repository={mechanical['source']['repository']}",
+        "-f",
+        f"commit={mechanical['source']['commit']}",
+        "-f",
+        f"challenge_sha256={challenge['sha256']}",
+        "-f",
+        f"request_id={request_id}",
+    ]
+    if mechanical.get("schema_version") == 3:
+        dispatch.extend(
+            [
+                "-f",
+                f"project_path={mechanical['source'].get('project_path', '')}",
+                "-f",
+                f"challenge_path={mechanical['challenge']['path']}",
+                "-f",
+                f"solution_path={mechanical['solution']['path']}",
+                "-f",
+                f"comparator_config_path={mechanical['comparator']['path']}",
+                "-f",
+                f"lakefile_path={mechanical['lakefile']['path']}",
+                "-f",
+                f"lean_toolchain_path={mechanical['lean_toolchain_path']}",
+            ]
+        )
+    gh(dispatch)
     expected_title = (
         f"Render {mechanical['source']['repository']}@{mechanical['source']['commit']} [{request_id}]"
     )
@@ -977,13 +1153,19 @@ def download_mechanical_artifact(
     raise ReviewerError(f"could not download trusted mechanical report artifact: {detail}")
 
 
-def expected_issue_source(issue: dict[str, Any]) -> tuple[str, str]:
+def issue_source_fields(issue: dict[str, Any]) -> dict[str, str]:
     body = issue.get("body")
     if not isinstance(body, str):
         raise ReviewerError("submission issue has no parseable body")
     values: dict[str, str] = {}
     matches = list(ISSUE_HEADING_RE.finditer(body))
-    recognized = {"Repository URL", "Commit SHA"}
+    recognized = {
+        "Repository URL",
+        "Commit SHA",
+        "Project path (optional)",
+        "Comparator configuration path (optional)",
+        "Formalization metadata path (optional)",
+    }
     for index, match in enumerate(matches):
         heading = match.group("heading").strip()
         if heading not in recognized:
@@ -991,7 +1173,13 @@ def expected_issue_source(issue: dict[str, Any]) -> tuple[str, str]:
         if heading in values:
             raise ReviewerError(f"submission issue repeats {heading!r}")
         end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
-        values[heading] = body[match.end() : end].strip()
+        value = body[match.end() : end].strip()
+        values[heading] = "" if value == "_No response_" else value
+    return values
+
+
+def expected_issue_source(issue: dict[str, Any]) -> tuple[str, str]:
+    values = issue_source_fields(issue)
     repository_match = ISSUE_SOURCE_RE.fullmatch(values.get("Repository URL", ""))
     commit = values.get("Commit SHA", "").lower()
     if repository_match is None or not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -1007,6 +1195,71 @@ def validate_mechanical_artifact(
         MECHANICAL_REPORT_SCHEMA,
         format_checker=jsonschema.FormatChecker(),
     )
+    version = report["schema_version"]
+    if version == 3:
+        required_paths = (
+            (report.get("challenge", {}), "path", "challenge.path"),
+            (report.get("solution", {}), "path", "solution.path"),
+            (report.get("comparator", {}), "path", "comparator.path"),
+            (report.get("formalization", {}), "path", "formalization.path"),
+            (report.get("lakefile", {}), "path", "lakefile.path"),
+            (report, "lean_toolchain_path", "lean_toolchain_path"),
+        )
+        for container, key, field in required_paths:
+            safe_repository_path(container.get(key), field)
+        for field in ("module",):
+            if not isinstance(report["challenge"].get(field), str):
+                raise ReviewerError("mechanical report has no configured Challenge module")
+            if not isinstance(report["solution"].get(field), str):
+                raise ReviewerError("mechanical report has no configured Solution module")
+        if report["challenge"]["module"] != report["comparator"].get("challenge_module"):
+            raise ReviewerError("mechanical report disagrees on the configured Challenge module")
+        if report["solution"]["module"] != report["comparator"].get("solution_module"):
+            raise ReviewerError("mechanical report disagrees on the configured Solution module")
+        project_path = report["source"].get("project_path")
+        prefix = f"{project_path}/" if project_path else ""
+        for container, key, field in (
+            (report["challenge"], "path", "challenge.path"),
+            (report["solution"], "path", "solution.path"),
+            (report["comparator"], "path", "comparator.path"),
+            (report["lakefile"], "path", "lakefile.path"),
+        ):
+            if not container[key].startswith(prefix):
+                raise ReviewerError(f"mechanical report {field} is outside the selected project")
+        if report["lakefile"]["path"] not in {
+            f"{prefix}lakefile.toml",
+            f"{prefix}lakefile.lean",
+        }:
+            raise ReviewerError("mechanical report Lakefile is not the selected project's Lakefile")
+        expected_format = "lean" if report["lakefile"]["path"].endswith(".lean") else "toml"
+        if report["lakefile"]["format"] != expected_format:
+            raise ReviewerError("mechanical report Lakefile format disagrees with its path")
+        if report["lean_toolchain_path"] not in {
+            f"{prefix}lean-toolchain",
+            "lean-toolchain",
+        }:
+            raise ReviewerError("mechanical report lean-toolchain is outside its accepted locations")
+        seen_dependency_names: set[str] = set()
+        for dependency in report["project_dependencies"]:
+            if dependency["name"] in seen_dependency_names:
+                raise ReviewerError("mechanical report repeats a project dependency name")
+            seen_dependency_names.add(dependency["name"])
+            if "path" in dependency and dependency["path"] != ".":
+                safe_repository_path(dependency["path"], "project dependency path")
+    else:
+        if report["source"].get("project_path"):
+            raise ReviewerError("mechanical report v2 may not select a nested project")
+        for container, key, expected, field in (
+            (report["challenge"], "path", "Challenge.lean", "challenge.path"),
+            (report["solution"], "path", "Solution.lean", "solution.path"),
+            (report["comparator"], "path", "comparator.json", "comparator.path"),
+            (report.get("formalization", {}), "path", "formalization.yaml", "formalization.path"),
+        ):
+            value = container.get(key)
+            if value is not None and value != expected:
+                raise ReviewerError(f"mechanical report v2 has a non-root {field}")
+        if report.get("lakefile") is not None or report.get("lean_toolchain_path") is not None:
+            raise ReviewerError("mechanical report v2 carries report-v3 Lake path fields")
     issue_number = int(issue["number"])
     if report["issue"]["number"] != issue_number:
         raise ReviewerError("mechanical report issue number mismatch")
@@ -1015,11 +1268,29 @@ def validate_mechanical_artifact(
     source = report["source"]
     if source["repository_url"] != f"https://github.com/{source['repository']}":
         raise ReviewerError("mechanical report source repository URL is inconsistent")
-    if source["tree_url"] != f"{source['repository_url']}/tree/{source['commit']}":
+    if source["tree_url"] != source_tree_url(source):
         raise ReviewerError("mechanical report source tree URL is inconsistent")
     expected_repository, expected_commit = expected_issue_source(issue)
     if source["repository"].lower() != expected_repository.lower() or source["commit"] != expected_commit:
         raise ReviewerError("mechanical report source does not match the current submission issue")
+    if version == 3:
+        issue_fields = issue_source_fields(issue)
+        requested_project = issue_fields.get("Project path (optional)", "")
+        if requested_project:
+            safe_repository_path(requested_project, "issue project path")
+        if (source.get("project_path") or "") != requested_project:
+            raise ReviewerError("mechanical report project path does not match the submission issue")
+        default_prefix = f"{requested_project}/" if requested_project else ""
+        expected_config = issue_fields.get("Comparator configuration path (optional)", "") or (
+            default_prefix + "comparator.json"
+        )
+        expected_metadata = issue_fields.get("Formalization metadata path (optional)", "") or (
+            default_prefix + "formalization.yaml"
+        )
+        if report["comparator"]["path"] != expected_config:
+            raise ReviewerError("mechanical report Comparator path does not match the submission issue")
+        if report["formalization"]["path"] != expected_metadata:
+            raise ReviewerError("mechanical report metadata path does not match the submission issue")
     head_sha = run_data.get("headSha")
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise ReviewerError("trusted verification run has no full workflow commit")
@@ -1373,10 +1644,15 @@ def prepare_workspace(
     if source_commit != source_info["commit"]:
         raise ReviewerError("source checkout does not match mechanical report")
     source = work / "source"
+    formalization_path = mechanical_source_path(
+        source,
+        mechanical_relative_path(mechanical, "formalization_metadata"),
+        "formalization metadata",
+    )
     verify_repository_license(
         source,
         mechanical,
-        load_formalization_metadata(source / "formalization.yaml"),
+        load_formalization_metadata(formalization_path),
     )
     prepare_challenge_review_sources(work, mechanical)
     resolved_policy = resolve_remote_commit(POLICY_REPO, policy_ref)
@@ -1397,15 +1673,28 @@ def prepare_workspace(
     return work, issue, mechanical, policy_commit
 
 
-def has_proof_account(source: Path) -> bool:
-    text = (source / "formalization.yaml").read_text(encoding="utf-8", errors="replace")
+def has_proof_account(source: Path, mechanical: dict[str, Any] | None = None) -> bool:
+    mechanical = mechanical or {"challenge": {}, "solution": {}, "comparator": {}}
+    path = mechanical_source_path(
+        source,
+        mechanical_relative_path(mechanical, "formalization_metadata"),
+        "formalization metadata",
+    )
+    text = path.read_text(encoding="utf-8", errors="replace")
     return bool(re.search(r"(?im)^\s*(informal_?proof|proof_?description|proof_?account)\s*:", text))
 
 
 def context_file(source: Path, relative: str) -> str:
-    path = source / relative
+    safe_repository_path(relative, "review context path")
+    path = source
+    for segment in relative.split("/"):
+        path /= segment
+        if path.is_symlink():
+            raise ReviewerError(f"review context path contains a symlinked component: {relative}")
     if not path.is_file():
         return f"<missing file: {relative}>"
+    if not path.resolve().is_relative_to(source.resolve()):
+        raise ReviewerError(f"review context path escapes the source checkout: {relative}")
     data = path.read_bytes()
     if len(data) > MAX_CONTEXT_BYTES:
         return data[:MAX_CONTEXT_BYTES].decode("utf-8", errors="replace") + "\n<TRUNCATED>"
@@ -1442,6 +1731,7 @@ def render_prompt(
         f"\nPolicy commit: `{policy_commit}`",
         f"\nSubmission issue: `{issue['number']}`",
         f"\nSource: `{mechanical['source']['repository']}@{mechanical['source']['commit']}`",
+        f"\nProject directory: `{mechanical['source'].get('project_path') or 'repository root'}`",
     ]
     for name in step.get("inputs", []):
         if not name.startswith("policy:"):
@@ -1471,6 +1761,7 @@ def render_prompt(
     for name in step.get("inputs", []):
         if name.startswith("policy:"):
             continue
+        evidence_path: str | None = None
         if name == "issue":
             content = json.dumps(issue, indent=2)
         elif name == "mechanical_report":
@@ -1479,17 +1770,35 @@ def render_prompt(
             content = json.dumps(previous, indent=2)
         elif name == "challenge_review_sources":
             content = challenge_review_source_context(work)
-        elif name == "README.md":
-            content = context_file(source, name)
+        elif name in {"README.md", "repository_readme", "project_readme"}:
+            evidence_path = project_readme_relative(mechanical, source)
+            content = context_file(source, evidence_path)
         elif name in {
             "formalization.yaml",
+            "formalization_metadata",
             "Challenge.lean",
+            "challenge_source",
             "Solution.lean",
+            "solution_source",
             "comparator.json",
+            "comparator_config",
             "lakefile.toml",
+            "lakefile.lean",
+            "lakefile",
             "lean-toolchain",
+            "lean_toolchain",
         }:
-            content = context_file(source, name)
+            semantic_name = {
+                "formalization.yaml": "formalization_metadata",
+                "Challenge.lean": "challenge_source",
+                "Solution.lean": "solution_source",
+                "comparator.json": "comparator_config",
+                "lakefile.toml": "lakefile",
+                "lakefile.lean": "lakefile",
+                "lean-toolchain": "lean_toolchain",
+            }.get(name, name)
+            evidence_path = mechanical_relative_path(mechanical, semantic_name)
+            content = context_file(source, evidence_path)
         else:
             continue
         envelope = {
@@ -1497,6 +1806,8 @@ def render_prompt(
             "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
             "untrusted_text": content,
         }
+        if evidence_path is not None:
+            envelope["path"] = evidence_path
         sections.extend(["\n# Untrusted evidence envelope", json.dumps(envelope, ensure_ascii=False)])
     sections.extend(
         [
@@ -2173,7 +2484,7 @@ def run_review(args: argparse.Namespace) -> int:
     passes: list[dict[str, Any]] = []
     synthesis: dict[str, Any] | None = None
     for step in rubric["steps"]:
-        if step["id"] == "proof_account" and not has_proof_account(work / "source"):
+        if step["id"] == "proof_account" and not has_proof_account(work / "source", mechanical):
             continue
         prompt = render_prompt(
             step,
@@ -2345,14 +2656,18 @@ def registry_record(
     )
     license_record = validated_repository_license(mechanical, metadata)
     challenge = mechanical["challenge"]
-    dependencies = [
-        {
-            "name": item["name"],
-            "repository": item["repository"],
-            "revision": item["revision"],
-        }
-        for item in mechanical.get("project_dependencies", [])
-    ]
+    dependencies = []
+    for item in mechanical.get("project_dependencies", []):
+        if "path" in item:
+            dependencies.append({"name": item["name"], "path": item["path"]})
+        else:
+            dependencies.append(
+                {
+                    "name": item["name"],
+                    "repository": item["repository"],
+                    "revision": item["revision"],
+                }
+            )
     reasons = []
     if challenge["trust_level"] == "qualified":
         reasons.append("Challenge imports Tau Ceti or a Palomar-indexed project")
@@ -2372,8 +2687,33 @@ def registry_record(
         database_challenge_dependencies.append(database_dependency)
     if challenge["lines"] > 300 or challenge["bytes"] > 32 * 1024:
         reasons.append("Challenge exceeds the preferred audit surface")
+    source_record = {
+        "repository": mechanical["source"]["repository"],
+        "repository_url": mechanical["source"]["repository_url"],
+        "commit": mechanical["source"]["commit"],
+        "tree_url": mechanical["source"]["tree_url"],
+        "license": license_record,
+    }
+    if mechanical["source"].get("project_path"):
+        source_record["project_path"] = mechanical["source"]["project_path"]
+    record_schema_version = 6 if mechanical.get("schema_version") == 3 else 5
+    formalization_record = {
+        "lean_toolchain": mechanical["lean_toolchain"],
+        "challenge_path": mechanical_relative_path(mechanical, "challenge_source"),
+        "solution_path": mechanical_relative_path(mechanical, "solution_source"),
+        "comparator_config_path": mechanical_relative_path(mechanical, "comparator_config"),
+        "formalization_metadata_path": mechanical_relative_path(
+            mechanical, "formalization_metadata"
+        ),
+        "project_dependencies": dependencies,
+        "theorem_names": mechanical["comparator"]["theorem_names"],
+        "definition_names": mechanical["comparator"]["definition_names"],
+        "permitted_axioms": mechanical["comparator"]["permitted_axioms"],
+    }
+    if record_schema_version == 6:
+        formalization_record["lakefile_path"] = mechanical_relative_path(mechanical, "lakefile")
     return {
-        "schema_version": 5,
+        "schema_version": record_schema_version,
         "id": permanent_id,
         "accepted_at": accepted_at,
         "version": version,
@@ -2383,24 +2723,8 @@ def registry_record(
         "authors": authors_from_metadata(metadata, mechanical["issue"]["submitter"]),
         "classification": validated_classification(mechanical, metadata),
         "provenance": copy.deepcopy(mechanical["provenance"]),
-        "source": {
-            "repository": mechanical["source"]["repository"],
-            "repository_url": mechanical["source"]["repository_url"],
-            "commit": mechanical["source"]["commit"],
-            "tree_url": mechanical["source"]["tree_url"],
-            "license": license_record,
-        },
-        "formalization": {
-            "lean_toolchain": mechanical["lean_toolchain"],
-            "challenge_path": "Challenge.lean",
-            "solution_path": "Solution.lean",
-            "comparator_config_path": "comparator.json",
-            "formalization_metadata_path": "formalization.yaml",
-            "project_dependencies": dependencies,
-            "theorem_names": mechanical["comparator"]["theorem_names"],
-            "definition_names": mechanical["comparator"]["definition_names"],
-            "permitted_axioms": mechanical["comparator"]["permitted_axioms"],
-        },
+        "source": source_record,
+        "formalization": formalization_record,
         "verification": {
             "verified_at": mechanical["checked_at"],
             "workflow_url": mechanical["workflow_url"],
@@ -2598,7 +2922,11 @@ def publish(args: argparse.Namespace) -> int:
     if review["decision"] != "accept":
         raise ReviewerError("only an accepted review can be published")
     source = work / "source"
-    formalization_path = source / "formalization.yaml"
+    formalization_path = mechanical_source_path(
+        source,
+        mechanical_relative_path(mechanical, "formalization_metadata"),
+        "formalization metadata",
+    )
     formalization_record = mechanical.get("formalization")
     expected_formalization_sha256 = (
         formalization_record.get("sha256") if isinstance(formalization_record, dict) else None
@@ -2620,8 +2948,12 @@ def publish(args: argparse.Namespace) -> int:
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
-    if not (database / "schema-v5.json").is_file():
-        raise ReviewerError("PalomarDatabase main does not publish schema-v5.json")
+    record_schema_version = 6 if mechanical.get("schema_version") == 3 else 5
+    schema_path = database / f"schema-v{record_schema_version}.json"
+    if not schema_path.is_file():
+        raise ReviewerError(
+            f"PalomarDatabase main does not publish schema-v{record_schema_version}.json"
+        )
 
     existing_id = mechanical.get("existing_id")
     permanent_id, accepted_at, version = publication_identity(
@@ -2710,7 +3042,7 @@ def publish(args: argparse.Namespace) -> int:
         database / "index.json",
         {"schema_version": 2, "generated_at": utc_now(), "entries": entries},
     )
-    schema = load_json(database / "schema-v5.json")
+    schema = load_json(schema_path)
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
     run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.issue}-v{version}"
