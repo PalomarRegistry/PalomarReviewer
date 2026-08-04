@@ -1,20 +1,25 @@
 # Palomar Reviewer
 
-An operator-run tool for reviewing mechanically passing Palomar submissions.
-Nothing here runs in CI.
+The editorial reviewer for mechanically passing Palomar submissions. It runs
+automatically. No person starts a review, approves a report, or merges an
+entry.
 
 `palomar-review` finds open issues labeled `status:awaiting-review`, checks out
 the immutable source and a pinned
 [`PalomarPolicy`](https://github.com/kim-em/PalomarPolicy) commit, executes the
 ordered policy prompts with Codex, Claude, or another JSON-producing command,
-validates the final report, and optionally:
+validates the final report, and then:
 
 - claims and labels the issue;
 - posts the public editorial decision;
-- prepares a database branch and pull request for an accepted entry.
+- prepares, opens, and merges the append-only database pull request for an
+  accepted entry;
+- verifies the merged record, links the live entry, and closes the issue as
+  published.
 
-The operator remains responsible for inspecting the report and merging the
-database PR. The tool never merges.
+Nothing in that sequence waits for a person. The subcommands documented below
+exist so a run can be repeated or inspected after a failure, not because any
+step is normally performed by hand.
 
 The reviewer resolves the exact successful `PalomarSubmission` workflow run
 and uses its downloaded `mechanical-report.json` artifact as the sole mechanical
@@ -32,8 +37,8 @@ uv tool install git+https://github.com/kim-em/PalomarReviewer.git
 palomar-review doctor
 ```
 
-`gh` must be authenticated as the operator. Install and authenticate at least one
-review engine:
+`gh` must be authenticated as the account the pipeline runs as. Install and
+authenticate at least one review engine:
 
 ```bash
 codex login
@@ -41,7 +46,10 @@ codex login
 claude auth
 ```
 
-## Typical review
+## Running a review by hand
+
+These are the steps the pipeline performs. Run them yourself to reproduce a
+decision, or to recover a run that failed partway.
 
 Preview the queue without changing GitHub:
 
@@ -57,15 +65,17 @@ For version 2 policies, the runner rejects an internally inconsistent positive
 review: synthesis must reproduce the evidence-pass scores exactly, acceptance
 cannot override a failed or escalated pass, and every completed evidence score
 must meet the policy's acceptance minimum. Version 1 remains supported for
-historical policy commits. The operator should still inspect whether the cited
-evidence supports the model's substantive judgments.
+historical policy commits. These structural checks are the whole enforcement:
+whether the cited evidence genuinely supports the model's substantive judgments
+is not separately confirmed before publication. The complete packet is retained
+so a reader can check that afterwards.
 
 The policy may also designate a low score as a fundamental editorial failure.
 Currently, notability below the minimum requires `reject` or, when the reviewer
 cannot responsibly settle the question, `escalate`; it cannot be softened to a
 request for revisions.
 
-After inspecting `review.json`, post that exact editorial result:
+Post that exact editorial result:
 
 ```bash
 palomar-review run --issue 12 --engine codex --model gpt-5.6-sol --apply
@@ -85,8 +95,9 @@ schema is version 2 and also binds one root licence file, its SHA-256, and the
 agreeing declared and detected SPDX identifiers; older reports must likewise be
 re-verified.
 
-This separation is a security boundary: model output and repository prose are
-untrusted evidence until an operator has inspected the stored report.
+This separation is a security boundary. Model output and repository prose are
+untrusted evidence, and the only thing that can be published is a stored report
+that still matches the trusted inputs it was produced from.
 
 If the decision is `accept`, prepare the append-only database PR:
 
@@ -108,8 +119,8 @@ existing entry filenames. A renderer or infrastructure failure does not undo
 acceptance: rerun `publish`, or pass a previously downloaded trusted result with
 `--render-result PATH`.
 
-After inspecting and merging that PR, verify the immutable database record,
-link the live website entry, label the submission as published, and close it:
+Once that PR is merged, verify the immutable database record, link the live
+website entry, label the submission as published, and close it:
 
 ```bash
 palomar-review finalize --issue 12 --pr 34
@@ -136,9 +147,8 @@ literature score above the policy's verification ceiling.
 Every engine is additionally launched inside a fail-closed Bubblewrap
 namespace. The namespace exposes the submission at `/workspace`, a dedicated
 output directory, an empty scratch home, and only the selected engine's model
-authentication file. It does not expose the operator's GitHub CLI
-configuration, publication credentials, unrelated home files, or other
-workspaces. The engine transport can reach its model API in every pass. Claude
+authentication file. It does not expose the runner's GitHub CLI configuration,
+publication credentials, unrelated home files, or other workspaces. The engine transport can reach its model API in every pass. Claude
 web tools are disabled, and Codex search is not enabled, outside the
 literature/notability pass; general host-level egress filtering would require a
 separate API-aware proxy. `palomar-review doctor` refuses an installation
@@ -203,5 +213,6 @@ and prior model results may contain prompt-injection attempts. The reviewer puts
 them in hashed JSON evidence envelopes, repeats the binding instruction after
 all evidence, runs engines without write/shell tools, validates strict output
 schemas, and renders model-authored public prose inertly. These controls reduce
-accidental instruction following; operator inspection of the dry-run report is
-the final backstop.
+accidental instruction following. Because publication is automatic, they are
+also the last line: the retained packet above lets a reader audit any decision
+after the fact, but nothing holds an entry back while that happens.
