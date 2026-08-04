@@ -21,9 +21,17 @@ from urllib.parse import quote
 import jsonschema
 import yaml
 
+# Deliberately still the pre-migration name, even though the repository now
+# lives at PalomarRegistry/PalomarSubmission. This value is written into
+# published records as `submission.repository`, and every schema from v2 to v6
+# pins it with `"const": "kim-em/PalomarSubmission"`. Frozen schemas cannot be
+# edited, so a record naming the new repository would not validate: publication
+# is frozen until schema-v7 restructures submission identity. GitHub redirects
+# the old name for every API call, so the reviewer keeps working meanwhile.
+# Move this in the same change that introduces schema-v7.
 SUBMISSION_REPO = "kim-em/PalomarSubmission"
-POLICY_REPO = "kim-em/PalomarPolicy"
-DATABASE_REPO = "kim-em/PalomarDatabase"
+POLICY_REPO = "PalomarRegistry/PalomarPolicy"
+DATABASE_REPO = "PalomarRegistry/PalomarDatabase"
 RENDER_WORKFLOW = "render-challenge.yml"
 VERIFY_WORKFLOW = "submission.yml"
 MAX_RENDER_FILES = 2_000
@@ -36,7 +44,7 @@ MECHANICAL_MARKER = "<!-- palomar-mechanical-report -->"
 REVIEW_MARKER = "<!-- palomar-editorial-review -->"
 CLAIM_MARKER = "<!-- palomar-review-claim -->"
 PUBLICATION_MARKER = "<!-- palomar-publication -->"
-WEB_URL = "https://kim-em.github.io/PalomarWeb"
+WEB_URL = "https://palomarregistry.github.io/PalomarWeb"
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<issue>[0-9]{6})")
 ISSUE_HEADING_RE = re.compile(r"(?m)^### (?P<heading>[^\n]+)\s*$")
 ISSUE_SOURCE_RE = re.compile(
@@ -330,7 +338,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "checked_at": {"type": "string", "format": "date-time"},
         "workflow_url": {
             "type": "string",
-            "pattern": r"^https://github\.com/kim-em/PalomarSubmission/actions/runs/[1-9][0-9]*$",
+            "pattern": rf"^https://github\.com/{re.escape(SUBMISSION_REPO)}/actions/runs/[1-9][0-9]*$",
         },
         "existing_id": {
             "type": ["string", "null"],
@@ -2134,11 +2142,35 @@ def post_review(issue: int, report: dict[str, Any]) -> str:
 
 
 def matching_review_comment(issue: dict[str, Any], report: dict[str, Any]) -> str | None:
-    owner = SUBMISSION_REPO.split("/", 1)[0].lower()
+    """Find this exact report already posted by this operator, for idempotent --apply.
+
+    Authorship is the trust boundary here: the returned URL becomes the
+    published `review.report_url`, so anything accepted is what the registry
+    presents as its editorial record.
+
+    This used to compare the comment author's login to the submission
+    repository's owner, which was only ever right because the registry lived
+    under a personal account whose name was also the operator's. An
+    organisation owner authors nothing, so that test silently matches nothing.
+
+    `authorAssociation` is the obvious replacement and is the wrong answer:
+    MEMBER means any member of the organisation, and ordinary members hold base
+    `read`, which is enough to comment. That would let a read-only member's
+    comment be adopted as the official review.
+
+    `viewerDidAuthor` asks the question that actually matters: did the account
+    now running this tool post this comment. An operator can only ever match
+    their own comments, which is exactly the intent.
+
+    The cost is that a second operator does not recognise the first operator's
+    posted review and would post a duplicate. That is a visible, recoverable
+    annoyance rather than a silent acceptance of someone else's text, so it is
+    the right direction to fail in. A shared operator account or an explicit
+    login allowlist is the fix if Palomar ever has more than one reviewer.
+    """
     for comment in reversed(issue.get("comments", [])):
         body = comment.get("body", "")
-        author = comment.get("author", {})
-        if str(author.get("login", "")).lower() != owner or body.count(REVIEW_MARKER) != 1:
+        if comment.get("viewerDidAuthor") is not True or body.count(REVIEW_MARKER) != 1:
             continue
         details = body.rfind("<details><summary>Machine-readable editorial report</summary>")
         if details < 0:

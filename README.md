@@ -6,7 +6,7 @@ entry.
 
 `palomar-review` finds open issues labeled `status:awaiting-review`, checks out
 the immutable source and a pinned
-[`PalomarPolicy`](https://github.com/kim-em/PalomarPolicy) commit, executes the
+[`PalomarPolicy`](https://github.com/PalomarRegistry/PalomarPolicy) commit, executes the
 ordered policy prompts with Codex, Claude, or another JSON-producing command,
 validates the final report, and then:
 
@@ -30,7 +30,7 @@ workflow revision; fenced JSON in issue comments is never a certificate input.
 ## Install
 
 ```bash
-uv tool install git+https://github.com/kim-em/PalomarReviewer.git
+uv tool install git+https://github.com/PalomarRegistry/PalomarReviewer.git
 palomar-review doctor
 ```
 
@@ -111,7 +111,7 @@ It then validates the generated record and immutable
 render bundle against the database schema. It also archives the exact
 mechanical-report bytes and normalized run/job provenance in a content-addressed
 evidence bundle; raw Actions logs are deliberately not retained. It pushes an issue-specific branch to
-`kim-em/PalomarDatabase`, and opens a PR. It refuses non-accept decisions and
+`PalomarRegistry/PalomarDatabase`, and opens a PR. It refuses non-accept decisions and
 existing entry filenames. A renderer or infrastructure failure does not undo
 acceptance: rerun `publish`, or pass a previously downloaded trusted result with
 `--render-result PATH`.
@@ -152,7 +152,7 @@ separate API-aware proxy. `palomar-review doctor` refuses an installation
 without `bwrap`.
 
 Use `--policy-ref <40-char-sha>` to review against a specific policy commit.
-Otherwise the tool resolves and records `kim-em/PalomarPolicy@main` at preparation
+Otherwise the tool resolves and records `PalomarRegistry/PalomarPolicy@main` at preparation
 time.
 
 Deploy reviewer support for a new rubric schema before merging a policy that

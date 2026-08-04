@@ -1151,7 +1151,7 @@ class ReviewerTests(unittest.TestCase):
                 "mergedAt": "2026-08-01T13:00:00Z",
                 "mergeCommit": {"oid": "e" * 40},
                 "files": [{"path": f"entries/{entry_path.name}"}, {"path": "index.json"}],
-                "url": "https://github.com/kim-em/PalomarDatabase/pull/99",
+                "url": "https://github.com/PalomarRegistry/PalomarDatabase/pull/99",
             }
 
             def finalize_gh(arguments, **_kwargs):
@@ -1612,6 +1612,8 @@ class ReviewerTests(unittest.TestCase):
                 {
                     "url": "https://example.test/issues/7#attacker",
                     "author": {"login": "attacker"},
+                    "authorAssociation": "NONE",
+                    "viewerDidAuthor": False,
                     "body": (
                         "<!-- palomar-editorial-review -->\n"
                         "<details><summary>Machine-readable editorial report</summary>\n\n"
@@ -1621,6 +1623,8 @@ class ReviewerTests(unittest.TestCase):
                 {
                     "url": "https://example.test/issues/7#review",
                     "author": {"login": "kim-em"},
+                    "authorAssociation": "MEMBER",
+                    "viewerDidAuthor": True,
                     "body": (
                         "<!-- palomar-editorial-review -->\n"
                         "<details><summary>Machine-readable editorial report</summary>\n\n"
@@ -1638,6 +1642,56 @@ class ReviewerTests(unittest.TestCase):
             matching_review_comment(issue, report)
         changed = {**report, "summary": "A later, different report"}
         self.assertIsNone(matching_review_comment(issue, changed))
+
+    def test_matching_review_comment_trusts_authorship_not_a_name_or_membership(self):
+        """The trust boundary is "this operator posted it", not who they are.
+
+        The repository owner used to stand in for the operator, which broke when
+        the registry moved to an organisation. Organisation membership is not a
+        replacement: members hold base read, which is enough to comment, so
+        MEMBER would let a read-only member's comment be adopted as the official
+        editorial record.
+        """
+        report = {
+            "issue": 7,
+            "mechanical_report": "https://example.test/run",
+            "source": {"repository": "example/repo", "commit": "1" * 40},
+            "policy_commit": "2" * 40,
+            "decision": "reject",
+        }
+        body = (
+            "<!-- palomar-editorial-review -->\n"
+            "<details><summary>Machine-readable editorial report</summary>\n\n"
+            "```json\n" + json.dumps(report) + "\n```\n</details>"
+        )
+
+        def issue_with(**comment):
+            return {
+                "url": "https://example.test/issues/7",
+                "comments": [{
+                    "url": "https://example.test/issues/7#review",
+                    "author": {"login": "someone"},
+                    "body": body,
+                    **comment,
+                }],
+            }
+
+        self.assertEqual(
+            matching_review_comment(issue_with(viewerDidAuthor=True), report),
+            "https://example.test/issues/7#review",
+        )
+        # A read-only organisation member can comment, and must not be adopted.
+        for association in ("MEMBER", "OWNER", "COLLABORATOR", "CONTRIBUTOR", "NONE"):
+            self.assertIsNone(
+                matching_review_comment(
+                    issue_with(viewerDidAuthor=False, authorAssociation=association), report
+                ),
+                f"{association} must not stand in for authorship",
+            )
+        # Absent or non-boolean authorship fails closed.
+        for value in (None, "true", 1):
+            self.assertIsNone(matching_review_comment(issue_with(viewerDidAuthor=value), report))
+        self.assertIsNone(matching_review_comment(issue_with(), report))
 
     def test_apply_posts_the_stored_review_without_rerunning_an_engine(self):
         with tempfile.TemporaryDirectory() as directory:
