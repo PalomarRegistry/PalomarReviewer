@@ -11,12 +11,12 @@ commit, executes the ordered policy prompts with Codex, Claude, or another
 JSON-producing command, validates the final report, and then:
 
 - delivers the review privately to the submitter, and to nobody else;
-- once, and only once, the submitter chooses to publish, prepares and opens the
+- once, and only once, the submitter chooses to register, prepares and opens the
   append-only database pull request for an accepted entry;
-- verifies the merged record and records the publication against the private
+- verifies the merged record and records the registration against the private
   submission record.
 
-The review is never posted in public. A decision the submitter does not publish
+The review is never posted in public. A decision the submitter does not register
 leaves no public trace of itself, which is the whole reason the intake is
 private. What is public from the moment of submission is the mechanical
 verification: the repository, the commit, and the GitHub Actions run that
@@ -87,32 +87,32 @@ validates it again, and requires its submission, source commit,
 mechanical-report URL and policy commit to match the current trusted inputs. It
 writes the review into the private state repository, records the digest of what
 it delivered, and clears any consent given to an earlier review: consent is to a
-particular review, not to publishing at large.
+particular review, not to registering at large.
 
 This separation is a security boundary. Model output and repository prose are
 untrusted evidence, and the only thing that can be delivered is a stored report
 that still matches the trusted inputs it was produced from.
 
-## Publication
+## Registration
 
-Nothing is published until the submitter asks for it on their status page. When
+Nothing is registered until the submitter asks for it on their status page. When
 they have, and the review was an acceptance:
 
 ```bash
-palomar-review publish --submission a1b2c3d4e5f6
+palomar-review register --submission a1b2c3d4e5f6
 ```
 
-`publish` authorises first, before anything public happens. It requires the
+`register` authorises first, before anything public happens. It requires the
 private record to hold a delivered review, to show proved write access, to name
-no previous publication, to carry the submitter's consent, and for the digest
+no previous registration, to carry the submitter's consent, and for the digest
 delivered, the digest consented to, and the review about to be archived to be
 the same bytes. Only then does it dispatch the pinned Challenge renderer, which
 is a public Actions run naming the repository and commit and would otherwise
-signal an acceptance the submitter never agreed to publish.
+signal an acceptance the submitter never agreed to register.
 
 It then checks that the render matches the accepted source, Challenge hash,
 workflow run and renderer commit, revalidates every stored evidence pass and the
-score-to-decision policy, binds published metadata to the mechanically recorded
+score-to-decision policy, binds registered metadata to the mechanically recorded
 `formalization.yaml` digest, and validates the generated record and render
 bundle against the database schema. It archives the exact mechanical-report
 bytes, the normalized run and job provenance, and the review itself in one
@@ -120,12 +120,12 @@ content-addressed evidence bundle, so a single tree hash covers everything
 justifying the record; raw Actions logs are deliberately not retained. It pushes
 a branch to `PalomarRegistry/PalomarDatabase` and opens a PR.
 
-A renderer or infrastructure failure does not undo acceptance: rerun `publish`,
+A renderer or infrastructure failure does not undo acceptance: rerun `register`,
 or pass a previously downloaded trusted result with `--render-result PATH`.
 
 Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`, where the serial is drawn
-at random and retried against the identifiers already published. A sequential
-serial would publish the ordering and approximate count of accepted private
+at random and retried against the identifiers already registered. A sequential
+serial would register the ordering and approximate count of accepted private
 submissions, which is precisely what a private intake exists to avoid.
 
 Once the PR is merged, verify the immutable record and close out the private
@@ -157,7 +157,7 @@ Every engine is additionally launched inside a fail-closed Bubblewrap namespace.
 The namespace exposes the submission at `/workspace`, a dedicated output
 directory, an empty scratch home, and only the selected engine's model
 authentication file. It does not expose the runner's GitHub CLI configuration,
-publication credentials, unrelated home files, or other workspaces. The engine
+registration credentials, unrelated home files, or other workspaces. The engine
 transport can reach its model API in every pass. Claude web tools are disabled,
 and Codex search is not enabled, outside the literature/notability pass;
 general host-level egress filtering would require a separate API-aware proxy.
@@ -183,9 +183,9 @@ Each review directory retains:
 state.json                     # the private submission record under review
 mechanical-report.json
 mechanical-report-sha256       # binds the normalized report used by editorial review
-mechanical-report-bytes-sha256 # binds the exact artifact bytes archived at publication
+mechanical-report-bytes-sha256 # binds the exact artifact bytes archived at registration
 workflow-run.json              # normalized run identity, workflow commit, job conclusions
-workflow-run-sha256            # detects provenance drift before publication
+workflow-run-sha256            # detects provenance drift before registration
 source/                        # detached source commit
 policy/                        # detached policy commit
 prompts/                       # fully rendered prompts
