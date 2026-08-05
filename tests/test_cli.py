@@ -1027,10 +1027,16 @@ class ReviewerTests(unittest.TestCase):
             state_stub = mock.patch("palomar_reviewer.cli.submission_state", side_effect=state_for)
             state_stub.start()
             self.addCleanup(state_stub.stop)
-            (work / "review-sha256").write_text("0" * 64 + "\n")
-            with self.assertRaisesRegex(ReviewerError, "delivered review does not match"):
-                publish(args)
-            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            review_stub = mock.patch("palomar_reviewer.cli.delivered_review", return_value=review)
+            review_stub.start()
+            self.addCleanup(review_stub.stop)
+            # A review that is not the one the submitter was given is refused,
+            # whichever side of the binding was tampered with.
+            with mock.patch.object(
+                cli, "delivered_review", return_value={**review, "summary": "Rewritten."}
+            ):
+                with self.assertRaisesRegex(ReviewerError, "not the review delivered"):
+                    publish(args)
             (work / "mechanical-report-sha256").write_text("0" * 64 + "\n")
             with self.assertRaisesRegex(ReviewerError, "mechanical report no longer matches"):
                 publish(args)
@@ -1165,9 +1171,15 @@ class ReviewerTests(unittest.TestCase):
                 "mechanical_report": update_mechanical_url,
             }
             (update_work / "review.json").write_text(json.dumps(update_review))
+            review_stub.stop()
+            update_review_stub = mock.patch(
+                "palomar_reviewer.cli.delivered_review",
+                side_effect=lambda submission: review if submission == "a1b2c3d4e5f6" else update_review,
+            )
+            update_review_stub.start()
+            self.addCleanup(update_review_stub.stop)
             (update_work / "state.json").write_text(json.dumps({"id": "b2c3d4e5f6a1", "repository": update_mechanical["source"]["repository"], "commit": update_mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": record["id"], "push_verified": True, "status": "review-ready", "run": {"id": 103}, "publish_consent": True, "review_sha256": review_digest(update_review), "publish_consent_review_sha256": review_digest(update_review)}))
             (update_work / "mechanical-report-url").write_text(update_mechanical_url + "\n")
-            (update_work / "review-sha256").write_text(review_digest(update_review) + "\n")
             update_render = root / "update-render-result"
             shutil.copytree(sample_bundle, update_render / "bundle")
             update_report = json.loads((render_result / "challenge-render.json").read_text())
@@ -1861,6 +1873,112 @@ class MechanicalReportContractTests(unittest.TestCase):
             self.validate(self.submission_block(
                 authorization={"relationship": "legacy-unspecified"}
             ))
+
+
+class AutomaticLoopTests(unittest.TestCase):
+    """Each pass advances a submission by one step, and never past consent."""
+
+    def records(self, *rows):
+        by_id = {row["id"]: row for row in rows}
+        return (
+            mock.patch.object(cli, "state_directory_names", return_value=list(by_id)),
+            mock.patch.object(cli, "submission_state", side_effect=by_id.get),
+        )
+
+    def row(self, ident, **fields):
+        return {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
+
+    def split(self, *rows):
+        listing, state = self.records(*rows)
+        with listing, state:
+            return [[row["id"] for row in group] for group in cli.submissions_needing_work()]
+
+    def test_work_is_split_by_what_the_record_says(self):
+        self.assertEqual(
+            self.split(
+                self.row("aaaaaaaaaaaa", status="awaiting-review"),
+                self.row("bbbbbbbbbbbb", status="review-ready", publish_consent=True),
+                self.row("cccccccccccc", status="review-ready", publish_consent=True,
+                         publication_pr=7),
+            ),
+            [["aaaaaaaaaaaa"], ["bbbbbbbbbbbb"], ["cccccccccccc"]],
+        )
+
+    def test_a_submission_without_consent_is_never_picked_up(self):
+        """The loop must not be the thing that decides to publish."""
+        self.assertEqual(
+            self.split(
+                self.row("aaaaaaaaaaaa", status="review-ready"),
+                self.row("bbbbbbbbbbbb", status="review-ready", publish_consent=False),
+            ),
+            [[], [], []],
+        )
+
+    def test_finished_and_terminal_submissions_are_left_alone(self):
+        self.assertEqual(
+            self.split(
+                self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
+                         published_entry="PALOMAR-2026-08-01-000001-v1"),
+                self.row("bbbbbbbbbbbb", status="withdrawn", publish_consent=True),
+                self.row("cccccccccccc", status="verifying"),
+                self.row("dddddddddddd", status="verification-failed"),
+            ),
+            [[], [], []],
+        )
+
+    def test_reviews_are_capped_so_a_queue_cannot_run_up_a_bill(self):
+        rows = [self.row(f"{n:012d}".replace("0", "a"), status="awaiting-review") for n in range(5)]
+        listing, state = self.records(*rows)
+        seen = []
+        with listing, state, mock.patch.object(cli, "run_review", side_effect=lambda a: seen.append((a.submission, a.apply)) or 0):
+            cli.auto(SimpleNamespace(max_reviews=2, policy_ref="main", engine="codex",
+                                     model=None, reasoning_effort=None, command=None,
+                                     work_dir=".palomar-reviews"))
+        # Two submissions, each dry-run then applied.
+        self.assertEqual(len(seen), 4)
+        self.assertEqual([apply_step for _, apply_step in seen], [False, True, False, True])
+
+    def test_one_failing_submission_does_not_stall_the_queue(self):
+        rows = [self.row("aaaaaaaaaaaa", status="awaiting-review"),
+                self.row("bbbbbbbbbbbb", status="awaiting-review")]
+        listing, state = self.records(*rows)
+        attempted = []
+
+        def flaky(namespace):
+            attempted.append(namespace.submission)
+            if namespace.submission == "aaaaaaaaaaaa":
+                raise ReviewerError("engine exploded")
+            return 0
+
+        with listing, state, mock.patch.object(cli, "run_review", side_effect=flaky):
+            self.assertEqual(cli.auto(SimpleNamespace(
+                max_reviews=5, policy_ref="main", engine="codex", model=None,
+                reasoning_effort=None, command=None, work_dir=".palomar-reviews")), 1)
+        self.assertIn("bbbbbbbbbbbb", attempted)
+
+    def test_finalizing_waits_for_the_database_change_to_merge(self):
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
+                         publication_pr=7)]
+        listing, state = self.records(*rows)
+        with (
+            listing, state,
+            mock.patch.object(cli, "gh", return_value=json.dumps({"state": "OPEN"})),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertEqual(cli.auto(SimpleNamespace(
+                max_reviews=5, policy_ref="main", engine="codex", model=None,
+                reasoning_effort=None, command=None, work_dir=".palomar-reviews")), 0)
+        finalized.assert_not_called()
+
+        with (
+            listing, state,
+            mock.patch.object(cli, "gh", return_value=json.dumps({"state": "MERGED"})),
+            mock.patch.object(cli, "finalize", return_value=0) as finalized,
+        ):
+            cli.auto(SimpleNamespace(max_reviews=5, policy_ref="main", engine="codex",
+                                     model=None, reasoning_effort=None, command=None,
+                                     work_dir=".palomar-reviews"))
+        self.assertEqual(finalized.call_args.args[0].pr, 7)
 
 
 class SpendAccountingTests(unittest.TestCase):
