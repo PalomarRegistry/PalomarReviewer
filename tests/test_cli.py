@@ -167,23 +167,29 @@ class ReviewerTests(unittest.TestCase):
         mechanical["project_dependencies"].append({"name": "local", "path": "."})
         return mechanical
 
-    def nested_issue_body(self, commit="1" * 40):
-        return (
-            self.issue_body(commit)
-            + "\n### Project path (optional)\n\nexamples/comparator\n"
-            + "\n### Comparator configuration path (optional)\n\n"
-            + "examples/comparator/Audit/settings.json\n"
-            + "\n### Formalization metadata path (optional)\n\nformalization.yaml\n"
-        )
-
-
-    def test_schema_v2_cannot_smuggle_report_v3_paths(self):
-        mechanical = self.mechanical_fixture()
+    def test_accepted_files_must_lie_inside_the_selected_project(self):
+        """A report cannot name files outside the project it says it verified."""
+        mechanical = self.nested_mechanical_fixture()
         mechanical["challenge"]["path"] = "vendor/Challenge.lean"
-        state = {"id": "a1b2c3d4e5f6", "repository": "example/repo",
-                 "commit": "1" * 40, "requested_paths": {}}
-        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40}
-        with self.assertRaisesRegex(ReviewerError, "v2 has a non-root challenge.path"):
+        state = {"id": "a1b2c3d4e5f6", "repository": "example/project",
+                 "commit": mechanical["source"]["commit"],
+                 "requested_paths": {"project_path": "examples/comparator"},
+                 "run": {"id": 101}}
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
+                    "event": "workflow_dispatch"}
+        with self.assertRaisesRegex(ReviewerError, "challenge.path is outside the selected project"):
+            validate_mechanical_artifact(mechanical, state, run_data)
+
+    def test_the_lakefile_must_be_the_selected_project_lakefile(self):
+        mechanical = self.nested_mechanical_fixture()
+        mechanical["lakefile"]["path"] = "examples/comparator/nested/lakefile.toml"
+        state = {"id": "a1b2c3d4e5f6", "repository": "example/project",
+                 "commit": mechanical["source"]["commit"],
+                 "requested_paths": {"project_path": "examples/comparator"},
+                 "run": {"id": 101}}
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
+                    "event": "workflow_dispatch"}
+        with self.assertRaisesRegex(ReviewerError, "not the selected project's Lakefile"):
             validate_mechanical_artifact(mechanical, state, run_data)
 
     def test_mechanical_schema_accepts_explicitly_unspecified_provenance(self):
@@ -933,7 +939,7 @@ class ReviewerTests(unittest.TestCase):
             (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             bind_publication_evidence(work, mechanical)
             (work / "review.json").write_text(json.dumps(review))
-            (work / "state.json").write_text(json.dumps({"id": "a1b2c3d4e5f6", "repository": "example/project", "commit": mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": None, "push_verified": True, "status": "review-ready", "publish_consent": True}))
+            (work / "state.json").write_text(json.dumps({"id": "a1b2c3d4e5f6", "repository": "example/project", "commit": mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": None, "push_verified": True, "status": "review-ready", "run": {"id": 101}, "publish_consent": True, "review_sha256": review_digest(review), "publish_consent_review_sha256": review_digest(review)}))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
             (work / "mechanical-report-url").write_text(mechanical["workflow_url"] + "\n")
 
@@ -1016,6 +1022,9 @@ class ReviewerTests(unittest.TestCase):
                 render_result=str(render_result),
                 dry_run=True,
             )
+            state_stub = mock.patch("palomar_reviewer.cli.submission_state", side_effect=state_for)
+            state_stub.start()
+            self.addCleanup(state_stub.stop)
             (work / "review-sha256").write_text("0" * 64 + "\n")
             with self.assertRaisesRegex(ReviewerError, "delivered review does not match"):
                 publish(args)
@@ -1045,7 +1054,6 @@ class ReviewerTests(unittest.TestCase):
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
-                mock.patch("palomar_reviewer.cli.submission_state", side_effect=state_for),
             ):
                 self.assertEqual(publish(args), 0)
 
@@ -1155,7 +1163,7 @@ class ReviewerTests(unittest.TestCase):
                 "mechanical_report": update_mechanical_url,
             }
             (update_work / "review.json").write_text(json.dumps(update_review))
-            (update_work / "state.json").write_text(json.dumps({"id": "b2c3d4e5f6a1", "repository": update_mechanical["source"]["repository"], "commit": update_mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": record["id"], "push_verified": True, "status": "review-ready", "publish_consent": True}))
+            (update_work / "state.json").write_text(json.dumps({"id": "b2c3d4e5f6a1", "repository": update_mechanical["source"]["repository"], "commit": update_mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": record["id"], "push_verified": True, "status": "review-ready", "run": {"id": 103}, "publish_consent": True, "review_sha256": review_digest(update_review), "publish_consent_review_sha256": review_digest(update_review)}))
             (update_work / "mechanical-report-url").write_text(update_mechanical_url + "\n")
             (update_work / "review-sha256").write_text(review_digest(update_review) + "\n")
             update_render = root / "update-render-result"
@@ -1179,9 +1187,32 @@ class ReviewerTests(unittest.TestCase):
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
-                mock.patch("palomar_reviewer.cli.submission_state", side_effect=state_for),
             ):
                 self.assertEqual(publish(update_args), 0)
+
+            # Nothing public may happen for a submission that has not consented:
+            # a render dispatch is a public Actions run naming the repository
+            # and commit, which would signal the decision by itself.
+            unconsented = json.loads((work / "state.json").read_text())
+            unconsented["publish_consent"] = False
+            (work / "state.json").write_text(json.dumps(unconsented))
+            with (
+                mock.patch("palomar_reviewer.cli.request_render") as render,
+                mock.patch("palomar_reviewer.cli.gh") as public_gh,
+                mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
+                mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+            ):
+                with self.assertRaisesRegex(ReviewerError, "has not consented"):
+                    publish(SimpleNamespace(
+                        submission="a1b2c3d4e5f6",
+                        work_dir=str(root),
+                        render_result=None,
+                        dry_run=False,
+                    ))
+            render.assert_not_called()
+            public_gh.assert_not_called()
+            (work / "state.json").write_text(json.dumps(json.loads(
+                (work / "state.json").read_text()) | {"publish_consent": True}))
 
             update_database = update_work / "database"
             update_entry = update_database / "entries" / f"{record['id']}-v2.json"
@@ -1693,6 +1724,22 @@ class PublicationIdentityTests(unittest.TestCase):
         seen = {self.resolve(self.database())[0] for _ in range(25)}
         self.assertGreater(len(seen), 1)
 
+    def test_a_collision_with_a_published_identifier_is_retried(self):
+        """Forced, not hoped for: a chance collision is far too rare to test."""
+        database = self.database(self.prior(identifier="PALOMAR-2026-08-01-000042"))
+        draws = iter([41, 41, 7])
+        with mock.patch.object(cli.secrets, "randbelow", side_effect=lambda _: next(draws)):
+            identifier, _, _ = self.resolve(
+                database, submission="b2c3d4e5f6a1"
+            )
+        self.assertEqual(identifier, "PALOMAR-2026-08-01-000008")
+
+    def test_allocation_gives_up_rather_than_reusing_an_identifier(self):
+        database = self.database(self.prior(identifier="PALOMAR-2026-08-01-000042"))
+        with mock.patch.object(cli.secrets, "randbelow", return_value=41):
+            with self.assertRaisesRegex(ReviewerError, "could not allocate"):
+                self.resolve(database, submission="b2c3d4e5f6a1")
+
     def test_a_second_publication_of_one_submission_needs_an_update(self):
         database = self.database(self.prior())
         with self.assertRaisesRegex(ReviewerError, "already has a permanent ID"):
@@ -1710,6 +1757,21 @@ class PublicationIdentityTests(unittest.TestCase):
     def test_an_update_to_an_unpublished_identifier_is_refused(self):
         with self.assertRaisesRegex(ReviewerError, "not in the database"):
             self.resolve(self.database(), existing_id="PALOMAR-2026-08-01-999999")
+
+    def test_an_update_from_another_project_in_the_repository_is_refused(self):
+        """One repository can hold many formalizations; identifiers are not shared."""
+        prior = self.prior()
+        prior["source"]["project_path"] = "projects/first"
+        with self.assertRaisesRegex(ReviewerError, "comes from project"):
+            publication_identity(
+                self.database(prior),
+                submission_id="b2c3d4e5f6a1",
+                existing_id="PALOMAR-2026-08-01-000012",
+                reviewed_at="2026-08-01T12:00:00Z",
+                mechanical={
+                    "source": {"repository": "example/project", "project_path": "projects/second"}
+                },
+            )
 
     def test_an_update_from_another_repository_is_refused(self):
         """An update must come from the repository the current version names."""
@@ -1729,6 +1791,124 @@ class PublicationIdentityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReviewerError, "already associated with another"):
             self.resolve(database, existing_id="PALOMAR-2026-08-01-000013")
+
+
+class TrustedRunSelectionTests(unittest.TestCase):
+    """The run is the one the server recorded, not the one that says the right words.
+
+    The submission id is public: it is in the run name. Anyone able to dispatch
+    the workflow can therefore produce a run that carries it.
+    """
+
+    def runs(self, *items):
+        return mock.patch.object(cli, "gh", return_value=json.dumps(list(items)))
+
+    def run_entry(self, run_id, title="Verify submission a1b2c3d4e5f6", **overrides):
+        return {
+            "databaseId": run_id,
+            "displayTitle": title,
+            "headBranch": "main",
+            "status": "completed",
+            "conclusion": "success",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "url": f"https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/{run_id}",
+            **overrides,
+        }
+
+    def state(self, run_id=101):
+        return {"id": "a1b2c3d4e5f6", "run": {"id": run_id}}
+
+    def test_the_recorded_run_is_selected(self):
+        with self.runs(self.run_entry(101)):
+            selected = cli.trusted_verification_runs(self.state())
+        self.assertEqual([item["databaseId"] for item in selected], [101])
+
+    def test_a_later_run_replaying_the_public_id_is_refused(self):
+        """The attack the recorded run id exists to stop."""
+        forged = self.run_entry(999, createdAt="2026-08-02T00:00:00Z")
+        with self.runs(forged, self.run_entry(101)):
+            selected = cli.trusted_verification_runs(self.state())
+        self.assertEqual([item["databaseId"] for item in selected], [101])
+
+        with self.runs(forged):
+            with self.assertRaisesRegex(ReviewerError, "is not a"):
+                cli.trusted_verification_runs(self.state())
+
+    def test_a_run_whose_name_merely_contains_the_id_is_refused(self):
+        """The name must be the workflow's, not something that quotes the id."""
+        for title in (
+            "Verify submission a1b2c3d4e5f6 (rerun)",
+            "Render a1b2c3d4e5f6",
+            "Verify submission ffffffffffff",
+        ):
+            with self.subTest(title):
+                with self.runs(self.run_entry(101, title=title)):
+                    with self.assertRaisesRegex(ReviewerError, "is not a"):
+                        cli.trusted_verification_runs(self.state())
+
+    def test_a_submission_with_no_recorded_run_is_refused(self):
+        with self.runs(self.run_entry(101)):
+            with self.assertRaisesRegex(ReviewerError, "recorded no verification run"):
+                cli.trusted_verification_runs({"id": "a1b2c3d4e5f6"})
+
+
+class DeliveredReviewChainTests(unittest.TestCase):
+    """What the submitter read, consented to, and what gets archived are one thing."""
+
+    def test_delivery_records_the_digest_and_clears_any_earlier_consent(self):
+        state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
+                 "publish_consent": True,
+                 "publish_consent_review_sha256": "0" * 64,
+                 "_blob_sha": "blob-1"}
+        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept", "summary": "Fine."}
+        written = {}
+
+        def record(path, value, message, blob_sha=None):
+            written[path] = (value, blob_sha)
+
+        with (
+            mock.patch.object(cli, "put_state", side_effect=record),
+            mock.patch.object(cli, "state_json", return_value=None),
+        ):
+            updated = cli.deliver_review(state, review)
+
+        self.assertEqual(updated["status"], "review-ready")
+        self.assertEqual(updated["review_sha256"], cli.review_digest(review))
+        # A second review must not inherit consent given to the first.
+        self.assertIs(updated["publish_consent"], False)
+        self.assertIsNone(updated["publish_consent_review_sha256"])
+        self.assertEqual(written["submissions/a1b2c3d4e5f6/review.json"][0], review)
+        self.assertEqual(written["submissions/a1b2c3d4e5f6/state.json"][1], "blob-1")
+
+    def test_the_delivered_bytes_are_what_the_record_cites(self):
+        """Delivered digest, consented digest, archived bytes, and record agree."""
+        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept", "summary": "Fine."}
+        work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (work / "review.json").write_text(json.dumps(review, indent=2) + "\n")
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "status": "review-ready",
+            "repository": "example/project",
+            "commit": "1" * 40,
+            "authorization": {"relationship": "maintainer"},
+            "existing_id": None,
+            "push_verified": True,
+            "publish_consent": True,
+            "review_sha256": cli.review_digest(review),
+            "publish_consent_review_sha256": cli.review_digest(review),
+        }
+        mechanical = {
+            "submission": {"submission_id": "a1b2c3d4e5f6",
+                           "authorization": {"relationship": "maintainer"}},
+            "source": {"repository": "example/project", "commit": "1" * 40},
+        }
+        with mock.patch.object(cli, "submission_state", return_value=state):
+            cli.authorize_publication("a1b2c3d4e5f6", mechanical, review)
+        # The archived file is the one the record's digest is taken over.
+        self.assertEqual(
+            cli.review_digest(json.loads((work / "review.json").read_text())),
+            state["review_sha256"],
+        )
 
 
 class PublicationAuthorizationTests(unittest.TestCase):
@@ -1756,7 +1936,10 @@ class PublicationAuthorizationTests(unittest.TestCase):
             "existing_id": None,
             "push_verified": True,
             "status": "review-ready",
+            "run": {"id": 101},
             "publish_consent": True,
+            "review_sha256": cli.review_digest(review),
+            "publish_consent_review_sha256": cli.review_digest(review),
             **state_overrides,
         }
         return mechanical, review, state
@@ -1781,9 +1964,27 @@ class PublicationAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "not consented"):
             self.authorize(mechanical, review, state)
 
-    def test_a_withdrawn_submission_is_refused(self):
-        mechanical, review, state = self.parts(status="withdrawn")
-        with self.assertRaisesRegex(ReviewerError, "withdrew"):
+    def test_a_submission_not_holding_a_review_is_refused(self):
+        """A stale consent flag on a record in any other state authorizes nothing."""
+        for status in ("withdrawn", "awaiting-review", "verifying", "verification-failed"):
+            with self.subTest(status):
+                mechanical, review, state = self.parts(status=status)
+                with self.assertRaisesRegex(ReviewerError, "only a submission holding"):
+                    self.authorize(mechanical, review, state)
+
+    def test_consent_to_one_review_does_not_publish_another(self):
+        """Consent is to the review the submitter read, not to publishing at large."""
+        mechanical, review, state = self.parts()
+        revised = {**review, "summary": "A different review."}
+        with self.assertRaisesRegex(ReviewerError, "not the review delivered"):
+            self.authorize(mechanical, revised, state)
+
+        stale, _, state = self.parts()
+        state["review_sha256"] = cli.review_digest(review)
+        state["publish_consent_review_sha256"] = cli.review_digest(
+            {**review, "summary": "An earlier review."}
+        )
+        with self.assertRaisesRegex(ReviewerError, "consented to a different review"):
             self.authorize(mechanical, review, state)
 
     def test_a_second_publication_is_refused(self):

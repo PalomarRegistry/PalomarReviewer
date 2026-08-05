@@ -183,8 +183,12 @@ MECHANICAL_REPORT_SCHEMA = {
         "schema_version": {"const": 1},
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
+        # Closed, and deliberately narrow: the whole report is archived in the
+        # public evidence bundle, so anything this block accepts becomes public.
+        # A submitter identity must not be able to ride in here.
         "submission": {
             "type": "object",
+            "additionalProperties": False,
             "required": ["submission_id", "authorization"],
             "properties": {
                 "submission_id": {"type": "string", "pattern": "^[0-9a-z]{12}$"},
@@ -193,7 +197,7 @@ MECHANICAL_REPORT_SCHEMA = {
                     "additionalProperties": False,
                     "required": ["relationship"],
                     "properties": {
-                        "relationship": {"enum": ["maintainer", "approved", "legacy-unspecified"]},
+                        "relationship": {"enum": ["maintainer", "approved"]},
                         "evidence": {"type": "string", "minLength": 1, "maxLength": 4000},
                     },
                 },
@@ -1025,71 +1029,55 @@ def validate_mechanical_artifact(
         MECHANICAL_REPORT_SCHEMA,
         format_checker=jsonschema.FormatChecker(),
     )
-    version = 1
-    if version == 3:
-        required_paths = (
-            (report.get("challenge", {}), "path", "challenge.path"),
-            (report.get("solution", {}), "path", "solution.path"),
-            (report.get("comparator", {}), "path", "comparator.path"),
-            (report.get("formalization", {}), "path", "formalization.path"),
-            (report.get("lakefile", {}), "path", "lakefile.path"),
-            (report, "lean_toolchain_path", "lean_toolchain_path"),
-        )
-        for container, key, field in required_paths:
-            safe_repository_path(container.get(key), field)
-        for field in ("module",):
-            if not isinstance(report["challenge"].get(field), str):
-                raise ReviewerError("mechanical report has no configured Challenge module")
-            if not isinstance(report["solution"].get(field), str):
-                raise ReviewerError("mechanical report has no configured Solution module")
-        if report["challenge"]["module"] != report["comparator"].get("challenge_module"):
-            raise ReviewerError("mechanical report disagrees on the configured Challenge module")
-        if report["solution"]["module"] != report["comparator"].get("solution_module"):
-            raise ReviewerError("mechanical report disagrees on the configured Solution module")
-        project_path = report["source"].get("project_path")
-        prefix = f"{project_path}/" if project_path else ""
-        for container, key, field in (
-            (report["challenge"], "path", "challenge.path"),
-            (report["solution"], "path", "solution.path"),
-            (report["comparator"], "path", "comparator.path"),
-            (report["lakefile"], "path", "lakefile.path"),
-        ):
-            if not container[key].startswith(prefix):
-                raise ReviewerError(f"mechanical report {field} is outside the selected project")
-        if report["lakefile"]["path"] not in {
-            f"{prefix}lakefile.toml",
-            f"{prefix}lakefile.lean",
-        }:
-            raise ReviewerError("mechanical report Lakefile is not the selected project's Lakefile")
-        expected_format = "lean" if report["lakefile"]["path"].endswith(".lean") else "toml"
-        if report["lakefile"]["format"] != expected_format:
-            raise ReviewerError("mechanical report Lakefile format disagrees with its path")
-        if report["lean_toolchain_path"] not in {
-            f"{prefix}lean-toolchain",
-            "lean-toolchain",
-        }:
-            raise ReviewerError("mechanical report lean-toolchain is outside its accepted locations")
-        seen_dependency_names: set[str] = set()
-        for dependency in report["project_dependencies"]:
-            if dependency["name"] in seen_dependency_names:
-                raise ReviewerError("mechanical report repeats a project dependency name")
-            seen_dependency_names.add(dependency["name"])
-            if "path" in dependency and dependency["path"] != ".":
-                safe_repository_path(dependency["path"], "project dependency path")
-    else:
-        if report["source"].get("project_path"):
-            raise ReviewerError("mechanical report v2 may not select a nested project")
-        for container, key, expected, field in (
-            (report["challenge"], "path", "Challenge.lean", "challenge.path"),
-            (report["solution"], "path", "Solution.lean", "solution.path"),
-            (report["comparator"], "path", "comparator.json", "comparator.path"),
-            (report.get("formalization", {}), "path", "formalization.yaml", "formalization.path"),
-        ):
-            value = container.get(key)
-            if value is not None and value != expected:
-                raise ReviewerError(f"mechanical report v2 has a non-root {field}")
-        if report.get("lakefile") is not None or report.get("lean_toolchain_path") is not None:
-            raise ReviewerError("mechanical report v2 carries report-v3 Lake path fields")
+    required_paths = (
+        (report.get("challenge", {}), "path", "challenge.path"),
+        (report.get("solution", {}), "path", "solution.path"),
+        (report.get("comparator", {}), "path", "comparator.path"),
+        (report.get("formalization", {}), "path", "formalization.path"),
+        (report.get("lakefile", {}), "path", "lakefile.path"),
+        (report, "lean_toolchain_path", "lean_toolchain_path"),
+    )
+    for container, key, field in required_paths:
+        safe_repository_path(container.get(key), field)
+    for field in ("module",):
+        if not isinstance(report["challenge"].get(field), str):
+            raise ReviewerError("mechanical report has no configured Challenge module")
+        if not isinstance(report["solution"].get(field), str):
+            raise ReviewerError("mechanical report has no configured Solution module")
+    if report["challenge"]["module"] != report["comparator"].get("challenge_module"):
+        raise ReviewerError("mechanical report disagrees on the configured Challenge module")
+    if report["solution"]["module"] != report["comparator"].get("solution_module"):
+        raise ReviewerError("mechanical report disagrees on the configured Solution module")
+    project_path = report["source"].get("project_path")
+    prefix = f"{project_path}/" if project_path else ""
+    for container, key, field in (
+        (report["challenge"], "path", "challenge.path"),
+        (report["solution"], "path", "solution.path"),
+        (report["comparator"], "path", "comparator.path"),
+        (report["lakefile"], "path", "lakefile.path"),
+    ):
+        if not container[key].startswith(prefix):
+            raise ReviewerError(f"mechanical report {field} is outside the selected project")
+    if report["lakefile"]["path"] not in {
+        f"{prefix}lakefile.toml",
+        f"{prefix}lakefile.lean",
+    }:
+        raise ReviewerError("mechanical report Lakefile is not the selected project's Lakefile")
+    expected_format = "lean" if report["lakefile"]["path"].endswith(".lean") else "toml"
+    if report["lakefile"]["format"] != expected_format:
+        raise ReviewerError("mechanical report Lakefile format disagrees with its path")
+    if report["lean_toolchain_path"] not in {
+        f"{prefix}lean-toolchain",
+        "lean-toolchain",
+    }:
+        raise ReviewerError("mechanical report lean-toolchain is outside its accepted locations")
+    seen_dependency_names: set[str] = set()
+    for dependency in report["project_dependencies"]:
+        if dependency["name"] in seen_dependency_names:
+            raise ReviewerError("mechanical report repeats a project dependency name")
+        seen_dependency_names.add(dependency["name"])
+        if "path" in dependency and dependency["path"] != ".":
+            safe_repository_path(dependency["path"], "project dependency path")
     if report["submission"]["submission_id"] != state["id"]:
         raise ReviewerError("mechanical report names a different submission")
     if report["workflow_url"] != run_data.get("url"):
@@ -1131,13 +1119,21 @@ def validate_mechanical_artifact(
         raise ReviewerError("verification workflow commit is not an ancestor of main")
 
 
-def trusted_verification_runs(submission_id: str) -> list[dict[str, Any]]:
-    """Completed successful runs whose name carries this submission id.
+def trusted_verification_runs(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The one run the submission server recorded for this submission.
 
-    Dispatching does not return a run id, so the run is found by the id the
-    workflow puts in its name. Only runs on the default branch count: a run
-    from another ref is not the trusted workflow.
+    The submission id is public: it is in the run name, so anyone who can
+    dispatch the workflow can produce a run carrying it. The name is therefore
+    not the trust boundary. The server records the run it dispatched, and that
+    recorded id is what is accepted here; the name is checked exactly as well,
+    so a run that matches the id but not the submission is still refused.
     """
+    submission_id = state["id"]
+    recorded = (state.get("run") or {}).get("id")
+    if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 1:
+        raise ReviewerError(
+            f"the submission server recorded no verification run for {submission_id}"
+        )
     runs = json.loads(
         gh([
             "run", "list", "--repo", SUBMISSION_REPO, "--workflow", VERIFY_WORKFLOW,
@@ -1151,12 +1147,17 @@ def trusted_verification_runs(submission_id: str) -> list[dict[str, Any]]:
     eligible = [
         item for item in runs
         if isinstance(item, dict)
+        and item.get("databaseId") == recorded
         and item.get("headBranch") == "main"
         and item.get("status") == "completed"
         and item.get("conclusion") == "success"
-        and submission_id in str(item.get("displayTitle", ""))
+        and str(item.get("displayTitle", "")) == f"Verify submission {submission_id}"
     ]
-    eligible.sort(key=lambda item: (item["createdAt"], item["databaseId"]), reverse=True)
+    if not eligible:
+        raise ReviewerError(
+            f"run {recorded}, which the server recorded for {submission_id}, is not a "
+            "completed successful run of the verification workflow on main"
+        )
     return eligible
 
 
@@ -1164,9 +1165,7 @@ def mechanical_report(
     state: dict[str, Any], download_root: Path
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     submission_id = state["id"]
-    runs = trusted_verification_runs(submission_id)
-    if not runs:
-        raise ReviewerError("no completed trusted verification workflow run found")
+    runs = trusted_verification_runs(state)
     for run_data in runs:
         report_path = download_mechanical_artifact(
             run_data["databaseId"], submission_id, download_root
@@ -1273,14 +1272,22 @@ def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def state_json(path: str) -> dict[str, Any] | None:
-    """Read a JSON file from the private submission state repository."""
+    """Read a JSON file from the private submission state repository.
+
+    The blob sha of what was read is carried along, so a later write can refuse
+    to clobber a change the submitter made in between: withdrawing, or
+    revoking consent, must not be silently overwritten.
+    """
     raw = run(
-        ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".content"],
+        ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".content + \" \" + .sha"],
         check=False,
     )
     if raw.returncode != 0 or not raw.stdout.strip():
         return None
-    return json.loads(base64.b64decode(raw.stdout.strip()))
+    content, _, blob_sha = raw.stdout.strip().rpartition(" ")
+    value = json.loads(base64.b64decode(content))
+    value["_blob_sha"] = blob_sha
+    return value
 
 
 def submission_state(submission_id: str) -> dict[str, Any] | None:
@@ -1290,21 +1297,22 @@ def submission_state(submission_id: str) -> dict[str, Any] | None:
     return state_json(f"submissions/{submission_id}/state.json")
 
 
-def put_state(path: str, value: Any, message: str) -> None:
-    """Commit a file into the private state repository, creating or replacing it."""
-    body = json.dumps(value, indent=2) + "\n"
+def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) -> None:
+    """Commit a file into the private state repository.
+
+    The write is conditional on the sha that was read, not on whatever the sha
+    is now: fetching the current sha and writing against it would authorize
+    overwriting a concurrent change rather than detecting it.
+    """
+    body = json.dumps({k: v for k, v in value.items() if k != "_blob_sha"}, indent=2) + "\n"
     fields = [
         "-f",
         f"message={message}",
         "-f",
         "content=" + base64.b64encode(body.encode("utf-8")).decode("ascii"),
     ]
-    existing = run(
-        ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".sha"],
-        check=False,
-    )
-    if existing.returncode == 0 and existing.stdout.strip():
-        fields += ["-f", f"sha={existing.stdout.strip()}"]
+    if blob_sha:
+        fields += ["-f", f"sha={blob_sha}"]
     gh(["api", "--method", "PUT", f"repos/{STATE_REPO}/contents/{path}", *fields])
 
 
@@ -1323,18 +1331,34 @@ def advance_state(
         f"submissions/{state['id']}/state.json",
         updated,
         f"{note} ({state['id']})",
+        blob_sha=state.get("_blob_sha"),
     )
     return updated
 
 
 def deliver_review(state: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
-    """Hand the review to the submitter privately, and to nobody else."""
+    """Hand the review to the submitter privately, and to nobody else.
+
+    The digest of what was delivered is recorded alongside it. Consent is to a
+    particular review, not to the idea of publishing: without this, a later
+    review of the same submission could be published under consent given to an
+    earlier one.
+    """
+    existing = state_json(f"submissions/{state['id']}/review.json")
     put_state(
         f"submissions/{state['id']}/review.json",
         review,
         f"Deliver review for {state['id']}",
+        blob_sha=(existing or {}).get("_blob_sha"),
     )
-    return advance_state(state, "review-ready", "The editorial review is ready for you")
+    return advance_state(
+        state,
+        "review-ready",
+        "The editorial review is ready for you",
+        review_sha256=review_digest(review),
+        publish_consent=False,
+        publish_consent_review_sha256=None,
+    )
 
 
 def queue() -> list[dict[str, Any]]:
@@ -2323,8 +2347,13 @@ def authorize_publication(
         raise ReviewerError("mechanical report and state disagree on the update intent")
     if state.get("push_verified") is not True:
         raise ReviewerError("the submitter never proved write access to the repository")
-    if state.get("status") == "withdrawn":
-        raise ReviewerError("the submitter withdrew this submission")
+    # A positive status, not merely "not withdrawn": a stale consent flag on a
+    # record that has gone back to any other state must not authorize anything.
+    if state.get("status") != "review-ready":
+        raise ReviewerError(
+            f"submission {submission_id} is {state.get('status')}, and only a submission "
+            "holding a delivered review may be published"
+        )
     if state.get("published_entry"):
         raise ReviewerError(
             f"submission {submission_id} was already published as {state['published_entry']}"
@@ -2334,6 +2363,18 @@ def authorize_publication(
             "the submitter has not consented to publication; "
             "nothing is published until they choose to"
         )
+    # Consent is to the exact review the submitter read. The digest recorded at
+    # delivery, the digest they consented to, and the review about to be
+    # archived must all be the same bytes.
+    delivered = state.get("review_sha256")
+    consented = state.get("publish_consent_review_sha256")
+    publishing = review_digest(review)
+    if delivered != publishing:
+        raise ReviewerError(
+            "the review being published is not the review delivered to the submitter"
+        )
+    if consented != publishing:
+        raise ReviewerError("the submitter consented to a different review")
     return state
 
 
@@ -2508,7 +2549,9 @@ def publication_identity(
         identifier = str(prior.get("id", ""))
         version = prior.get("version")
         accepted_at = prior.get("accepted_at")
-        repository = prior.get("source", {}).get("repository")
+        prior_source = prior.get("source", {})
+        repository = prior_source.get("repository")
+        project_path = prior_source.get("project_path") or ""
         prior_submission = prior.get("submission", {}).get("submission_id")
         if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
             raise ReviewerError(f"database entry has invalid publication identity: {path.name}")
@@ -2517,7 +2560,7 @@ def publication_identity(
         if not isinstance(accepted_at, str) or not isinstance(repository, str):
             raise ReviewerError(f"database entry has incomplete publication identity: {path.name}")
         by_id.setdefault(identifier, []).append(
-            (version, prior_submission, accepted_at, repository)
+            (version, prior_submission, accepted_at, repository, project_path)
         )
         if prior_submission == submission_id:
             by_submission.add(identifier)
@@ -2534,6 +2577,14 @@ def publication_identity(
         if current[3].casefold() != submitted_repository.casefold():
             raise ReviewerError(
                 f"update to {identifier} comes from {submitted_repository}, not {current[3]}"
+            )
+        # A repository can hold many formalizations. Without this, a submission
+        # for one project in a monorepo could take over another's identifier.
+        submitted_project = mechanical["source"].get("project_path") or ""
+        if current[4] != submitted_project:
+            raise ReviewerError(
+                f"update to {identifier} comes from project {submitted_project or 'the repository root'}, "
+                f"not {current[4] or 'the repository root'}"
             )
         return identifier, current[2], current[0] + 1
 
@@ -2637,6 +2688,10 @@ def publish(args: argparse.Namespace) -> int:
     )
     if review["decision"] != "accept":
         raise ReviewerError("only an accepted review can be published")
+    # Before anything public happens. Rendering dispatches a public Actions run
+    # named with the repository and commit, which would signal an acceptance
+    # the submitter has not agreed to publish, and cannot be taken back.
+    state = authorize_publication(args.submission, mechanical, review)
     source = work / "source"
     formalization_path = mechanical_source_path(
         source,
@@ -2708,7 +2763,6 @@ def publish(args: argparse.Namespace) -> int:
         "landrun_commit": render_report["landrun_commit"],
         "rendered_at": render_report["rendered_at"],
     }
-    state = authorize_publication(args.submission, mechanical, review)
     evidence_bundle, verification_evidence = build_verification_evidence(work)
     evidence_hash = verification_evidence["evidence_tree_sha256"]
     evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
