@@ -26,9 +26,9 @@ import yaml
 
 # Deliberately still the pre-migration name, even though the repository now
 # lives at PalomarRegistry/PalomarSubmission. This value is written into
-# published records as `submission.repository`, and every schema from v2 to v6
+# registered records as `submission.repository`, and every schema from v2 to v6
 # pins it with `"const": "kim-em/PalomarSubmission"`. Frozen schemas cannot be
-# edited, so a record naming the new repository would not validate: publication
+# edited, so a record naming the new repository would not validate: registration
 # is frozen until schema-v7 restructures submission identity. GitHub redirects
 # the old name for every API call, so the reviewer keeps working meanwhile.
 # Move this in the same change that introduces schema-v7.
@@ -47,7 +47,6 @@ MAX_EVIDENCE_BYTES = 24 * 1024 * 1024
 MECHANICAL_MARKER = "<!-- palomar-mechanical-report -->"
 REVIEW_MARKER = "<!-- palomar-editorial-review -->"
 CLAIM_MARKER = "<!-- palomar-review-claim -->"
-PUBLICATION_MARKER = "<!-- palomar-publication -->"
 WEB_URL = "https://palomar-registry.org"
 SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
@@ -57,7 +56,7 @@ _ENGINE_CREDENTIAL_DIR: Path | None = None
 # What a review cost, in tokens, is reported by the engine and is never a
 # guess. Money is a guess unless somebody keeps this table current, so a model
 # absent from it records tokens and no price rather than an invented one.
-# USD per million tokens, as published by the provider.
+# USD per million tokens, as registered by the provider.
 MODEL_PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {}
 _PRICES_ENV = "PALOMAR_MODEL_PRICES"
 MAX_CHALLENGE_PROMPT_BYTES = 8 * 1024 * 1024
@@ -488,7 +487,7 @@ def project_readme_relative(mechanical: dict[str, Any], source: Path) -> str:
 
 
 class UniqueKeySafeLoader(yaml.SafeLoader):
-    """Safe YAML loader that rejects ambiguous mappings before publication."""
+    """Safe YAML loader that rejects ambiguous mappings before registration."""
 
 
 def _construct_unique_mapping(
@@ -783,7 +782,7 @@ def render_bundle_manifest(bundle: Path) -> tuple[list[dict[str, Any]], str]:
 
 
 def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
-    """Build the small content-addressed evidence bundle committed at publication."""
+    """Build the small content-addressed evidence bundle committed at registration."""
     bundle = work / "verification-evidence"
     if bundle.exists():
         shutil.rmtree(bundle)
@@ -791,7 +790,7 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
     for name in ("mechanical-report.json", "workflow-run.json", "review.json"):
         source = work / name
         if source.is_symlink() or not source.is_file():
-            raise ReviewerError(f"publication requires a regular {name}")
+            raise ReviewerError(f"registration requires a regular {name}")
         size = source.stat().st_size
         if size > MAX_EVIDENCE_FILE_BYTES:
             raise ReviewerError(f"verification evidence file exceeds the size cap: {name}")
@@ -836,7 +835,7 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
     if report.get("status") != "pass":
         errors = report.get("errors") or ["unknown renderer failure"]
         raise ReviewerError(
-            "Challenge rendering failed; the acceptance remains valid and publication may be retried: "
+            "Challenge rendering failed; the acceptance remains valid and registration may be retried: "
             + "; ".join(str(error) for error in errors)
         )
     challenge = mechanical["challenge"]
@@ -951,7 +950,7 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
             break
         time.sleep(5)
     if run_data is None:
-        raise ReviewerError("render workflow dispatch was not visible after five minutes; retry publish")
+        raise ReviewerError("render workflow dispatch was not visible after five minutes; retry the registration")
     run_id = str(run_data["databaseId"])
     watched = run(
         ["gh", "run", "watch", run_id, "--repo", SUBMISSION_REPO, "--exit-status"],
@@ -961,7 +960,7 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
     if watched.returncode:
         raise ReviewerError(
             "Challenge rendering failed as infrastructure; the acceptance remains valid and "
-            f"publication may be retried: {run_data['url']}"
+            f"registration may be retried: {run_data['url']}"
         )
     download = work / "render-download"
     if download.exists():
@@ -1365,8 +1364,8 @@ def deliver_review(
     """Hand the review to the submitter privately, and to nobody else.
 
     The digest of what was delivered is recorded alongside it. Consent is to a
-    particular review, not to the idea of publishing: without this, a later
-    review of the same submission could be published under consent given to an
+    particular review, not to the idea of registering: without this, a later
+    review of the same submission could be registered under consent given to an
     earlier one.
     """
     existing = state_json(f"submissions/{state['id']}/review.json")
@@ -1377,7 +1376,7 @@ def deliver_review(
         blob_sha=(existing or {}).get("_blob_sha"),
     )
     # What the review cost is operational, not editorial: it is kept with the
-    # private record and never enters the published one. Reviews are cumulative
+    # private record and never enters the registered one. Reviews are cumulative
     # because a redelivered review is a review that was paid for twice.
     previous = state.get("spend") or []
     return advance_state(
@@ -1385,8 +1384,8 @@ def deliver_review(
         "review-ready",
         "The editorial review is ready for you",
         review_sha256=review_digest(review),
-        publish_consent=False,
-        publish_consent_review_sha256=None,
+        registration_consent=False,
+        registration_consent_review_sha256=None,
         spend=[*previous, spend] if spend else previous,
     )
 
@@ -1461,7 +1460,7 @@ def prepare_workspace(
     if state.get("status") not in {"awaiting-review", "review-ready"}:
         raise ReviewerError(
             f"submission {submission_id} is {state.get('status')}, so there is nothing to review "
-            "or publish"
+            "or register"
         )
     work = root / submission_id
     work.mkdir(parents=True, exist_ok=True)
@@ -1547,7 +1546,7 @@ def submission_evidence(state: dict[str, Any]) -> dict[str, Any]:
 
     The submitter's identity is deliberately withheld: a review assesses the
     work, and a model that knows who submitted can be swayed by it. The private
-    record holds the login for the operator and for publication, not for here.
+    record holds the login for the operator and for registration, not for here.
     """
     return {
         "submission_id": state["id"],
@@ -2300,7 +2299,7 @@ def run_review(args: argparse.Namespace) -> int:
             policy_commit=policy_commit,
         )
         # The review goes to the submitter alone. Nothing about the decision is
-        # public unless they choose to publish it.
+        # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
         spend = load_json(spend_path) if spend_path.is_file() else None
         state = deliver_review(state, stored, spend)
@@ -2407,7 +2406,7 @@ def authors_from_metadata(
     """Authors as the formalization declares them.
 
     The submitter's GitHub login is deliberately not a fallback. Submitting is
-    not the same as authorship, and the login is private: publishing it as an
+    not the same as authorship, and the login is private: registering it as an
     author would disclose an identity the submitter never offered.
     """
     raw = metadata_value(data, [("project", "authors"), ("authors",)])
@@ -2433,7 +2432,7 @@ def authors_from_metadata(
     if not result:
         raise ReviewerError(
             "the formalization declares no authors and the report names no "
-            "responsible maintainers; a record cannot be published without one"
+            "responsible maintainers; a record cannot be registered without one"
         )
     return result
 
@@ -2477,18 +2476,18 @@ def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any
     return result
 
 
-def authorize_publication(
+def authorize_registration(
     submission_id: str, mechanical: dict[str, Any], review: dict[str, Any]
 ) -> dict[str, Any]:
-    """Refuse to publish anything the submission server did not authorize.
+    """Refuse to register anything the submission server did not authorize.
 
     The submission id is public: it appears in the verification run's name, so
     anyone able to dispatch the workflow can produce a mechanical report
     carrying a real one. Existence of a state record is therefore not enough.
     What is checked is that the private record and the report describe the same
     submission, that the submitter proved write access, that they have not
-    withdrawn, that they explicitly consented to publication, and that nothing
-    has been published for this submission already.
+    withdrawn, that they explicitly consented to registration, and that nothing
+    has been registered for this submission already.
     """
     state = submission_state(submission_id)
     if state is None:
@@ -2526,28 +2525,28 @@ def authorize_publication(
     if state.get("status") != "review-ready":
         raise ReviewerError(
             f"submission {submission_id} is {state.get('status')}, and only a submission "
-            "holding a delivered review may be published"
+            "holding a delivered review may be registered"
         )
-    if state.get("published_entry"):
+    if state.get("registered_entry"):
         raise ReviewerError(
-            f"submission {submission_id} was already published as {state['published_entry']}"
+            f"submission {submission_id} was already registered as {state['registered_entry']}"
         )
-    if state.get("publish_consent") is not True:
+    if state.get("registration_consent") is not True:
         raise ReviewerError(
-            "the submitter has not consented to publication; "
-            "nothing is published until they choose to"
+            "the submitter has not consented to registration; "
+            "nothing is registered until they choose to"
         )
     # Consent is to the exact review the submitter read. The digest recorded at
     # delivery, the digest they consented to, and the review about to be
     # archived must all be the same bytes.
     delivered = state.get("review_sha256")
-    consented = state.get("publish_consent_review_sha256")
-    publishing = review_digest(review)
-    if delivered != publishing:
+    consented = state.get("registration_consent_review_sha256")
+    registering = review_digest(review)
+    if delivered != registering:
         raise ReviewerError(
-            "the review being published is not the review delivered to the submitter"
+            "the review being registered is not the review delivered to the submitter"
         )
-    if consented != publishing:
+    if consented != registering:
         raise ReviewerError("the submitter consented to a different review")
     return state
 
@@ -2555,10 +2554,10 @@ def authorize_publication(
 def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
     """Choose a free permanent identifier at random.
 
-    Sequential allocation would publish the exact ordering and approximate
+    Sequential allocation would reveal the exact ordering and approximate
     count of accepted private submissions, which is precisely what a private
     intake exists to avoid. Six digits give 999,999 values; collisions are
-    retried against the identifiers already published.
+    retried against the identifiers already registered.
     """
     for _ in range(10_000):
         candidate = f"PALOMAR-{accepted_at}-{secrets.randbelow(999_999) + 1:06d}"
@@ -2704,7 +2703,7 @@ def registry_record(
     }
 
 
-def publication_identity(
+def registration_identity(
     database: Path,
     *,
     submission_id: str,
@@ -2728,11 +2727,11 @@ def publication_identity(
         project_path = prior_source.get("project_path") or ""
         prior_submission = prior.get("submission", {}).get("submission_id")
         if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
-            raise ReviewerError(f"database entry has invalid publication identity: {path.name}")
+            raise ReviewerError(f"database entry has invalid registration identity: {path.name}")
         if not isinstance(prior_submission, str):
             raise ReviewerError(f"database entry names no submission: {path.name}")
         if not isinstance(accepted_at, str) or not isinstance(repository, str):
-            raise ReviewerError(f"database entry has incomplete publication identity: {path.name}")
+            raise ReviewerError(f"database entry has incomplete registration identity: {path.name}")
         by_id.setdefault(identifier, []).append(
             (version, prior_submission, accepted_at, repository, project_path)
         )
@@ -2765,7 +2764,7 @@ def publication_identity(
     if by_submission:
         identifiers = ", ".join(sorted(by_submission))
         raise ReviewerError(
-            f"this submission already has a permanent ID; publish an update to: {identifiers}"
+            f"this submission already has a permanent ID; register an update to: {identifiers}"
         )
     try:
         accepted_at = dt.date.fromisoformat(str(reviewed_at)[:10]).isoformat()
@@ -2786,10 +2785,10 @@ def delivered_review(submission_id: str) -> dict[str, Any]:
     return review
 
 
-def publish(args: argparse.Namespace) -> int:
+def register(args: argparse.Namespace) -> int:
     root = Path(args.work_dir).expanduser().resolve()
     work = root / str(args.submission)
-    # The review that gets published is the one the submitter was given, taken
+    # The review that gets registered is the one the submitter was given, taken
     # from the private record rather than from a locally writable file. An
     # unattended runner has no dry-run workspace to inherit, and even an
     # operator's workspace is a weaker thing to trust than what was delivered.
@@ -2828,7 +2827,7 @@ def publish(args: argparse.Namespace) -> int:
         or workflow_run_digest_path.is_symlink()
         or not workflow_run_digest_path.is_file()
     ):
-        raise ReviewerError("publication requires an inspected review bound to the mechanical report")
+        raise ReviewerError("registration requires an inspected review bound to the mechanical report")
     mechanical_url = mechanical_url_path.read_text().strip()
     if mechanical_digest_path.read_text().strip() != review_digest(mechanical):
         raise ReviewerError("mechanical report no longer matches the reviewed artifact")
@@ -2839,7 +2838,7 @@ def publish(args: argparse.Namespace) -> int:
     policy = work / "policy"
     review_schema = policy / "schemas" / "review.schema.json"
     if review_schema.is_symlink() or not review_schema.is_file():
-        raise ReviewerError("publication requires the exact reviewed policy checkout")
+        raise ReviewerError("registration requires the exact reviewed policy checkout")
     git_env = os.environ.copy()
     git_env.update(
         {
@@ -2862,7 +2861,7 @@ def publish(args: argparse.Namespace) -> int:
         env=git_env,
     ).stdout.strip()
     if policy_head != review.get("policy_commit"):
-        raise ReviewerError("publication policy checkout does not match the inspected review")
+        raise ReviewerError("registration policy checkout does not match the inspected review")
     committed_review_schema = git_json_at(
         policy,
         policy_head,
@@ -2881,11 +2880,11 @@ def publish(args: argparse.Namespace) -> int:
         rubric=committed_rubric,
     )
     if review["decision"] != "accept":
-        raise ReviewerError("only an accepted review can be published")
+        raise ReviewerError("only an accepted review can be registered")
     # Before anything public happens. Rendering dispatches a public Actions run
     # named with the repository and commit, which would signal an acceptance
-    # the submitter has not agreed to publish, and cannot be taken back.
-    state = authorize_publication(args.submission, mechanical, review)
+    # the submitter has not agreed to register, and cannot be taken back.
+    state = authorize_registration(args.submission, mechanical, review)
     source = work / "source"
     formalization_path = mechanical_source_path(
         source,
@@ -2916,11 +2915,11 @@ def publish(args: argparse.Namespace) -> int:
     schema_path = database / "schema-v1.json"
     if not schema_path.is_file():
         raise ReviewerError(
-            f"PalomarDatabase main does not publish schema-v{record_schema_version}.json"
+            f"PalomarDatabase main does not register schema-v{record_schema_version}.json"
         )
 
     existing_id = mechanical.get("existing_id")
-    permanent_id, accepted_at, version = publication_identity(
+    permanent_id, accepted_at, version = registration_identity(
         database,
         existing_id=existing_id,
         mechanical=mechanical,
@@ -2933,7 +2932,7 @@ def publish(args: argparse.Namespace) -> int:
         render_candidate = work / "render-result"
     elif args.dry_run:
         raise ReviewerError(
-            "dry-run publication does not dispatch workflows; pass --render-result or reuse "
+            "dry-run registration does not dispatch workflows; pass --render-result or reuse "
             f"{work / 'render-result'}"
         )
     else:
@@ -3059,12 +3058,12 @@ def publish(args: argparse.Namespace) -> int:
             f"Add {record['id']} v{version}: {record['title']}",
             "--body",
             (
-                f"Publishes accepted submission `{args.submission}`.\n\n"
+                f"Registers accepted submission `{args.submission}`.\n\n"
                 f"- Source: `{record['source']['repository']}@{record['source']['commit']}`\n"
                 f"- Mechanical run: {record['verification']['workflow_url']}\n"
                 f"- Render run: {render_report['workflow_url']}\n"
                 f"- Policy: `{record['review']['policy_commit']}`\n\n"
-                "This PR was prepared by PalomarReviewer. Merging is the publication event."
+                "This PR was prepared by PalomarReviewer. Merging is the registration event."
             ),
         ]
     ).strip()
@@ -3075,14 +3074,14 @@ def publish(args: argparse.Namespace) -> int:
         advance_state(
             fresh,
             fresh.get("status", "review-ready"),
-            "Prepared the registry record; publication is pending review of the database change",
-            publication_pr=int(pr_url.rstrip("/").rsplit("/", 1)[-1]),
+            "Prepared the registry record; registration is pending review of the database change",
+            registration_pr=int(pr_url.rstrip("/").rsplit("/", 1)[-1]),
         )
     print(pr_url)
     return 0
 
 
-def publication_entry_path(pr: dict[str, Any]) -> str:
+def registration_entry_path(pr: dict[str, Any]) -> str:
     paths = [
         item["path"]
         for item in pr.get("files", [])
@@ -3092,7 +3091,7 @@ def publication_entry_path(pr: dict[str, Any]) -> str:
         )
     ]
     if len(paths) != 1:
-        raise ReviewerError("publication PR must contain exactly one Palomar entry file")
+        raise ReviewerError("registration PR must contain exactly one Palomar entry file")
     return paths[0]
 
 
@@ -3111,9 +3110,9 @@ def finalize(args: argparse.Namespace) -> int:
         )
     )
     if pr["state"] != "MERGED" or not pr.get("mergeCommit", {}).get("oid"):
-        raise ReviewerError("database publication PR is not merged")
+        raise ReviewerError("database registration PR is not merged")
     merge_commit = pr["mergeCommit"]["oid"]
-    entry_path = publication_entry_path(pr)
+    entry_path = registration_entry_path(pr)
     record = json.loads(
         gh(
             [
@@ -3125,10 +3124,10 @@ def finalize(args: argparse.Namespace) -> int:
         )
     )
     if record["submission"]["submission_id"] != args.submission:
-        raise ReviewerError("published record points to a different submission")
+        raise ReviewerError("registered record points to a different submission")
     expected = f"entries/{record['id']}-v{record['version']}.json"
     if entry_path != expected or record["status"] != "accepted":
-        raise ReviewerError("published record has an inconsistent path or status")
+        raise ReviewerError("registered record has an inconsistent path or status")
 
     database_url = f"https://github.com/{DATABASE_REPO}/blob/{merge_commit}/{entry_path}"
     website_url = f"{WEB_URL}/entry.html?id={record['id']}&version={record['version']}"
@@ -3143,29 +3142,29 @@ def finalize(args: argparse.Namespace) -> int:
         raise ReviewerError(f"submission {args.submission} has no record in {STATE_REPO}")
     advance_state(
         state,
-        "published",
-        f"Published as {record['id']} version {record['version']}",
-        published_entry=f"{record['id']}-v{record['version']}",
-        published_url=website_url,
+        "registered",
+        f"Registered as {record['id']} version {record['version']}",
+        registered_entry=f"{record['id']}-v{record['version']}",
+        registered_url=website_url,
     )
-    print("Recorded the publication against the private submission record.")
+    print("Recorded the registration against the private submission record.")
     return 0
 
 
 def submissions_needing_work() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split every live submission by what the next step for it would be."""
-    to_review, to_publish, to_finalize = [], [], []
+    to_review, to_register, to_finalize = [], [], []
     for submission_id in state_directory_names():
         record = submission_state(submission_id)
-        if record is None or record.get("published_entry"):
+        if record is None or record.get("registered_entry"):
             continue
         status = record.get("status")
         if status == "awaiting-review":
             to_review.append(record)
-        elif status == "review-ready" and record.get("publish_consent") is True:
-            (to_finalize if record.get("publication_pr") else to_publish).append(record)
+        elif status == "review-ready" and record.get("registration_consent") is True:
+            (to_finalize if record.get("registration_pr") else to_register).append(record)
     order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))
-    return order(to_review), order(to_publish), order(to_finalize)
+    return order(to_review), order(to_register), order(to_finalize)
 
 
 def auto(args: argparse.Namespace) -> int:
@@ -3173,11 +3172,11 @@ def auto(args: argparse.Namespace) -> int:
 
     Idempotent and state-driven, so a failed or interrupted pass costs at most
     the step it was in, and the next pass picks the submission up where the
-    private record says it is. Nothing here decides to publish: a submission
-    reaches this function's publish arm only because its submitter asked.
+    private record says it is. Nothing here decides to register: a submission
+    reaches this function's register arm only because its submitter asked.
     """
-    to_review, to_publish, to_finalize = submissions_needing_work()
-    if not (to_review or to_publish or to_finalize):
+    to_review, to_register, to_finalize = submissions_needing_work()
+    if not (to_review or to_register or to_finalize):
         print("Nothing to do.")
         return 0
 
@@ -3197,10 +3196,10 @@ def auto(args: argparse.Namespace) -> int:
         finally:
             print("::endgroup::", flush=True)
 
-    for record in to_publish:
-        print(f"::group::Publish {record['id']}", flush=True)
+    for record in to_register:
+        print(f"::group::Register {record['id']}", flush=True)
         try:
-            publish(argparse.Namespace(
+            register(argparse.Namespace(
                 submission=record["id"],
                 work_dir=args.work_dir,
                 render_result=None,
@@ -3208,12 +3207,12 @@ def auto(args: argparse.Namespace) -> int:
             ))
         except Exception as error:
             failures += 1
-            print(f"error: publication of {record['id']} failed: {error}", file=sys.stderr)
+            print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
         finally:
             print("::endgroup::", flush=True)
 
     for record in to_finalize:
-        pr = record["publication_pr"]
+        pr = record["registration_pr"]
         view = json.loads(
             gh([
                 "pr", "view", str(pr), "--repo", DATABASE_REPO,
@@ -3221,7 +3220,7 @@ def auto(args: argparse.Namespace) -> int:
             ])
         )
         if view.get("state") == "OPEN":
-            # Merging is the publication event, and no person signs it. The
+            # Merging is the registration event, and no person signs it. The
             # database's own checks are what stand between an accepted review
             # and the registry, so a change that has not passed them waits.
             checks = view.get("statusCheckRollup") or []
@@ -3322,14 +3321,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--command")
     run_parser.add_argument("--apply", action="store_true", help="deliver the inspected review privately to the submitter")
     run_parser.set_defaults(func=run_review)
-    publish_parser = commands.add_parser("publish", help="prepare a database PR from an accepted report")
-    publish_parser.add_argument("--submission", type=str, required=True)
-    publish_parser.add_argument(
+    register_parser = commands.add_parser("register", help="prepare a database PR from an accepted report")
+    register_parser.add_argument("--submission", type=str, required=True)
+    register_parser.add_argument(
         "--render-result",
         help="use an extracted trusted renderer result instead of dispatching a workflow",
     )
-    publish_parser.add_argument("--dry-run", action="store_true")
-    publish_parser.set_defaults(func=publish)
+    register_parser.add_argument("--dry-run", action="store_true")
+    register_parser.set_defaults(func=register)
     finalize_parser = commands.add_parser(
         "finalize",
         help="verify a merged database PR and close out the private submission record",

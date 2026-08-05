@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,9 +32,9 @@ from palomar_reviewer.cli import (
     load_formalization_metadata,
     mechanical_report,
     parse_engine_json,
-    publication_entry_path,
-    publication_identity,
-    publish,
+    registration_entry_path,
+    registration_identity,
+    register,
     registry_record,
     registry_title,
     render_bundle_manifest,
@@ -941,7 +942,7 @@ class ReviewerTests(unittest.TestCase):
             (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             bind_publication_evidence(work, mechanical)
             (work / "review.json").write_text(json.dumps(review))
-            (work / "state.json").write_text(json.dumps({"id": "a1b2c3d4e5f6", "repository": "example/project", "commit": mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": None, "push_verified": True, "status": "review-ready", "run": {"id": 101}, "publish_consent": True, "review_sha256": review_digest(review), "publish_consent_review_sha256": review_digest(review)}))
+            (work / "state.json").write_text(json.dumps({"id": "a1b2c3d4e5f6", "repository": "example/project", "commit": mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": None, "push_verified": True, "status": "review-ready", "run": {"id": 101}, "registration_consent": True, "review_sha256": review_digest(review), "registration_consent_review_sha256": review_digest(review)}))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
             (work / "mechanical-report-url").write_text(mechanical["workflow_url"] + "\n")
 
@@ -1036,10 +1037,10 @@ class ReviewerTests(unittest.TestCase):
                 cli, "delivered_review", return_value={**review, "summary": "Rewritten."}
             ):
                 with self.assertRaisesRegex(ReviewerError, "not the review delivered"):
-                    publish(args)
+                    register(args)
             (work / "mechanical-report-sha256").write_text("0" * 64 + "\n")
             with self.assertRaisesRegex(ReviewerError, "mechanical report no longer matches"):
-                publish(args)
+                register(args)
             (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             classification_pass = next(item for item in review["passes"] if item["step"] == "classification")
             classification_pass["scores"]["classification"] = 2
@@ -1049,7 +1050,7 @@ class ReviewerTests(unittest.TestCase):
             (work / "review.json").write_text(json.dumps(review))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
             with self.assertRaisesRegex(ReviewerError, "scores below"):
-                publish(args)
+                register(args)
             classification_pass["scores"]["classification"] = 4
             (work / "review.json").write_text(json.dumps(review))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
@@ -1057,13 +1058,13 @@ class ReviewerTests(unittest.TestCase):
             formalization_bytes = formalization_path.read_bytes()
             formalization_path.write_bytes(formalization_bytes + b"# changed\n")
             with self.assertRaisesRegex(ReviewerError, "no longer matches the mechanical report"):
-                publish(args)
+                register(args)
             formalization_path.write_bytes(formalization_bytes)
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
             ):
-                self.assertEqual(publish(args), 0)
+                self.assertEqual(register(args), 0)
 
             database = work / "database"
             # The permanent identifier is allocated at random, so the entry is
@@ -1178,7 +1179,7 @@ class ReviewerTests(unittest.TestCase):
             )
             update_review_stub.start()
             self.addCleanup(update_review_stub.stop)
-            (update_work / "state.json").write_text(json.dumps({"id": "b2c3d4e5f6a1", "repository": update_mechanical["source"]["repository"], "commit": update_mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": record["id"], "push_verified": True, "status": "review-ready", "run": {"id": 103}, "publish_consent": True, "review_sha256": review_digest(update_review), "publish_consent_review_sha256": review_digest(update_review)}))
+            (update_work / "state.json").write_text(json.dumps({"id": "b2c3d4e5f6a1", "repository": update_mechanical["source"]["repository"], "commit": update_mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": record["id"], "push_verified": True, "status": "review-ready", "run": {"id": 103}, "registration_consent": True, "review_sha256": review_digest(update_review), "registration_consent_review_sha256": review_digest(update_review)}))
             (update_work / "mechanical-report-url").write_text(update_mechanical_url + "\n")
             update_render = root / "update-render-result"
             shutil.copytree(sample_bundle, update_render / "bundle")
@@ -1202,13 +1203,13 @@ class ReviewerTests(unittest.TestCase):
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
             ):
-                self.assertEqual(publish(update_args), 0)
+                self.assertEqual(register(update_args), 0)
 
             # Nothing public may happen for a submission that has not consented:
             # a render dispatch is a public Actions run naming the repository
             # and commit, which would signal the decision by itself.
             unconsented = json.loads((work / "state.json").read_text())
-            unconsented["publish_consent"] = False
+            unconsented["registration_consent"] = False
             (work / "state.json").write_text(json.dumps(unconsented))
             with (
                 mock.patch("palomar_reviewer.cli.request_render") as render,
@@ -1217,7 +1218,7 @@ class ReviewerTests(unittest.TestCase):
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
             ):
                 with self.assertRaisesRegex(ReviewerError, "has not consented"):
-                    publish(SimpleNamespace(
+                    register(SimpleNamespace(
                         submission="a1b2c3d4e5f6",
                         work_dir=str(root),
                         render_result=None,
@@ -1226,7 +1227,7 @@ class ReviewerTests(unittest.TestCase):
             render.assert_not_called()
             public_gh.assert_not_called()
             (work / "state.json").write_text(json.dumps(json.loads(
-                (work / "state.json").read_text()) | {"publish_consent": True}))
+                (work / "state.json").read_text()) | {"registration_consent": True}))
 
             update_database = update_work / "database"
             update_entry = update_database / "entries" / f"{record['id']}-v2.json"
@@ -1251,7 +1252,7 @@ class ReviewerTests(unittest.TestCase):
                     0,
                 )
 
-    def test_publication_entry_path(self):
+    def test_registration_entry_path(self):
         pr = {
             "files": [
                 {"path": "entries/PALOMAR-2026-08-01-000012-v2.json"},
@@ -1259,7 +1260,7 @@ class ReviewerTests(unittest.TestCase):
             ]
         }
         self.assertEqual(
-            publication_entry_path(pr),
+            registration_entry_path(pr),
             "entries/PALOMAR-2026-08-01-000012-v2.json",
         )
 
@@ -1693,7 +1694,7 @@ class IdentifierAllocationTests(unittest.TestCase):
             self.assertRegex(allocated, r"^PALOMAR-2026-08-05-[0-9]{6}$")
 
     def test_allocation_is_not_sequential(self):
-        """Sequential allocation would publish the exact ordering of accepts."""
+        """Sequential allocation would reveal the exact ordering of accepts."""
         seen = {allocate_identifier("2026-08-05", set()) for _ in range(40)}
         self.assertGreater(len(seen), 30, "identifiers look sequential")
 
@@ -1720,7 +1721,7 @@ class PublicationIdentityTests(unittest.TestCase):
         }
 
     def resolve(self, database, *, submission="a1b2c3d4e5f6", existing_id=None):
-        return publication_identity(
+        return registration_identity(
             database,
             submission_id=submission,
             existing_id=existing_id,
@@ -1734,7 +1735,7 @@ class PublicationIdentityTests(unittest.TestCase):
         self.assertEqual((accepted_at, version), ("2026-08-01", 1))
 
     def test_identifiers_are_not_sequential(self):
-        """A sequential serial would publish the count of private acceptances."""
+        """A sequential serial would reveal the count of private acceptances."""
         seen = {self.resolve(self.database())[0] for _ in range(25)}
         self.assertGreater(len(seen), 1)
 
@@ -1777,7 +1778,7 @@ class PublicationIdentityTests(unittest.TestCase):
         prior = self.prior()
         prior["source"]["project_path"] = "projects/first"
         with self.assertRaisesRegex(ReviewerError, "comes from project"):
-            publication_identity(
+            registration_identity(
                 self.database(prior),
                 submission_id="b2c3d4e5f6a1",
                 existing_id="PALOMAR-2026-08-01-000012",
@@ -1897,19 +1898,19 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(
             self.split(
                 self.row("aaaaaaaaaaaa", status="awaiting-review"),
-                self.row("bbbbbbbbbbbb", status="review-ready", publish_consent=True),
-                self.row("cccccccccccc", status="review-ready", publish_consent=True,
-                         publication_pr=7),
+                self.row("bbbbbbbbbbbb", status="review-ready", registration_consent=True),
+                self.row("cccccccccccc", status="review-ready", registration_consent=True,
+                         registration_pr=7),
             ),
             [["aaaaaaaaaaaa"], ["bbbbbbbbbbbb"], ["cccccccccccc"]],
         )
 
     def test_a_submission_without_consent_is_never_picked_up(self):
-        """The loop must not be the thing that decides to publish."""
+        """The loop must not be the thing that decides to register."""
         self.assertEqual(
             self.split(
                 self.row("aaaaaaaaaaaa", status="review-ready"),
-                self.row("bbbbbbbbbbbb", status="review-ready", publish_consent=False),
+                self.row("bbbbbbbbbbbb", status="review-ready", registration_consent=False),
             ),
             [[], [], []],
         )
@@ -1917,9 +1918,9 @@ class AutomaticLoopTests(unittest.TestCase):
     def test_finished_and_terminal_submissions_are_left_alone(self):
         self.assertEqual(
             self.split(
-                self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
-                         published_entry="PALOMAR-2026-08-01-000001-v1"),
-                self.row("bbbbbbbbbbbb", status="withdrawn", publish_consent=True),
+                self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+                         registered_entry="PALOMAR-2026-08-01-000001-v1"),
+                self.row("bbbbbbbbbbbb", status="withdrawn", registration_consent=True),
                 self.row("cccccccccccc", status="verifying"),
                 self.row("dddddddddddd", status="verification-failed"),
             ),
@@ -1958,8 +1959,8 @@ class AutomaticLoopTests(unittest.TestCase):
 
     def test_a_database_change_that_is_not_green_is_not_merged(self):
         """The database's own checks are what stand between a review and the registry."""
-        rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
-                         publication_pr=7)]
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+                         registration_pr=7)]
         listing, state = self.records(*rows)
         for rollup in ([], [{"conclusion": "FAILURE"}], [{"conclusion": "SUCCESS"}, {"state": "PENDING"}]):
             with self.subTest(rollup):
@@ -1980,8 +1981,8 @@ class AutomaticLoopTests(unittest.TestCase):
                 self.assertNotIn("merge", [step for call in calls for step in call])
 
     def test_a_green_database_change_is_merged_and_finalized(self):
-        rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
-                         publication_pr=7)]
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+                         registration_pr=7)]
         listing, state = self.records(*rows)
         calls = []
         with (
@@ -2000,8 +2001,8 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(finalized.call_args.args[0].pr, 7)
 
     def test_finalizing_waits_for_the_database_change_to_merge(self):
-        rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
-                         publication_pr=7)]
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+                         registration_pr=7)]
         listing, state = self.records(*rows)
         with (
             listing, state,
@@ -2166,8 +2167,8 @@ class DeliveredReviewChainTests(unittest.TestCase):
 
     def test_delivery_records_the_digest_and_clears_any_earlier_consent(self):
         state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
-                 "publish_consent": True,
-                 "publish_consent_review_sha256": "0" * 64,
+                 "registration_consent": True,
+                 "registration_consent_review_sha256": "0" * 64,
                  "_blob_sha": "blob-1"}
         review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept", "summary": "Fine."}
         written = {}
@@ -2184,8 +2185,8 @@ class DeliveredReviewChainTests(unittest.TestCase):
         self.assertEqual(updated["status"], "review-ready")
         self.assertEqual(updated["review_sha256"], cli.review_digest(review))
         # A second review must not inherit consent given to the first.
-        self.assertIs(updated["publish_consent"], False)
-        self.assertIsNone(updated["publish_consent_review_sha256"])
+        self.assertIs(updated["registration_consent"], False)
+        self.assertIsNone(updated["registration_consent_review_sha256"])
         self.assertEqual(written["submissions/a1b2c3d4e5f6/review.json"][0], review)
         self.assertEqual(written["submissions/a1b2c3d4e5f6/state.json"][1], "blob-1")
 
@@ -2202,9 +2203,9 @@ class DeliveredReviewChainTests(unittest.TestCase):
             "authorization": {"relationship": "maintainer"},
             "existing_id": None,
             "push_verified": True,
-            "publish_consent": True,
+            "registration_consent": True,
             "review_sha256": cli.review_digest(review),
-            "publish_consent_review_sha256": cli.review_digest(review),
+            "registration_consent_review_sha256": cli.review_digest(review),
         }
         mechanical = {
             "submission": {"submission_id": "a1b2c3d4e5f6",
@@ -2212,7 +2213,7 @@ class DeliveredReviewChainTests(unittest.TestCase):
             "source": {"repository": "example/project", "commit": "1" * 40},
         }
         with mock.patch.object(cli, "submission_state", return_value=state):
-            cli.authorize_publication("a1b2c3d4e5f6", mechanical, review)
+            cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
         # The archived file is the one the record's digest is taken over.
         self.assertEqual(
             cli.review_digest(json.loads((work / "review.json").read_text())),
@@ -2246,16 +2247,16 @@ class PublicationAuthorizationTests(unittest.TestCase):
             "push_verified": True,
             "status": "review-ready",
             "run": {"id": 101},
-            "publish_consent": True,
+            "registration_consent": True,
             "review_sha256": cli.review_digest(review),
-            "publish_consent_review_sha256": cli.review_digest(review),
+            "registration_consent_review_sha256": cli.review_digest(review),
             **state_overrides,
         }
         return mechanical, review, state
 
     def authorize(self, mechanical, review, state):
         with mock.patch.object(cli, "submission_state", return_value=state):
-            return cli.authorize_publication("a1b2c3d4e5f6", mechanical, review)
+            return cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
 
     def test_an_authorized_submission_publishes(self):
         mechanical, review, state = self.parts()
@@ -2265,11 +2266,11 @@ class PublicationAuthorizationTests(unittest.TestCase):
         mechanical, review, _ = self.parts()
         with mock.patch.object(cli, "submission_state", return_value=None):
             with self.assertRaisesRegex(ReviewerError, "never created it"):
-                cli.authorize_publication("a1b2c3d4e5f6", mechanical, review)
+                cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
 
     def test_publication_without_consent_is_refused(self):
-        """Nothing is published until the submitter chooses to publish it."""
-        mechanical, review, state = self.parts(publish_consent=False)
+        """Nothing is registered until the submitter chooses to register it."""
+        mechanical, review, state = self.parts(registration_consent=False)
         with self.assertRaisesRegex(ReviewerError, "not consented"):
             self.authorize(mechanical, review, state)
 
@@ -2290,15 +2291,15 @@ class PublicationAuthorizationTests(unittest.TestCase):
 
         stale, _, state = self.parts()
         state["review_sha256"] = cli.review_digest(review)
-        state["publish_consent_review_sha256"] = cli.review_digest(
+        state["registration_consent_review_sha256"] = cli.review_digest(
             {**review, "summary": "An earlier review."}
         )
         with self.assertRaisesRegex(ReviewerError, "consented to a different review"):
             self.authorize(mechanical, review, state)
 
     def test_a_second_publication_is_refused(self):
-        mechanical, review, state = self.parts(published_entry="PALOMAR-2026-08-05-123456-v1")
-        with self.assertRaisesRegex(ReviewerError, "already published"):
+        mechanical, review, state = self.parts(registered_entry="PALOMAR-2026-08-05-123456-v1")
+        with self.assertRaisesRegex(ReviewerError, "already registered"):
             self.authorize(mechanical, review, state)
 
     def test_a_submitter_who_never_proved_write_access_is_refused(self):
@@ -2336,3 +2337,16 @@ class PublicationAuthorizationTests(unittest.TestCase):
         review["submission_id"] = "f6e5d4c3b2a1"
         with self.assertRaisesRegex(ReviewerError, "review and state disagree"):
             self.authorize(mechanical, review, state)
+
+
+class VocabularyTests(unittest.TestCase):
+    def test_the_reviewer_says_registration_everywhere(self):
+        """One word for one thing.
+
+        The state fields here are written by the submission server and read
+        here. Two words for one idea is how a field gets written under one name
+        and read under the other.
+        """
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        stray = sorted(set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source)))
+        self.assertEqual(stray, [], f"cli.py still says {', '.join(stray)}")
