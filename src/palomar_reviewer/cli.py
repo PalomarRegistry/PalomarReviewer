@@ -1391,16 +1391,18 @@ def deliver_review(
     )
 
 
-def queue() -> list[dict[str, Any]]:
-    """Submissions whose verification passed and which have no review yet."""
+def state_directory_names() -> list[str]:
     listing = run(
         ["gh", "api", f"repos/{STATE_REPO}/contents/submissions", "--jq", ".[].name"],
         check=False,
     )
-    if listing.returncode != 0:
-        return []
+    return listing.stdout.split() if listing.returncode == 0 else []
+
+
+def queue() -> list[dict[str, Any]]:
+    """Submissions whose verification passed and which have no review yet."""
     waiting = []
-    for submission_id in listing.stdout.split():
+    for submission_id in state_directory_names():
         record = submission_state(submission_id)
         if record and record.get("status") == "awaiting-review":
             waiting.append(record)
@@ -1456,9 +1458,10 @@ def prepare_workspace(
     state = submission_state(submission_id)
     if state is None:
         raise ReviewerError(f"submission {submission_id} has no record in {STATE_REPO}")
-    if state.get("status") != "awaiting-review":
+    if state.get("status") not in {"awaiting-review", "review-ready"}:
         raise ReviewerError(
-            f"submission {submission_id} is {state.get('status')}, not awaiting review"
+            f"submission {submission_id} is {state.get('status')}, so there is nothing to review "
+            "or publish"
         )
     work = root / submission_id
     work.mkdir(parents=True, exist_ok=True)
@@ -2771,9 +2774,34 @@ def publication_identity(
     return allocate_identifier(accepted_at, set(by_id)), accepted_at, 1
 
 
+def delivered_review(submission_id: str) -> dict[str, Any]:
+    """The exact review the submitter was shown."""
+    review = state_json(f"submissions/{submission_id}/review.json")
+    if review is None:
+        raise ReviewerError(
+            f"submission {submission_id} has no delivered review in {STATE_REPO}; "
+            "run `palomar-review run --apply` first"
+        )
+    review.pop("_blob_sha", None)
+    return review
+
+
 def publish(args: argparse.Namespace) -> int:
-    work = Path(args.work_dir).expanduser().resolve() / str(args.submission)
-    review = load_json(work / "review.json")
+    root = Path(args.work_dir).expanduser().resolve()
+    work = root / str(args.submission)
+    # The review that gets published is the one the submitter was given, taken
+    # from the private record rather than from a locally writable file. An
+    # unattended runner has no dry-run workspace to inherit, and even an
+    # operator's workspace is a weaker thing to trust than what was delivered.
+    review = delivered_review(args.submission)
+    if not (work / "mechanical-report.json").is_file():
+        work, _, _, _ = prepare_workspace(
+            args.submission,
+            root=root,
+            policy_ref=str(review.get("policy_commit", "main")),
+        )
+    write_json(work / "review.json", review)
+    (work / "review-sha256").write_text(review_digest(review) + "\n")
     state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")
     if state.get("id") != args.submission:
@@ -2788,7 +2816,6 @@ def publish(args: argparse.Namespace) -> int:
     mechanical_bytes_digest_path = work / "mechanical-report-bytes-sha256"
     workflow_run_path = work / "workflow-run.json"
     workflow_run_digest_path = work / "workflow-run-sha256"
-    review_digest_path = work / "review-sha256"
     if (
         mechanical_url_path.is_symlink()
         or not mechanical_url_path.is_file()
@@ -2800,8 +2827,6 @@ def publish(args: argparse.Namespace) -> int:
         or not workflow_run_path.is_file()
         or workflow_run_digest_path.is_symlink()
         or not workflow_run_digest_path.is_file()
-        or review_digest_path.is_symlink()
-        or not review_digest_path.is_file()
     ):
         raise ReviewerError("publication requires an inspected review bound to the mechanical report")
     mechanical_url = mechanical_url_path.read_text().strip()
@@ -2811,8 +2836,6 @@ def publish(args: argparse.Namespace) -> int:
         raise ReviewerError("mechanical report bytes no longer match the downloaded artifact")
     if workflow_run_digest_path.read_text().strip() != sha256_file(workflow_run_path):
         raise ReviewerError("verification run provenance changed after review")
-    if review_digest_path.read_text().strip() != review_digest(review):
-        raise ReviewerError("delivered review does not match the current inspected review")
     policy = work / "policy"
     review_schema = policy / "schemas" / "review.schema.json"
     if review_schema.is_symlink() or not review_schema.is_file():
@@ -3036,7 +3059,7 @@ def publish(args: argparse.Namespace) -> int:
             f"Add {record['id']} v{version}: {record['title']}",
             "--body",
             (
-                f"Publishes accepted submission {SUBMISSION_REPO}#{args.submission}.\n\n"
+                f"Publishes accepted submission `{args.submission}`.\n\n"
                 f"- Source: `{record['source']['repository']}@{record['source']['commit']}`\n"
                 f"- Mechanical run: {record['verification']['workflow_url']}\n"
                 f"- Render run: {render_report['workflow_url']}\n"
@@ -3045,6 +3068,16 @@ def publish(args: argparse.Namespace) -> int:
             ),
         ]
     ).strip()
+    # Recorded so the next pass knows a PR is already open for this submission
+    # and does not build a second one.
+    fresh = submission_state(args.submission)
+    if fresh is not None:
+        advance_state(
+            fresh,
+            fresh.get("status", "review-ready"),
+            "Prepared the registry record; publication is pending review of the database change",
+            publication_pr=int(pr_url.rstrip("/").rsplit("/", 1)[-1]),
+        )
     print(pr_url)
     return 0
 
@@ -3119,6 +3152,86 @@ def finalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def submissions_needing_work() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split every live submission by what the next step for it would be."""
+    to_review, to_publish, to_finalize = [], [], []
+    for submission_id in state_directory_names():
+        record = submission_state(submission_id)
+        if record is None or record.get("published_entry"):
+            continue
+        status = record.get("status")
+        if status == "awaiting-review":
+            to_review.append(record)
+        elif status == "review-ready" and record.get("publish_consent") is True:
+            (to_finalize if record.get("publication_pr") else to_publish).append(record)
+    order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))
+    return order(to_review), order(to_publish), order(to_finalize)
+
+
+def auto(args: argparse.Namespace) -> int:
+    """One pass of the loop: advance every submission by exactly one step.
+
+    Idempotent and state-driven, so a failed or interrupted pass costs at most
+    the step it was in, and the next pass picks the submission up where the
+    private record says it is. Nothing here decides to publish: a submission
+    reaches this function's publish arm only because its submitter asked.
+    """
+    to_review, to_publish, to_finalize = submissions_needing_work()
+    if not (to_review or to_publish or to_finalize):
+        print("Nothing to do.")
+        return 0
+
+    failures = 0
+    for record in to_review[: args.max_reviews]:
+        print(f"::group::Review {record['id']}", flush=True)
+        try:
+            for apply_step in (False, True):
+                step = argparse.Namespace(**vars(args))
+                step.submission = record["id"]
+                step.apply = apply_step
+                step.policy_ref = args.policy_ref
+                run_review(step)
+        except Exception as error:  # one bad submission must not stall the queue
+            failures += 1
+            print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
+        finally:
+            print("::endgroup::", flush=True)
+
+    for record in to_publish:
+        print(f"::group::Publish {record['id']}", flush=True)
+        try:
+            publish(argparse.Namespace(
+                submission=record["id"],
+                work_dir=args.work_dir,
+                render_result=None,
+                dry_run=False,
+            ))
+        except Exception as error:
+            failures += 1
+            print(f"error: publication of {record['id']} failed: {error}", file=sys.stderr)
+        finally:
+            print("::endgroup::", flush=True)
+
+    for record in to_finalize:
+        pr = record["publication_pr"]
+        merged = json.loads(
+            gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", "state"])
+        ).get("state")
+        if merged != "MERGED":
+            print(f"{record['id']}: database PR #{pr} is {merged}; nothing to finalize yet")
+            continue
+        print(f"::group::Finalize {record['id']}", flush=True)
+        try:
+            finalize(argparse.Namespace(submission=record["id"], pr=pr, dry_run=False))
+        except Exception as error:
+            failures += 1
+            print(f"error: finalizing {record['id']} failed: {error}", file=sys.stderr)
+        finally:
+            print("::endgroup::", flush=True)
+
+    return 1 if failures else 0
+
+
 def doctor(_: argparse.Namespace) -> int:
     failed = False
     for tool in ("gh", "git", "bwrap"):
@@ -3160,6 +3273,22 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command_name", required=True)
     list_parser = commands.add_parser("list", help="list open mechanically passing submissions")
     list_parser.set_defaults(func=list_queue)
+    auto_parser = commands.add_parser(
+        "auto",
+        help="advance every live submission by one step; safe to run on a schedule",
+    )
+    auto_parser.add_argument("--policy-ref", default="main")
+    auto_parser.add_argument("--engine", choices=("codex", "claude", "command"), default="codex")
+    auto_parser.add_argument("--model")
+    auto_parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"))
+    auto_parser.add_argument("--command")
+    auto_parser.add_argument(
+        "--max-reviews",
+        type=int,
+        default=3,
+        help="most reviews to run in one pass, so a queue cannot run up an unbounded bill",
+    )
+    auto_parser.set_defaults(func=auto)
     doctor_parser = commands.add_parser("doctor", help="check local prerequisites")
     doctor_parser.set_defaults(func=doctor)
     run_parser = commands.add_parser("run", help="prepare and execute all editorial review passes")
