@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -51,6 +52,14 @@ WEB_URL = "https://palomar-registry.org"
 SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
 MAX_CONTEXT_BYTES = 300_000
+_ENGINE_CREDENTIAL_DIR: Path | None = None
+
+# What a review cost, in tokens, is reported by the engine and is never a
+# guess. Money is a guess unless somebody keeps this table current, so a model
+# absent from it records tokens and no price rather than an invented one.
+# USD per million tokens, as published by the provider.
+MODEL_PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {}
+_PRICES_ENV = "PALOMAR_MODEL_PRICES"
 MAX_CHALLENGE_PROMPT_BYTES = 8 * 1024 * 1024
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
@@ -1348,7 +1357,11 @@ def advance_state(
     return updated
 
 
-def deliver_review(state: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+def deliver_review(
+    state: dict[str, Any],
+    review: dict[str, Any],
+    spend: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Hand the review to the submitter privately, and to nobody else.
 
     The digest of what was delivered is recorded alongside it. Consent is to a
@@ -1363,6 +1376,10 @@ def deliver_review(state: dict[str, Any], review: dict[str, Any]) -> dict[str, A
         f"Deliver review for {state['id']}",
         blob_sha=(existing or {}).get("_blob_sha"),
     )
+    # What the review cost is operational, not editorial: it is kept with the
+    # private record and never enters the published one. Reviews are cumulative
+    # because a redelivered review is a review that was paid for twice.
+    previous = state.get("spend") or []
     return advance_state(
         state,
         "review-ready",
@@ -1370,6 +1387,7 @@ def deliver_review(state: dict[str, Any], review: dict[str, Any]) -> dict[str, A
         review_sha256=review_digest(review),
         publish_consent=False,
         publish_consent_review_sha256=None,
+        spend=[*previous, spend] if spend else previous,
     )
 
 
@@ -1684,6 +1702,86 @@ def _bind_if_present(command: list[str], source: Path, destination: str) -> None
         command.extend(["--ro-bind", str(source), destination])
 
 
+def model_prices() -> dict[str, dict[str, float]]:
+    """Prices from the environment, if the operator supplied any."""
+    raw = os.environ.get(_PRICES_ENV, "").strip()
+    if not raw:
+        return MODEL_PRICES_USD_PER_MTOK
+    try:
+        supplied = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ReviewerError(f"{_PRICES_ENV} is not valid JSON: {error}") from error
+    if not isinstance(supplied, dict):
+        raise ReviewerError(f"{_PRICES_ENV} must be an object keyed by model")
+    return {**MODEL_PRICES_USD_PER_MTOK, **supplied}
+
+
+def usage_cost(model: str, usage: dict[str, Any]) -> float | None:
+    """The USD a pass cost, or None when the model's price is not known here."""
+    price = model_prices().get(model)
+    if not isinstance(price, dict):
+        return None
+    try:
+        uncached = max(0, int(usage["input_tokens"]) - int(usage.get("cached_input_tokens", 0)))
+        total = (
+            uncached * float(price["input"])
+            + int(usage.get("cached_input_tokens", 0)) * float(price.get("cached_input", price["input"]))
+            + int(usage["output_tokens"]) * float(price["output"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return round(total / 1_000_000, 6)
+
+
+def codex_usage(events: str) -> dict[str, int]:
+    """Token usage from the JSONL codex writes with --json.
+
+    Every completed turn is added up: a pass that retried is a pass that cost
+    twice, and reporting only the last turn would understate what was spent.
+    """
+    totals = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    for line in events.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = event.get("usage")
+        if event.get("type") != "turn.completed" or not isinstance(usage, dict):
+            continue
+        for key in totals:
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[key] += value
+    return totals
+
+
+def engine_credential_file(api_key: str) -> Path:
+    """A private, 0600 credential file for the engine to read inside its namespace.
+
+    Held for the lifetime of the process, in a directory only this user can
+    enter, and never under the workspace or the engine's output directory: the
+    model can read anything bound into its namespace, and an output directory is
+    exactly where a prompt-injected model would try to copy a secret to.
+    """
+    global _ENGINE_CREDENTIAL_DIR
+    if _ENGINE_CREDENTIAL_DIR is None:
+        _ENGINE_CREDENTIAL_DIR = Path(tempfile.mkdtemp(prefix="palomar-engine-"))
+        _ENGINE_CREDENTIAL_DIR.chmod(0o700)
+    path = _ENGINE_CREDENTIAL_DIR / "auth.json"
+    path.write_text(json.dumps({"OPENAI_API_KEY": api_key}), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def isolated_engine_command(
     engine: str,
     argv: list[str],
@@ -1769,9 +1867,19 @@ def isolated_engine_command(
         except StopIteration as error:
             raise ReviewerError("could not locate the installed Codex package") from error
         _bind_if_present(command, codex_root, "/engine/codex")
-        auth = host_home / ".codex" / "auth.json"
-        if not auth.is_file() or auth.is_symlink():
-            raise ReviewerError("Codex authentication file is missing or symbolic")
+        # An API key, when one is configured, is written to a private file and
+        # bound in as the engine's credential rather than passed with --setenv,
+        # which would put it in argv where any process on the host can read it.
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if api_key:
+            auth = engine_credential_file(api_key)
+        else:
+            auth = host_home / ".codex" / "auth.json"
+            if not auth.is_file() or auth.is_symlink():
+                raise ReviewerError(
+                    "set OPENAI_API_KEY, or sign in with `codex login`: the Codex engine "
+                    "has no credential"
+                )
         _bind_if_present(command, auth, "/home/reviewer/.codex/auth.json")
         command.extend(["--setenv", "CODEX_HOME", "/home/reviewer/.codex"])
         argv = [str(Path(node).resolve(strict=True)), "/engine/codex/bin/codex.js", *argv[1:]]
@@ -1824,11 +1932,13 @@ def engine_result(
     cwd: Path,
     schema: dict[str, Any],
     raw_path: Path,
+    reasoning_effort: str | None = None,
     allow_network: bool = False,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     if raw_path.is_symlink() or (raw_path.exists() and not raw_path.is_file()):
         raise ReviewerError("review raw-output path is not a regular file")
+    usage: dict[str, Any] = {}
     engine_output = raw_path.parent / f".{raw_path.name}.engine-output"
     if engine_output.is_symlink() or (engine_output.exists() and not engine_output.is_dir()):
         raise ReviewerError("review engine-output path is not a real directory")
@@ -1846,6 +1956,9 @@ def engine_result(
             "read-only",
             "--ephemeral",
             "--ignore-user-config",
+            # Events on stdout, so what the pass cost is read from the engine
+            # rather than estimated.
+            "--json",
             "--output-schema",
             f"/output/{schema_path.name}",
             "--output-last-message",
@@ -1855,8 +1968,10 @@ def engine_result(
         ]
         if model:
             argv.extend(["--model", model])
+        if reasoning_effort:
+            argv.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
         argv.append("-")
-        run(
+        events = run(
             isolated_engine_command(
                 "codex",
                 argv,
@@ -1865,7 +1980,9 @@ def engine_result(
             ),
             input_text=prompt,
             timeout=7200,
-        )
+        ).stdout
+        (raw_path.parent / f"{raw_path.stem}.events.jsonl").write_text(events, encoding="utf-8")
+        usage = codex_usage(events)
         if output_path.is_symlink() or not output_path.is_file():
             raise ReviewerError("Codex did not create a regular final-message file")
         text = output_path.read_text(encoding="utf-8")
@@ -1917,7 +2034,7 @@ def engine_result(
     raw_path.write_text(text, encoding="utf-8")
     result = parse_engine_json(text)
     jsonschema.validate(result, schema)
-    return result
+    return result, usage
 
 
 def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
@@ -1927,6 +2044,40 @@ def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
     return f"{engine}:{model or 'default'}"
 
 
+
+
+def review_spend(model_id: str, passes: list[dict[str, Any]]) -> dict[str, Any]:
+    """What this review cost: tokens always, money only if the price is known."""
+    totals: dict[str, int] = {}
+    for entry in passes:
+        for key, value in entry["usage"].items():
+            totals[key] = totals.get(key, 0) + value
+    priced = [entry["usd"] for entry in passes if entry["usd"] is not None]
+    return {
+        "schema_version": 1,
+        "model": model_id,
+        "measured_at": utc_now(),
+        "passes": passes,
+        "usage": totals,
+        # None, not zero, when the price of any pass is unknown: a review that
+        # cost money must never be recorded as having cost nothing.
+        "usd": round(sum(priced), 6) if len(priced) == len(passes) and passes else None,
+    }
+
+
+def spend_summary(accounting: dict[str, Any]) -> str:
+    usage = accounting["usage"]
+    tokens = (
+        f"{usage.get('input_tokens', 0):,} in "
+        f"({usage.get('cached_input_tokens', 0):,} cached), "
+        f"{usage.get('output_tokens', 0):,} out"
+    )
+    if accounting["usd"] is None:
+        return (
+            f"Spend: {tokens}. No price is recorded for {accounting['model']}; "
+            f"set {_PRICES_ENV} to convert tokens to money."
+        )
+    return f"Spend: {tokens} — ${accounting['usd']:.2f}."
 
 
 def normalize_final(
@@ -2147,7 +2298,9 @@ def run_review(args: argparse.Namespace) -> int:
         )
         # The review goes to the submitter alone. Nothing about the decision is
         # public unless they choose to publish it.
-        state = deliver_review(state, stored)
+        spend_path = root / args.submission / "spend.json"
+        spend = load_json(spend_path) if spend_path.is_file() else None
+        state = deliver_review(state, stored, spend)
         write_json(work / "state.json", state)
         (work / "review-sha256").write_text(review_digest(stored) + "\n")
         print(f"Delivered the review privately for submission {args.submission}.")
@@ -2162,6 +2315,7 @@ def run_review(args: argparse.Namespace) -> int:
     rubric = load_json(work / "policy" / "rubric.json")
     rubric_version = validate_rubric(rubric)
     passes: list[dict[str, Any]] = []
+    spend: list[dict[str, Any]] = []
     synthesis: dict[str, Any] | None = None
     for step in rubric["steps"]:
         if step["id"] == "proof_account" and not has_proof_account(work / "source", mechanical):
@@ -2180,7 +2334,7 @@ def run_review(args: argparse.Namespace) -> int:
         schema = (
             SYNTHESIS_SCHEMA if step["id"] == "synthesis" else step_schema_for_rubric(step, rubric_version)
         )
-        result = engine_result(
+        result, usage = engine_result(
             prompt,
             engine=args.engine,
             command=args.command,
@@ -2189,7 +2343,9 @@ def run_review(args: argparse.Namespace) -> int:
             schema=schema,
             raw_path=work / "raw" / f"{step['id']}.txt",
             allow_network=step["id"] == "literature_notability",
+            reasoning_effort=args.reasoning_effort,
         )
+        spend.append({"step": step["id"], "usage": usage, "usd": usage_cost(model_id, usage)})
         if step["id"] == "synthesis":
             synthesis = result
         else:
@@ -2199,6 +2355,9 @@ def run_review(args: argparse.Namespace) -> int:
             write_json(work / "passes" / f"{step['id']}.json", result)
     if synthesis is None:
         raise ReviewerError("rubric did not produce a synthesis result")
+    accounting = review_spend(model_id, spend)
+    write_json(work / "spend.json", accounting)
+    print(spend_summary(accounting), file=sys.stderr)
     if rubric_version >= 2:
         validate_synthesis_policy(
             synthesis,
@@ -3008,6 +3167,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--policy-ref", default="main")
     run_parser.add_argument("--engine", choices=("codex", "claude", "command"), default="codex")
     run_parser.add_argument("--model")
+    run_parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high"),
+        help="reasoning effort for engines that expose it (codex)",
+    )
     run_parser.add_argument("--command")
     run_parser.add_argument("--apply", action="store_true", help="deliver the inspected review privately to the submitter")
     run_parser.set_defaults(func=run_review)

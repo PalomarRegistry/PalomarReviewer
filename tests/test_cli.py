@@ -339,7 +339,7 @@ class ReviewerTests(unittest.TestCase):
                         raw_path=output,
                         allow_network=True,
                     ),
-                    {},
+                    ({}, {}),
                 )
 
             argv = runner.call_args.args[0]
@@ -1861,6 +1861,83 @@ class MechanicalReportContractTests(unittest.TestCase):
             self.validate(self.submission_block(
                 authorization={"relationship": "legacy-unspecified"}
             ))
+
+
+class SpendAccountingTests(unittest.TestCase):
+    """What a review cost is read from the engine, never estimated."""
+
+    EVENTS = "\n".join([
+        '{"type":"thread.started","thread_id":"t"}',
+        '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,'
+        '"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":5}}',
+        'not json at all',
+        '{"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":0,'
+        '"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":1}}',
+    ])
+
+    def test_every_completed_turn_is_counted(self):
+        """A pass that retried cost twice; reporting the last turn understates it."""
+        self.assertEqual(
+            cli.codex_usage(self.EVENTS),
+            {"input_tokens": 150, "cached_input_tokens": 40, "cache_write_input_tokens": 0,
+             "output_tokens": 14, "reasoning_output_tokens": 6},
+        )
+
+    def test_only_completed_turns_count(self):
+        """An in-progress usage snapshot would be added to the completed one."""
+        events = "\n".join([
+            '{"type":"turn.progress","usage":{"input_tokens":999,"output_tokens":999}}',
+            '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,'
+            '"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}',
+        ])
+        self.assertEqual(cli.codex_usage(events)["input_tokens"], 10)
+        self.assertEqual(cli.codex_usage(events)["output_tokens"], 2)
+
+    def test_malformed_and_unrelated_events_are_ignored(self):
+        self.assertEqual(cli.codex_usage("")["input_tokens"], 0)
+        self.assertEqual(cli.codex_usage('{"type":"turn.completed"}')["input_tokens"], 0)
+        self.assertEqual(
+            cli.codex_usage('{"type":"turn.completed","usage":{"input_tokens":-5}}')["input_tokens"],
+            0,
+        )
+
+    def test_an_unpriced_model_records_tokens_and_no_money(self):
+        usage = cli.codex_usage(self.EVENTS)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PALOMAR_MODEL_PRICES", None)
+            self.assertIsNone(cli.usage_cost("some-unpriced-model", usage))
+        accounting = cli.review_spend("some-unpriced-model", [
+            {"step": "metadata", "usage": usage, "usd": None},
+        ])
+        self.assertIsNone(accounting["usd"])
+        self.assertEqual(accounting["usage"]["input_tokens"], 150)
+        self.assertIn("No price is recorded", cli.spend_summary(accounting))
+
+    def test_a_priced_model_converts_tokens_to_money(self):
+        prices = json.dumps({"m": {"input": 1.0, "cached_input": 0.1, "output": 10.0}})
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000}
+        with mock.patch.dict(os.environ, {"PALOMAR_MODEL_PRICES": prices}):
+            # 500k uncached at $1/M, 500k cached at $0.10/M, 100k out at $10/M.
+            self.assertAlmostEqual(cli.usage_cost("m", usage), 0.5 + 0.05 + 1.0, places=6)
+
+    def test_a_partly_priced_review_reports_no_total(self):
+        """A review that cost money must never be recorded as costing nothing."""
+        accounting = cli.review_spend("m", [
+            {"step": "metadata", "usage": {"input_tokens": 1}, "usd": 0.25},
+            {"step": "synthesis", "usage": {"input_tokens": 1}, "usd": None},
+        ])
+        self.assertIsNone(accounting["usd"])
+
+    def test_the_spend_is_kept_with_the_private_record_and_accumulates(self):
+        state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
+                 "spend": [{"usd": 0.5}]}
+        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept"}
+        with (
+            mock.patch.object(cli, "put_state"),
+            mock.patch.object(cli, "state_json", return_value=None),
+        ):
+            updated = cli.deliver_review(state, review, {"usd": 1.25})
+        self.assertEqual([entry["usd"] for entry in updated["spend"]], [0.5, 1.25])
 
 
 class TrustedRunSelectionTests(unittest.TestCase):
