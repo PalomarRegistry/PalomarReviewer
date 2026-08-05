@@ -104,7 +104,7 @@ class ReviewerTests(unittest.TestCase):
                 ],
                 "trust_level": "high",
             },
-            "solution": {"sha256": "3" * 64},
+            "solution": {"sha256": "3" * 64, "path": "Solution.lean"},
             "lean_toolchain": "leanprover/lean4:v4.31.0",
             "comparator": {
                 "theorem_names": ["Example.result"],
@@ -555,7 +555,7 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_keeps_report_v2_on_schema_v5(self):
+    def test_registry_record_carries_the_single_schema(self):
         record = registry_record(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
                    "repository": "example/project", "commit": "1" * 40},
@@ -601,7 +601,7 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_run_attempt": 1,
             },
         )
-        self.assertEqual(record["schema_version"], 5)
+        self.assertEqual(record["schema_version"], 1)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         # Identifiers are allocated at random, so publishing one reveals
@@ -611,7 +611,7 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v5.json").read_text())
+            schema = json.loads((Path(database) / "schema-v1.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -707,7 +707,7 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_run_attempt": 1,
             },
         )
-        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["schema_version"], 1)
         self.assertEqual(record["source"]["project_path"], "examples/comparator")
         self.assertEqual(
             record["formalization"]["lakefile_path"],
@@ -938,7 +938,7 @@ class ReviewerTests(unittest.TestCase):
                     ["git", "clone", "--quiet", str(database_source), str(destination)],
                     check=True,
                 )
-                shutil.copy(database_source / "schema-v6.json", destination / "schema-v6.json")
+                shutil.copy(database_source / "schema-v1.json", destination / "schema-v1.json")
                 shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
                 return database_head
 
@@ -983,7 +983,7 @@ class ReviewerTests(unittest.TestCase):
             database = work / "database"
             entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
             record = json.loads(entry_path.read_text())
-            self.assertEqual(record["schema_version"], 5)
+            self.assertEqual(record["schema_version"], 1)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -1442,8 +1442,24 @@ class ReviewerTests(unittest.TestCase):
                     "repository_url": source["repository_url"],
                     "commit": source["commit"],
                 },
-                "challenge": {"sha256": source["challenge_sha256"]},
+                "challenge": {"sha256": source["challenge_sha256"], "path": "Challenge.lean"},
+                "solution": {"sha256": "b" * 64, "path": "Solution.lean"},
+                "comparator": {"path": "comparator.json"},
+                "formalization": {"path": "formalization.yaml"},
+                "lakefile": {"path": "lakefile.toml"},
+                "lean_toolchain_path": "lean-toolchain",
             }
+            report["source"] = {
+                **source,
+                "project_path": "",
+                "challenge_path": "Challenge.lean",
+                "solution_path": "Solution.lean",
+                "comparator_config_path": "comparator.json",
+                "lakefile_path": "lakefile.toml",
+                "lean_toolchain_path": "lean-toolchain",
+            }
+            report["schema_version"] = 2
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
             validated, validated_bundle = validate_render_result(result, mechanical)
             self.assertEqual(validated["artifact_tree_sha256"], tree_hash)
             self.assertEqual(validated_bundle, bundle)
@@ -1466,8 +1482,19 @@ class ReviewerTests(unittest.TestCase):
             report["source"] = nested_source
             (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
             self.assertEqual(validate_render_result(result, nested)[0]["schema_version"], 2)
-            report.pop("schema_version")
-            report["source"] = dict(source)
+            report["schema_version"] = 2
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+
+            # Back to the flat fixture, which is what the checks below use.
+            report["source"] = {
+                **source,
+                "project_path": "",
+                "challenge_path": "Challenge.lean",
+                "solution_path": "Solution.lean",
+                "comparator_config_path": "comparator.json",
+                "lakefile_path": "lakefile.toml",
+                "lean_toolchain_path": "lean-toolchain",
+            }
             (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
 
             with mock.patch("palomar_reviewer.cli.MAX_RENDER_FILE_BYTES", 1):

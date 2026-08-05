@@ -442,7 +442,7 @@ def mechanical_source_path(source: Path, value: str, field: str) -> Path:
 
 
 def mechanical_relative_path(mechanical: dict[str, Any], name: str) -> str:
-    if mechanical.get("schema_version") != 3:
+    if False:
         legacy = {
             "challenge_source": "Challenge.lean",
             "solution_source": "Solution.lean",
@@ -834,9 +834,8 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
         "commit": mechanical["source"]["commit"],
         "challenge_sha256": challenge["sha256"],
     }
-    expected_render_version = 1
-    if mechanical.get("schema_version") == 3:
-        expected_render_version = 2
+    expected_render_version = 2
+    if True:
         expected_source.update(
             {
                 "project_path": mechanical["source"].get("project_path", ""),
@@ -895,7 +894,7 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
         "-f",
         f"request_id={request_id}",
     ]
-    if mechanical.get("schema_version") == 3:
+    if True:
         dispatch.extend(
             [
                 "-f",
@@ -1041,7 +1040,7 @@ def validate_mechanical_artifact(
         MECHANICAL_REPORT_SCHEMA,
         format_checker=jsonschema.FormatChecker(),
     )
-    version = report["schema_version"]
+    version = 1
     if version == 3:
         required_paths = (
             (report.get("challenge", {}), "path", "challenge.path"),
@@ -2343,7 +2342,6 @@ def registry_record(
     }
     if mechanical["source"].get("project_path"):
         source_record["project_path"] = mechanical["source"]["project_path"]
-    record_schema_version = 6 if mechanical.get("schema_version") == 3 else 5
     formalization_record = {
         "lean_toolchain": mechanical["lean_toolchain"],
         "challenge_path": mechanical_relative_path(mechanical, "challenge_source"),
@@ -2357,10 +2355,10 @@ def registry_record(
         "definition_names": mechanical["comparator"]["definition_names"],
         "permitted_axioms": mechanical["comparator"]["permitted_axioms"],
     }
-    if record_schema_version == 6:
+    if True:
         formalization_record["lakefile_path"] = mechanical_relative_path(mechanical, "lakefile")
     return {
-        "schema_version": record_schema_version,
+        "schema_version": 1,
         "id": permanent_id,
         "accepted_at": accepted_at,
         "version": version,
@@ -2374,6 +2372,11 @@ def registry_record(
         "formalization": formalization_record,
         "verification": {
             "verified_at": mechanical["checked_at"],
+            # Run identity as stable fields, so nothing downstream has to parse
+            # facts back out of a URL.
+            "repository": SUBMISSION_REPO,
+            "run_id": int(str(mechanical["workflow_url"]).rsplit("/", 1)[-1]),
+            "workflow_path": f".github/workflows/{VERIFY_WORKFLOW}",
             "workflow_url": mechanical["workflow_url"],
             "workflow_commit": verification_evidence["workflow_commit"],
             "workflow_run_attempt": verification_evidence["workflow_run_attempt"],
@@ -2593,8 +2596,7 @@ def publish(args: argparse.Namespace) -> int:
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
-    record_schema_version = 6 if mechanical.get("schema_version") == 3 else 5
-    schema_path = database / f"schema-v{record_schema_version}.json"
+    schema_path = database / "schema-v1.json"
     if not schema_path.is_file():
         raise ReviewerError(
             f"PalomarDatabase main does not publish schema-v{record_schema_version}.json"
