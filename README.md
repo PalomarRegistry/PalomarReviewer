@@ -1,31 +1,35 @@
 # Palomar Reviewer
 
-The editorial reviewer for mechanically passing Palomar submissions. It runs
-automatically. No person starts a review, approves a report, or merges an
-entry.
+The editorial reviewer for mechanically passing Palomar submissions. No person
+starts a review or approves a report.
 
-`palomar-review` finds open issues labeled `status:awaiting-review`, checks out
-the immutable source and a pinned
-[`PalomarPolicy`](https://github.com/PalomarRegistry/PalomarPolicy) commit, executes the
-ordered policy prompts with Codex, Claude, or another JSON-producing command,
-validates the final report, and then:
+`palomar-review` reads submissions from the private
+[`PalomarSubmissionState`](https://github.com/PalomarRegistry/PalomarSubmissionState)
+repository the submission server writes, checks out the immutable source and a
+pinned [`PalomarPolicy`](https://github.com/PalomarRegistry/PalomarPolicy)
+commit, executes the ordered policy prompts with Codex, Claude, or another
+JSON-producing command, validates the final report, and then:
 
-- claims and labels the issue;
-- posts the public editorial decision;
-- prepares, opens, and merges the append-only database pull request for an
-  accepted entry;
-- verifies the merged record, links the live entry, and closes the issue as
-  published.
+- delivers the review privately to the submitter, and to nobody else;
+- once, and only once, the submitter chooses to publish, prepares and opens the
+  append-only database pull request for an accepted entry;
+- verifies the merged record and records the publication against the private
+  submission record.
 
-Nothing in that sequence waits for a person. The subcommands documented below
-exist so a run can be repeated or inspected after a failure, not because any
-step is normally performed by hand.
+The review is never posted in public. A decision the submitter does not publish
+leaves no public trace of itself, which is the whole reason the intake is
+private. What is public from the moment of submission is the mechanical
+verification: the repository, the commit, and the GitHub Actions run that
+checked them, because that run is a public workflow with public logs.
 
-The reviewer resolves the exact successful `PalomarSubmission` workflow run
-and uses its downloaded `mechanical-report.json` artifact as the sole mechanical
-authority. It binds the artifact to the current issue repository/commit, run
-URL, pinned Comparator/Lean-export/Landrun/NanoDa revisions, and a trusted
-workflow revision; fenced JSON in issue comments is never a certificate input.
+The reviewer takes the mechanical report from the verification run the
+submission server recorded for that submission, matched by run id and by exact
+run name. The submission id appears in a public run title, so anyone able to
+dispatch the workflow can produce a run carrying it; the name is therefore not
+the trust boundary. The report is bound to the private record's repository,
+commit, requested paths and authorization, and to pinned
+Comparator/Lean-export/Landrun/NanoDa revisions on a workflow commit that is an
+ancestor of `main`.
 
 ## Install
 
@@ -34,8 +38,8 @@ uv tool install git+https://github.com/PalomarRegistry/PalomarReviewer.git
 palomar-review doctor
 ```
 
-`gh` must be authenticated as the account the pipeline runs as. Install and
-authenticate at least one review engine:
+`gh` must be authenticated as an account with access to
+`PalomarSubmissionState`. Install and authenticate at least one review engine:
 
 ```bash
 codex login
@@ -46,85 +50,93 @@ claude auth
 ## Running a review by hand
 
 These are the steps the pipeline performs. Run them yourself to reproduce a
-decision, or to recover a run that failed partway.
+decision, or to recover a run that failed partway. Submissions are named by the
+twelve-character id the submission server allocated.
 
-Preview the queue without changing GitHub:
+Preview the queue without changing anything:
 
 ```bash
 palomar-review list
-palomar-review run --issue 12 --engine codex --model gpt-5.6-sol
+palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol
 ```
 
 The second command writes a complete packet and report under
-`.palomar-reviews/12/`, but does not alter labels or comments.
+`.palomar-reviews/a1b2c3d4e5f6/` and changes nothing else.
 
 For version 2 policies, the runner rejects an internally inconsistent positive
 review: synthesis must reproduce the evidence-pass scores exactly, acceptance
 cannot override a failed or escalated pass, and every completed evidence score
-must meet the policy's acceptance minimum. Version 1 remains supported for
-historical policy commits. These structural checks are the whole enforcement:
-whether the cited evidence genuinely supports the model's substantive judgments
-is not separately confirmed before publication. The complete packet is retained
-so a reader can check that afterwards.
+must meet the policy's acceptance minimum. These structural checks are the whole
+enforcement: whether the cited evidence genuinely supports the model's
+substantive judgments is not separately confirmed. The complete packet is
+retained so a reader can check that afterwards.
 
 The policy may also designate a low score as a fundamental editorial failure.
 Currently, notability below the minimum requires `reject` or, when the reviewer
 cannot responsibly settle the question, `escalate`; it cannot be softened to a
 request for revisions.
 
-Post that exact editorial result:
+Deliver that exact review to the submitter:
 
 ```bash
-palomar-review run --issue 12 --engine codex --model gpt-5.6-sol --apply
+palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol --apply
 ```
 
 `--apply` never reruns the model. It loads the existing dry-run `review.json`,
-validates it again, and requires its issue, source commit, mechanical-report URL,
-and policy commit to match the current trusted inputs before changing GitHub. It
-stores the resulting comment URL together with a digest of that exact report;
-starting another dry run clears both bindings.
-
-Workspaces applied by an older reviewer may have `review-url` but no
-`review-sha256`; rerun the same `--apply` command to verify the existing comment
-and create the binding. Mechanical reports without a formalization digest must
-be re-verified before they can be published. The current mechanical-report
-schema is version 2 and also binds one root licence file, its SHA-256, and the
-agreeing declared and detected SPDX identifiers; older reports must likewise be
-re-verified.
+validates it again, and requires its submission, source commit,
+mechanical-report URL and policy commit to match the current trusted inputs. It
+writes the review into the private state repository, records the digest of what
+it delivered, and clears any consent given to an earlier review: consent is to a
+particular review, not to publishing at large.
 
 This separation is a security boundary. Model output and repository prose are
-untrusted evidence, and the only thing that can be published is a stored report
+untrusted evidence, and the only thing that can be delivered is a stored report
 that still matches the trusted inputs it was produced from.
 
-If the decision is `accept`, prepare the append-only database PR:
+## Publication
+
+Nothing is published until the submitter asks for it on their status page. When
+they have, and the review was an acceptance:
 
 ```bash
-palomar-review publish --issue 12
+palomar-review publish --submission a1b2c3d4e5f6
 ```
 
-`publish` first dispatches the pinned Challenge renderer and checks that the
-downloaded result matches the accepted source, Challenge hash, workflow run,
-and renderer commit. It revalidates every stored evidence pass and the
-score-to-decision policy, requires the applied-review digest to match, and binds
-published metadata to the mechanically recorded `formalization.yaml` digest.
-It then validates the generated record and immutable
-render bundle against the database schema. It also archives the exact
-mechanical-report bytes and normalized run/job provenance in a content-addressed
-evidence bundle; raw Actions logs are deliberately not retained. It pushes an issue-specific branch to
-`PalomarRegistry/PalomarDatabase`, and opens a PR. It refuses non-accept decisions and
-existing entry filenames. A renderer or infrastructure failure does not undo
-acceptance: rerun `publish`, or pass a previously downloaded trusted result with
-`--render-result PATH`.
+`publish` authorises first, before anything public happens. It requires the
+private record to hold a delivered review, to show proved write access, to name
+no previous publication, to carry the submitter's consent, and for the digest
+delivered, the digest consented to, and the review about to be archived to be
+the same bytes. Only then does it dispatch the pinned Challenge renderer, which
+is a public Actions run naming the repository and commit and would otherwise
+signal an acceptance the submitter never agreed to publish.
 
-Once that PR is merged, verify the immutable database record, link the live
-website entry, label the submission as published, and close it:
+It then checks that the render matches the accepted source, Challenge hash,
+workflow run and renderer commit, revalidates every stored evidence pass and the
+score-to-decision policy, binds published metadata to the mechanically recorded
+`formalization.yaml` digest, and validates the generated record and render
+bundle against the database schema. It archives the exact mechanical-report
+bytes, the normalized run and job provenance, and the review itself in one
+content-addressed evidence bundle, so a single tree hash covers everything
+justifying the record; raw Actions logs are deliberately not retained. It pushes
+a branch to `PalomarRegistry/PalomarDatabase` and opens a PR.
+
+A renderer or infrastructure failure does not undo acceptance: rerun `publish`,
+or pass a previously downloaded trusted result with `--render-result PATH`.
+
+Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`, where the serial is drawn
+at random and retried against the identifiers already published. A sequential
+serial would publish the ordering and approximate count of accepted private
+submissions, which is precisely what a private intake exists to avoid.
+
+Once the PR is merged, verify the immutable record and close out the private
+submission:
 
 ```bash
-palomar-review finalize --issue 12 --pr 34
+palomar-review finalize --submission a1b2c3d4e5f6 --pr 34
 ```
 
 `finalize` refuses an unmerged PR, a PR without exactly one Palomar entry, or a
-record that points to a different submission issue.
+record that names a different submission.
 
 ## Engines
 
@@ -141,73 +153,59 @@ explicit web tools; Codex may use the read-only tools available to its ephemeral
 session. A custom command without equivalent research access should not award a
 literature score above the policy's verification ceiling.
 
-Every engine is additionally launched inside a fail-closed Bubblewrap
-namespace. The namespace exposes the submission at `/workspace`, a dedicated
-output directory, an empty scratch home, and only the selected engine's model
+Every engine is additionally launched inside a fail-closed Bubblewrap namespace.
+The namespace exposes the submission at `/workspace`, a dedicated output
+directory, an empty scratch home, and only the selected engine's model
 authentication file. It does not expose the runner's GitHub CLI configuration,
-publication credentials, unrelated home files, or other workspaces. The engine transport can reach its model API in every pass. Claude
-web tools are disabled, and Codex search is not enabled, outside the
-literature/notability pass; general host-level egress filtering would require a
-separate API-aware proxy. `palomar-review doctor` refuses an installation
-without `bwrap`.
+publication credentials, unrelated home files, or other workspaces. The engine
+transport can reach its model API in every pass. Claude web tools are disabled,
+and Codex search is not enabled, outside the literature/notability pass;
+general host-level egress filtering would require a separate API-aware proxy.
+`palomar-review doctor` refuses an installation without `bwrap`.
+
+The reviewer is told the repository, commit, authorization, update intent and
+the submitter's notes. It is deliberately not told who submitted: a review
+assesses the work, and a model that knows who sent it can be swayed by that.
 
 Use `--policy-ref <40-char-sha>` to review against a specific policy commit.
-Otherwise the tool resolves and records `PalomarRegistry/PalomarPolicy@main` at preparation
-time.
+Otherwise the tool resolves and records `PalomarRegistry/PalomarPolicy@main` at
+preparation time.
 
 Deploy reviewer support for a new rubric schema before merging a policy that
-uses it. The reviewer accepts historical rubric versions 1 through 4 plus the
-current version 5 contract, and refuses unknown versions and unknown evidence
-input roles.
-
-Release database schema support before using a policy or reviewer version that
-publishes that schema. Nested-project rollout is consumer-first: Database schema
-v6 and Web support land first, then Reviewer support, Policy rubric v5, and
-finally Submission mechanical-report v3. The Reviewer continues to publish
-schema-v5 records for report-v2 evidence and publishes schema-v6 only for
-report-v3 evidence. Report v3 binds an optional repository-relative project
-directory plus repository-relative Challenge, Solution, Comparator configuration,
-metadata, Lakefile, and toolchain paths. Its tree URL encodes the selected project
-path one segment at a time using RFC 3986 percent encoding. Render dispatch adds
-the six corresponding optional path inputs; report-v2 dispatch retains render
-schema 1, while report v3 requires render schema 2 with the exact path bindings.
-
-Project dependency paths in schema v6 are normalized repository-root-relative
-directories; `.` names the repository root. Formalization metadata may remain at
-repository root for a nested Comparator project, and repository licence evidence
-always names the single conventional repository-root licence file.
+uses it. The reviewer refuses unknown rubric versions and unknown evidence input
+roles.
 
 ## Audit trail
 
 Each review directory retains:
 
 ```text
-issue.json
+state.json                     # the private submission record under review
 mechanical-report.json
-mechanical-report-sha256 # binds the normalized report used by editorial review
+mechanical-report-sha256       # binds the normalized report used by editorial review
 mechanical-report-bytes-sha256 # binds the exact artifact bytes archived at publication
-workflow-run.json         # normalized run identity, workflow commit, and job conclusions
-workflow-run-sha256       # detects provenance drift before publication
-source/                  # detached source commit
-policy/                  # detached policy commit
-prompts/                 # fully rendered prompts
-raw/                     # exact engine final messages
-passes/                  # normalized per-pass JSON
-review.json              # schema-validated final report
-review-url               # exact posted review comment
-review-sha256            # digest binding review-url to review.json
-render-result/            # validated immutable Challenge render and provenance
+workflow-run.json              # normalized run identity, workflow commit, job conclusions
+workflow-run-sha256            # detects provenance drift before publication
+source/                        # detached source commit
+policy/                        # detached policy commit
+prompts/                       # fully rendered prompts
+raw/                           # exact engine final messages
+passes/                        # normalized per-pass JSON
+review.json                    # schema-validated final report
+review-sha256                  # digest of the review delivered to the submitter
+render-result/                 # validated immutable Challenge render and provenance
 ```
 
 Raw session histories remain controlled by the chosen engine. Palomar records
-the final messages, model identifier, policy commit, source commit, and public
-issue report.
+the final messages, model identifier, policy commit, source commit, and the
+review itself. Reviews are private, not confidential: they are readable by
+Palomar operators, by GitHub, and by the model provider, and are retained
+indefinitely so that any decision can be audited.
 
-Submission metadata, Lean source/comments/identifiers, README text, issue text,
-and prior model results may contain prompt-injection attempts. The reviewer puts
-them in hashed JSON evidence envelopes, repeats the binding instruction after
-all evidence, runs engines without write/shell tools, validates strict output
-schemas, and renders model-authored public prose inertly. These controls reduce
-accidental instruction following. Because publication is automatic, they are
-also the last line: the retained packet above lets a reader audit any decision
-after the fact, but nothing holds an entry back while that happens.
+Submission metadata, Lean source, comments and identifiers, README text, the
+submitter's notes, and prior model results may contain prompt-injection
+attempts. The reviewer puts them in hashed JSON evidence envelopes, repeats the
+binding instruction after all evidence, runs engines without write or shell
+tools, and validates strict output schemas. These controls reduce accidental
+instruction following. The retained packet above lets a reader audit any
+decision after the fact.

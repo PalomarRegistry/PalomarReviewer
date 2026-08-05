@@ -1,4 +1,6 @@
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -1791,6 +1793,29 @@ class PublicationIdentityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReviewerError, "already associated with another"):
             self.resolve(database, existing_id="PALOMAR-2026-08-01-000013")
+
+
+class QueueListingTests(unittest.TestCase):
+    def test_the_listing_orders_by_arrival_and_omits_the_submitter(self):
+        """Ids are random, so arrival is the only meaningful order."""
+        records = [
+            {"id": "bbbbbbbbbbbb", "created_at": "2026-08-02T00:00:00Z",
+             "repository": "example/second", "commit": "2" * 40,
+             "submitter": "someone", "run": {"id": 102}},
+            {"id": "aaaaaaaaaaaa", "created_at": "2026-08-01T00:00:00Z",
+             "repository": "example/first", "commit": "1" * 40,
+             "submitter": "someone-else", "run": {"id": 101}},
+        ]
+        printed = io.StringIO()
+        with (
+            mock.patch.object(cli, "queue", return_value=records),
+            contextlib.redirect_stdout(printed),
+        ):
+            cli.list_queue(SimpleNamespace())
+        lines = printed.getvalue().splitlines()
+        self.assertEqual([line.split("\t")[0] for line in lines],
+                         ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+        self.assertNotIn("someone", printed.getvalue())
 
 
 class MechanicalReportContractTests(unittest.TestCase):
