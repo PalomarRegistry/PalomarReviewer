@@ -633,7 +633,6 @@ class ReviewerTests(unittest.TestCase):
                 "evidence_tree_sha256": "e" * 64,
                 "mechanical_report_sha256": "f" * 64,
                 "review_sha256": "e" * 64,
-                "review_sha256": "e" * 64,
                 "workflow_commit": "8" * 40,
                 "workflow_run_attempt": 1,
             },
@@ -738,7 +737,6 @@ class ReviewerTests(unittest.TestCase):
                 "evidence_path": "evidence/PALOMAR-2026-08-01-000012-v1/" + "e" * 64 + "/",
                 "evidence_tree_sha256": "e" * 64,
                 "mechanical_report_sha256": "f" * 64,
-                "review_sha256": "e" * 64,
                 "review_sha256": "e" * 64,
                 "workflow_commit": "8" * 40,
                 "workflow_run_attempt": 1,
@@ -1653,6 +1651,84 @@ class IdentifierAllocationTests(unittest.TestCase):
         """Sequential allocation would publish the exact ordering of accepts."""
         seen = {allocate_identifier("2026-08-05", set()) for _ in range(40)}
         self.assertGreater(len(seen), 30, "identifiers look sequential")
+
+
+class PublicationIdentityTests(unittest.TestCase):
+    """One submission gets one permanent identifier, and it is not guessable."""
+
+    def database(self, *entries) -> Path:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "entries").mkdir()
+        for record in entries:
+            (root / "entries" / f"{record['id']}-v{record['version']}.json").write_text(
+                json.dumps(record)
+            )
+        return root
+
+    def prior(self, identifier="PALOMAR-2026-08-01-000012", submission="a1b2c3d4e5f6", version=1):
+        return {
+            "id": identifier,
+            "version": version,
+            "accepted_at": "2026-08-01",
+            "source": {"repository": "example/project"},
+            "submission": {"submission_id": submission},
+        }
+
+    def resolve(self, database, *, submission="a1b2c3d4e5f6", existing_id=None):
+        return publication_identity(
+            database,
+            submission_id=submission,
+            existing_id=existing_id,
+            reviewed_at="2026-08-01T12:00:00Z",
+            mechanical={"source": {"repository": "example/project"}},
+        )
+
+    def test_a_new_submission_gets_a_random_dated_identifier(self):
+        identifier, accepted_at, version = self.resolve(self.database())
+        self.assertRegex(identifier, r"\APALOMAR-2026-08-01-[0-9]{6}\Z")
+        self.assertEqual((accepted_at, version), ("2026-08-01", 1))
+
+    def test_identifiers_are_not_sequential(self):
+        """A sequential serial would publish the count of private acceptances."""
+        seen = {self.resolve(self.database())[0] for _ in range(25)}
+        self.assertGreater(len(seen), 1)
+
+    def test_a_second_publication_of_one_submission_needs_an_update(self):
+        database = self.database(self.prior())
+        with self.assertRaisesRegex(ReviewerError, "already has a permanent ID"):
+            self.resolve(database)
+
+    def test_an_update_takes_the_next_version_and_the_original_date(self):
+        database = self.database(self.prior())
+        identifier, accepted_at, version = self.resolve(
+            database, submission="b2c3d4e5f6a1", existing_id="PALOMAR-2026-08-01-000012"
+        )
+        self.assertEqual(
+            (identifier, accepted_at, version), ("PALOMAR-2026-08-01-000012", "2026-08-01", 2)
+        )
+
+    def test_an_update_to_an_unpublished_identifier_is_refused(self):
+        with self.assertRaisesRegex(ReviewerError, "not in the database"):
+            self.resolve(self.database(), existing_id="PALOMAR-2026-08-01-999999")
+
+    def test_an_update_from_another_repository_is_refused(self):
+        """An update must come from the repository the current version names."""
+        prior = self.prior()
+        prior["source"]["repository"] = "someone-else/project"
+        with self.assertRaisesRegex(ReviewerError, "comes from example/project"):
+            self.resolve(
+                self.database(prior),
+                submission="b2c3d4e5f6a1",
+                existing_id="PALOMAR-2026-08-01-000012",
+            )
+
+    def test_a_submission_cannot_be_moved_onto_a_second_identifier(self):
+        database = self.database(
+            self.prior(),
+            self.prior(identifier="PALOMAR-2026-08-01-000013", submission="b2c3d4e5f6a1"),
+        )
+        with self.assertRaisesRegex(ReviewerError, "already associated with another"):
+            self.resolve(database, existing_id="PALOMAR-2026-08-01-000013")
 
 
 class PublicationAuthorizationTests(unittest.TestCase):
