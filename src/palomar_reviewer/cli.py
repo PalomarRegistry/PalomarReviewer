@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import secrets
 import argparse
 import copy
 import datetime as dt
@@ -29,7 +31,8 @@ import yaml
 # is frozen until schema-v7 restructures submission identity. GitHub redirects
 # the old name for every API call, so the reviewer keeps working meanwhile.
 # Move this in the same change that introduces schema-v7.
-SUBMISSION_REPO = "kim-em/PalomarSubmission"
+SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
+STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
 DATABASE_REPO = "PalomarRegistry/PalomarDatabase"
 RENDER_WORKFLOW = "render-challenge.yml"
@@ -45,12 +48,13 @@ REVIEW_MARKER = "<!-- palomar-editorial-review -->"
 CLAIM_MARKER = "<!-- palomar-review-claim -->"
 PUBLICATION_MARKER = "<!-- palomar-publication -->"
 WEB_URL = "https://palomar-registry.org"
+SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<issue>[0-9]{6})")
 ISSUE_HEADING_RE = re.compile(r"(?m)^### (?P<heading>[^\n]+)\s*$")
 ISSUE_SOURCE_RE = re.compile(
     r"^https://github\.com/(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
-STATUS_LABELS = (
+_UNUSED_STATUS_LABELS = (
     "status:awaiting-review",
     "status:review-in-progress",
     "status:accepted",
@@ -83,7 +87,7 @@ RUBRIC_EVIDENCE_INPUTS = {
     "comparator_config",
     "formalization.yaml",
     "formalization_metadata",
-    "issue",
+    "submission",
     "lakefile",
     "lakefile.lean",
     "lakefile.toml",
@@ -172,7 +176,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "schema_version",
         "status",
         "stage",
-        "issue",
+        "submission",
         "source",
         "challenge",
         "solution",
@@ -189,15 +193,14 @@ MECHANICAL_REPORT_SCHEMA = {
         "license",
     ],
     "properties": {
-        "schema_version": {"enum": [2, 3]},
+        "schema_version": {"const": 1},
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
-        "issue": {
+        "submission": {
             "type": "object",
-            "required": ["number", "submitter", "authorization"],
+            "required": ["submission_id", "authorization"],
             "properties": {
-                "number": {"type": "integer", "minimum": 1},
-                "submitter": {"type": "string", "minLength": 1},
+                "submission_id": {"type": "string", "pattern": "^[0-9a-z]{12}$"},
                 "authorization": {
                     "type": "object",
                     "additionalProperties": False,
@@ -773,7 +776,7 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
     if bundle.exists():
         shutil.rmtree(bundle)
     bundle.mkdir()
-    for name in ("mechanical-report.json", "workflow-run.json"):
+    for name in ("mechanical-report.json", "workflow-run.json", "review.json"):
         source = work / name
         if source.is_symlink() or not source.is_file():
             raise ReviewerError(f"publication requires a regular {name}")
@@ -798,10 +801,12 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
         {"schema_version": 1, "evidence_tree_sha256": tree_hash, "files": files},
     )
     report = next(item for item in files if item["path"] == "mechanical-report.json")
+    archived_review = next(item for item in files if item["path"] == "review.json")
     provenance = load_json(bundle / "workflow-run.json")
     return bundle, {
         "evidence_tree_sha256": tree_hash,
         "mechanical_report_sha256": report["sha256"],
+        "review_sha256": archived_review["sha256"],
         "workflow_commit": provenance["workflow_commit"],
         "workflow_run_attempt": provenance["run_attempt"],
     }
@@ -980,95 +985,22 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
     return download
 
 
-def queue() -> list[dict[str, Any]]:
-    return json.loads(
-        gh(
-            [
-                "issue",
-                "list",
-                "--repo",
-                SUBMISSION_REPO,
-                "--state",
-                "open",
-                "--label",
-                "status:awaiting-review",
-                "--limit",
-                "100",
-                "--json",
-                "number,title,url,author,createdAt,labels,body",
-            ]
-        )
-    )
 
 
-def issue_data(number: int) -> dict[str, Any]:
-    return json.loads(
-        gh(
-            [
-                "issue",
-                "view",
-                str(number),
-                "--repo",
-                SUBMISSION_REPO,
-                "--json",
-                "number,title,url,author,body,state,labels,comments,createdAt",
-            ]
-        )
-    )
 
 
-def trusted_verification_runs(issue_number: int, issue_title: str) -> tuple[list[dict[str, Any]], bool]:
-    runs = json.loads(
-        gh(
-            [
-                "run",
-                "list",
-                "--repo",
-                SUBMISSION_REPO,
-                "--workflow",
-                VERIFY_WORKFLOW,
-                "--event",
-                "issues",
-                "--limit",
-                "1000",
-                "--json",
-                (
-                    "databaseId,displayTitle,status,conclusion,url,headSha,headBranch,"
-                    "event,createdAt,updatedAt,attempt,workflowName"
-                ),
-            ]
-        )
-    )
-    if not isinstance(runs, list):
-        raise ReviewerError("GitHub returned a malformed verification-run list")
-    eligible = [
-        item
-        for item in runs
-        if isinstance(item, dict)
-        and item.get("event") == "issues"
-        and item.get("headBranch") == "main"
-        and item.get("status") == "completed"
-        and item.get("conclusion") == "success"
-        and isinstance(item.get("databaseId"), int)
-        and isinstance(item.get("createdAt"), str)
-    ]
-    eligible.sort(key=lambda item: (item["createdAt"], item["databaseId"]), reverse=True)
-    expected_title = f"Verify submission #{issue_number}"
-    exact = [item for item in eligible if item.get("displayTitle") == expected_title]
-    legacy = [item for item in eligible if item.get("displayTitle") == issue_title]
-    return (exact or legacy), bool(exact)
 
 
 def download_mechanical_artifact(
     run_id: int,
-    issue_number: int,
+    submission_id: int,
     destination: Path,
 ) -> Path:
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
     errors: list[str] = []
-    for name in (f"mechanical-report-{issue_number}", "mechanical-report"):
+    for name in (f"mechanical-report-{submission_id}", "mechanical-report"):
         proc = run(
             [
                 "gh",
@@ -1097,42 +1029,12 @@ def download_mechanical_artifact(
     raise ReviewerError(f"could not download trusted mechanical report artifact: {detail}")
 
 
-def issue_source_fields(issue: dict[str, Any]) -> dict[str, str]:
-    body = issue.get("body")
-    if not isinstance(body, str):
-        raise ReviewerError("submission issue has no parseable body")
-    values: dict[str, str] = {}
-    matches = list(ISSUE_HEADING_RE.finditer(body))
-    recognized = {
-        "Repository URL",
-        "Commit SHA",
-        "Project path (optional)",
-        "Comparator configuration path (optional)",
-        "Formalization metadata path (optional)",
-    }
-    for index, match in enumerate(matches):
-        heading = match.group("heading").strip()
-        if heading not in recognized:
-            continue
-        if heading in values:
-            raise ReviewerError(f"submission issue repeats {heading!r}")
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
-        value = body[match.end() : end].strip()
-        values[heading] = "" if value == "_No response_" else value
-    return values
 
 
-def expected_issue_source(issue: dict[str, Any]) -> tuple[str, str]:
-    values = issue_source_fields(issue)
-    repository_match = ISSUE_SOURCE_RE.fullmatch(values.get("Repository URL", ""))
-    commit = values.get("Commit SHA", "").lower()
-    if repository_match is None or not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise ReviewerError("submission issue does not identify one canonical repository and commit")
-    return repository_match.group("repository"), commit
 
 
 def validate_mechanical_artifact(
-    report: dict[str, Any], issue: dict[str, Any], run_data: dict[str, Any]
+    report: dict[str, Any], state: dict[str, Any], run_data: dict[str, Any]
 ) -> None:
     jsonschema.validate(
         report,
@@ -1204,9 +1106,8 @@ def validate_mechanical_artifact(
                 raise ReviewerError(f"mechanical report v2 has a non-root {field}")
         if report.get("lakefile") is not None or report.get("lean_toolchain_path") is not None:
             raise ReviewerError("mechanical report v2 carries report-v3 Lake path fields")
-    issue_number = int(issue["number"])
-    if report["issue"]["number"] != issue_number:
-        raise ReviewerError("mechanical report issue number mismatch")
+    if report["submission"]["submission_id"] != state["id"]:
+        raise ReviewerError("mechanical report names a different submission")
     if report["workflow_url"] != run_data.get("url"):
         raise ReviewerError("mechanical report does not name its trusted workflow run")
     source = report["source"]
@@ -1214,27 +1115,17 @@ def validate_mechanical_artifact(
         raise ReviewerError("mechanical report source repository URL is inconsistent")
     if source["tree_url"] != source_tree_url(source):
         raise ReviewerError("mechanical report source tree URL is inconsistent")
-    expected_repository, expected_commit = expected_issue_source(issue)
-    if source["repository"].lower() != expected_repository.lower() or source["commit"] != expected_commit:
-        raise ReviewerError("mechanical report source does not match the current submission issue")
-    if version == 3:
-        issue_fields = issue_source_fields(issue)
-        requested_project = issue_fields.get("Project path (optional)", "")
-        if requested_project:
-            safe_repository_path(requested_project, "issue project path")
-        if (source.get("project_path") or "") != requested_project:
-            raise ReviewerError("mechanical report project path does not match the submission issue")
-        default_prefix = f"{requested_project}/" if requested_project else ""
-        expected_config = issue_fields.get("Comparator configuration path (optional)", "") or (
-            default_prefix + "comparator.json"
-        )
-        expected_metadata = issue_fields.get("Formalization metadata path (optional)", "") or (
-            default_prefix + "formalization.yaml"
-        )
-        if report["comparator"]["path"] != expected_config:
-            raise ReviewerError("mechanical report Comparator path does not match the submission issue")
-        if report["formalization"]["path"] != expected_metadata:
-            raise ReviewerError("mechanical report metadata path does not match the submission issue")
+    if (
+        source["repository"].lower() != str(state["repository"]).lower()
+        or source["commit"] != state["commit"]
+    ):
+        raise ReviewerError("mechanical report source does not match the submission")
+    requested = state.get("requested_paths") or {}
+    requested_project = requested.get("project_path", "") or ""
+    if requested_project:
+        safe_repository_path(requested_project, "requested project path")
+    if (source.get("project_path") or "") != requested_project:
+        raise ReviewerError("mechanical report project path does not match the submission")
     head_sha = run_data.get("headSha")
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise ReviewerError("trusted verification run has no full workflow commit")
@@ -1250,28 +1141,55 @@ def validate_mechanical_artifact(
         raise ReviewerError("verification workflow commit is not an ancestor of main")
 
 
+def trusted_verification_runs(submission_id: str) -> list[dict[str, Any]]:
+    """Completed successful runs whose name carries this submission id.
+
+    Dispatching does not return a run id, so the run is found by the id the
+    workflow puts in its name. Only runs on the default branch count: a run
+    from another ref is not the trusted workflow.
+    """
+    runs = json.loads(
+        gh([
+            "run", "list", "--repo", SUBMISSION_REPO, "--workflow", VERIFY_WORKFLOW,
+            "--event", "workflow_dispatch", "--limit", "200", "--json",
+            "databaseId,displayTitle,status,conclusion,url,headSha,headBranch,event,"
+            "createdAt,updatedAt,attempt,workflowName",
+        ])
+    )
+    if not isinstance(runs, list):
+        raise ReviewerError("GitHub returned a malformed verification-run list")
+    eligible = [
+        item for item in runs
+        if isinstance(item, dict)
+        and item.get("headBranch") == "main"
+        and item.get("status") == "completed"
+        and item.get("conclusion") == "success"
+        and submission_id in str(item.get("displayTitle", ""))
+    ]
+    eligible.sort(key=lambda item: (item["createdAt"], item["databaseId"]), reverse=True)
+    return eligible
+
+
 def mechanical_report(
-    issue: dict[str, Any], download_root: Path
+    state: dict[str, Any], download_root: Path
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    issue_number = int(issue["number"])
-    runs, exact_titles = trusted_verification_runs(issue_number, str(issue.get("title", "")))
+    submission_id = state["id"]
+    runs = trusted_verification_runs(submission_id)
     if not runs:
         raise ReviewerError("no completed trusted verification workflow run found")
-    for index, run_data in enumerate(runs):
-        report_path = download_mechanical_artifact(run_data["databaseId"], issue_number, download_root)
+    for run_data in runs:
+        report_path = download_mechanical_artifact(
+            run_data["databaseId"], submission_id, download_root
+        )
         try:
             report = load_json(report_path)
         except (OSError, json.JSONDecodeError) as error:
             raise ReviewerError(f"trusted mechanical report artifact is invalid: {error}") from error
         if not isinstance(report, dict):
             raise ReviewerError("trusted mechanical report artifact must be a JSON object")
-        if not exact_titles and report.get("issue", {}).get("number") != issue_number:
-            continue  # Legacy run titles did not carry the issue number.
-        if index > 0 and exact_titles:
-            raise ReviewerError("newer exact verification runs were unexpectedly skipped")
-        validate_mechanical_artifact(report, issue, run_data)
+        validate_mechanical_artifact(report, state, run_data)
         return report, str(run_data["url"]), run_data
-    raise ReviewerError("no trusted mechanical report artifact belongs to this issue")
+    raise ReviewerError("no trusted mechanical report artifact belongs to this submission")
 
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
@@ -1358,6 +1276,40 @@ def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def state_json(path: str) -> dict[str, Any] | None:
+    """Read a JSON file from the private submission state repository."""
+    raw = run(
+        ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".content"],
+        check=False,
+    )
+    if raw.returncode != 0 or not raw.stdout.strip():
+        return None
+    return json.loads(base64.b64decode(raw.stdout.strip()))
+
+
+def submission_state(submission_id: str) -> dict[str, Any] | None:
+    """The private record for a submission, or None if the server never made one."""
+    if not SUBMISSION_ID_RE.fullmatch(submission_id):
+        raise ReviewerError("submission id is malformed")
+    return state_json(f"submissions/{submission_id}/state.json")
+
+
+def queue() -> list[dict[str, Any]]:
+    """Submissions whose verification passed and which have no review yet."""
+    listing = run(
+        ["gh", "api", f"repos/{STATE_REPO}/contents/submissions", "--jq", ".[].name"],
+        check=False,
+    )
+    if listing.returncode != 0:
+        return []
+    waiting = []
+    for submission_id in listing.stdout.split():
+        record = submission_state(submission_id)
+        if record and record.get("status") == "awaiting-review":
+            waiting.append(record)
+    return waiting
+
+
 def clone_at(repository_url: str, revision: str, destination: Path) -> str:
     if destination.exists():
         shutil.rmtree(destination)
@@ -1399,21 +1351,21 @@ def resolve_remote_commit(repository: str, revision: str) -> str:
 
 
 def prepare_workspace(
-    issue_number: int,
+    submission_id: int,
     *,
     root: Path,
     policy_ref: str,
 ) -> tuple[Path, dict[str, Any], dict[str, Any], str]:
-    issue = issue_data(issue_number)
+    issue = issue_data(submission_id)
     labels = {label["name"] for label in issue["labels"]}
     if not labels & {"status:awaiting-review", "status:review-in-progress"}:
-        raise ReviewerError(f"issue #{issue_number} is not awaiting or undergoing review")
-    work = root / str(issue_number)
+        raise ReviewerError(f"issue #{submission_id} is not awaiting or undergoing review")
+    work = root / str(submission_id)
     work.mkdir(parents=True, exist_ok=True)
     download_root = work / "mechanical-download"
     mechanical, report_url, run_data = mechanical_report(issue, download_root)
     source_info = mechanical["source"]
-    if int(mechanical["issue"]["number"]) != issue_number:
+    if int(mechanical["submission"]["number"]) != submission_id:
         raise ReviewerError("mechanical report issue number mismatch")
     source_commit = clone_at(source_info["repository_url"], source_info["commit"], work / "source")
     if source_commit != source_info["commit"]:
@@ -1437,7 +1389,7 @@ def prepare_workspace(
     )
     if policy_commit != resolved_policy:
         raise ReviewerError("policy checkout mismatch")
-    write_json(work / "issue.json", issue)
+    write_json(work / "state.json", issue)
     shutil.copyfile(download_root / "mechanical-report.json", work / "mechanical-report.json")
     write_json(work / "workflow-run.json", verification_run_provenance(run_data))
     (work / "mechanical-report-url").write_text(report_url + "\n")
@@ -1491,7 +1443,7 @@ def render_prompt(
     step: dict[str, Any],
     *,
     work: Path,
-    issue: dict[str, Any],
+    state: dict[str, Any],
     mechanical: dict[str, Any],
     previous: list[dict[str, Any]],
     policy_commit: str,
@@ -1503,7 +1455,7 @@ def render_prompt(
         base,
         "\n# Binding review context",
         f"\nPolicy commit: `{policy_commit}`",
-        f"\nSubmission issue: `{issue['number']}`",
+        f"\nSubmission: `{state['id']}`",
         f"\nSource: `{mechanical['source']['repository']}@{mechanical['source']['commit']}`",
         f"\nProject directory: `{mechanical['source'].get('project_path') or 'repository root'}`",
     ]
@@ -1536,8 +1488,8 @@ def render_prompt(
         if name.startswith("policy:"):
             continue
         evidence_path: str | None = None
-        if name == "issue":
-            content = json.dumps(issue, indent=2)
+        if name == "submission":
+            content = json.dumps(state, indent=2)
         elif name == "mechanical_report":
             content = json.dumps(mechanical, indent=2)
         elif name == "all_previous_results":
@@ -1876,26 +1828,6 @@ def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
     return f"{engine}:{model or 'default'}"
 
 
-def claim_issue(issue: int, *, policy_commit: str, model: str) -> None:
-    for label in STATUS_LABELS:
-        gh(["issue", "edit", str(issue), "--repo", SUBMISSION_REPO, "--remove-label", label], check=False)
-    gh(
-        [
-            "issue",
-            "edit",
-            str(issue),
-            "--repo",
-            SUBMISSION_REPO,
-            "--add-label",
-            "status:review-in-progress",
-        ]
-    )
-    body = (
-        f"{CLAIM_MARKER}\nEditorial review started with `{model}` against "
-        f"[PalomarPolicy `{policy_commit[:12]}`]"
-        f"(https://github.com/{POLICY_REPO}/tree/{policy_commit})."
-    )
-    gh(["issue", "comment", str(issue), "--repo", SUBMISSION_REPO, "--body", body])
 
 
 def normalize_final(
@@ -1933,7 +1865,7 @@ def validate_stored_review(
     report: dict[str, Any],
     *,
     work: Path,
-    issue: dict[str, Any],
+    state: dict[str, Any],
     mechanical: dict[str, Any],
     mechanical_url: str,
     policy_commit: str,
@@ -1951,8 +1883,8 @@ def validate_stored_review(
         "repository": mechanical["source"]["repository"],
         "commit": mechanical["source"]["commit"],
     }
-    if report.get("submission_issue") != int(issue["number"]):
-        raise ReviewerError("stored review belongs to another submission issue")
+    if report.get("submission_id") != state["id"]:
+        raise ReviewerError("stored review belongs to another submission")
     if report.get("source") != expected_source:
         raise ReviewerError("stored review belongs to another source snapshot")
     if report.get("mechanical_report") != mechanical_url:
@@ -2068,155 +2000,26 @@ def validate_synthesis_policy(
         )
 
 
-def set_review_status(issue: int, decision: str) -> None:
-    for label in STATUS_LABELS:
-        gh(["issue", "edit", str(issue), "--repo", SUBMISSION_REPO, "--remove-label", label], check=False)
-    label = {
-        "accept": "status:accepted",
-        "revise": "status:changes-requested",
-        "reject": "status:rejected",
-        "escalate": "status:escalated",
-    }[decision]
-    gh(["issue", "edit", str(issue), "--repo", SUBMISSION_REPO, "--add-label", label])
 
 
-def markdown_text(value: object) -> str:
-    """Render model-authored prose as one inert Markdown line."""
-    text = " ".join(str(value).replace("\r", "\n").splitlines())
-    for character in "\\`*_{}[]<>()#+-.!|>":
-        text = text.replace(character, f"\\{character}")
-    return text
 
 
-def post_review(issue: int, report: dict[str, Any]) -> str:
-    decision = report["decision"]
-    icon = {"accept": "✅", "revise": "🛠️", "reject": "❌", "escalate": "🧭"}[decision]
-    lines = [
-        REVIEW_MARKER,
-        f"## {icon} Palomar editorial review: `{decision}`",
-        "",
-        markdown_text(report["summary"]),
-        "",
-        f"- Policy: [`{report['policy_commit'][:12]}`]"
-        f"(https://github.com/{POLICY_REPO}/tree/{report['policy_commit']})",
-        f"- Reviewer: `{', '.join(report['reviewer_models'])}`",
-        f"- Mechanical report: {report['mechanical_report']}",
-    ]
-    if report["warnings"]:
-        lines.extend(
-            ["", "### Permanent warnings", *[f"- {markdown_text(item)}" for item in report["warnings"]]]
-        )
-    if report["requested_changes"]:
-        lines.extend(
-            [
-                "",
-                "### Requested changes",
-                *[f"- {markdown_text(item)}" for item in report["requested_changes"]],
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "<details><summary>Machine-readable editorial report</summary>",
-            "",
-            "```json",
-            json.dumps(report, indent=2, sort_keys=True),
-            "```",
-            "</details>",
-        ]
-    )
-    set_review_status(issue, decision)
-    body = "\n".join(lines)
-    output = gh(
-        [
-            "api",
-            "--method",
-            "POST",
-            f"repos/{SUBMISSION_REPO}/issues/{issue}/comments",
-            "--input",
-            "-",
-        ],
-        input_text=json.dumps({"body": body}),
-    )
-    return json.loads(output)["html_url"]
 
 
-def matching_review_comment(issue: dict[str, Any], report: dict[str, Any]) -> str | None:
-    """Find this exact report already posted by this operator, for idempotent --apply.
-
-    Authorship is the trust boundary here: the returned URL becomes the
-    published `review.report_url`, so anything accepted is what the registry
-    presents as its editorial record.
-
-    This used to compare the comment author's login to the submission
-    repository's owner, which was only ever right because the registry lived
-    under a personal account whose name was also the operator's. An
-    organisation owner authors nothing, so that test silently matches nothing.
-
-    `authorAssociation` is the obvious replacement and is the wrong answer:
-    MEMBER means any member of the organisation, and ordinary members hold base
-    `read`, which is enough to comment. That would let a read-only member's
-    comment be adopted as the official review.
-
-    `viewerDidAuthor` asks the question that actually matters: did the account
-    now running this tool post this comment. An operator can only ever match
-    their own comments, which is exactly the intent.
-
-    The cost is that a second operator does not recognise the first operator's
-    posted review and would post a duplicate. That is a visible, recoverable
-    annoyance rather than a silent acceptance of someone else's text, so it is
-    the right direction to fail in. A shared operator account or an explicit
-    login allowlist is the fix if Palomar ever has more than one reviewer.
-    """
-    for comment in reversed(issue.get("comments", [])):
-        body = comment.get("body", "")
-        if comment.get("viewerDidAuthor") is not True or body.count(REVIEW_MARKER) != 1:
-            continue
-        details = body.rfind("<details><summary>Machine-readable editorial report</summary>")
-        if details < 0:
-            continue
-        match = REVIEW_DETAILS_RE.fullmatch(body[details:])
-        if match is None:
-            continue
-        try:
-            posted = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        if posted == report:
-            url = comment.get("url")
-            if not url:
-                raise ReviewerError("matching posted review has no comment URL")
-            return url
-    return None
 
 
-def restore_awaiting_review(issue: int) -> None:
-    for label in STATUS_LABELS:
-        gh(["issue", "edit", str(issue), "--repo", SUBMISSION_REPO, "--remove-label", label], check=False)
-    gh(
-        [
-            "issue",
-            "edit",
-            str(issue),
-            "--repo",
-            SUBMISSION_REPO,
-            "--add-label",
-            "status:awaiting-review",
-        ],
-        check=False,
-    )
 
 
 def run_review(args: argparse.Namespace) -> int:
     candidates = queue()
-    if args.issue is None:
+    if args.submission is None:
         if not candidates:
             print("No submissions are awaiting review.")
             return 0
-        args.issue = min(item["number"] for item in candidates)
+        args.submission = min(item["number"] for item in candidates)
     root = Path(args.work_dir).expanduser().resolve()
     if args.apply:
-        stored_path = root / str(args.issue) / "review.json"
+        stored_path = root / str(args.submission) / "review.json"
         if not stored_path.is_file():
             raise ReviewerError(
                 "no inspected dry-run review exists; run without --apply and inspect review.json first"
@@ -2227,7 +2030,7 @@ def run_review(args: argparse.Namespace) -> int:
         ):
             raise ReviewerError("stored review has no valid policy commit")
         work, issue, mechanical, policy_commit = prepare_workspace(
-            args.issue,
+            args.submission,
             root=root,
             policy_ref=stored["policy_commit"],
         )
@@ -2242,20 +2045,20 @@ def run_review(args: argparse.Namespace) -> int:
         )
         existing_url = matching_review_comment(issue, stored)
         if existing_url:
-            set_review_status(args.issue, stored["decision"])
+            set_review_status(args.submission, stored["decision"])
             (work / "review-url").write_text(existing_url + "\n")
             (work / "review-sha256").write_text(review_digest(stored) + "\n")
             print(f"Review was already posted: {existing_url}")
             return 0
         try:
             claim_issue(
-                args.issue,
+                args.submission,
                 policy_commit=policy_commit,
                 model=", ".join(stored["reviewer_models"]),
             )
-            url = post_review(args.issue, stored)
+            url = post_review(args.submission, stored)
         except Exception:
-            restore_awaiting_review(args.issue)
+            restore_awaiting_review(args.submission)
             raise
         (work / "review-url").write_text(url + "\n")
         (work / "review-sha256").write_text(review_digest(stored) + "\n")
@@ -2263,7 +2066,7 @@ def run_review(args: argparse.Namespace) -> int:
         return 0
 
     work, issue, mechanical, policy_commit = prepare_workspace(
-        args.issue,
+        args.submission,
         root=root,
         policy_ref=args.policy_ref,
     )
@@ -2409,22 +2212,91 @@ def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any
     return result
 
 
+def authorize_publication(
+    submission_id: str, mechanical: dict[str, Any], review: dict[str, Any]
+) -> dict[str, Any]:
+    """Refuse to publish anything the submission server did not authorize.
+
+    The submission id is public: it appears in the verification run's name, so
+    anyone able to dispatch the workflow can produce a mechanical report
+    carrying a real one. Existence of a state record is therefore not enough.
+    What is checked is that the private record and the report describe the same
+    submission, that the submitter proved write access, that they have not
+    withdrawn, that they explicitly consented to publication, and that nothing
+    has been published for this submission already.
+    """
+    state = submission_state(submission_id)
+    if state is None:
+        raise ReviewerError(
+            f"submission {submission_id} has no record in {STATE_REPO}: "
+            "the submission server never created it"
+        )
+
+    submission = mechanical.get("submission", {})
+    if submission.get("submission_id") != state.get("id") != submission_id:
+        raise ReviewerError("mechanical report and state disagree on the submission id")
+
+    for field, reported, recorded in (
+        ("repository", mechanical["source"]["repository"], state.get("repository")),
+        ("commit", mechanical["source"]["commit"], state.get("commit")),
+    ):
+        if reported != recorded:
+            raise ReviewerError(
+                f"mechanical report and state disagree on {field}: "
+                f"{reported!r} against {recorded!r}"
+            )
+
+    if submission.get("authorization") != state.get("authorization"):
+        raise ReviewerError("mechanical report and state disagree on the authorization")
+    if (review.get("existing_id") or None) != (state.get("existing_id") or None):
+        raise ReviewerError("mechanical report and state disagree on the update intent")
+    if state.get("push_verified") is not True:
+        raise ReviewerError("the submitter never proved write access to the repository")
+    if state.get("status") == "withdrawn":
+        raise ReviewerError("the submitter withdrew this submission")
+    if state.get("published_entry"):
+        raise ReviewerError(
+            f"submission {submission_id} was already published as {state['published_entry']}"
+        )
+    if state.get("publish_consent") is not True:
+        raise ReviewerError(
+            "the submitter has not consented to publication; "
+            "nothing is published until they choose to"
+        )
+    return state
+
+
+def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
+    """Choose a free permanent identifier at random.
+
+    Sequential allocation would publish the exact ordering and approximate
+    count of accepted private submissions, which is precisely what a private
+    intake exists to avoid. Six digits give 999,999 values; collisions are
+    retried against the identifiers already published.
+    """
+    for _ in range(10_000):
+        candidate = f"PALOMAR-{accepted_at}-{secrets.randbelow(999_999) + 1:06d}"
+        if candidate not in taken:
+            return candidate
+    raise ReviewerError("could not allocate a free permanent identifier")
+
+
 def registry_record(
     *,
-    issue: dict[str, Any],
+    state: dict[str, Any],
+    taken: set[str],
     mechanical: dict[str, Any],
     review: dict[str, Any],
     metadata: dict[str, Any],
     accepted_at: str,
     version: int,
-    review_url: str,
     challenge_render: dict[str, Any],
     verification_evidence: dict[str, Any],
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", accepted_at):
         raise ReviewerError("review has no valid acceptance date")
-    permanent_id = review.get("existing_id") or f"PALOMAR-{accepted_at}-{int(issue['number']):06d}"
-    title = registry_title(metadata, issue["title"])
+    permanent_id = review.get("existing_id") or allocate_identifier(accepted_at, taken)
+    title = registry_title(metadata, state.get("title") or state["repository"])
     abstract = (
         metadata_value(
             metadata,
@@ -2495,7 +2367,7 @@ def registry_record(
         "status": "accepted",
         "title": str(title),
         "abstract": str(abstract),
-        "authors": authors_from_metadata(metadata, mechanical["issue"]["submitter"]),
+        "authors": authors_from_metadata(metadata, state["submitter"]),
         "classification": validated_classification(mechanical, metadata),
         "provenance": copy.deepcopy(mechanical["provenance"]),
         "source": source_record,
@@ -2520,7 +2392,7 @@ def registry_record(
             "reviewed_at": review["reviewed_at"],
             "policy_commit": review["policy_commit"],
             "verdict": "accept",
-            "report_url": review_url,
+            "report": {"sha256": verification_evidence["review_sha256"]},
             "reviewer_models": review["reviewer_models"],
             "scores": review["scores"],
             "warnings": review["warnings"],
@@ -2533,12 +2405,12 @@ def registry_record(
             "challenge_dependencies": database_challenge_dependencies,
             "reasons": reasons,
         },
+        # No issue, no URL, no submitter: keeping the submitter private is
+        # what the private intake exists for, and schema-v1 forbids those
+        # fields structurally rather than trusting this code to omit them.
         "submission": {
-            "repository": SUBMISSION_REPO,
-            "issue": int(issue["number"]),
-            "url": issue["url"],
-            "submitter": mechanical["issue"]["submitter"],
-            "authorization": copy.deepcopy(mechanical["issue"]["authorization"]),
+            "submission_id": state["id"],
+            "authorization": copy.deepcopy(mechanical["submission"]["authorization"]),
         },
     }
 
@@ -2546,51 +2418,53 @@ def registry_record(
 def publication_identity(
     database: Path,
     *,
-    issue_number: int,
+    submission_id: int,
     existing_id: object,
     reviewed_at: object,
     mechanical: dict[str, Any],
 ) -> tuple[str, str, int]:
-    """Resolve one issue to one permanent ID and its next append-only version."""
+    """Resolve one submission to one permanent ID and its next append-only version."""
     if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
 
-    by_issue: set[str] = set()
-    by_id: dict[str, list[tuple[int, int, str, str]]] = {}
+    by_submission: set[str] = set()
+    by_id: dict[str, list[tuple[int, str, str, str]]] = {}
     for path in (database / "entries").glob("*.json"):
         prior = load_json(path)
         identifier = str(prior.get("id", ""))
         version = prior.get("version")
-        prior_issue = prior.get("submission", {}).get("issue")
         accepted_at = prior.get("accepted_at")
         repository = prior.get("source", {}).get("repository")
+        prior_submission = prior.get("submission", {}).get("submission_id")
         if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
             raise ReviewerError(f"database entry has invalid publication identity: {path.name}")
-        if not isinstance(prior_issue, int):
-            raise ReviewerError(f"database entry has no submission issue: {path.name}")
+        if not isinstance(prior_submission, str):
+            raise ReviewerError(f"database entry names no submission: {path.name}")
         if not isinstance(accepted_at, str) or not isinstance(repository, str):
             raise ReviewerError(f"database entry has incomplete publication identity: {path.name}")
-        by_id.setdefault(identifier, []).append((version, prior_issue, accepted_at, repository))
-        if prior_issue == issue_number:
-            by_issue.add(identifier)
+        by_id.setdefault(identifier, []).append(
+            (version, prior_submission, accepted_at, repository)
+        )
+        if prior_submission == submission_id:
+            by_submission.add(identifier)
 
     if existing_id:
         identifier = str(existing_id)
         records = by_id.get(identifier, [])
         if not records:
             raise ReviewerError(f"requested existing ID is not in the database: {identifier}")
-        if {prior_issue for _version, prior_issue, _date, _repo in records} != {issue_number}:
-            raise ReviewerError("requested existing ID belongs to another submission issue")
-        if by_issue - {identifier}:
-            raise ReviewerError("submission issue is already associated with another permanent ID")
+        if by_submission - {identifier}:
+            raise ReviewerError("this submission is already associated with another permanent ID")
         current = max(records, key=lambda record: record[0])
         submitted_repository = mechanical["source"]["repository"]
         if current[3].casefold() != submitted_repository.casefold():
-            raise ReviewerError(f"update to {identifier} comes from {submitted_repository}, not {current[3]}")
+            raise ReviewerError(
+                f"update to {identifier} comes from {submitted_repository}, not {current[3]}"
+            )
         return identifier, current[2], current[0] + 1
 
-    if by_issue:
-        identifiers = ", ".join(sorted(by_issue))
+    if by_submission:
+        identifiers = ", ".join(sorted(by_submission))
         raise ReviewerError(
             f"submission issue already has a permanent ID; publish an update to: {identifiers}"
         )
@@ -2598,18 +2472,18 @@ def publication_identity(
         accepted_at = dt.date.fromisoformat(str(reviewed_at)[:10]).isoformat()
     except ValueError as error:
         raise ReviewerError("accepted review has no valid review date") from error
-    identifier = f"PALOMAR-{accepted_at}-{issue_number:06d}"
+    identifier = f"PALOMAR-{accepted_at}-{submission_id:06d}"
     if identifier in by_id:
         raise ReviewerError("new permanent ID collides with an existing database record")
     return identifier, accepted_at, 1
 
 
 def publish(args: argparse.Namespace) -> int:
-    work = Path(args.work_dir).expanduser().resolve() / str(args.issue)
+    work = Path(args.work_dir).expanduser().resolve() / str(args.submission)
     review = load_json(work / "review.json")
-    issue = load_json(work / "issue.json")
+    state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")
-    if int(issue.get("number", 0)) != int(args.issue):
+    if int(issue.get("number", 0)) != int(args.submission):
         raise ReviewerError("publication issue file does not match the requested submission")
     jsonschema.validate(
         mechanical,
@@ -2621,7 +2495,6 @@ def publish(args: argparse.Namespace) -> int:
     mechanical_bytes_digest_path = work / "mechanical-report-bytes-sha256"
     workflow_run_path = work / "workflow-run.json"
     workflow_run_digest_path = work / "workflow-run-sha256"
-    review_url_path = work / "review-url"
     review_digest_path = work / "review-sha256"
     if (
         mechanical_url_path.is_symlink()
@@ -2634,12 +2507,10 @@ def publish(args: argparse.Namespace) -> int:
         or not workflow_run_path.is_file()
         or workflow_run_digest_path.is_symlink()
         or not workflow_run_digest_path.is_file()
-        or review_url_path.is_symlink()
-        or not review_url_path.is_file()
         or review_digest_path.is_symlink()
         or not review_digest_path.is_file()
     ):
-        raise ReviewerError("publication requires a posted review bound to the mechanical report")
+        raise ReviewerError("publication requires an inspected review bound to the mechanical report")
     mechanical_url = mechanical_url_path.read_text().strip()
     if mechanical_digest_path.read_text().strip() != review_digest(mechanical):
         raise ReviewerError("mechanical report no longer matches the reviewed artifact")
@@ -2647,7 +2518,6 @@ def publish(args: argparse.Namespace) -> int:
         raise ReviewerError("mechanical report bytes no longer match the downloaded artifact")
     if workflow_run_digest_path.read_text().strip() != sha256_file(workflow_run_path):
         raise ReviewerError("verification run provenance changed after review")
-    review_url = review_url_path.read_text().strip()
     if review_digest_path.read_text().strip() != review_digest(review):
         raise ReviewerError("posted review does not match the current inspected review")
     policy = work / "policy"
@@ -2736,7 +2606,7 @@ def publish(args: argparse.Namespace) -> int:
         existing_id=existing_id,
         mechanical=mechanical,
         reviewed_at=str(review["reviewed_at"]),
-        issue_number=int(issue["number"]),
+        submission_id=int(issue["number"]),
     )
     if args.render_result:
         render_candidate = Path(args.render_result).expanduser().resolve()
@@ -2768,14 +2638,23 @@ def publish(args: argparse.Namespace) -> int:
         "landrun_commit": render_report["landrun_commit"],
         "rendered_at": render_report["rendered_at"],
     }
+    # Settle the review before it is archived. It used to be mutated after the
+    # bundle was built, which left the archived bytes describing something
+    # slightly different from the record that cites their digest.
+    review["existing_id"] = existing_id
+    write_json(work / "review.json", review)
+    state = authorize_publication(args.submission, mechanical, review)
+    taken = {
+        path.name.rsplit("-v", 1)[0]
+        for path in (database / "entries").glob("*.json")
+    }
     evidence_bundle, verification_evidence = build_verification_evidence(work)
     evidence_hash = verification_evidence["evidence_tree_sha256"]
     evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
     verification_evidence["evidence_path"] = evidence_path
-    # Preserve the update ID through deterministic local context.
-    review["existing_id"] = existing_id
     record = registry_record(
-        issue=issue,
+        state=state,
+        taken=taken,
         mechanical=mechanical,
         review=review,
         metadata=metadata,
@@ -2783,7 +2662,6 @@ def publish(args: argparse.Namespace) -> int:
         version=version,
         challenge_render=challenge_render,
         verification_evidence=verification_evidence,
-        review_url=review_url,
     )
     filename = f"{record['id']}-v{version}.json"
     destination = database / "entries" / filename
@@ -2820,7 +2698,7 @@ def publish(args: argparse.Namespace) -> int:
     schema = load_json(schema_path)
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
     run([sys.executable, "tools/validate.py"], cwd=database)
-    branch = f"submission-{args.issue}-v{version}"
+    branch = f"submission-{args.submission}-v{version}"
     run(["git", "checkout", "-b", branch], cwd=database)
     run(
         [
@@ -2872,7 +2750,7 @@ def publish(args: argparse.Namespace) -> int:
             f"Add {record['id']} v{version}: {record['title']}",
             "--body",
             (
-                f"Publishes accepted submission {SUBMISSION_REPO}#{args.issue}.\n\n"
+                f"Publishes accepted submission {SUBMISSION_REPO}#{args.submission}.\n\n"
                 f"- Source: `{record['source']['repository']}@{record['source']['commit']}`\n"
                 f"- Mechanical run: {record['verification']['workflow_url']}\n"
                 f"- Render run: {render_report['workflow_url']}\n"
@@ -2881,17 +2759,6 @@ def publish(args: argparse.Namespace) -> int:
             ),
         ]
     ).strip()
-    gh(
-        [
-            "issue",
-            "comment",
-            str(args.issue),
-            "--repo",
-            SUBMISSION_REPO,
-            "--body",
-            f"Database publication PR prepared: {pr_url}",
-        ]
-    )
     print(pr_url)
     return 0
 
@@ -2946,7 +2813,7 @@ def finalize(args: argparse.Namespace) -> int:
             ]
         )
     )
-    if int(record["submission"]["issue"]) != args.issue:
+    if int(record["submission"]["issue"]) != args.submission:
         raise ReviewerError("published record points to a different submission issue")
     expected = f"entries/{record['id']}-v{record['version']}.json"
     if entry_path != expected or record["status"] != "accepted":
@@ -2978,7 +2845,7 @@ def finalize(args: argparse.Namespace) -> int:
             [
                 "issue",
                 "edit",
-                str(args.issue),
+                str(args.submission),
                 "--repo",
                 SUBMISSION_REPO,
                 "--remove-label",
@@ -2990,14 +2857,14 @@ def finalize(args: argparse.Namespace) -> int:
         [
             "issue",
             "edit",
-            str(args.issue),
+            str(args.submission),
             "--repo",
             SUBMISSION_REPO,
             "--add-label",
             "status:published",
         ]
     )
-    issue = issue_data(args.issue)
+    issue = issue_data(args.submission)
     if not has_publication_comment(issue, record):
         body = (
             f"{PUBLICATION_MARKER}\n"
@@ -3006,13 +2873,13 @@ def finalize(args: argparse.Namespace) -> int:
             f"- [Canonical database record]({database_url})\n"
             f"- Database PR: {pr['url']}\n"
         )
-        gh(["issue", "comment", str(args.issue), "--repo", SUBMISSION_REPO, "--body", body])
+        gh(["issue", "comment", str(args.submission), "--repo", SUBMISSION_REPO, "--body", body])
     if issue["state"] != "CLOSED":
         gh(
             [
                 "issue",
                 "close",
-                str(args.issue),
+                str(args.submission),
                 "--repo",
                 SUBMISSION_REPO,
                 "--reason",
@@ -3059,7 +2926,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = commands.add_parser("doctor", help="check local prerequisites")
     doctor_parser.set_defaults(func=doctor)
     run_parser = commands.add_parser("run", help="prepare and execute all editorial review passes")
-    run_parser.add_argument("--issue", type=int)
+    run_parser.add_argument("--submission", type=str)
     run_parser.add_argument("--policy-ref", default="main")
     run_parser.add_argument("--engine", choices=("codex", "claude", "command"), default="codex")
     run_parser.add_argument("--model")
@@ -3067,7 +2934,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--apply", action="store_true", help="claim, label, and comment on GitHub")
     run_parser.set_defaults(func=run_review)
     publish_parser = commands.add_parser("publish", help="prepare a database PR from an accepted report")
-    publish_parser.add_argument("--issue", type=int, required=True)
+    publish_parser.add_argument("--submission", type=str, required=True)
     publish_parser.add_argument(
         "--render-result",
         help="use an extracted trusted renderer result instead of dispatching a workflow",
@@ -3078,7 +2945,7 @@ def build_parser() -> argparse.ArgumentParser:
         "finalize",
         help="verify a merged database PR and complete the submission issue",
     )
-    finalize_parser.add_argument("--issue", type=int, required=True)
+    finalize_parser.add_argument("--submission", type=str, required=True)
     finalize_parser.add_argument("--pr", type=int, required=True)
     finalize_parser.add_argument("--dry-run", action="store_true")
     finalize_parser.set_defaults(func=finalize)
