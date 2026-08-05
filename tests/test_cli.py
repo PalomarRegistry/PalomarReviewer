@@ -1956,13 +1956,56 @@ class AutomaticLoopTests(unittest.TestCase):
                 reasoning_effort=None, command=None, work_dir=".palomar-reviews")), 1)
         self.assertIn("bbbbbbbbbbbb", attempted)
 
+    def test_a_database_change_that_is_not_green_is_not_merged(self):
+        """The database's own checks are what stand between a review and the registry."""
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
+                         publication_pr=7)]
+        listing, state = self.records(*rows)
+        for rollup in ([], [{"conclusion": "FAILURE"}], [{"conclusion": "SUCCESS"}, {"state": "PENDING"}]):
+            with self.subTest(rollup):
+                calls = []
+                with (
+                    listing, state,
+                    mock.patch.object(
+                        cli, "gh",
+                        side_effect=lambda a, **k: calls.append(a) or json.dumps(
+                            {"state": "OPEN", "statusCheckRollup": rollup}),
+                    ),
+                    mock.patch.object(cli, "finalize") as finalized,
+                ):
+                    cli.auto(SimpleNamespace(max_reviews=5, policy_ref="main", engine="codex",
+                                             model=None, reasoning_effort=None, command=None,
+                                             work_dir=".palomar-reviews"))
+                finalized.assert_not_called()
+                self.assertNotIn("merge", [step for call in calls for step in call])
+
+    def test_a_green_database_change_is_merged_and_finalized(self):
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
+                         publication_pr=7)]
+        listing, state = self.records(*rows)
+        calls = []
+        with (
+            listing, state,
+            mock.patch.object(
+                cli, "gh",
+                side_effect=lambda a, **k: calls.append(a) or json.dumps(
+                    {"state": "OPEN", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}),
+            ),
+            mock.patch.object(cli, "finalize", return_value=0) as finalized,
+        ):
+            cli.auto(SimpleNamespace(max_reviews=5, policy_ref="main", engine="codex",
+                                     model=None, reasoning_effort=None, command=None,
+                                     work_dir=".palomar-reviews"))
+        self.assertIn(["pr", "merge", "7", "--repo", cli.DATABASE_REPO, "--squash", "--delete-branch"], calls)
+        self.assertEqual(finalized.call_args.args[0].pr, 7)
+
     def test_finalizing_waits_for_the_database_change_to_merge(self):
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", publish_consent=True,
                          publication_pr=7)]
         listing, state = self.records(*rows)
         with (
             listing, state,
-            mock.patch.object(cli, "gh", return_value=json.dumps({"state": "OPEN"})),
+            mock.patch.object(cli, "gh", return_value=json.dumps({"state": "CLOSED"})),
             mock.patch.object(cli, "finalize") as finalized,
         ):
             self.assertEqual(cli.auto(SimpleNamespace(
@@ -1979,6 +2022,7 @@ class AutomaticLoopTests(unittest.TestCase):
                                      model=None, reasoning_effort=None, command=None,
                                      work_dir=".palomar-reviews"))
         self.assertEqual(finalized.call_args.args[0].pr, 7)
+
 
 
 class SpendAccountingTests(unittest.TestCase):

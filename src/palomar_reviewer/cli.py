@@ -3214,11 +3214,29 @@ def auto(args: argparse.Namespace) -> int:
 
     for record in to_finalize:
         pr = record["publication_pr"]
-        merged = json.loads(
-            gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", "state"])
-        ).get("state")
-        if merged != "MERGED":
-            print(f"{record['id']}: database PR #{pr} is {merged}; nothing to finalize yet")
+        view = json.loads(
+            gh([
+                "pr", "view", str(pr), "--repo", DATABASE_REPO,
+                "--json", "state,statusCheckRollup",
+            ])
+        )
+        if view.get("state") == "OPEN":
+            # Merging is the publication event, and no person signs it. The
+            # database's own checks are what stand between an accepted review
+            # and the registry, so a change that has not passed them waits.
+            checks = view.get("statusCheckRollup") or []
+            outcomes = {
+                str(check.get("conclusion") or check.get("state") or "").upper()
+                for check in checks
+            }
+            if not checks or outcomes - {"SUCCESS", "SKIPPED", "NEUTRAL"}:
+                print(f"{record['id']}: database PR #{pr} is not green yet ({sorted(outcomes)})")
+                continue
+            print(f"{record['id']}: merging database PR #{pr}")
+            gh(["pr", "merge", str(pr), "--repo", DATABASE_REPO, "--squash", "--delete-branch"])
+            view["state"] = "MERGED"
+        if view.get("state") != "MERGED":
+            print(f"{record['id']}: database PR #{pr} is {view.get('state')}; nothing to finalize")
             continue
         print(f"::group::Finalize {record['id']}", flush=True)
         try:
