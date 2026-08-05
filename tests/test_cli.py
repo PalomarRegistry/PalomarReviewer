@@ -1793,6 +1793,51 @@ class PublicationIdentityTests(unittest.TestCase):
             self.resolve(database, existing_id="PALOMAR-2026-08-01-000013")
 
 
+class MechanicalReportContractTests(unittest.TestCase):
+    """The reviewer must accept exactly the report the workflow emits.
+
+    The submission block is closed, because the whole report is archived in
+    public evidence. Closing it once rejected every report the workflow
+    actually produces, which no test noticed; these bind the two.
+    """
+
+    def submission_block(self, **overrides):
+        block = {
+            "submission_id": "a1b2c3d4e5f6",
+            "authorization": {"relationship": "maintainer"},
+            # verify_submission.py emits this on every report.
+            "requested_paths": {
+                "project_path": "",
+                "comparator_config_path": "",
+                "formalization_metadata_path": "",
+            },
+        }
+        block.update(overrides)
+        return block
+
+    def validate(self, block):
+        report = ReviewerTests.mechanical_fixture(ReviewerTests())
+        report["submission"] = block
+        jsonschema.validate(report, cli.MECHANICAL_REPORT_SCHEMA,
+                            format_checker=jsonschema.FormatChecker())
+
+    def test_the_block_the_workflow_emits_is_accepted(self):
+        self.validate(self.submission_block())
+        self.validate(self.submission_block(requested_paths={"project_path": "examples/one"}))
+
+    def test_an_identity_cannot_ride_in_the_archived_report(self):
+        for extra in ({"submitter": "someone"}, {"issue": 12}, {"owner": "someone"}):
+            with self.subTest(sorted(extra)):
+                with self.assertRaises(jsonschema.ValidationError):
+                    self.validate(self.submission_block(**extra))
+
+    def test_an_undeclared_authorization_is_refused(self):
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(self.submission_block(
+                authorization={"relationship": "legacy-unspecified"}
+            ))
+
+
 class TrustedRunSelectionTests(unittest.TestCase):
     """The run is the one the server recorded, not the one that says the right words.
 

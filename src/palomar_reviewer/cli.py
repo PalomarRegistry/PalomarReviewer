@@ -201,6 +201,18 @@ MECHANICAL_REPORT_SCHEMA = {
                         "evidence": {"type": "string", "minLength": 1, "maxLength": 4000},
                     },
                 },
+                # What the submitter asked the workflow to verify. Kept so the
+                # archived report says what it was asked for, not only what it
+                # found; the reviewer binds these to the private record.
+                "requested_paths": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "project_path": {"type": "string", "maxLength": 400},
+                        "comparator_config_path": {"type": "string", "maxLength": 400},
+                        "formalization_metadata_path": {"type": "string", "maxLength": 400},
+                    },
+                },
             },
         },
         "provenance": {
