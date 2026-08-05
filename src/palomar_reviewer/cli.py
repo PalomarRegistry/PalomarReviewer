@@ -2979,8 +2979,15 @@ def list_queue(_: argparse.Namespace) -> int:
     if not items:
         print("No submissions are awaiting review.")
         return 0
-    for item in sorted(items, key=lambda row: row["number"]):
-        print(f"#{item['number']}\t{item['title']}\t{item['author']['login']}\t{item['url']}")
+    # Ordered by arrival, since submission ids are random. The submitter is not
+    # printed: the operator does not need it to review, and a terminal is a
+    # place things get pasted from.
+    for item in sorted(items, key=lambda row: (row.get("created_at") or "", row["id"])):
+        run_id = (item.get("run") or {}).get("id", "-")
+        print(
+            f"{item['id']}\t{item.get('created_at', '')}\t"
+            f"{item.get('repository', '')}@{str(item.get('commit', ''))[:12]}\trun {run_id}"
+        )
     return 0
 
 
