@@ -25,7 +25,6 @@ from palomar_reviewer.cli import (
     engine_result,
     finalize,
     has_proof_account,
-    has_publication_comment,
     isolated_engine_command,
     load_formalization_metadata,
     mechanical_report,
@@ -92,6 +91,8 @@ class ReviewerTests(unittest.TestCase):
                 "related_formalizations": [],
             },
             "challenge": {
+                "path": "Challenge.lean",
+                "module": "Challenge",
                 "sha256": "2" * 64,
                 "lines": 10,
                 "bytes": 100,
@@ -104,9 +105,16 @@ class ReviewerTests(unittest.TestCase):
                 ],
                 "trust_level": "high",
             },
-            "solution": {"sha256": "3" * 64, "path": "Solution.lean"},
+            "solution": {"sha256": "3" * 64, "path": "Solution.lean", "module": "Solution"},
             "lean_toolchain": "leanprover/lean4:v4.31.0",
+            "lean_toolchain_path": "lean-toolchain",
+            "formalization": {"path": "formalization.yaml", "sha256": "a" * 64},
+            "lakefile": {"path": "lakefile.toml", "sha256": "9" * 64, "format": "toml"},
             "comparator": {
+                "path": "comparator.json",
+                "sha256": "b" * 64,
+                "challenge_module": "Challenge",
+                "solution_module": "Solution",
                 "theorem_names": ["Example.result"],
                 "definition_names": [],
                 "permitted_axioms": ["propext"],
@@ -130,7 +138,6 @@ class ReviewerTests(unittest.TestCase):
     def nested_mechanical_fixture(self, submission="a1b2c3d4e5f6", run_id=101):
         mechanical = self.mechanical_fixture(submission=submission, run_id=run_id)
         project = "examples/comparator"
-        mechanical["schema_version"] = 3
         mechanical["source"]["project_path"] = project
         mechanical["source"]["tree_url"] += f"/{project}"
         mechanical["challenge"].update(
@@ -406,7 +413,7 @@ class ReviewerTests(unittest.TestCase):
             "attempt": 2,
             "url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
             "headSha": "8" * 40,
-            "event": "issues",
+            "event": "workflow_dispatch",
             "status": "completed",
             "conclusion": "success",
             "createdAt": "2026-08-01T00:00:00Z",
@@ -431,13 +438,43 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(provenance["workflow_commit"], "8" * 40)
         self.assertEqual(provenance["jobs"][0]["conclusion"], "success")
 
+    def test_verification_run_provenance_rejects_a_run_nobody_dispatched(self):
+        """Only the submission server starts verification runs."""
+        run_data = {
+            "databaseId": 101,
+            "attempt": 1,
+            "url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
+            "headSha": "8" * 40,
+            "event": "push",
+            "status": "completed",
+            "conclusion": "success",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "updatedAt": "2026-08-01T00:10:00Z",
+        }
+        jobs = {
+            "attempt": 1,
+            "jobs": [
+                {
+                    "databaseId": 501,
+                    "name": "verify",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "startedAt": "2026-08-01T00:00:00Z",
+                    "completedAt": "2026-08-01T00:10:00Z",
+                }
+            ],
+        }
+        with mock.patch("palomar_reviewer.cli.gh", return_value=json.dumps(jobs)):
+            with self.assertRaisesRegex(ReviewerError, "not a dispatch"):
+                verification_run_provenance(run_data)
+
     def test_verification_run_provenance_rejects_unsuccessful_jobs(self):
         run_data = {
             "databaseId": 101,
             "attempt": 1,
             "url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
             "headSha": "8" * 40,
-            "event": "issues",
+            "event": "workflow_dispatch",
             "status": "completed",
             "conclusion": "success",
             "createdAt": "2026-08-01T00:00:00Z",
@@ -546,12 +583,12 @@ class ReviewerTests(unittest.TestCase):
     def test_registry_title_prefers_human_text(self):
         metadata = {"result": {"name": "machine_readable_name"}}
         self.assertEqual(
-            registry_title(metadata, "[submission] A human-readable result"),
+            registry_title(metadata, "A human-readable result"),
             "A human-readable result",
         )
         metadata["result"]["title"] = "Explicit metadata title"
         self.assertEqual(
-            registry_title(metadata, "[submission] A human-readable result"),
+            registry_title(metadata, "A human-readable result"),
             "Explicit metadata title",
         )
 
@@ -559,7 +596,7 @@ class ReviewerTests(unittest.TestCase):
         record = registry_record(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
                    "repository": "example/project", "commit": "1" * 40},
-            taken=set(),
+            permanent_id="PALOMAR-2026-08-01-000012",
             mechanical=self.mechanical_fixture(),
             review={
                 "reviewed_at": "2026-08-01T12:34:56Z",
@@ -665,7 +702,7 @@ class ReviewerTests(unittest.TestCase):
         record = registry_record(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
                    "repository": "example/project", "commit": "1" * 40},
-            taken=set(),
+            permanent_id="PALOMAR-2026-08-01-000012",
             mechanical=mechanical,
             review={
                 "reviewed_at": "2026-08-01T12:34:56Z",
@@ -731,9 +768,11 @@ class ReviewerTests(unittest.TestCase):
     def test_publish_and_finalize_against_live_database_validator(self):
         database_source = Path(os.environ["PALOMAR_DATABASE_CHECKOUT"]).resolve()
         policy_source = Path(os.environ["PALOMAR_POLICY_CHECKOUT"]).resolve()
-        sample_record_path = next((database_source / "entries").glob("*.json"))
+        # The registry starts empty, so the canonical record comes from the
+        # database's own test fixture rather than from what is published.
+        sample_record_path = database_source / "tests" / "fixtures" / "entry.json"
         sample_record = json.loads(sample_record_path.read_text())
-        sample_bundle = database_source / sample_record["challenge_render"]["artifact_path"]
+        sample_bundle = database_source / "tests" / "fixtures" / "render"
         database_head = subprocess.run(
             ["git", "-C", str(database_source), "rev-parse", "HEAD"],
             check=True,
@@ -744,7 +783,7 @@ class ReviewerTests(unittest.TestCase):
         def commit_source(path, mechanical):
             formalization_sha256 = hashlib.sha256((path / "formalization.yaml").read_bytes()).hexdigest()
             mechanical["formalization_sha256"] = formalization_sha256
-            mechanical["formalization"] = {"sha256": formalization_sha256}
+            mechanical["formalization"]["sha256"] = formalization_sha256
             subprocess.run(["git", "init", "--quiet", str(path)], check=True)
             subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
             subprocess.run(
@@ -784,7 +823,7 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_path": ".github/workflows/submission.yml",
                 "workflow_commit": "8" * 40,
                 "workflow_url": mechanical["workflow_url"],
-                "event": "issues",
+                "event": "workflow_dispatch",
                 "status": "completed",
                 "conclusion": "success",
                 "created_at": "2026-08-01T12:00:00Z",
@@ -811,7 +850,7 @@ class ReviewerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            work = root / "12"
+            work = root / "a1b2c3d4e5f6"
             source = work / "source"
             source.mkdir(parents=True)
             subprocess.run(
@@ -883,11 +922,6 @@ class ReviewerTests(unittest.TestCase):
                     ),
                 ],
             }
-            issue = {
-                "number": 12,
-                "title": "[submission] Example result",
-                "url": "https://github.com/PalomarRegistry/PalomarSubmission/issues/12",
-            }
             (source / "formalization.yaml").write_text(
                 "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
             )
@@ -901,10 +935,7 @@ class ReviewerTests(unittest.TestCase):
             (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
             bind_publication_evidence(work, mechanical)
             (work / "review.json").write_text(json.dumps(review))
-            (work / "issue.json").write_text(json.dumps(issue))
-            (work / "review-url").write_text(
-                "https://github.com/PalomarRegistry/PalomarSubmission/issues/12#issuecomment-1\n"
-            )
+            (work / "state.json").write_text(json.dumps({"id": "a1b2c3d4e5f6", "repository": "example/project", "commit": mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": None, "push_verified": True, "status": "review-ready", "publish_consent": True}))
             (work / "review-sha256").write_text(review_digest(review) + "\n")
             (work / "mechanical-report-url").write_text(mechanical["workflow_url"] + "\n")
 
@@ -914,12 +945,19 @@ class ReviewerTests(unittest.TestCase):
             (render_result / "challenge-render.json").write_text(
                 json.dumps(
                     {
+                        "schema_version": 2,
                         "status": "pass",
                         "source": {
                             "repository": mechanical["source"]["repository"],
                             "repository_url": mechanical["source"]["repository_url"],
                             "commit": mechanical["source"]["commit"],
                             "challenge_sha256": mechanical["challenge"]["sha256"],
+                            "project_path": mechanical["source"].get("project_path", ""),
+                            "challenge_path": mechanical["challenge"]["path"],
+                            "solution_path": mechanical["solution"]["path"],
+                            "comparator_config_path": mechanical["comparator"]["path"],
+                            "lakefile_path": mechanical["lakefile"]["path"],
+                            "lean_toolchain_path": mechanical["lean_toolchain_path"],
                         },
                         "format": "verso-html",
                         "entrypoint": "Challenge/index.html",
@@ -933,23 +971,55 @@ class ReviewerTests(unittest.TestCase):
                 )
             )
 
+            def state_for(submission_id):
+                """The private record the submission server would hold."""
+                for path in sorted(root.glob("*/state.json")):
+                    record = json.loads(path.read_text())
+                    if record["id"] == submission_id:
+                        return record
+                return None
+
             def clone_database(_url, _revision, destination):
+                # An update must see the version it supersedes, so once the
+                # first record is published the clone comes from that branch.
+                published = work / "database"
+                branch = None
+                if published != destination and (published / "entries").is_dir():
+                    origin = published
+                    branch = subprocess.run(
+                        ["git", "-C", str(published), "rev-parse", "--abbrev-ref", "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                else:
+                    origin = database_source
                 subprocess.run(
-                    ["git", "clone", "--quiet", str(database_source), str(destination)],
+                    ["git", "clone", "--quiet", str(origin), str(destination)],
                     check=True,
                 )
+                if branch:
+                    subprocess.run(
+                        ["git", "-C", str(destination), "checkout", "--quiet", branch],
+                        check=True,
+                    )
                 shutil.copy(database_source / "schema-v1.json", destination / "schema-v1.json")
                 shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
-                return database_head
+                return subprocess.run(
+                    ["git", "-C", str(destination), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
 
             args = SimpleNamespace(
-        state=12,
+                submission="a1b2c3d4e5f6",
                 work_dir=str(root),
                 render_result=str(render_result),
                 dry_run=True,
             )
             (work / "review-sha256").write_text("0" * 64 + "\n")
-            with self.assertRaisesRegex(ReviewerError, "posted review does not match"):
+            with self.assertRaisesRegex(ReviewerError, "delivered review does not match"):
                 publish(args)
             (work / "review-sha256").write_text(review_digest(review) + "\n")
             (work / "mechanical-report-sha256").write_text("0" * 64 + "\n")
@@ -977,12 +1047,18 @@ class ReviewerTests(unittest.TestCase):
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+                mock.patch("palomar_reviewer.cli.submission_state", side_effect=state_for),
             ):
                 self.assertEqual(publish(args), 0)
 
             database = work / "database"
-            entry_path = database / "entries" / "PALOMAR-2026-08-01-000012-v1.json"
+            # The permanent identifier is allocated at random, so the entry is
+            # found rather than named.
+            entries = sorted((database / "entries").glob("*.json"))
+            self.assertEqual(len(entries), 1)
+            entry_path = entries[0]
             record = json.loads(entry_path.read_text())
+            self.assertRegex(record["id"], r"\APALOMAR-2026-08-01-[0-9]{6}\Z")
             self.assertEqual(record["schema_version"], 1)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
@@ -1022,8 +1098,7 @@ class ReviewerTests(unittest.TestCase):
                     0,
                 )
 
-            update_issue_number = sample_record["submission"]["issue"]
-            update_work = root / str(update_issue_number)
+            update_work = root / "b2c3d4e5f6a1"
             update_source = update_work / "source"
             update_source.mkdir(parents=True)
             subprocess.run(
@@ -1031,11 +1106,7 @@ class ReviewerTests(unittest.TestCase):
                 check=True,
             )
             update_mechanical = self.mechanical_fixture(submission="b2c3d4e5f6a1", run_id=103)
-            update_mechanical["existing_id"] = sample_record["id"]
-            update_mechanical["source"] = {
-                key: sample_record["source"][key]
-                for key in ("repository", "repository_url", "commit", "tree_url")
-            }
+            update_mechanical["existing_id"] = record["id"]
             update_mechanical["challenge"].update(
                 {
                     "sha256": sample_record["verification"]["challenge_sha256"],
@@ -1049,6 +1120,10 @@ class ReviewerTests(unittest.TestCase):
             update_mechanical["solution"]["sha256"] = sample_record["verification"]["solution_sha256"]
             update_mechanical["lean_toolchain"] = sample_record["formalization"]["lean_toolchain"]
             update_mechanical["comparator"] = {
+                "path": sample_record["formalization"]["comparator_config_path"],
+                "sha256": "b" * 64,
+                "challenge_module": "Challenge",
+                "solution_module": "Solution",
                 "theorem_names": sample_record["formalization"]["theorem_names"],
                 "definition_names": sample_record["formalization"]["definition_names"],
                 "permitted_axioms": sample_record["formalization"]["permitted_axioms"],
@@ -1060,11 +1135,6 @@ class ReviewerTests(unittest.TestCase):
                 }
                 for dependency in sample_record["formalization"]["project_dependencies"]
             ]
-            update_issue = {
-                "number": update_issue_number,
-                "title": "[submission] Updated example result",
-                "url": (f"https://github.com/PalomarRegistry/PalomarSubmission/issues/{update_issue_number}"),
-            }
             (update_source / "formalization.yaml").write_text(
                 "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
             )
@@ -1087,23 +1157,23 @@ class ReviewerTests(unittest.TestCase):
                 "mechanical_report": update_mechanical_url,
             }
             (update_work / "review.json").write_text(json.dumps(update_review))
-            (update_work / "issue.json").write_text(json.dumps(update_issue))
+            (update_work / "state.json").write_text(json.dumps({"id": "b2c3d4e5f6a1", "repository": update_mechanical["source"]["repository"], "commit": update_mechanical["source"]["commit"], "authorization": {"relationship": "maintainer"}, "existing_id": record["id"], "push_verified": True, "status": "review-ready", "publish_consent": True}))
             (update_work / "mechanical-report-url").write_text(update_mechanical_url + "\n")
-            (update_work / "review-url").write_text(
-                f"https://github.com/PalomarRegistry/PalomarSubmission/issues/{update_issue_number}#issuecomment-2\n"
-            )
             (update_work / "review-sha256").write_text(review_digest(update_review) + "\n")
             update_render = root / "update-render-result"
             shutil.copytree(sample_bundle, update_render / "bundle")
             update_report = json.loads((render_result / "challenge-render.json").read_text())
             update_report["source"] = {
+                **update_report["source"],
                 "repository": update_mechanical["source"]["repository"],
                 "repository_url": update_mechanical["source"]["repository_url"],
                 "commit": update_mechanical["source"]["commit"],
                 "challenge_sha256": update_mechanical["challenge"]["sha256"],
+                "comparator_config_path": update_mechanical["comparator"]["path"],
             }
             (update_render / "challenge-render.json").write_text(json.dumps(update_report))
             update_args = SimpleNamespace(
+                submission="b2c3d4e5f6a1",
                 work_dir=str(root),
                 render_result=str(update_render),
                 dry_run=True,
@@ -1111,14 +1181,15 @@ class ReviewerTests(unittest.TestCase):
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+                mock.patch("palomar_reviewer.cli.submission_state", side_effect=state_for),
             ):
                 self.assertEqual(publish(update_args), 0)
 
             update_database = update_work / "database"
-            update_entry = update_database / "entries" / f"{sample_record['id']}-v2.json"
+            update_entry = update_database / "entries" / f"{record['id']}-v2.json"
             update_record = json.loads(update_entry.read_text())
             self.assertEqual(update_record["version"], 2)
-            self.assertEqual(update_record["accepted_at"], sample_record["accepted_at"])
+            self.assertEqual(update_record["accepted_at"], record["accepted_at"])
             update_pr = {
                 **pr,
                 "files": [{"path": f"entries/{update_entry.name}"}, {"path": "index.json"}],
@@ -1133,7 +1204,7 @@ class ReviewerTests(unittest.TestCase):
 
             with mock.patch("palomar_reviewer.cli.gh", side_effect=finalize_update_gh):
                 self.assertEqual(
-                    finalize(SimpleNamespace(issue=update_issue_number, pr=100, dry_run=True)),
+                    finalize(SimpleNamespace(submission="b2c3d4e5f6a1", pr=100, dry_run=True)),
                     0,
                 )
 
@@ -1149,18 +1220,6 @@ class ReviewerTests(unittest.TestCase):
             "entries/PALOMAR-2026-08-01-000012-v2.json",
         )
 
-    def test_publication_comment_is_idempotent_per_version(self):
-        record = {"id": "PALOMAR-2026-08-01-000012", "version": 2}
-        issue = {
-            "comments": [
-                {"body": ("<!-- palomar-publication -->\n## 🔭 Published as `PALOMAR-2026-08-01-000012` v1")}
-            ]
-        }
-        self.assertFalse(has_publication_comment(issue, record))
-        issue["comments"].append(
-            {"body": ("<!-- palomar-publication -->\n## 🔭 Published as `PALOMAR-2026-08-01-000012` v2")}
-        )
-        self.assertTrue(has_publication_comment(issue, record))
 
 
     def test_validated_classification_is_bound_to_the_mechanical_report(self):
@@ -1612,7 +1671,7 @@ class PublicationAuthorizationTests(unittest.TestCase):
             },
             "source": {"repository": "example/project", "commit": "1" * 40},
         }
-        review = {"existing_id": None}
+        review = {"submission_id": "a1b2c3d4e5f6"}
         state = {
             "id": "a1b2c3d4e5f6",
             "repository": "example/project",
@@ -1679,8 +1738,15 @@ class PublicationAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "authorization"):
             self.authorize(mechanical, review, state)
 
-    def test_a_review_claiming_a_different_update_target_is_refused(self):
+    def test_a_report_claiming_a_different_update_target_is_refused(self):
         mechanical, review, state = self.parts()
-        review["existing_id"] = "PALOMAR-2026-08-05-123456"
+        mechanical["existing_id"] = "PALOMAR-2026-08-05-123456"
         with self.assertRaisesRegex(ReviewerError, "update intent"):
+            self.authorize(mechanical, review, state)
+
+    def test_a_review_of_another_submission_is_refused(self):
+        """The review is bound to the submission, not merely to a decision."""
+        mechanical, review, state = self.parts()
+        review["submission_id"] = "f6e5d4c3b2a1"
+        with self.assertRaisesRegex(ReviewerError, "review and state disagree"):
             self.authorize(mechanical, review, state)
