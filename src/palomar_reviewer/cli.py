@@ -1326,6 +1326,17 @@ def submission_state(submission_id: str) -> dict[str, Any] | None:
 
 
 def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) -> None:
+    # Writing here changes the live, private record of somebody's submission,
+    # so it has to be asked for. Twice now a test has reached this by way of a
+    # failure path nobody remembered to stub, and invented submissions in
+    # production. Refusing by default costs an operator one environment
+    # variable; permitting by default costs whatever the next unstubbed path
+    # happens to write.
+    if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
+        raise ReviewerError(
+            f"refusing to write {path}: set PALOMAR_ALLOW_STATE_WRITES=1 to change the "
+            f"live submission record in {STATE_REPO}"
+        )
     """Commit a file into the private state repository.
 
     The write is conditional on the sha that was read, not on whatever the sha

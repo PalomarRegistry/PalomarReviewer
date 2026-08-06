@@ -39,7 +39,9 @@ palomar-review doctor
 ```
 
 `gh` must be authenticated as an account with access to
-`PalomarSubmissionState`. Install and authenticate at least one review engine:
+`PalomarSubmissionState`. Anything that changes a submission's record refuses
+to run unless `PALOMAR_ALLOW_STATE_WRITES=1` is set, because that record is
+live and private and writing to it should be deliberate. Install and authenticate at least one review engine:
 
 ```bash
 codex login
