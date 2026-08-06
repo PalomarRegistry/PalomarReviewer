@@ -2102,6 +2102,14 @@ class ReviewTimingTests(unittest.TestCase):
         self.assertRegex(updated["review_started_at"], r"\A\d{4}-\d{2}-\d{2}T")
         self.assertIn("running", write.call_args.args[2])
 
+    def test_a_duration_too_short_to_be_a_review_is_not_recorded(self):
+        """Three one-second durations reached the live record and the page
+        told a submitter reviews take about one second."""
+        with mock.patch.object(cli, "put_state") as write:
+            cli.record_review_duration(1)
+            cli.record_review_duration(19)
+        write.assert_not_called()
+
     def test_durations_are_kept_recent_and_unattributed(self):
         with (
             mock.patch.object(cli, "state_json", return_value={"seconds": list(range(1, 25))}),
