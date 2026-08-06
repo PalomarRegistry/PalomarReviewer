@@ -2773,6 +2773,9 @@ def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
     for field in ("result_origin", "repository_role"):
         if provenance.get(field) == "unspecified":
             raise ReviewerError(f"cannot register a submission whose {field} is unspecified")
+    for source in provenance.get("mathematical_sources", []):
+        if isinstance(source, dict):
+            source.pop("author_contacted", None)
     return provenance
 
 
