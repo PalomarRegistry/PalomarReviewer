@@ -2066,6 +2066,18 @@ class AutomaticLoopTests(unittest.TestCase):
             )), 0)
         abandoned.assert_called_once_with(row, "review attempt limit reached")
 
+        delivered = {**row, "status": "review-ready"}
+        with (
+            mock.patch.object(cli, "state_directory_names", return_value=[row["id"]]),
+            mock.patch.object(cli, "submission_state", side_effect=[row, delivered]),
+            mock.patch.object(cli, "abandon_review") as abandoned,
+        ):
+            self.assertEqual(cli.auto(SimpleNamespace(
+                max_reviews=5, policy_ref="main", engine="codex", model=None,
+                reasoning_effort=None, command=None, work_dir=".palomar-reviews",
+            )), 0)
+        abandoned.assert_not_called()
+
     def test_the_attempt_is_counted_when_it_starts_not_when_it_fails(self):
         """A runner that dies recording nothing would otherwise never count."""
         with mock.patch.object(cli, "put_state"):

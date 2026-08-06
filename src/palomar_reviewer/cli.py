@@ -24,14 +24,8 @@ from urllib.parse import quote
 import jsonschema
 import yaml
 
-# Deliberately still the pre-migration name, even though the repository now
-# lives at PalomarRegistry/PalomarSubmission. This value is written into
-# registered records as `submission.repository`, and every schema from v2 to v6
-# pins it with `"const": "kim-em/PalomarSubmission"`. Frozen schemas cannot be
-# edited, so a record naming the new repository would not validate: registration
-# is frozen until schema-v7 restructures submission identity. GitHub redirects
-# the old name for every API call, so the reviewer keeps working meanwhile.
-# Move this in the same change that introduces schema-v7.
+# The public verification repository is also recorded in registered verification
+# provenance, where the current database schema pins this canonical name.
 SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
 STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
@@ -3292,6 +3286,14 @@ def _stale_review(record: dict[str, Any], limit_seconds: int = 7200) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - began).total_seconds() > limit_seconds
 
 
+def _exhausted_review(record: dict[str, Any]) -> bool:
+    status = record.get("status")
+    eligible = status == "awaiting-review" or (
+        status == "reviewing" and _stale_review(record)
+    )
+    return eligible and int(record.get("review_attempts") or 0) >= REVIEW_ATTEMPT_LIMIT
+
+
 def submissions_needing_work() -> tuple[
     list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
 ]:
@@ -3307,7 +3309,7 @@ def submissions_needing_work() -> tuple[
             # marked as running for ever, with nothing ever picking it up.
             status == "reviewing" and _stale_review(record)
         ):
-            if int(record.get("review_attempts") or 0) >= REVIEW_ATTEMPT_LIMIT:
+            if _exhausted_review(record):
                 exhausted.append(record)
             else:
                 to_review.append(record)
@@ -3335,7 +3337,7 @@ def auto(args: argparse.Namespace) -> int:
         print(f"::group::Abandon review {record['id']}", flush=True)
         try:
             fresh = submission_state(record["id"])
-            if fresh is not None:
+            if fresh is not None and _exhausted_review(fresh):
                 reason = str(fresh.get("review_error") or "review attempt limit reached")
                 abandon_review(fresh, reason)
         except Exception as error:
