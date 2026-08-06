@@ -2403,3 +2403,20 @@ class VocabularyTests(unittest.TestCase):
         source = Path(cli.__file__).read_text(encoding="utf-8")
         stray = sorted(set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source)))
         self.assertEqual(stray, [], f"cli.py still says {', '.join(stray)}")
+
+
+class FailedVerificationTests(unittest.TestCase):
+    def test_a_failed_report_is_refused_in_words(self):
+        """It reached review at all because a failed run reported success.
+
+        The schema refused it too, in a wall of output nobody could read.
+        """
+        report = {
+            "schema_version": 1,
+            "status": "error",
+            "stage": "intake",
+            "errors": ["formalization.yaml field project must be a mapping"],
+        }
+        state = {"id": "a1b2c3d4e5f6", "run": {"id": 1}}
+        with self.assertRaisesRegex(ReviewerError, "did not pass.*project must be a mapping"):
+            cli.validate_mechanical_artifact(report, state, {"url": "x", "headSha": "9" * 40})
