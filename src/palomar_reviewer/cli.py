@@ -1412,6 +1412,12 @@ def abandon_review(state: dict[str, Any], reason: str) -> dict[str, Any]:
     )
 
 
+# A review runs six model passes over a Lean repository. Anything faster than
+# this did not happen: it is a stubbed engine or a path that failed early, and
+# recording it would put a figure on the page that no review ever took.
+MINIMUM_PLAUSIBLE_REVIEW_SECONDS = 20
+
+
 def record_review_duration(seconds: float) -> None:
     """Keep what reviews cost in wall-clock, so the page can say how long.
 
@@ -1419,6 +1425,12 @@ def record_review_duration(seconds: float) -> None:
     it was. Only recent ones are kept, so an estimate follows the model rather
     than averaging over its whole history.
     """
+    if seconds < MINIMUM_PLAUSIBLE_REVIEW_SECONDS:
+        print(
+            f"not recording a {seconds:.0f}s review: too fast to have been one",
+            file=sys.stderr,
+        )
+        return
     path = "index/review-timing.json"
     existing = state_json(path) or {}
     previous = [n for n in existing.get("seconds", []) if isinstance(n, (int, float)) and n > 0]
