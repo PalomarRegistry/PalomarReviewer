@@ -2017,11 +2017,24 @@ class AutomaticLoopTests(unittest.TestCase):
         )
 
     def row(self, ident, **fields):
-        return {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
+        row = {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
+        if row.get("status") == "review-ready":
+            row.setdefault("review_schema_version", 2)
+        return row
 
     def split(self, *rows):
         listing, state = self.records(*rows)
-        with listing, state:
+        current_review = {
+            "schema_version": 2,
+            "submission_id": "",
+            "decision": "accept",
+        }
+
+        def review_for(path):
+            current_review["submission_id"] = path.split("/")[1]
+            return current_review
+
+        with listing, state, mock.patch.object(cli, "state_json", side_effect=review_for):
             return [[row["id"] for row in group] for group in cli.submissions_needing_work()[:3]]
 
     def test_work_is_split_by_what_the_record_says(self):
@@ -2041,6 +2054,24 @@ class AutomaticLoopTests(unittest.TestCase):
             self.split(self.row("aaaaaaaaaaaa", status="reviewing", review_started_at=recent)),
             [[], [], []],
         )
+
+    def test_an_obsolete_delivered_review_is_queued_for_rerun(self):
+        row = self.row(
+            "aaaaaaaaaaaa",
+            status="review-ready",
+            registration_consent=False,
+            review_schema_version=1,
+        )
+        listing, state = self.records(row)
+        obsolete = {
+            "schema_version": 1,
+            "submission_id": row["id"],
+            "decision": "accept",
+        }
+        with listing, state, mock.patch.object(cli, "state_json", return_value=obsolete):
+            to_review, to_register, to_finalize, exhausted = cli.submissions_needing_work()
+        self.assertEqual([record["id"] for record in to_review], [row["id"]])
+        self.assertEqual((to_register, to_finalize, exhausted), ([], [], []))
 
     def test_a_review_that_keeps_failing_is_eventually_given_up_on(self):
         """Every pass reset the clock, so a failing review retried for ever:
@@ -2339,7 +2370,7 @@ class SpendAccountingTests(unittest.TestCase):
     def test_the_spend_is_kept_with_the_private_record_and_accumulates(self):
         state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
                  "spend": [{"usd": 0.5}]}
-        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept"}
+        review = {"schema_version": 2, "submission_id": "a1b2c3d4e5f6", "decision": "accept"}
         with (
             mock.patch.object(cli, "put_state"),
             mock.patch.object(cli, "state_json", return_value=None),
@@ -2415,7 +2446,12 @@ class DeliveredReviewChainTests(unittest.TestCase):
                  "registration_consent": True,
                  "registration_consent_review_sha256": "0" * 64,
                  "_blob_sha": "blob-1"}
-        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept", "summary": "Fine."}
+        review = {
+            "schema_version": 2,
+            "submission_id": "a1b2c3d4e5f6",
+            "decision": "accept",
+            "summary": "Fine.",
+        }
         written = {}
 
         def record(path, value, message, blob_sha=None):
@@ -2429,6 +2465,7 @@ class DeliveredReviewChainTests(unittest.TestCase):
 
         self.assertEqual(updated["status"], "review-ready")
         self.assertEqual(updated["review_sha256"], cli.review_digest(review))
+        self.assertEqual(updated["review_schema_version"], 2)
         # A second review must not inherit consent given to the first.
         self.assertIs(updated["registration_consent"], False)
         self.assertIsNone(updated["registration_consent_review_sha256"])

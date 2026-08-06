@@ -1512,6 +1512,7 @@ def deliver_review(
         "review-ready",
         "The editorial review is ready for you",
         review_sha256=review_digest(review),
+        review_schema_version=review["schema_version"],
         registration_consent=False,
         registration_consent_review_sha256=None,
         spend=[*previous, spend] if spend else previous,
@@ -3294,6 +3295,18 @@ def _exhausted_review(record: dict[str, Any]) -> bool:
     return eligible and int(record.get("review_attempts") or 0) >= REVIEW_ATTEMPT_LIMIT
 
 
+def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
+    if record.get("review_schema_version") == REVIEW_SCHEMA_VERSION:
+        return False
+    review = state_json(f"submissions/{record['id']}/review.json")
+    return not (
+        isinstance(review, dict)
+        and review.get("schema_version") == REVIEW_SCHEMA_VERSION
+        and review.get("submission_id") == record["id"]
+        and review.get("decision") in REVIEW_DECISIONS
+    )
+
+
 def submissions_needing_work() -> tuple[
     list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
 ]:
@@ -3313,8 +3326,11 @@ def submissions_needing_work() -> tuple[
                 exhausted.append(record)
             else:
                 to_review.append(record)
-        elif status == "review-ready" and record.get("registration_consent") is True:
-            (to_finalize if record.get("registration_pr") else to_register).append(record)
+        elif status == "review-ready":
+            if _delivered_review_needs_rerun(record):
+                to_review.append(record)
+            elif record.get("registration_consent") is True:
+                (to_finalize if record.get("registration_pr") else to_register).append(record)
     order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))
     return order(to_review), order(to_register), order(to_finalize), order(exhausted)
 

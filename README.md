@@ -177,7 +177,9 @@ Treat a rubric or final-review schema bump as a coupled Policy and Reviewer
 deployment. Pause new review starts, confirm that no review is in flight, merge
 Policy and then Reviewer back-to-back, and resume the runner. A current reviewer
 refuses a policy checkout or stored review from another contract version rather
-than delivering or registering it.
+than delivering or registering it. The automatic loop queues an already
+delivered review from an older contract for a fresh review before it can be
+registered.
 
 ## Audit trail
 
