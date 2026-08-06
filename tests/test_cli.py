@@ -309,10 +309,11 @@ class ReviewerTests(unittest.TestCase):
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
         ]
         rubric = {
-            "schema_version": 4,
+            "schema_version": 6,
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
+            "step_result": {"verdicts": ["pass", "warn", "fail"]},
             "steps": [
                 {
                     "id": "metadata",
@@ -1383,6 +1384,36 @@ class ReviewerTests(unittest.TestCase):
         rubric["schema_version"] = 3
         self.assertEqual(validate_rubric(rubric), 3)
 
+    def test_version_six_rubric_requires_current_verdicts(self):
+        _, _, rubric = self.review_policy_fixture()
+        self.assertEqual(validate_rubric(rubric), 6)
+        rubric["step_result"]["verdicts"] = ["pass", "warn", "unknown"]
+        with self.assertRaisesRegex(ReviewerError, "supported pass verdicts"):
+            validate_rubric(rubric)
+
+    def test_current_engine_schemas_reject_unknown_outcomes(self):
+        result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
+        result["verdict"] = "unknown"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(result, STEP_SCHEMA)
+        synthesis, _passes, _rubric = self.review_policy_fixture()
+        synthesis["decision"] = "unknown"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(synthesis, SYNTHESIS_SCHEMA)
+
+    def test_normalized_review_uses_current_schema(self):
+        synthesis, passes, _rubric = self.review_policy_fixture()
+        report = cli.normalize_final(
+            synthesis,
+            state={"id": "a1b2c3d4e5f6"},
+            mechanical={"source": {"repository": "example/project", "commit": "1" * 40}},
+            mechanical_url="https://example.test/mechanical-report.json",
+            policy_commit="2" * 40,
+            model_id="command:test",
+            passes=passes,
+        )
+        self.assertEqual(report["schema_version"], 2)
+
     def test_rubric_rejects_unknown_evidence_inputs(self):
         _, _, rubric = self.review_policy_fixture()
         rubric["steps"][0]["inputs"] = ["challange_source"]
@@ -1459,29 +1490,12 @@ class ReviewerTests(unittest.TestCase):
             mechanical={"status": "pass"},
         )
 
-        synthesis["decision"] = "escalate"
-        with self.assertRaisesRegex(ReviewerError, "require reject"):
-            validate_synthesis_policy(
-                synthesis,
-                passes=passes,
-                rubric=rubric,
-                mechanical={"status": "pass"},
-            )
-
-        passes[3]["verdict"] = "escalate"
-        validate_synthesis_policy(
-            synthesis,
-            passes=passes,
-            rubric=rubric,
-            mechanical={"status": "pass"},
-        )
-
     def test_low_notability_requires_a_blocking_pass_verdict(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["notability"] = 3
         synthesis["scores"]["notability"] = 3
         synthesis["decision"] = "reject"
-        with self.assertRaisesRegex(ReviewerError, "requires a fail or escalate verdict"):
+        with self.assertRaisesRegex(ReviewerError, "requires a fail verdict"):
             validate_synthesis_policy(
                 synthesis,
                 passes=passes,
@@ -1489,22 +1503,12 @@ class ReviewerTests(unittest.TestCase):
                 mechanical={"status": "pass"},
             )
 
-    def test_any_escalated_pass_dominates_fundamental_rejection(self):
+    def test_correctable_failed_pass_can_be_revised(self):
         synthesis, passes, rubric = self.review_policy_fixture()
-        passes[1]["verdict"] = "escalate"
-        passes[3]["scores"]["notability"] = 3
-        passes[3]["verdict"] = "fail"
-        synthesis["scores"]["notability"] = 3
-        synthesis["decision"] = "reject"
-        with self.assertRaisesRegex(ReviewerError, "require escalate"):
-            validate_synthesis_policy(
-                synthesis,
-                passes=passes,
-                rubric=rubric,
-                mechanical={"status": "pass"},
-            )
-
-        synthesis["decision"] = "escalate"
+        passes[1]["verdict"] = "fail"
+        passes[1]["scores"]["statement_alignment"] = 3
+        synthesis["scores"]["statement_alignment"] = 3
+        synthesis["decision"] = "revise"
         validate_synthesis_policy(
             synthesis,
             passes=passes,
@@ -1515,6 +1519,7 @@ class ReviewerTests(unittest.TestCase):
     def test_correctable_low_literature_can_be_revised(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["literature"] = 3
+        passes[3]["verdict"] = "fail"
         synthesis["scores"]["literature"] = 3
         synthesis["decision"] = "revise"
         validate_synthesis_policy(

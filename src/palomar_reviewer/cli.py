@@ -107,7 +107,7 @@ STEP_SCHEMA = {
     ],
     "properties": {
         "step": {"type": "string"},
-        "verdict": {"enum": ["pass", "warn", "fail", "escalate"]},
+        "verdict": {"enum": ["pass", "warn", "fail"]},
         "summary": {"type": "string", "minLength": 1},
         "findings": {
             "type": "array",
@@ -145,7 +145,7 @@ SYNTHESIS_SCHEMA = {
     "additionalProperties": False,
     "required": ["decision", "summary", "scores", "warnings", "requested_changes"],
     "properties": {
-        "decision": {"enum": ["accept", "revise", "reject", "escalate"]},
+        "decision": {"enum": ["accept", "revise", "reject"]},
         "summary": {"type": "string", "minLength": 1},
         "scores": {
             "type": "object",
@@ -591,7 +591,7 @@ def review_digest(report: dict[str, Any]) -> str:
 
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5}:
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5, 6}:
         raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -619,6 +619,8 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
+    if version >= 6 and rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
+        raise ReviewerError("rubric v6 must declare exactly the supported pass verdicts")
     allowed_step_scores = set(STEP_SCORE_KEYS)
     if version < 4:
         allowed_step_scores.remove("classification")
@@ -2203,7 +2205,7 @@ def normalize_final(
     passes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     final = {
-        "schema_version": 1,
+        "schema_version": 2,
         "submission_id": state["id"],
         "source": {
             "repository": mechanical["source"]["repository"],
@@ -2317,11 +2319,6 @@ def validate_synthesis_policy(
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
-    escalated = sorted(result["step"] for result in passes if result["verdict"] == "escalate")
-    if escalated and synthesis["decision"] != "escalate":
-        raise ReviewerError(
-            f"escalated passes require escalate, not {synthesis['decision']}: " + ", ".join(escalated)
-        )
     fundamental: list[tuple[str, int, str]] = []
     for key in mandatory_reject:
         if evidence_scores[key] >= minimum:
@@ -2331,24 +2328,23 @@ def validate_synthesis_policy(
         )
         provider = by_step[owner]
         verdict = provider["verdict"]
-        if verdict not in {"fail", "escalate"}:
+        if verdict != "fail":
             raise ReviewerError(
-                f"a fundamental {key} score below the minimum requires a fail or escalate verdict"
+                f"a fundamental {key} score below the minimum requires a fail verdict"
             )
         fundamental.append((key, evidence_scores[key], verdict))
     if fundamental:
-        expected = "escalate" if escalated else "reject"
-        if synthesis["decision"] != expected:
+        if synthesis["decision"] != "reject":
             details = ", ".join(f"{key}={score}" for key, score, _verdict in fundamental)
             raise ReviewerError(
-                f"fundamental editorial failures require {expected}, not {synthesis['decision']}: {details}"
+                f"fundamental editorial failures require reject, not {synthesis['decision']}: {details}"
             )
 
     if synthesis["decision"] != "accept":
         return
     if mechanical.get("status") != "pass":
         raise ReviewerError("an acceptance requires a passing mechanical report")
-    blocking = sorted(result["step"] for result in passes if result["verdict"] in {"fail", "escalate"})
+    blocking = sorted(result["step"] for result in passes if result["verdict"] == "fail")
     if blocking:
         raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
     below_minimum = []

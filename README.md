@@ -65,18 +65,18 @@ palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol
 The second command writes a complete packet and report under
 `.palomar-reviews/a1b2c3d4e5f6/` and changes nothing else.
 
-For version 2 policies, the runner rejects an internally inconsistent positive
-review: synthesis must reproduce the evidence-pass scores exactly, acceptance
-cannot override a failed or escalated pass, and every completed evidence score
+For rubric version 2 and later, the runner rejects an internally inconsistent
+positive review: synthesis must reproduce the evidence-pass scores exactly, acceptance
+cannot override a failed pass, and every completed evidence score
 must meet the policy's acceptance minimum. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
 substantive judgments is not separately confirmed. The complete packet is
 retained so a reader can check that afterwards.
 
 The policy may also designate a low score as a fundamental editorial failure.
-Currently, notability below the minimum requires `reject` or, when the reviewer
-cannot responsibly settle the question, `escalate`; it cannot be softened to a
-request for revisions.
+Currently, notability below the minimum requires `reject`; it cannot be
+softened to a request for revisions. Other failed passes may lead to `revise`
+when the synthesis identifies a specific, realistically correctable gap.
 
 Deliver that exact review to the submitter:
 
