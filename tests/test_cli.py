@@ -70,6 +70,11 @@ class ReviewerTests(unittest.TestCase):
             "submission": {
                 "submission_id": submission,
                 "authorization": {"relationship": "maintainer"},
+                "requested_paths": {
+                    "project_path": "",
+                    "comparator_config_path": "",
+                    "formalization_metadata_path": "",
+                },
             },
             "source": {
                 "repository": "example/project",
@@ -168,6 +173,13 @@ class ReviewerTests(unittest.TestCase):
             "format": "toml",
         }
         mechanical["lean_toolchain_path"] = "lean-toolchain"
+        # A nested project with a configuration and metadata of its own naming
+        # is only reachable by asking for it, so the report says it was asked.
+        mechanical["submission"]["requested_paths"] = {
+            "project_path": project,
+            "comparator_config_path": f"{project}/Audit/settings.json",
+            "formalization_metadata_path": "formalization.yaml",
+        }
         mechanical["project_dependencies"].append({"name": "local", "path": "."})
         return mechanical
 
@@ -195,6 +207,57 @@ class ReviewerTests(unittest.TestCase):
                     "event": "workflow_dispatch"}
         with self.assertRaisesRegex(ReviewerError, "not the selected project's Lakefile"):
             validate_mechanical_artifact(mechanical, state, run_data)
+
+    def nested_state(self, **paths):
+        requested = {
+            "project_path": "examples/comparator",
+            "comparator_config_path": "examples/comparator/Audit/settings.json",
+            "formalization_metadata_path": "formalization.yaml",
+        }
+        requested.update(paths)
+        return {"id": "a1b2c3d4e5f6", "repository": "example/project",
+                "commit": "1" * 40, "requested_paths": requested,
+                "run": {"id": 101}}
+
+    def test_a_run_that_read_other_files_is_not_this_submission(self):
+        """The submission id is public, so a run can be dispatched for it.
+
+        Repository, commit and project directory can all be made to agree while
+        the run reads a different comparator configuration or a different
+        metadata file. Nothing else in the pipeline would notice.
+        """
+        for field, container, other in (
+            ("comparator_config_path", "comparator", "examples/comparator/other.json"),
+            ("formalization_metadata_path", "formalization", "examples/comparator/other.yaml"),
+        ):
+            with self.subTest(field):
+                mechanical = self.nested_mechanical_fixture()
+                mechanical[container]["path"] = other
+                run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
+                            "event": "workflow_dispatch"}
+                with self.assertRaisesRegex(ReviewerError, f"different {field}"):
+                    validate_mechanical_artifact(mechanical, self.nested_state(), run_data)
+
+    def test_a_run_asked_for_other_files_is_not_this_submission(self):
+        """What the run was asked for must be what the submitter asked for."""
+        mechanical = self.nested_mechanical_fixture()
+        mechanical["submission"]["requested_paths"] = {
+            "project_path": "examples/comparator",
+            "comparator_config_path": "examples/comparator/other.json",
+            "formalization_metadata_path": "",
+        }
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
+                    "event": "workflow_dispatch"}
+        with self.assertRaisesRegex(ReviewerError, "asked for a different comparator_config_path"):
+            validate_mechanical_artifact(mechanical, self.nested_state(), run_data)
+
+    def test_the_paths_a_submission_did_ask_for_are_accepted(self):
+        """A layout nowhere near the defaults still has to go through."""
+        mechanical = self.nested_mechanical_fixture()
+        run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
+                    "event": "workflow_dispatch"}
+        with mock.patch.object(cli, "gh", return_value="identical\n"):
+            validate_mechanical_artifact(mechanical, self.nested_state(), run_data)
 
     def test_mechanical_schema_accepts_explicitly_unspecified_provenance(self):
         mechanical = self.mechanical_fixture()
