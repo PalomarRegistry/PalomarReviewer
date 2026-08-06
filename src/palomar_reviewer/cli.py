@@ -1364,6 +1364,12 @@ def advance_state(
     return updated
 
 
+# A review that keeps failing must stop being retried. Attempts are counted
+# when they start, not when they fail, so a runner that dies without recording
+# anything is counted too.
+REVIEW_ATTEMPT_LIMIT = 3
+
+
 def begin_review(state: dict[str, Any]) -> dict[str, Any]:
     """Say that a review is running, so the submitter sees something moving.
 
@@ -1376,6 +1382,22 @@ def begin_review(state: dict[str, Any]) -> dict[str, Any]:
         "reviewing",
         "The automated review is running",
         review_started_at=utc_now(),
+        review_attempts=int(state.get("review_attempts") or 0) + 1,
+    )
+
+
+def abandon_review(state: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Stop retrying a review that will not complete.
+
+    Without a limit a failing review is picked up again for ever: every pass
+    resets the clock, so it retries on a fixed cycle, spending a review's worth
+    of tokens each time and telling the submitter it is still running.
+    """
+    return advance_state(
+        state,
+        "review-failed",
+        "The automated review could not be completed",
+        review_error=reason[:500],
     )
 
 
@@ -3203,9 +3225,11 @@ def _stale_review(record: dict[str, Any], limit_seconds: int = 7200) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - began).total_seconds() > limit_seconds
 
 
-def submissions_needing_work() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def submissions_needing_work() -> tuple[
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
+]:
     """Split every live submission by what the next step for it would be."""
-    to_review, to_register, to_finalize = [], [], []
+    to_review, to_register, to_finalize, exhausted = [], [], [], []
     for submission_id in state_directory_names():
         record = submission_state(submission_id)
         if record is None or record.get("registered_entry"):
@@ -3216,11 +3240,14 @@ def submissions_needing_work() -> tuple[list[dict[str, Any]], list[dict[str, Any
             # marked as running for ever, with nothing ever picking it up.
             status == "reviewing" and _stale_review(record)
         ):
-            to_review.append(record)
+            if int(record.get("review_attempts") or 0) >= REVIEW_ATTEMPT_LIMIT:
+                exhausted.append(record)
+            else:
+                to_review.append(record)
         elif status == "review-ready" and record.get("registration_consent") is True:
             (to_finalize if record.get("registration_pr") else to_register).append(record)
     order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))
-    return order(to_review), order(to_register), order(to_finalize)
+    return order(to_review), order(to_register), order(to_finalize), order(exhausted)
 
 
 def auto(args: argparse.Namespace) -> int:
@@ -3231,7 +3258,7 @@ def auto(args: argparse.Namespace) -> int:
     private record says it is. Nothing here decides to register: a submission
     reaches this function's register arm only because its submitter asked.
     """
-    to_review, to_register, to_finalize = submissions_needing_work()
+    to_review, to_register, to_finalize, exhausted = submissions_needing_work()
     if not (to_review or to_register or to_finalize):
         print("Nothing to do.")
         return 0
@@ -3252,6 +3279,14 @@ def auto(args: argparse.Namespace) -> int:
         except Exception as error:  # one bad submission must not stall the queue
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if fresh is not None:
+                advance_state(
+                    fresh,
+                    "awaiting-review",
+                    "The automated review did not complete; it will be tried again",
+                    review_error=str(error)[:500],
+                )
         finally:
             print("::endgroup::", flush=True)
 
