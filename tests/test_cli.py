@@ -1893,7 +1893,7 @@ class AutomaticLoopTests(unittest.TestCase):
     def split(self, *rows):
         listing, state = self.records(*rows)
         with listing, state:
-            return [[row["id"] for row in group] for group in cli.submissions_needing_work()]
+            return [[row["id"] for row in group] for group in cli.submissions_needing_work()[:3]]
 
     def test_work_is_split_by_what_the_record_says(self):
         self.assertEqual(
@@ -1912,6 +1912,40 @@ class AutomaticLoopTests(unittest.TestCase):
             self.split(self.row("aaaaaaaaaaaa", status="reviewing", review_started_at=recent)),
             [[], [], []],
         )
+
+    def test_a_review_that_keeps_failing_is_eventually_given_up_on(self):
+        """Every pass reset the clock, so a failing review retried for ever:
+        a review's worth of tokens each time, and a submitter told it was
+        still running."""
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        row = self.row("aaaaaaaaaaaa", status="reviewing", review_started_at=old,
+                       review_attempts=cli.REVIEW_ATTEMPT_LIMIT)
+        to_review, _, _, exhausted = None, None, None, None
+        listing, state = self.records(row)
+        with listing, state:
+            to_review, _, _, exhausted = cli.submissions_needing_work()
+        self.assertEqual([r["id"] for r in to_review], [])
+        self.assertEqual([r["id"] for r in exhausted], ["aaaaaaaaaaaa"])
+
+    def test_the_attempt_is_counted_when_it_starts_not_when_it_fails(self):
+        """A runner that dies recording nothing would otherwise never count."""
+        with mock.patch.object(cli, "put_state"):
+            first = cli.begin_review({"id": "a1b2c3d4e5f6", "status": "awaiting-review",
+                                      "events": []})
+            second = cli.begin_review(first)
+        self.assertEqual(first["review_attempts"], 1)
+        self.assertEqual(second["review_attempts"], 2)
+
+    def test_giving_up_says_so_to_the_submitter(self):
+        with mock.patch.object(cli, "put_state") as write:
+            state = cli.abandon_review(
+                {"id": "a1b2c3d4e5f6", "status": "reviewing", "events": []}, "engine exploded"
+            )
+        self.assertEqual(state["status"], "review-failed")
+        self.assertEqual(state["review_error"], "engine exploded")
+        self.assertIn("could not be completed", write.call_args.args[2])
 
     def test_a_review_whose_runner_died_is_picked_up_again(self):
         """Otherwise a submission stays marked as running for ever."""
@@ -1980,6 +2014,7 @@ class AutomaticLoopTests(unittest.TestCase):
             listing, state,
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "advance_state", side_effect=lambda s, *a, **k: s),
             mock.patch.object(cli, "run_review", side_effect=flaky),
         ):
             self.assertEqual(cli.auto(SimpleNamespace(
