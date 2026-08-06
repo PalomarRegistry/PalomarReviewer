@@ -1177,9 +1177,14 @@ class ReviewerTests(unittest.TestCase):
 
             database = work / "database"
             # The permanent identifier is allocated at random, so the entry is
-            # found rather than named.
-            entries = sorted((database / "entries").glob("*.json"))
-            self.assertEqual(len(entries), 1)
+            # found rather than named. It is found among whatever the real
+            # database already holds, too: this test clones it, and it stopped
+            # being empty the day the first record was registered.
+            entries = sorted(
+                path for path in (database / "entries").glob("*.json")
+                if path.name.startswith("PALOMAR-2026-08-01-")
+            )
+            self.assertEqual(len(entries), 1, "the registration under test was not written")
             entry_path = entries[0]
             record = json.loads(entry_path.read_text())
             self.assertRegex(record["id"], r"\APALOMAR-2026-08-01-[0-9]{6}\Z")
