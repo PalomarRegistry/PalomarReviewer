@@ -1356,6 +1356,39 @@ def advance_state(
     return updated
 
 
+def begin_review(state: dict[str, Any]) -> dict[str, Any]:
+    """Say that a review is running, so the submitter sees something moving.
+
+    Without this a submission sits at "waiting" for the whole review and the
+    page has nothing to show: the review is private, so unlike verification
+    there is no public run to point at.
+    """
+    return advance_state(
+        state,
+        "reviewing",
+        "The automated review is running",
+        review_started_at=utc_now(),
+    )
+
+
+def record_review_duration(seconds: float) -> None:
+    """Keep what reviews cost in wall-clock, so the page can say how long.
+
+    Aggregate and unattributed: a duration says nothing about whose submission
+    it was. Only recent ones are kept, so an estimate follows the model rather
+    than averaging over its whole history.
+    """
+    path = "index/review-timing.json"
+    existing = state_json(path) or {}
+    previous = [n for n in existing.get("seconds", []) if isinstance(n, (int, float)) and n > 0]
+    put_state(
+        path,
+        {"schema_version": 1, "seconds": [*previous, round(seconds)][-20:]},
+        "Record how long a review took",
+        blob_sha=existing.get("_blob_sha"),
+    )
+
+
 def deliver_review(
     state: dict[str, Any],
     review: dict[str, Any],
@@ -1457,7 +1490,7 @@ def prepare_workspace(
     state = submission_state(submission_id)
     if state is None:
         raise ReviewerError(f"submission {submission_id} has no record in {STATE_REPO}")
-    if state.get("status") not in {"awaiting-review", "review-ready"}:
+    if state.get("status") not in {"awaiting-review", "reviewing", "review-ready"}:
         raise ReviewerError(
             f"submission {submission_id} is {state.get('status')}, so there is nothing to review "
             "or register"
@@ -3151,6 +3184,17 @@ def finalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stale_review(record: dict[str, Any], limit_seconds: int = 7200) -> bool:
+    started = record.get("review_started_at")
+    if not isinstance(started, str):
+        return True
+    try:
+        began = dt.datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return True
+    return (dt.datetime.now(dt.timezone.utc) - began).total_seconds() > limit_seconds
+
+
 def submissions_needing_work() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split every live submission by what the next step for it would be."""
     to_review, to_register, to_finalize = [], [], []
@@ -3159,7 +3203,11 @@ def submissions_needing_work() -> tuple[list[dict[str, Any]], list[dict[str, Any
         if record is None or record.get("registered_entry"):
             continue
         status = record.get("status")
-        if status == "awaiting-review":
+        if status == "awaiting-review" or (
+            # A runner that died mid-review would otherwise leave a submission
+            # marked as running for ever, with nothing ever picking it up.
+            status == "reviewing" and _stale_review(record)
+        ):
             to_review.append(record)
         elif status == "review-ready" and record.get("registration_consent") is True:
             (to_finalize if record.get("registration_pr") else to_register).append(record)
@@ -3184,12 +3232,15 @@ def auto(args: argparse.Namespace) -> int:
     for record in to_review[: args.max_reviews]:
         print(f"::group::Review {record['id']}", flush=True)
         try:
+            started = time.monotonic()
+            begin_review(record)
             for apply_step in (False, True):
                 step = argparse.Namespace(**vars(args))
                 step.submission = record["id"]
                 step.apply = apply_step
                 step.policy_ref = args.policy_ref
                 run_review(step)
+            record_review_duration(time.monotonic() - started)
         except Exception as error:  # one bad submission must not stall the queue
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
