@@ -98,6 +98,15 @@ class ReviewerTests(unittest.TestCase):
                 "responsible_maintainers": [{"name": "Example Maintainer"}],
                 "mathematical_sources": [],
                 "related_formalizations": [],
+                # verify_submission.py emits this on every report. Leaving it
+                # out of the fixture is how a record carrying it reached the
+                # database schema for the first time during a real
+                # registration, rather than in CI.
+                "declared": {
+                    "result_origin": True,
+                    "repository_role": True,
+                    "responsible_maintainers": True,
+                },
             },
             "challenge": {
                 "path": "Challenge.lean",
@@ -674,8 +683,9 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_carries_the_single_schema(self):
-        record = registry_record(
+    def example_record(self, **overrides):
+        """One accepted record, built the way `register` builds it."""
+        arguments = dict(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
                    "repository": "example/project", "commit": "1" * 40},
             permanent_id="PALOMAR-2026-08-01-000012",
@@ -686,11 +696,8 @@ class ReviewerTests(unittest.TestCase):
                 "reviewer_models": ["codex:test"],
                 "summary": "Editorially accepted example.",
                 "scores": {
-                    "statement_alignment": 4,
-                    "definition_fidelity": 4,
-                    "notability": 4,
-                    "literature": 4,
-                    "clarity": 4,
+                    "statement_alignment": 4, "definition_fidelity": 4,
+                    "notability": 4, "literature": 4, "clarity": 4,
                 },
                 "warnings": [],
             },
@@ -719,6 +726,11 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_run_attempt": 1,
             },
         )
+        arguments.update(overrides)
+        return registry_record(**arguments)
+
+    def test_registry_record_carries_the_single_schema(self):
+        record = self.example_record()
         self.assertEqual(record["schema_version"], 1)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
@@ -735,6 +747,30 @@ class ReviewerTests(unittest.TestCase):
                 schema,
                 format_checker=jsonschema.FormatChecker(),
             )
+
+    def test_a_metadata_file_with_its_own_ideas_still_registers(self):
+        """People write formalization.yaml, and people write what they like.
+
+        Palomar reads the fields it needs and ignores the rest. Anything
+        stricter would refuse honest submissions over a key nobody asked
+        about, and anything looser would let a submitter put arbitrary text
+        into a permanent public record by naming it something new.
+        """
+        metadata = {
+            "project": {"license": "MIT", "funding": "ARC DP123456"},
+            "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            "lab_notebook": {"tried": ["induction", "a walk"], "cost_aud": 412.5},
+            "result": {"mood": "relieved"},
+        }
+        record = self.example_record(metadata=metadata)
+        self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
+        written = json.dumps(record)
+        for invented in ("lab_notebook", "funding", "mood", "cost_aud", "a walk"):
+            self.assertNotIn(invented, written, f"{invented} reached the record")
+        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
+        if database:
+            schema = json.loads((Path(database) / "schema-v1.json").read_text())
+            jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
 
     def test_repository_license_is_bound_to_metadata_and_file_bytes(self):
         mechanical = self.mechanical_fixture()
