@@ -1120,12 +1120,36 @@ def validate_mechanical_artifact(
         or source["commit"] != state["commit"]
     ):
         raise ReviewerError("mechanical report source does not match the submission")
+    # Every path the submitter chose, bound to the run that acted on it.
+    #
+    # The submission id is public in the run name, so a run can be dispatched by
+    # somebody else for the same repository, commit and project while naming a
+    # different comparator configuration or metadata file, and findVerificationRun
+    # can pin it. Checking only the project directory would accept that run: the
+    # report would agree about everything compared and differ about what was
+    # actually read. So the requested paths are compared as a whole, and then the
+    # paths the run resolved are compared against what those requests mean.
     requested = state.get("requested_paths") or {}
+    reported_request = (report["submission"].get("requested_paths") or {})
+    PATH_KEYS = ("project_path", "comparator_config_path", "formalization_metadata_path")
+    for key in PATH_KEYS:
+        wanted = requested.get(key, "") or ""
+        if wanted:
+            safe_repository_path(wanted, f"requested {key}")
+        if (reported_request.get(key, "") or "") != wanted:
+            raise ReviewerError(f"mechanical report was asked for a different {key}")
+
     requested_project = requested.get("project_path", "") or ""
-    if requested_project:
-        safe_repository_path(requested_project, "requested project path")
     if (source.get("project_path") or "") != requested_project:
         raise ReviewerError("mechanical report project path does not match the submission")
+    prefix_for = f"{requested_project}/" if requested_project else ""
+    for key, container, default in (
+        ("comparator_config_path", report["comparator"], "comparator.json"),
+        ("formalization_metadata_path", report["formalization"], "formalization.yaml"),
+    ):
+        expected = (requested.get(key, "") or "") or f"{prefix_for}{default}"
+        if container.get("path") != expected:
+            raise ReviewerError(f"mechanical report read a different {key} than the submission asked for")
     head_sha = run_data.get("headSha")
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise ReviewerError("trusted verification run has no full workflow commit")
