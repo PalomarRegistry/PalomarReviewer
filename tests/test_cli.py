@@ -2753,6 +2753,24 @@ class EntryProvenanceTests(unittest.TestCase):
         cli.entry_provenance(report)
         self.assertIn("declared", report["provenance"])
 
+    def test_legacy_contact_flag_is_folded_into_endorsement(self):
+        report = self.provenance()
+        report["provenance"]["mathematical_sources"] = [
+            {
+                "title": "A source",
+                "authors": [],
+                "relationship": "other",
+                "author_contacted": "yes",
+                "author_endorsement": "endorsed",
+            }
+        ]
+        result = cli.entry_provenance(report)
+        self.assertNotIn("author_contacted", result["mathematical_sources"][0])
+        self.assertEqual(
+            result["mathematical_sources"][0]["author_endorsement"],
+            "endorsed",
+        )
+
     def test_a_submission_that_declared_nothing_is_not_registered(self):
         """Dropping the block unread would publish defaults as assertions."""
         for field in ("result_origin", "repository_role", "responsible_maintainers"):
