@@ -2427,6 +2427,25 @@ class PublicationAuthorizationTests(unittest.TestCase):
             self.authorize(mechanical, review, state)
 
 
+class StateWriteGuardTests(unittest.TestCase):
+    def test_a_write_nobody_asked_for_is_refused(self):
+        """Not hypothetical: an unstubbed failure path invented submissions in
+        the live record twice, once through a runner that ignores conftest."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PALOMAR_ALLOW_STATE_WRITES", None)
+            with self.assertRaisesRegex(ReviewerError, "PALOMAR_ALLOW_STATE_WRITES"):
+                cli.put_state("submissions/aaaaaaaaaaaa/state.json", {"id": "x"}, "no")
+
+    def test_an_operator_can_still_ask_for_one(self):
+        with (
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+            mock.patch.object(cli, "run", return_value=SimpleNamespace(returncode=1, stdout="")),
+            mock.patch.object(cli, "gh") as api,
+        ):
+            cli.put_state("submissions/a1b2c3d4e5f6/state.json", {"id": "x"}, "yes")
+        self.assertTrue(api.called)
+
+
 class VocabularyTests(unittest.TestCase):
     def test_the_reviewer_says_registration_everywhere(self):
         """One word for one thing.
