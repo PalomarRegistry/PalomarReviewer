@@ -98,6 +98,15 @@ class ReviewerTests(unittest.TestCase):
                 "responsible_maintainers": [{"name": "Example Maintainer"}],
                 "mathematical_sources": [],
                 "related_formalizations": [],
+                # verify_submission.py emits this on every report. Leaving it
+                # out of the fixture is how a record carrying it reached the
+                # database schema for the first time during a real
+                # registration, rather than in CI.
+                "declared": {
+                    "result_origin": True,
+                    "repository_role": True,
+                    "responsible_maintainers": True,
+                },
             },
             "challenge": {
                 "path": "Challenge.lean",
@@ -674,8 +683,9 @@ class ReviewerTests(unittest.TestCase):
             "Explicit metadata title",
         )
 
-    def test_registry_record_carries_the_single_schema(self):
-        record = registry_record(
+    def example_record(self, **overrides):
+        """One accepted record, built the way `register` builds it."""
+        arguments = dict(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
                    "repository": "example/project", "commit": "1" * 40},
             permanent_id="PALOMAR-2026-08-01-000012",
@@ -686,11 +696,8 @@ class ReviewerTests(unittest.TestCase):
                 "reviewer_models": ["codex:test"],
                 "summary": "Editorially accepted example.",
                 "scores": {
-                    "statement_alignment": 4,
-                    "definition_fidelity": 4,
-                    "notability": 4,
-                    "literature": 4,
-                    "clarity": 4,
+                    "statement_alignment": 4, "definition_fidelity": 4,
+                    "notability": 4, "literature": 4, "clarity": 4,
                 },
                 "warnings": [],
             },
@@ -719,6 +726,11 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_run_attempt": 1,
             },
         )
+        arguments.update(overrides)
+        return registry_record(**arguments)
+
+    def test_registry_record_carries_the_single_schema(self):
+        record = self.example_record()
         self.assertEqual(record["schema_version"], 1)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
@@ -735,6 +747,30 @@ class ReviewerTests(unittest.TestCase):
                 schema,
                 format_checker=jsonschema.FormatChecker(),
             )
+
+    def test_a_metadata_file_with_its_own_ideas_still_registers(self):
+        """People write formalization.yaml, and people write what they like.
+
+        Palomar reads the fields it needs and ignores the rest. Anything
+        stricter would refuse honest submissions over a key nobody asked
+        about, and anything looser would let a submitter put arbitrary text
+        into a permanent public record by naming it something new.
+        """
+        metadata = {
+            "project": {"license": "MIT", "funding": "ARC DP123456"},
+            "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            "lab_notebook": {"tried": ["induction", "a walk"], "cost_aud": 412.5},
+            "result": {"mood": "relieved"},
+        }
+        record = self.example_record(metadata=metadata)
+        self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
+        written = json.dumps(record)
+        for invented in ("lab_notebook", "funding", "mood", "cost_aud", "a walk"):
+            self.assertNotIn(invented, written, f"{invented} reached the record")
+        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
+        if database:
+            schema = json.loads((Path(database) / "schema-v1.json").read_text())
+            jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
 
     def test_repository_license_is_bound_to_metadata_and_file_bytes(self):
         mechanical = self.mechanical_fixture()
@@ -2668,3 +2704,62 @@ class FailedVerificationTests(unittest.TestCase):
         state = {"id": "a1b2c3d4e5f6", "run": {"id": 1}}
         with self.assertRaisesRegex(ReviewerError, "did not pass.*project must be a mapping"):
             cli.validate_mechanical_artifact(report, state, {"url": "x", "headSha": "9" * 40})
+
+
+class EntryProvenanceTests(unittest.TestCase):
+    """What the mechanical report carries is not what a record carries.
+
+    Registration failed on its first real use because the report's provenance
+    was copied into the record wholesale, and the report has a `declared`
+    block that schema-v1 does not allow. Nothing caught it: the record is
+    validated against a schema cloned from PalomarDatabase at registration
+    time, and registration had never run.
+    """
+
+    def provenance(self, **overrides):
+        block = {
+            "result_origin": "source-based",
+            "repository_role": "thin-wrapper",
+            "responsible_maintainers": [{"name": "Example Maintainer"}],
+            "mathematical_sources": [],
+            "related_formalizations": [],
+            "declared": {
+                "result_origin": True,
+                "repository_role": True,
+                "responsible_maintainers": True,
+            },
+        }
+        block.update(overrides)
+        return {"provenance": block}
+
+    def test_the_bookkeeping_the_report_needs_is_not_registered(self):
+        result = cli.entry_provenance(self.provenance())
+        self.assertNotIn("declared", result)
+        # schema-v1 admits exactly these, and `additionalProperties` is false,
+        # so anything else would be refused at the last step of a submission.
+        self.assertLessEqual(
+            set(result),
+            {"result_origin", "repository_role", "responsible_maintainers",
+             "mathematical_sources", "related_formalizations",
+             "substantive_formalization"},
+        )
+        # And the report itself is untouched: it is archived as evidence.
+        report = self.provenance()
+        cli.entry_provenance(report)
+        self.assertIn("declared", report["provenance"])
+
+    def test_a_submission_that_declared_nothing_is_not_registered(self):
+        """Dropping the block unread would publish defaults as assertions."""
+        for field in ("result_origin", "repository_role", "responsible_maintainers"):
+            with self.subTest(field):
+                declared = {"result_origin": True, "repository_role": True,
+                            "responsible_maintainers": True}
+                declared[field] = False
+                with self.assertRaisesRegex(ReviewerError, f"declared no.*{field}"):
+                    cli.entry_provenance(self.provenance(declared=declared))
+
+    def test_an_unspecified_provenance_is_not_registered(self):
+        for field in ("result_origin", "repository_role"):
+            with self.subTest(field):
+                with self.assertRaisesRegex(ReviewerError, f"{field} is unspecified"):
+                    cli.entry_provenance(self.provenance(**{field: "unspecified"}))
