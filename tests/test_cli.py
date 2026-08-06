@@ -2829,3 +2829,44 @@ class UnshallowTests(unittest.TestCase):
                 cli.unshallow(checkout)
             fetched = [c for c in runner.call_args_list if "fetch" in c.args[0]]
             self.assertEqual(fetched, [], "an unshallow fetch was run on a complete checkout")
+
+
+class RegistrationRetryTests(unittest.TestCase):
+    """A registration that failed after pushing must still be retriable.
+
+    The first real registration needed six attempts. One of them pushed the
+    branch and then failed, and every attempt after that failed
+    non-fast-forward, because each allocates a fresh identifier and so builds
+    a commit the abandoned branch is not an ancestor of. It took deleting the
+    branch by hand to get past.
+    """
+
+    def test_a_new_branch_is_pushed_plainly(self):
+        with mock.patch.object(cli, "remote_branch_commit", return_value=None), \
+             mock.patch.object(cli, "run") as runner:
+            cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
+        command = runner.call_args.args[0]
+        self.assertIn("HEAD:refs/heads/submission-abc-v1", command)
+        self.assertFalse([part for part in command if part.startswith("--force")])
+
+    def test_an_abandoned_branch_is_replaced_under_a_lease(self):
+        with mock.patch.object(cli, "remote_branch_commit", return_value="a" * 40), \
+             mock.patch.object(cli, "run") as runner:
+            cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
+        command = runner.call_args.args[0]
+        # Leased against what was actually observed, so a branch that moved
+        # underneath this process is refused rather than overwritten.
+        self.assertIn(
+            f"--force-with-lease=refs/heads/submission-abc-v1:{'a' * 40}", command
+        )
+        self.assertNotIn("--force", command)
+
+    def test_an_open_pull_request_is_found_rather_than_duplicated(self):
+        with mock.patch.object(cli, "gh", return_value="34\n"):
+            self.assertEqual(cli.open_registration_pr("submission-abc-v1"), 34)
+        with mock.patch.object(cli, "gh", return_value="\n"):
+            self.assertIsNone(cli.open_registration_pr("submission-abc-v1"))
+
+    def test_a_branch_that_is_not_there_is_not_a_failure(self):
+        with mock.patch.object(cli, "gh", side_effect=ReviewerError("404")):
+            self.assertIsNone(cli.remote_branch_commit("submission-abc-v1"))
