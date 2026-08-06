@@ -933,9 +933,11 @@ class ReviewerTests(unittest.TestCase):
         self.assertRegex(record["id"], r"^PALOMAR-2026-08-01-[0-9]{6}$")
         self.assertEqual(record["accepted_at"], "2026-08-01")
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
-        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
-        if database:
-            schema = json.loads((Path(database) / "schema-v2.json").read_text())
+        schema_checkout = os.environ.get("PALOMAR_SCHEMA_CHECKOUT") or os.environ.get(
+            "PALOMAR_DATABASE_CHECKOUT"
+        )
+        if schema_checkout:
+            schema = json.loads((Path(schema_checkout) / "schema-v2.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -961,9 +963,11 @@ class ReviewerTests(unittest.TestCase):
         written = json.dumps(record)
         for invented in ("lab_notebook", "funding", "mood", "cost_aud", "a walk"):
             self.assertNotIn(invented, written, f"{invented} reached the record")
-        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
-        if database:
-            schema = json.loads((Path(database) / "schema-v2.json").read_text())
+        schema_checkout = os.environ.get("PALOMAR_SCHEMA_CHECKOUT") or os.environ.get(
+            "PALOMAR_DATABASE_CHECKOUT"
+        )
+        if schema_checkout:
+            schema = json.loads((Path(schema_checkout) / "schema-v2.json").read_text())
             jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
 
     def test_repository_license_is_bound_to_metadata_and_file_bytes(self):

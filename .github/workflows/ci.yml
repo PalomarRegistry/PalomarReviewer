@@ -16,14 +16,20 @@ jobs:
         with:
           persist-credentials: false
           path: reviewer
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: PalomarRegistry/PalomarDatabase
-          # Keep the coordinated database/schema change under test until it
-          # lands; this is returned to main before this pull request merges.
-          ref: codex/private-filtered-registry
-          persist-credentials: false
-          path: palomar-database
+      # PalomarDatabase is private. Public CI checks the public schema contract
+      # without granting a cross-repository credential; maintainers run the
+      # full publication integration with PALOMAR_DATABASE_CHECKOUT locally.
+      - name: Download the published schemas
+        env:
+          PUBLIC_DATA_ORIGIN: https://palomar-data.palomar-server.workers.dev
+        run: |
+          mkdir palomar-schemas
+          curl --fail --silent --show-error --retry 3 \
+            "$PUBLIC_DATA_ORIGIN/schema-v1.json" \
+            --output palomar-schemas/schema-v1.json
+          curl --fail --silent --show-error --retry 3 \
+            "$PUBLIC_DATA_ORIGIN/schema-v2.json" \
+            --output palomar-schemas/schema-v2.json
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: PalomarRegistry/PalomarPolicy
@@ -45,7 +51,7 @@ jobs:
       - name: Compile and test
         working-directory: reviewer
         env:
-          PALOMAR_DATABASE_CHECKOUT: ${{ github.workspace }}/palomar-database
+          PALOMAR_SCHEMA_CHECKOUT: ${{ github.workspace }}/palomar-schemas
           PALOMAR_POLICY_CHECKOUT: ${{ github.workspace }}/palomar-policy
         run: |
           python -m compileall -q src tests
