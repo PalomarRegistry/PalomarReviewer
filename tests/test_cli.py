@@ -309,10 +309,11 @@ class ReviewerTests(unittest.TestCase):
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
         ]
         rubric = {
-            "schema_version": 4,
+            "schema_version": 6,
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
+            "step_result": {"verdicts": ["pass", "warn", "fail"]},
             "steps": [
                 {
                     "id": "metadata",
@@ -375,6 +376,14 @@ class ReviewerTests(unittest.TestCase):
             root = Path(directory)
             (root / "formalization.yaml").write_text("proof_description: classical induction\n")
             self.assertTrue(has_proof_account(root))
+            (root / "formalization.yaml").write_text("project: {name: example}\n")
+            (root / "Challenge.lean").write_text("/-! Informal proof: induct on n. -/\n")
+            self.assertTrue(has_proof_account(root))
+            (root / "Challenge.lean").write_text("theorem example : True := by trivial\n")
+            (root / "README.md").write_text("## Proof outline\n\nInduct on n.\n")
+            self.assertTrue(has_proof_account(root))
+            (root / "README.md").write_text("## Result\n\nAn induction theorem.\n")
+            self.assertFalse(has_proof_account(root))
 
     def test_model_id(self):
         self.assertEqual(reviewer_model("codex", "gpt-test", None), "codex:gpt-test")
@@ -958,7 +967,7 @@ class ReviewerTests(unittest.TestCase):
                 }
             )
             review = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
                 "source": {
                     "repository": mechanical["source"]["repository"],
@@ -1383,6 +1392,36 @@ class ReviewerTests(unittest.TestCase):
         rubric["schema_version"] = 3
         self.assertEqual(validate_rubric(rubric), 3)
 
+    def test_version_six_rubric_requires_current_verdicts(self):
+        _, _, rubric = self.review_policy_fixture()
+        self.assertEqual(validate_rubric(rubric), 6)
+        rubric["step_result"]["verdicts"] = ["pass", "warn", "unknown"]
+        with self.assertRaisesRegex(ReviewerError, "supported pass verdicts"):
+            validate_rubric(rubric)
+
+    def test_current_engine_schemas_reject_unknown_outcomes(self):
+        result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
+        result["verdict"] = "unknown"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(result, STEP_SCHEMA)
+        synthesis, _passes, _rubric = self.review_policy_fixture()
+        synthesis["decision"] = "unknown"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(synthesis, SYNTHESIS_SCHEMA)
+
+    def test_normalized_review_uses_current_schema(self):
+        synthesis, passes, _rubric = self.review_policy_fixture()
+        report = cli.normalize_final(
+            synthesis,
+            state={"id": "a1b2c3d4e5f6"},
+            mechanical={"source": {"repository": "example/project", "commit": "1" * 40}},
+            mechanical_url="https://example.test/mechanical-report.json",
+            policy_commit="2" * 40,
+            model_id="command:test",
+            passes=passes,
+        )
+        self.assertEqual(report["schema_version"], 2)
+
     def test_rubric_rejects_unknown_evidence_inputs(self):
         _, _, rubric = self.review_policy_fixture()
         rubric["steps"][0]["inputs"] = ["challange_source"]
@@ -1459,29 +1498,12 @@ class ReviewerTests(unittest.TestCase):
             mechanical={"status": "pass"},
         )
 
-        synthesis["decision"] = "escalate"
-        with self.assertRaisesRegex(ReviewerError, "require reject"):
-            validate_synthesis_policy(
-                synthesis,
-                passes=passes,
-                rubric=rubric,
-                mechanical={"status": "pass"},
-            )
-
-        passes[3]["verdict"] = "escalate"
-        validate_synthesis_policy(
-            synthesis,
-            passes=passes,
-            rubric=rubric,
-            mechanical={"status": "pass"},
-        )
-
     def test_low_notability_requires_a_blocking_pass_verdict(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["notability"] = 3
         synthesis["scores"]["notability"] = 3
         synthesis["decision"] = "reject"
-        with self.assertRaisesRegex(ReviewerError, "requires a fail or escalate verdict"):
+        with self.assertRaisesRegex(ReviewerError, "requires a fail verdict"):
             validate_synthesis_policy(
                 synthesis,
                 passes=passes,
@@ -1489,22 +1511,12 @@ class ReviewerTests(unittest.TestCase):
                 mechanical={"status": "pass"},
             )
 
-    def test_any_escalated_pass_dominates_fundamental_rejection(self):
+    def test_correctable_failed_pass_can_be_revised(self):
         synthesis, passes, rubric = self.review_policy_fixture()
-        passes[1]["verdict"] = "escalate"
-        passes[3]["scores"]["notability"] = 3
-        passes[3]["verdict"] = "fail"
-        synthesis["scores"]["notability"] = 3
-        synthesis["decision"] = "reject"
-        with self.assertRaisesRegex(ReviewerError, "require escalate"):
-            validate_synthesis_policy(
-                synthesis,
-                passes=passes,
-                rubric=rubric,
-                mechanical={"status": "pass"},
-            )
-
-        synthesis["decision"] = "escalate"
+        passes[1]["verdict"] = "fail"
+        passes[1]["scores"]["statement_alignment"] = 3
+        synthesis["scores"]["statement_alignment"] = 3
+        synthesis["decision"] = "revise"
         validate_synthesis_policy(
             synthesis,
             passes=passes,
@@ -1515,6 +1527,7 @@ class ReviewerTests(unittest.TestCase):
     def test_correctable_low_literature_can_be_revised(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["literature"] = 3
+        passes[3]["verdict"] = "fail"
         synthesis["scores"]["literature"] = 3
         synthesis["decision"] = "revise"
         validate_synthesis_policy(
@@ -1529,7 +1542,16 @@ class ReviewerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "policy" / "schemas").mkdir(parents=True)
-            (work / "policy" / "schemas" / "review.schema.json").write_text(json.dumps({"type": "object"}))
+            review_schema = {
+                "type": "object",
+                "properties": {
+                    "schema_version": {"const": 2},
+                    "decision": {"enum": ["accept", "revise", "reject"]},
+                },
+            }
+            (work / "policy" / "schemas" / "review.schema.json").write_text(
+                json.dumps(review_schema)
+            )
             (work / "policy" / "rubric.json").write_text(json.dumps(rubric))
             mechanical = {
                 "status": "pass",
@@ -1537,6 +1559,7 @@ class ReviewerTests(unittest.TestCase):
             }
             report = {
                 **synthesis,
+                "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
                 "source": mechanical["source"],
                 "mechanical_report": "https://example.test/mechanical",
@@ -1563,9 +1586,52 @@ class ReviewerTests(unittest.TestCase):
                     policy_commit=report["policy_commit"],
                 )
 
+    def test_stored_review_refuses_obsolete_contracts(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        mechanical = {
+            "status": "pass",
+            "source": {"repository": "example/repo", "commit": "1" * 40},
+        }
+        report = {
+            **synthesis,
+            "schema_version": 2,
+            "submission_id": "a1b2c3d4e5f6",
+            "source": mechanical["source"],
+            "mechanical_report": "https://example.test/mechanical",
+            "policy_commit": "2" * 40,
+            "passes": passes,
+        }
+        review_schema = {
+            "type": "object",
+            "properties": {
+                "schema_version": {"const": 2},
+                "decision": {"enum": ["accept", "revise", "reject"]},
+            },
+        }
+        common = {
+            "work": Path("."),
+            "state": {"id": report["submission_id"]},
+            "mechanical": mechanical,
+            "mechanical_url": report["mechanical_report"],
+            "policy_commit": report["policy_commit"],
+            "review_schema": review_schema,
+            "rubric": rubric,
+        }
 
+        old_report = json.loads(json.dumps(report))
+        old_report["schema_version"] = 1
+        with self.assertRaisesRegex(ReviewerError, "must be rerun"):
+            validate_stored_review(old_report, **common)
 
+        unknown_report = json.loads(json.dumps(report))
+        unknown_report["decision"] = "unknown"
+        with self.assertRaisesRegex(ReviewerError, "unsupported decision"):
+            validate_stored_review(unknown_report, **common)
 
+        old_rubric = json.loads(json.dumps(rubric))
+        old_rubric["schema_version"] = 5
+        with self.assertRaisesRegex(ReviewerError, "current policy"):
+            validate_stored_review(report, **{**common, "rubric": old_rubric})
 
     def test_render_result_is_bound_to_source_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1951,11 +2017,24 @@ class AutomaticLoopTests(unittest.TestCase):
         )
 
     def row(self, ident, **fields):
-        return {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
+        row = {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
+        if row.get("status") == "review-ready":
+            row.setdefault("review_schema_version", 2)
+        return row
 
     def split(self, *rows):
         listing, state = self.records(*rows)
-        with listing, state:
+        current_review = {
+            "schema_version": 2,
+            "submission_id": "",
+            "decision": "accept",
+        }
+
+        def review_for(path):
+            current_review["submission_id"] = path.split("/")[1]
+            return current_review
+
+        with listing, state, mock.patch.object(cli, "state_json", side_effect=review_for):
             return [[row["id"] for row in group] for group in cli.submissions_needing_work()[:3]]
 
     def test_work_is_split_by_what_the_record_says(self):
@@ -1976,6 +2055,24 @@ class AutomaticLoopTests(unittest.TestCase):
             [[], [], []],
         )
 
+    def test_an_obsolete_delivered_review_is_queued_for_rerun(self):
+        row = self.row(
+            "aaaaaaaaaaaa",
+            status="review-ready",
+            registration_consent=False,
+            review_schema_version=1,
+        )
+        listing, state = self.records(row)
+        obsolete = {
+            "schema_version": 1,
+            "submission_id": row["id"],
+            "decision": "accept",
+        }
+        with listing, state, mock.patch.object(cli, "state_json", return_value=obsolete):
+            to_review, to_register, to_finalize, exhausted = cli.submissions_needing_work()
+        self.assertEqual([record["id"] for record in to_review], [row["id"]])
+        self.assertEqual((to_register, to_finalize, exhausted), ([], [], []))
+
     def test_a_review_that_keeps_failing_is_eventually_given_up_on(self):
         """Every pass reset the clock, so a failing review retried for ever:
         a review's worth of tokens each time, and a submitter told it was
@@ -1991,6 +2088,26 @@ class AutomaticLoopTests(unittest.TestCase):
             to_review, _, _, exhausted = cli.submissions_needing_work()
         self.assertEqual([r["id"] for r in to_review], [])
         self.assertEqual([r["id"] for r in exhausted], ["aaaaaaaaaaaa"])
+
+        listing, state = self.records(row)
+        with listing, state, mock.patch.object(cli, "abandon_review") as abandoned:
+            self.assertEqual(cli.auto(SimpleNamespace(
+                max_reviews=5, policy_ref="main", engine="codex", model=None,
+                reasoning_effort=None, command=None, work_dir=".palomar-reviews",
+            )), 0)
+        abandoned.assert_called_once_with(row, "review attempt limit reached")
+
+        delivered = {**row, "status": "review-ready"}
+        with (
+            mock.patch.object(cli, "state_directory_names", return_value=[row["id"]]),
+            mock.patch.object(cli, "submission_state", side_effect=[row, delivered]),
+            mock.patch.object(cli, "abandon_review") as abandoned,
+        ):
+            self.assertEqual(cli.auto(SimpleNamespace(
+                max_reviews=5, policy_ref="main", engine="codex", model=None,
+                reasoning_effort=None, command=None, work_dir=".palomar-reviews",
+            )), 0)
+        abandoned.assert_not_called()
 
     def test_the_attempt_is_counted_when_it_starts_not_when_it_fails(self):
         """A runner that dies recording nothing would otherwise never count."""
@@ -2253,7 +2370,7 @@ class SpendAccountingTests(unittest.TestCase):
     def test_the_spend_is_kept_with_the_private_record_and_accumulates(self):
         state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
                  "spend": [{"usd": 0.5}]}
-        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept"}
+        review = {"schema_version": 2, "submission_id": "a1b2c3d4e5f6", "decision": "accept"}
         with (
             mock.patch.object(cli, "put_state"),
             mock.patch.object(cli, "state_json", return_value=None),
@@ -2329,7 +2446,12 @@ class DeliveredReviewChainTests(unittest.TestCase):
                  "registration_consent": True,
                  "registration_consent_review_sha256": "0" * 64,
                  "_blob_sha": "blob-1"}
-        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept", "summary": "Fine."}
+        review = {
+            "schema_version": 2,
+            "submission_id": "a1b2c3d4e5f6",
+            "decision": "accept",
+            "summary": "Fine.",
+        }
         written = {}
 
         def record(path, value, message, blob_sha=None):
@@ -2343,6 +2465,7 @@ class DeliveredReviewChainTests(unittest.TestCase):
 
         self.assertEqual(updated["status"], "review-ready")
         self.assertEqual(updated["review_sha256"], cli.review_digest(review))
+        self.assertEqual(updated["review_schema_version"], 2)
         # A second review must not inherit consent given to the first.
         self.assertIs(updated["registration_consent"], False)
         self.assertIsNone(updated["registration_consent_review_sha256"])

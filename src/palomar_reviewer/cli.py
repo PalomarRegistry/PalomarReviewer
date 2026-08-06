@@ -24,14 +24,8 @@ from urllib.parse import quote
 import jsonschema
 import yaml
 
-# Deliberately still the pre-migration name, even though the repository now
-# lives at PalomarRegistry/PalomarSubmission. This value is written into
-# registered records as `submission.repository`, and every schema from v2 to v6
-# pins it with `"const": "kim-em/PalomarSubmission"`. Frozen schemas cannot be
-# edited, so a record naming the new repository would not validate: registration
-# is frozen until schema-v7 restructures submission identity. GitHub redirects
-# the old name for every API call, so the reviewer keeps working meanwhile.
-# Move this in the same change that introduces schema-v7.
+# The public verification repository is also recorded in registered verification
+# provenance, where the current database schema pins this canonical name.
 SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
 STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
@@ -52,6 +46,9 @@ SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
 MAX_CONTEXT_BYTES = 300_000
 _ENGINE_CREDENTIAL_DIR: Path | None = None
+CURRENT_RUBRIC_VERSION = 6
+REVIEW_SCHEMA_VERSION = 2
+REVIEW_DECISIONS = ("accept", "revise", "reject")
 
 # What a review cost, in tokens, is reported by the engine and is never a
 # guess. Money is a guess unless somebody keeps this table current, so a model
@@ -107,7 +104,7 @@ STEP_SCHEMA = {
     ],
     "properties": {
         "step": {"type": "string"},
-        "verdict": {"enum": ["pass", "warn", "fail", "escalate"]},
+        "verdict": {"enum": ["pass", "warn", "fail"]},
         "summary": {"type": "string", "minLength": 1},
         "findings": {
             "type": "array",
@@ -145,7 +142,7 @@ SYNTHESIS_SCHEMA = {
     "additionalProperties": False,
     "required": ["decision", "summary", "scores", "warnings", "requested_changes"],
     "properties": {
-        "decision": {"enum": ["accept", "revise", "reject", "escalate"]},
+        "decision": {"enum": ["accept", "revise", "reject"]},
         "summary": {"type": "string", "minLength": 1},
         "scores": {
             "type": "object",
@@ -591,7 +588,7 @@ def review_digest(report: dict[str, Any]) -> str:
 
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5}:
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5, 6}:
         raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -619,6 +616,8 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
+    if version >= 6 and rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
+        raise ReviewerError("rubric v6 must declare exactly the supported pass verdicts")
     allowed_step_scores = set(STEP_SCORE_KEYS)
     if version < 4:
         allowed_step_scores.remove("classification")
@@ -649,6 +648,25 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
     if any(not owners[key].get("required") for key in SYNTHESIS_SCORE_KEYS):
         raise ReviewerError("every registry score must be owned by a required pass")
     return version
+
+
+def validate_current_review_contract(
+    rubric: dict[str, Any], review_schema: dict[str, Any]
+) -> int:
+    """Reject a policy checkout that cannot produce a current review."""
+    rubric_version = validate_rubric(rubric)
+    properties = review_schema.get("properties", {})
+    schema_version = properties.get("schema_version", {}).get("const")
+    decisions = properties.get("decision", {}).get("enum")
+    if (
+        rubric_version != CURRENT_RUBRIC_VERSION
+        or schema_version != REVIEW_SCHEMA_VERSION
+        or decisions != list(REVIEW_DECISIONS)
+    ):
+        raise ReviewerError(
+            "policy commit predates the current review contract; rerun against current policy"
+        )
+    return rubric_version
 
 
 def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[str, Any]:
@@ -1494,6 +1512,7 @@ def deliver_review(
         "review-ready",
         "The editorial review is ready for you",
         review_sha256=review_digest(review),
+        review_schema_version=review["schema_version"],
         registration_consent=False,
         registration_consent_review_sha256=None,
         spend=[*previous, spend] if spend else previous,
@@ -1612,14 +1631,22 @@ def prepare_workspace(
 
 
 def has_proof_account(source: Path, mechanical: dict[str, Any] | None = None) -> bool:
-    mechanical = mechanical or {"challenge": {}, "solution": {}, "comparator": {}}
-    path = mechanical_source_path(
-        source,
+    mechanical = mechanical or {
+        "source": {},
+        "challenge": {},
+        "solution": {},
+        "comparator": {},
+    }
+    paths = {
         mechanical_relative_path(mechanical, "formalization_metadata"),
-        "formalization metadata",
+        mechanical_relative_path(mechanical, "challenge_source"),
+        project_readme_relative(mechanical, source),
+    }
+    marker = re.compile(
+        r"(?im)(?:^\s*(?:informal_?proof|proof_?description|proof_?account)\s*:"
+        r"|\b(?:informal\s+proof|proof\s+(?:account|architecture|description|outline|sketch|strategy))\b)"
     )
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return bool(re.search(r"(?im)^\s*(informal_?proof|proof_?description|proof_?account)\s*:", text))
+    return any(marker.search(context_file(source, path)) for path in paths)
 
 
 def context_file(source: Path, relative: str) -> str:
@@ -2203,7 +2230,7 @@ def normalize_final(
     passes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     final = {
-        "schema_version": 1,
+        "schema_version": REVIEW_SCHEMA_VERSION,
         "submission_id": state["id"],
         "source": {
             "repository": mechanical["source"]["repository"],
@@ -2235,11 +2262,17 @@ def validate_stored_review(
     rubric: dict[str, Any] | None = None,
 ) -> None:
     """Bind an operator-inspected dry-run report to the current trusted inputs."""
+    if report.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        raise ReviewerError("stored review predates the current review contract and must be rerun")
+    if report.get("decision") not in REVIEW_DECISIONS:
+        raise ReviewerError(f"stored review has an unsupported decision: {report.get('decision')!r}")
     schema = (
         review_schema
         if review_schema is not None
         else load_json(work / "policy" / "schemas" / "review.schema.json")
     )
+    rubric_data = rubric if rubric is not None else load_json(work / "policy" / "rubric.json")
+    rubric_version = validate_current_review_contract(rubric_data, schema)
     jsonschema.validate(report, schema, format_checker=jsonschema.FormatChecker())
     expected_source = {
         "repository": mechanical["source"]["repository"],
@@ -2254,8 +2287,6 @@ def validate_stored_review(
     if report.get("policy_commit") != policy_commit:
         raise ReviewerError("stored review was produced under another policy commit")
 
-    rubric_data = rubric if rubric is not None else load_json(work / "policy" / "rubric.json")
-    rubric_version = validate_rubric(rubric_data)
     steps = {step["id"]: step for step in rubric_data["steps"] if step["id"] != "synthesis"}
     seen: set[str] = set()
     for result in report["passes"]:
@@ -2317,11 +2348,6 @@ def validate_synthesis_policy(
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
-    escalated = sorted(result["step"] for result in passes if result["verdict"] == "escalate")
-    if escalated and synthesis["decision"] != "escalate":
-        raise ReviewerError(
-            f"escalated passes require escalate, not {synthesis['decision']}: " + ", ".join(escalated)
-        )
     fundamental: list[tuple[str, int, str]] = []
     for key in mandatory_reject:
         if evidence_scores[key] >= minimum:
@@ -2331,24 +2357,23 @@ def validate_synthesis_policy(
         )
         provider = by_step[owner]
         verdict = provider["verdict"]
-        if verdict not in {"fail", "escalate"}:
+        if verdict != "fail":
             raise ReviewerError(
-                f"a fundamental {key} score below the minimum requires a fail or escalate verdict"
+                f"a fundamental {key} score below the minimum requires a fail verdict"
             )
         fundamental.append((key, evidence_scores[key], verdict))
     if fundamental:
-        expected = "escalate" if escalated else "reject"
-        if synthesis["decision"] != expected:
+        if synthesis["decision"] != "reject":
             details = ", ".join(f"{key}={score}" for key, score, _verdict in fundamental)
             raise ReviewerError(
-                f"fundamental editorial failures require {expected}, not {synthesis['decision']}: {details}"
+                f"fundamental editorial failures require reject, not {synthesis['decision']}: {details}"
             )
 
     if synthesis["decision"] != "accept":
         return
     if mechanical.get("status") != "pass":
         raise ReviewerError("an acceptance requires a passing mechanical report")
-    blocking = sorted(result["step"] for result in passes if result["verdict"] in {"fail", "escalate"})
+    blocking = sorted(result["step"] for result in passes if result["verdict"] == "fail")
     if blocking:
         raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
     below_minimum = []
@@ -2360,16 +2385,6 @@ def validate_synthesis_policy(
         raise ReviewerError(
             "an acceptance cannot use scores below the rubric minimum: " + ", ".join(below_minimum)
         )
-
-
-
-
-
-
-
-
-
-
 
 
 def run_review(args: argparse.Namespace) -> int:
@@ -2425,7 +2440,8 @@ def run_review(args: argparse.Namespace) -> int:
     )
     model_id = reviewer_model(args.engine, args.model, args.command)
     rubric = load_json(work / "policy" / "rubric.json")
-    rubric_version = validate_rubric(rubric)
+    review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
+    rubric_version = validate_current_review_contract(rubric, review_schema)
     passes: list[dict[str, Any]] = []
     spend: list[dict[str, Any]] = []
     synthesis: dict[str, Any] | None = None
@@ -2443,8 +2459,10 @@ def run_review(args: argparse.Namespace) -> int:
         prompt_path = work / "prompts" / f"{step['id']}.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(prompt, encoding="utf-8")
-        schema = (
-            SYNTHESIS_SCHEMA if step["id"] == "synthesis" else step_schema_for_rubric(step, rubric_version)
+        result_schema = (
+            SYNTHESIS_SCHEMA
+            if step["id"] == "synthesis"
+            else step_schema_for_rubric(step, rubric_version)
         )
         result, usage = engine_result(
             prompt,
@@ -2452,7 +2470,7 @@ def run_review(args: argparse.Namespace) -> int:
             command=args.command,
             model=args.model,
             cwd=work / "source",
-            schema=schema,
+            schema=result_schema,
             raw_path=work / "raw" / f"{step['id']}.txt",
             allow_network=step["id"] == "literature_notability",
             reasoning_effort=args.reasoning_effort,
@@ -2487,8 +2505,7 @@ def run_review(args: argparse.Namespace) -> int:
         model_id=model_id,
         passes=passes,
     )
-    schema = load_json(work / "policy" / "schemas" / "review.schema.json")
-    jsonschema.validate(final, schema, format_checker=jsonschema.FormatChecker())
+    jsonschema.validate(final, review_schema, format_checker=jsonschema.FormatChecker())
     (work / "review-url").unlink(missing_ok=True)
     (work / "review-sha256").unlink(missing_ok=True)
     write_json(work / "review.json", final)
@@ -3024,9 +3041,7 @@ def register(args: argparse.Namespace) -> int:
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
     schema_path = database / "schema-v1.json"
     if not schema_path.is_file():
-        raise ReviewerError(
-            f"PalomarDatabase main does not register schema-v{record_schema_version}.json"
-        )
+        raise ReviewerError("PalomarDatabase main does not register schema-v1.json")
 
     existing_id = mechanical.get("existing_id")
     permanent_id, accepted_at, version = registration_identity(
@@ -3272,6 +3287,26 @@ def _stale_review(record: dict[str, Any], limit_seconds: int = 7200) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - began).total_seconds() > limit_seconds
 
 
+def _exhausted_review(record: dict[str, Any]) -> bool:
+    status = record.get("status")
+    eligible = status == "awaiting-review" or (
+        status == "reviewing" and _stale_review(record)
+    )
+    return eligible and int(record.get("review_attempts") or 0) >= REVIEW_ATTEMPT_LIMIT
+
+
+def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
+    if record.get("review_schema_version") == REVIEW_SCHEMA_VERSION:
+        return False
+    review = state_json(f"submissions/{record['id']}/review.json")
+    return not (
+        isinstance(review, dict)
+        and review.get("schema_version") == REVIEW_SCHEMA_VERSION
+        and review.get("submission_id") == record["id"]
+        and review.get("decision") in REVIEW_DECISIONS
+    )
+
+
 def submissions_needing_work() -> tuple[
     list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
 ]:
@@ -3287,12 +3322,15 @@ def submissions_needing_work() -> tuple[
             # marked as running for ever, with nothing ever picking it up.
             status == "reviewing" and _stale_review(record)
         ):
-            if int(record.get("review_attempts") or 0) >= REVIEW_ATTEMPT_LIMIT:
+            if _exhausted_review(record):
                 exhausted.append(record)
             else:
                 to_review.append(record)
-        elif status == "review-ready" and record.get("registration_consent") is True:
-            (to_finalize if record.get("registration_pr") else to_register).append(record)
+        elif status == "review-ready":
+            if _delivered_review_needs_rerun(record):
+                to_review.append(record)
+            elif record.get("registration_consent") is True:
+                (to_finalize if record.get("registration_pr") else to_register).append(record)
     order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))
     return order(to_review), order(to_register), order(to_finalize), order(exhausted)
 
@@ -3306,11 +3344,24 @@ def auto(args: argparse.Namespace) -> int:
     reaches this function's register arm only because its submitter asked.
     """
     to_review, to_register, to_finalize, exhausted = submissions_needing_work()
-    if not (to_review or to_register or to_finalize):
+    if not (to_review or to_register or to_finalize or exhausted):
         print("Nothing to do.")
         return 0
 
     failures = 0
+    for record in exhausted:
+        print(f"::group::Abandon review {record['id']}", flush=True)
+        try:
+            fresh = submission_state(record["id"])
+            if fresh is not None and _exhausted_review(fresh):
+                reason = str(fresh.get("review_error") or "review attempt limit reached")
+                abandon_review(fresh, reason)
+        except Exception as error:
+            failures += 1
+            print(f"error: abandoning review of {record['id']} failed: {error}", file=sys.stderr)
+        finally:
+            print("::endgroup::", flush=True)
+
     for record in to_review[: args.max_reviews]:
         print(f"::group::Review {record['id']}", flush=True)
         try:
