@@ -18,24 +18,24 @@ import jsonschema
 
 import palomar_reviewer.cli as cli
 from palomar_reviewer.cli import (
-    allocate_identifier,
     MECHANICAL_REPORT_SCHEMA,
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
     SYSTEM_RESOLUTION_PATHS,
     ReviewerError,
+    allocate_identifier,
     authors_from_metadata,
     engine_result,
     finalize,
     has_proof_account,
     isolated_engine_command,
     load_formalization_metadata,
-    mechanical_report,
     parse_engine_json,
+    preserve_sources,
+    register,
     registration_entry_path,
     registration_identity,
-    register,
     registry_record,
     registry_title,
     render_bundle_manifest,
@@ -43,7 +43,6 @@ from palomar_reviewer.cli import (
     request_render,
     review_digest,
     reviewer_model,
-    run_review,
     step_schema_for_rubric,
     validate_mechanical_artifact,
     validate_render_result,
@@ -153,6 +152,38 @@ class ReviewerTests(unittest.TestCase):
             ],
         }
 
+    def preservation_fixture(self, mechanical, identifier="PALOMAR-2026-08-01-000012", version=1):
+        rows = []
+        seen = set()
+        sources = [(mechanical["source"]["repository"], mechanical["source"]["commit"])]
+        sources.extend(
+            (item["repository"], item["revision"])
+            for item in mechanical.get("project_dependencies", [])
+            if "path" not in item
+        )
+        substantive = mechanical.get("provenance", {}).get("substantive_formalization")
+        if substantive:
+            sources.append((substantive["repository"], substantive["commit"]))
+        for repository, commit in sorted(sources, key=lambda item: (item[0].casefold(), item[1])):
+            key = (repository.casefold(), commit)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "source_repository": repository,
+                    "commit": commit,
+                    "fork_repository": "PalomarArchive/fixture",
+                    "ref": f"refs/tags/palomar/{identifier}-v{version}/{commit}",
+                }
+            )
+        return {
+            "archive_owner": "PalomarArchive",
+            "archived_at": "2026-08-01T12:34:56Z",
+            "receipt_sha256": "d" * 64,
+            "repositories": rows,
+        }
+
     def nested_mechanical_fixture(self, submission="a1b2c3d4e5f6", run_id=101):
         mechanical = self.mechanical_fixture(submission=submission, run_id=run_id)
         project = "examples/comparator"
@@ -191,6 +222,167 @@ class ReviewerTests(unittest.TestCase):
         }
         mechanical["project_dependencies"].append({"name": "local", "path": "."})
         return mechanical
+
+    def test_dry_run_preservation_receipt_covers_the_complete_source_graph(self):
+        mechanical = self.mechanical_fixture()
+        mechanical["provenance"] = {
+            **mechanical["provenance"],
+            "repository_role": "thin-wrapper",
+            "substantive_formalization": {
+                "repository": "example/substantive",
+                "commit": "9" * 40,
+            },
+        }
+        mechanical["project_dependencies"].append(
+            {
+                "name": "duplicate-source",
+                "repository": mechanical["source"]["repository"],
+                "revision": mechanical["source"]["commit"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            preservation = preserve_sources(
+                Path(directory),
+                mechanical,
+                permanent_id="PALOMAR-2026-08-01-000012",
+                version=2,
+                dry_run=True,
+            )
+            receipt = json.loads((Path(directory) / "source-archive.json").read_text())
+        self.assertEqual(len(preservation["repositories"]), 3)
+        self.assertEqual(receipt["repositories"], preservation["repositories"])
+        self.assertEqual(
+            {row["source_repository"] for row in preservation["repositories"]},
+            {"example/project", "example/substantive", "leanprover-community/mathlib4"},
+        )
+        self.assertTrue(
+            all(
+                row["ref"].startswith("refs/tags/palomar/PALOMAR-2026-08-01-000012-v2/")
+                for row in preservation["repositories"]
+            )
+        )
+
+    def test_preservation_reuses_one_native_fork_per_network(self):
+        mechanical = self.mechanical_fixture()
+        mechanical["project_dependencies"] = [
+            {
+                "name": "sibling",
+                "repository": "example/sibling-fork",
+                "url": "https://github.com/example/sibling-fork",
+                "revision": "2" * 40,
+            }
+        ]
+
+        def archive_get(endpoint, _context):
+            if "/git/commits/" in endpoint:
+                return {"sha": endpoint.rsplit("/", 1)[-1]}
+            repository = endpoint.removeprefix("repos/")
+            return {
+                "full_name": repository,
+                "source": {"full_name": "upstream/network-root"},
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+            mock.patch.object(cli, "validate_archive_token") as validate_token,
+            mock.patch.object(
+                cli,
+                "_ensure_archive_fork",
+                return_value="PalomarArchive/upstream--network-root--fixture",
+            ) as ensure_fork,
+            mock.patch.object(cli, "_ensure_archive_ruleset") as ensure_ruleset,
+            mock.patch.object(cli, "_drop_archive_admin") as drop_admin,
+            mock.patch.object(cli, "_ensure_archive_ref") as ensure_ref,
+        ):
+            preservation = preserve_sources(
+                Path(directory),
+                mechanical,
+                permanent_id="PALOMAR-2026-08-01-000012",
+                version=2,
+                dry_run=False,
+            )
+
+        validate_token.assert_called_once_with()
+        ensure_fork.assert_called_once_with("example/project", "upstream/network-root")
+        ensure_ruleset.assert_called_once_with("PalomarArchive/upstream--network-root--fixture")
+        drop_admin.assert_called_once_with("PalomarArchive/upstream--network-root--fixture")
+        self.assertEqual(ensure_ref.call_count, 2)
+        self.assertEqual(
+            {row["fork_repository"] for row in preservation["repositories"]},
+            {"PalomarArchive/upstream--network-root--fixture"},
+        )
+
+    def test_archive_token_must_belong_to_the_dedicated_machine_user(self):
+        def completed(value):
+            return subprocess.CompletedProcess(["gh", "api"], 0, json.dumps(value), "")
+        with mock.patch.object(
+            cli,
+            "archive_api",
+            side_effect=[
+                completed({"login": "PalomarArchivist", "type": "User"}),
+                completed({"login": "PalomarArchive"}),
+            ],
+        ):
+            self.assertEqual(cli.validate_archive_token()["login"], "PalomarArchivist")
+        with (
+            mock.patch.object(
+                cli,
+                "archive_api",
+                return_value=completed({"login": "some-owner", "type": "User"}),
+            ),
+            self.assertRaisesRegex(ReviewerError, "not PalomarArchivist"),
+        ):
+            cli.validate_archive_token()
+
+    def test_archive_fork_gets_an_immutable_tag_ruleset(self):
+        fork = "PalomarArchive/example--fixture"
+        desired = cli._archive_ruleset_body()
+        calls = []
+
+        def archive_api(endpoint, *, method="GET", body=None, check=True):
+            calls.append((endpoint, method, body, check))
+            if endpoint.endswith("?includes_parents=false"):
+                value = []
+            elif method == "POST":
+                value = {**desired, "id": 42}
+            else:
+                value = {**desired, "id": 42}
+            return subprocess.CompletedProcess(["gh", "api"], 0, json.dumps(value), "")
+
+        with (
+            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(
+                cli,
+                "_archive_get",
+                return_value={"full_name": fork, "permissions": {"admin": True, "push": True}},
+            ),
+        ):
+            cli._ensure_archive_ruleset(fork)
+
+        creation = next(call for call in calls if call[1] == "POST")
+        self.assertEqual(creation[2], desired)
+        self.assertEqual(desired["target"], "tag")
+        self.assertEqual(desired["conditions"]["ref_name"]["include"], ["refs/tags/palomar/**/*"])
+        self.assertEqual({rule["type"] for rule in desired["rules"]}, {"update", "deletion"})
+        self.assertEqual(desired["bypass_actors"], [])
+
+    def test_archive_creator_drops_to_the_organization_write_role(self):
+        fork = "PalomarArchive/example--fixture"
+        metadata = [
+            {"permissions": {"admin": True, "push": True}},
+            {"permissions": {"admin": False, "push": True}},
+        ]
+        with (
+            mock.patch.object(cli, "_archive_get", side_effect=metadata),
+            mock.patch.object(cli, "archive_api") as archive_api,
+            mock.patch.object(cli.time, "sleep"),
+        ):
+            cli._drop_archive_admin(fork)
+        archive_api.assert_called_once_with(
+            f"repos/{fork}/collaborators/PalomarArchivist",
+            method="DELETE",
+        )
 
     def test_accepted_files_must_lie_inside_the_selected_project(self):
         """A report cannot name files outside the project it says it verified."""
@@ -685,11 +877,12 @@ class ReviewerTests(unittest.TestCase):
 
     def example_record(self, **overrides):
         """One accepted record, built the way `register` builds it."""
+        mechanical = self.mechanical_fixture()
         arguments = dict(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
                    "repository": "example/project", "commit": "1" * 40},
             permanent_id="PALOMAR-2026-08-01-000012",
-            mechanical=self.mechanical_fixture(),
+            mechanical=mechanical,
             review={
                 "reviewed_at": "2026-08-01T12:34:56Z",
                 "policy_commit": "9" * 40,
@@ -725,13 +918,14 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_commit": "8" * 40,
                 "workflow_run_attempt": 1,
             },
+            preservation=self.preservation_fixture(mechanical),
         )
         arguments.update(overrides)
         return registry_record(**arguments)
 
     def test_registry_record_carries_the_single_schema(self):
         record = self.example_record()
-        self.assertEqual(record["schema_version"], 1)
+        self.assertEqual(record["schema_version"], 2)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         # Identifiers are allocated at random, so publishing one reveals
@@ -741,7 +935,7 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v1.json").read_text())
+            schema = json.loads((Path(database) / "schema-v2.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -769,7 +963,7 @@ class ReviewerTests(unittest.TestCase):
             self.assertNotIn(invented, written, f"{invented} reached the record")
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if database:
-            schema = json.loads((Path(database) / "schema-v1.json").read_text())
+            schema = json.loads((Path(database) / "schema-v2.json").read_text())
             jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
 
     def test_repository_license_is_bound_to_metadata_and_file_bytes(self):
@@ -859,8 +1053,9 @@ class ReviewerTests(unittest.TestCase):
                 "workflow_commit": "8" * 40,
                 "workflow_run_attempt": 1,
             },
+            preservation=self.preservation_fixture(mechanical),
         )
-        self.assertEqual(record["schema_version"], 1)
+        self.assertEqual(record["schema_version"], 2)
         self.assertEqual(record["source"]["project_path"], "examples/comparator")
         self.assertEqual(
             record["formalization"]["lakefile_path"],
@@ -1120,6 +1315,7 @@ class ReviewerTests(unittest.TestCase):
                         check=True,
                     )
                 shutil.copy(database_source / "schema-v1.json", destination / "schema-v1.json")
+                shutil.copy(database_source / "schema-v2.json", destination / "schema-v2.json")
                 shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
                 return subprocess.run(
                     ["git", "-C", str(destination), "rev-parse", "HEAD"],
@@ -1188,7 +1384,7 @@ class ReviewerTests(unittest.TestCase):
             entry_path = entries[0]
             record = json.loads(entry_path.read_text())
             self.assertRegex(record["id"], r"\APALOMAR-2026-08-01-[0-9]{6}\Z")
-            self.assertEqual(record["schema_version"], 1)
+            self.assertEqual(record["schema_version"], 2)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -2865,7 +3061,8 @@ class RegistrationRetryTests(unittest.TestCase):
     """
 
     def test_a_new_branch_is_pushed_plainly(self):
-        with mock.patch.object(cli, "remote_branch_commit", return_value=None), \
+        with mock.patch.object(cli, "database_git_environment", return_value={}), \
+             mock.patch.object(cli, "remote_branch_commit", return_value=None), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
         command = runner.call_args.args[0]
@@ -2873,7 +3070,8 @@ class RegistrationRetryTests(unittest.TestCase):
         self.assertFalse([part for part in command if part.startswith("--force")])
 
     def test_an_abandoned_branch_is_replaced_under_a_lease(self):
-        with mock.patch.object(cli, "remote_branch_commit", return_value="a" * 40), \
+        with mock.patch.object(cli, "database_git_environment", return_value={}), \
+             mock.patch.object(cli, "remote_branch_commit", return_value="a" * 40), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
         command = runner.call_args.args[0]

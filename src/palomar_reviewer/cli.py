@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import base64
-import secrets
 import argparse
+import base64
+import concurrent.futures
 import copy
 import datetime as dt
 import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -17,7 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -30,6 +31,10 @@ SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
 STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
 DATABASE_REPO = "PalomarRegistry/PalomarDatabase"
+ARCHIVE_OWNER = "PalomarArchive"
+ARCHIVE_USER = "PalomarArchivist"
+ARCHIVE_RULESET_NAME = "Palomar immutable preservation tags"
+ARCHIVE_TAG_PATTERN = "refs/tags/palomar/**/*"
 RENDER_WORKFLOW = "render-challenge.yml"
 VERIFY_WORKFLOW = "submission.yml"
 MAX_RENDER_FILES = 2_000
@@ -724,6 +729,40 @@ def gh(args: list[str], *, input_text: str | None = None, check: bool = True) ->
     return run(["gh", *args], input_text=input_text, check=check).stdout
 
 
+def archive_api(
+    endpoint: str,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Call GitHub as the dedicated, least-privilege archive machine user."""
+    token = os.environ.get("PALOMAR_ARCHIVE_TOKEN", "").strip()
+    if not token:
+        raise ReviewerError("PALOMAR_ARCHIVE_TOKEN is required to preserve registered sources")
+    command = [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "--method",
+        method,
+        endpoint,
+    ]
+    if body is not None:
+        command.extend(["--input", "-"])
+    environment = os.environ.copy()
+    environment["GH_TOKEN"] = token
+    return run(
+        command,
+        input_text=json.dumps(body) if body is not None else None,
+        check=check,
+        env=environment,
+    )
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -759,6 +798,414 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def preservation_sources(mechanical: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return the exact repository/commit closure promised by one record."""
+    candidates: list[tuple[object, object]] = [
+        (mechanical.get("source", {}).get("repository"), mechanical.get("source", {}).get("commit"))
+    ]
+    for dependency in mechanical.get("project_dependencies", []):
+        if isinstance(dependency, dict) and "path" not in dependency:
+            candidates.append((dependency.get("repository"), dependency.get("revision")))
+    substantive = mechanical.get("provenance", {}).get("substantive_formalization")
+    if isinstance(substantive, dict):
+        candidates.append((substantive.get("repository"), substantive.get("commit")))
+
+    unique: dict[tuple[str, str], tuple[str, str]] = {}
+    for repository, commit in candidates:
+        if not isinstance(repository, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+        ):
+            raise ReviewerError(f"source preservation found an invalid GitHub repository: {repository!r}")
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ReviewerError(f"source preservation found an invalid commit for {repository}")
+        unique.setdefault((repository.casefold(), commit), (repository, commit))
+    return sorted(unique.values(), key=lambda item: (item[0].casefold(), item[1]))
+
+
+def archive_repository_name(network_root: str) -> str:
+    readable = network_root.replace("/", "--")
+    suffix = hashlib.sha256(network_root.casefold().encode("utf-8")).hexdigest()[:12]
+    return f"{readable[:86]}--{suffix}"
+
+
+def _json_response(response: subprocess.CompletedProcess[str], context: str) -> dict[str, Any]:
+    try:
+        value = json.loads(response.stdout)
+    except json.JSONDecodeError as error:
+        raise ReviewerError(f"GitHub returned malformed JSON while {context}") from error
+    if not isinstance(value, dict):
+        raise ReviewerError(f"GitHub returned a non-object while {context}")
+    return value
+
+
+def _json_list_response(
+    response: subprocess.CompletedProcess[str], context: str
+) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(response.stdout)
+    except json.JSONDecodeError as error:
+        raise ReviewerError(f"GitHub returned malformed JSON while {context}") from error
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ReviewerError(f"GitHub returned a non-object list while {context}")
+    return value
+
+
+def validate_archive_token() -> dict[str, Any]:
+    """Prove that the archive credential is the intended machine identity."""
+    user = _json_response(archive_api("user"), "checking the archive identity")
+    login = user.get("login")
+    if (
+        not isinstance(login, str)
+        or login.casefold() != ARCHIVE_USER.casefold()
+        or user.get("type") != "User"
+    ):
+        raise ReviewerError(
+            f"PALOMAR_ARCHIVE_TOKEN authenticates as {login or 'an unknown account'}, "
+            f"not {ARCHIVE_USER}"
+        )
+    organization = _json_response(
+        archive_api(f"orgs/{ARCHIVE_OWNER}"),
+        "checking the archive organization",
+    )
+    if str(organization.get("login") or "").casefold() != ARCHIVE_OWNER.casefold():
+        raise ReviewerError(f"archive organization {ARCHIVE_OWNER} is unavailable")
+    return user
+
+
+def _archive_get(endpoint: str, context: str) -> dict[str, Any] | None:
+    response = archive_api(endpoint, check=False)
+    if response.returncode == 0:
+        return _json_response(response, context)
+    detail = f"{response.stderr}\n{response.stdout}"
+    if "HTTP 404" in detail or "404 Not Found" in detail:
+        return None
+    raise ReviewerError(f"GitHub API failed while {context}: {detail.strip()[-1000:]}")
+
+
+def _network_root(metadata: dict[str, Any]) -> str:
+    source = metadata.get("source")
+    candidate = source.get("full_name") if isinstance(source, dict) else metadata.get("full_name")
+    if not isinstance(candidate, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", candidate
+    ):
+        raise ReviewerError("GitHub repository metadata has no valid fork-network root")
+    return candidate
+
+
+def _ensure_archive_fork(source_repository: str, network_root: str) -> str:
+    name = archive_repository_name(network_root)
+    expected = f"{ARCHIVE_OWNER}/{name}"
+    existing = _archive_get(f"repos/{expected}", f"checking archive fork {expected}")
+    if existing is None:
+        archive_api(
+            f"repos/{source_repository}/forks",
+            method="POST",
+            body={
+                "organization": ARCHIVE_OWNER,
+                "name": name,
+                "default_branch_only": False,
+            },
+        )
+        for _ in range(60):
+            existing = _archive_get(f"repos/{expected}", f"waiting for archive fork {expected}")
+            if existing is not None:
+                break
+            time.sleep(5)
+        else:
+            raise ReviewerError(f"archive fork {expected} was not ready after five minutes")
+    if _network_root(existing).casefold() != network_root.casefold():
+        raise ReviewerError(f"archive repository collision: {expected} is in another fork network")
+    return str(existing.get("full_name") or expected)
+
+
+def _archive_ruleset_body() -> dict[str, Any]:
+    return {
+        "name": ARCHIVE_RULESET_NAME,
+        "target": "tag",
+        "enforcement": "active",
+        "bypass_actors": [],
+        "conditions": {
+            "ref_name": {
+                "include": [ARCHIVE_TAG_PATTERN],
+                "exclude": [],
+            }
+        },
+        # Creation remains permitted. Once a preservation tag exists, nobody
+        # without control of the organization can move or remove it.
+        "rules": [
+            {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}},
+            {"type": "deletion"},
+        ],
+    }
+
+
+def _archive_ruleset_matches(ruleset: dict[str, Any]) -> bool:
+    expected = _archive_ruleset_body()
+    actual_rules = {
+        (
+            rule.get("type"),
+            (rule.get("parameters") or {}).get("update_allows_fetch_and_merge"),
+        )
+        for rule in ruleset.get("rules", [])
+        if isinstance(rule, dict)
+    }
+    return (
+        ruleset.get("name") == expected["name"]
+        and ruleset.get("target") == expected["target"]
+        and ruleset.get("enforcement") == expected["enforcement"]
+        and ruleset.get("bypass_actors") == []
+        and ruleset.get("conditions") == expected["conditions"]
+        and actual_rules == {("update", False), ("deletion", None)}
+    )
+
+
+def _ensure_archive_ruleset(fork_repository: str) -> None:
+    """Install or repair the repository-level immutable-tag policy."""
+    response = archive_api(f"repos/{fork_repository}/rulesets?includes_parents=false")
+    rulesets = _json_list_response(response, f"listing rulesets for {fork_repository}")
+    matches = [item for item in rulesets if item.get("name") == ARCHIVE_RULESET_NAME]
+    if len(matches) > 1:
+        raise ReviewerError(f"archive fork {fork_repository} has duplicate Palomar rulesets")
+
+    metadata = _archive_get(f"repos/{fork_repository}", f"checking access to {fork_repository}")
+    permissions = metadata.get("permissions") if isinstance(metadata, dict) else None
+    is_admin = isinstance(permissions, dict) and permissions.get("admin") is True
+    body = _archive_ruleset_body()
+
+    if matches:
+        ruleset_id = matches[0].get("id")
+        if not isinstance(ruleset_id, int):
+            raise ReviewerError(f"archive fork {fork_repository} returned an invalid ruleset id")
+        current = _json_response(
+            archive_api(f"repos/{fork_repository}/rulesets/{ruleset_id}"),
+            f"checking the immutable-tag ruleset on {fork_repository}",
+        )
+        if not _archive_ruleset_matches(current):
+            if not is_admin:
+                raise ReviewerError(
+                    f"immutable-tag ruleset on {fork_repository} is incorrect and the archive "
+                    "account cannot repair it"
+                )
+            archive_api(
+                f"repos/{fork_repository}/rulesets/{ruleset_id}",
+                method="PUT",
+                body=body,
+            )
+    else:
+        if not is_admin:
+            raise ReviewerError(
+                f"archive fork {fork_repository} has no immutable-tag ruleset and the archive "
+                "account cannot create it"
+            )
+        created = _json_response(
+            archive_api(f"repos/{fork_repository}/rulesets", method="POST", body=body),
+            f"creating the immutable-tag ruleset on {fork_repository}",
+        )
+        ruleset_id = created.get("id")
+        if not isinstance(ruleset_id, int):
+            raise ReviewerError(f"GitHub did not return the new ruleset for {fork_repository}")
+
+    verified = _json_response(
+        archive_api(f"repos/{fork_repository}/rulesets/{ruleset_id}"),
+        f"verifying the immutable-tag ruleset on {fork_repository}",
+    )
+    if not _archive_ruleset_matches(verified):
+        raise ReviewerError(f"immutable-tag ruleset verification failed for {fork_repository}")
+
+
+def _drop_archive_admin(fork_repository: str) -> None:
+    """Leave the machine user with only the organization's base Write role."""
+    for attempt in range(10):
+        metadata = _archive_get(
+            f"repos/{fork_repository}",
+            f"checking archive permissions on {fork_repository}",
+        )
+        permissions = metadata.get("permissions") if isinstance(metadata, dict) else None
+        if not isinstance(permissions, dict) or permissions.get("push") is not True:
+            raise ReviewerError(f"archive account cannot write {fork_repository}")
+        if permissions.get("admin") is not True:
+            return
+        if attempt == 0:
+            archive_api(
+                f"repos/{fork_repository}/collaborators/{ARCHIVE_USER}",
+                method="DELETE",
+            )
+        time.sleep(1)
+    raise ReviewerError(f"archive account retained unexpected admin access to {fork_repository}")
+
+
+def _archive_ref_endpoint(fork_repository: str, ref: str) -> str:
+    return f"repos/{fork_repository}/git/ref/{quote(ref.removeprefix('refs/'), safe='/')}"
+
+
+def _push_archive_ref(source_repository: str, commit: str, fork_repository: str, ref: str) -> None:
+    token = os.environ["PALOMAR_ARCHIVE_TOKEN"]
+    authorization = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {authorization}",
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="palomar-archive-") as directory:
+        repository = Path(directory) / "repository"
+        run(["git", "-c", "core.hooksPath=/dev/null", "init", "--quiet", str(repository)], env=environment)
+        run(
+            [
+                "git", "-c", "core.hooksPath=/dev/null", "-C", str(repository),
+                "fetch", "--quiet", "--depth=1",
+                f"https://github.com/{source_repository}.git", commit,
+            ],
+            env=environment,
+        )
+        run(
+            [
+                "git", "-c", "core.hooksPath=/dev/null", "-C", str(repository),
+                "push", "--quiet", f"https://github.com/{fork_repository}.git",
+                f"{commit}:{ref}",
+            ],
+            env=environment,
+        )
+
+
+def _ensure_archive_ref(source_repository: str, commit: str, fork_repository: str, ref: str) -> None:
+    existing = _archive_get(
+        _archive_ref_endpoint(fork_repository, ref),
+        f"checking archive ref {fork_repository}:{ref}",
+    )
+    if existing is not None:
+        if (
+            existing.get("object", {}).get("type") != "commit"
+            or existing.get("object", {}).get("sha") != commit
+        ):
+            raise ReviewerError(f"archive ref conflict: {fork_repository}:{ref}")
+        return
+
+    commit_object = _archive_get(
+        f"repos/{fork_repository}/git/commits/{commit}",
+        f"checking archived commit {fork_repository}@{commit}",
+    )
+    if commit_object is None:
+        _push_archive_ref(source_repository, commit, fork_repository, ref)
+    else:
+        archive_api(
+            f"repos/{fork_repository}/git/refs",
+            method="POST",
+            body={"ref": ref, "sha": commit},
+        )
+
+    verified_ref = _archive_get(
+        _archive_ref_endpoint(fork_repository, ref),
+        f"verifying archive ref {fork_repository}:{ref}",
+    )
+    verified_commit = _archive_get(
+        f"repos/{fork_repository}/git/commits/{commit}",
+        f"verifying archived commit {fork_repository}@{commit}",
+    )
+    if (
+        verified_ref is None
+        or verified_ref.get("object", {}).get("sha") != commit
+        or verified_ref.get("object", {}).get("type") != "commit"
+        or verified_commit is None
+        or verified_commit.get("sha") != commit
+    ):
+        raise ReviewerError(f"archive verification failed for {fork_repository}@{commit}")
+
+
+def preserve_sources(
+    work: Path,
+    mechanical: dict[str, Any],
+    *,
+    permanent_id: str,
+    version: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Create permanent archive refs and write their deterministic receipt."""
+    sources = preservation_sources(mechanical)
+    def ref_for(commit: str) -> str:
+        return f"refs/tags/palomar/{permanent_id}-v{version}/{commit}"
+    rows: list[dict[str, str]] = []
+    if dry_run:
+        for repository, commit in sources:
+            root = repository
+            rows.append(
+                {
+                    "source_repository": repository,
+                    "commit": commit,
+                    "fork_repository": f"{ARCHIVE_OWNER}/{archive_repository_name(root)}",
+                    "ref": ref_for(commit),
+                }
+            )
+    else:
+        validate_archive_token()
+        resolved: list[tuple[str, str, str]] = []
+        for repository, commit in sources:
+            metadata = _archive_get(f"repos/{repository}", f"resolving source repository {repository}")
+            if metadata is None:
+                raise ReviewerError(f"source repository disappeared before preservation: {repository}")
+            if _archive_get(
+                f"repos/{repository}/git/commits/{commit}",
+                f"checking source commit {repository}@{commit}",
+            ) is None:
+                raise ReviewerError(f"source commit disappeared before preservation: {repository}@{commit}")
+            resolved.append((repository, commit, _network_root(metadata)))
+
+        groups: dict[str, list[tuple[str, str]]] = {}
+        roots: dict[str, str] = {}
+        for repository, commit, root in resolved:
+            key = root.casefold()
+            roots.setdefault(key, root)
+            groups.setdefault(key, []).append((repository, commit))
+
+        def preserve_group(key: str) -> list[dict[str, str]]:
+            items = sorted(groups[key], key=lambda item: (item[0].casefold(), item[1]))
+            fork = _ensure_archive_fork(items[0][0], roots[key])
+            _ensure_archive_ruleset(fork)
+            _drop_archive_admin(fork)
+            result = []
+            for repository, commit in items:
+                ref = ref_for(commit)
+                _ensure_archive_ref(repository, commit, fork, ref)
+                result.append(
+                    {
+                        "source_repository": repository,
+                        "commit": commit,
+                        "fork_repository": fork,
+                        "ref": ref,
+                    }
+                )
+            return result
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(preserve_group, key) for key in sorted(groups)]
+            for future in futures:
+                rows.extend(future.result())
+
+    rows.sort(key=lambda item: (item["source_repository"].casefold(), item["commit"]))
+    archived_at = utc_now()
+    receipt = {
+        "schema_version": 1,
+        "id": permanent_id,
+        "version": version,
+        "archive_owner": ARCHIVE_OWNER,
+        "archived_at": archived_at,
+        "repositories": rows,
+    }
+    receipt_path = work / "source-archive.json"
+    write_json(receipt_path, receipt)
+    return {
+        "archive_owner": ARCHIVE_OWNER,
+        "archived_at": archived_at,
+        "receipt_sha256": sha256_file(receipt_path),
+        "repositories": rows,
+    }
 
 
 def render_bundle_manifest(bundle: Path) -> tuple[list[dict[str, Any]], str]:
@@ -805,7 +1252,12 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
     if bundle.exists():
         shutil.rmtree(bundle)
     bundle.mkdir()
-    for name in ("mechanical-report.json", "workflow-run.json", "review.json"):
+    for name in (
+        "mechanical-report.json",
+        "workflow-run.json",
+        "review.json",
+        "source-archive.json",
+    ):
         source = work / name
         if source.is_symlink() or not source.is_file():
             raise ReviewerError(f"registration requires a regular {name}")
@@ -831,11 +1283,13 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
     )
     report = next(item for item in files if item["path"] == "mechanical-report.json")
     archived_review = next(item for item in files if item["path"] == "review.json")
+    archive_receipt = next(item for item in files if item["path"] == "source-archive.json")
     provenance = load_json(bundle / "workflow-run.json")
     return bundle, {
         "evidence_tree_sha256": tree_hash,
         "mechanical_report_sha256": report["sha256"],
         "review_sha256": archived_review["sha256"],
+        "source_archive_sha256": archive_receipt["sha256"],
         "workflow_commit": provenance["workflow_commit"],
         "workflow_run_attempt": provenance["run_attempt"],
     }
@@ -1534,6 +1988,24 @@ def queue() -> list[dict[str, Any]]:
     return waiting
 
 
+def database_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Authenticate Git over HTTPS without putting the private token in argv."""
+    token = gh(["auth", "token"]).strip()
+    if not token or "\n" in token or "\r" in token:
+        raise ReviewerError("gh auth did not provide a usable token for PalomarDatabase")
+    credential = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    environment = dict(base or os.environ)
+    environment.update(
+        {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credential}",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
 def clone_at(repository_url: str, revision: str, destination: Path) -> str:
     if destination.exists():
         shutil.rmtree(destination)
@@ -1546,6 +2018,8 @@ def clone_at(repository_url: str, revision: str, destination: Path) -> str:
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
+    if repository_url.rstrip("/").removesuffix(".git") == f"https://github.com/{DATABASE_REPO}":
+        git_env = database_git_environment(git_env)
     git = [
         "git",
         "-c",
@@ -1611,15 +2085,17 @@ def push_registration_branch(database: Path, branch: str) -> None:
     a branch that changed underneath this process is not overwritten.
     """
     remote = ["git", "push", f"https://github.com/{DATABASE_REPO}.git"]
+    git_env = database_git_environment()
     existing = remote_branch_commit(branch)
     if existing is None:
-        run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database)
+        run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
         return
     print(f"replacing abandoned registration branch {branch} at {existing[:12]}")
     run(
         [*remote, f"--force-with-lease=refs/heads/{branch}:{existing}",
          f"HEAD:refs/heads/{branch}"],
         cwd=database,
+        env=git_env,
     )
 
 
@@ -2821,6 +3297,7 @@ def registry_record(
     version: int,
     challenge_render: dict[str, Any],
     verification_evidence: dict[str, Any],
+    preservation: dict[str, Any],
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", accepted_at):
         raise ReviewerError("review has no valid acceptance date")
@@ -2887,7 +3364,7 @@ def registry_record(
     if True:
         formalization_record["lakefile_path"] = mechanical_relative_path(mechanical, "lakefile")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "id": permanent_id,
         "accepted_at": accepted_at,
         "version": version,
@@ -2898,6 +3375,7 @@ def registry_record(
         "classification": validated_classification(mechanical, metadata),
         "provenance": entry_provenance(mechanical),
         "source": source_record,
+        "preservation": copy.deepcopy(preservation),
         "formalization": formalization_record,
         "verification": {
             "verified_at": mechanical["checked_at"],
@@ -3161,9 +3639,9 @@ def register(args: argparse.Namespace) -> int:
     # it introduced every file in the tree, workflows included, and GitHub
     # refuses a token that may not touch workflows. Nothing here writes one.
     unshallow(database)
-    schema_path = database / "schema-v1.json"
+    schema_path = database / "schema-v2.json"
     if not schema_path.is_file():
-        raise ReviewerError("PalomarDatabase main does not register schema-v1.json")
+        raise ReviewerError("PalomarDatabase main does not register schema-v2.json")
 
     existing_id = mechanical.get("existing_id")
     permanent_id, accepted_at, version = registration_identity(
@@ -3172,6 +3650,13 @@ def register(args: argparse.Namespace) -> int:
         mechanical=mechanical,
         reviewed_at=str(review["reviewed_at"]),
         submission_id=args.submission,
+    )
+    preservation = preserve_sources(
+        work,
+        mechanical,
+        permanent_id=permanent_id,
+        version=version,
+        dry_run=args.dry_run,
     )
     if args.render_result:
         render_candidate = Path(args.render_result).expanduser().resolve()
@@ -3204,6 +3689,8 @@ def register(args: argparse.Namespace) -> int:
         "rendered_at": render_report["rendered_at"],
     }
     evidence_bundle, verification_evidence = build_verification_evidence(work)
+    if verification_evidence["source_archive_sha256"] != preservation["receipt_sha256"]:
+        raise ReviewerError("source archive receipt changed while building verification evidence")
     evidence_hash = verification_evidence["evidence_tree_sha256"]
     evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
     verification_evidence["evidence_path"] = evidence_path
@@ -3217,6 +3704,7 @@ def register(args: argparse.Namespace) -> int:
         version=version,
         challenge_render=challenge_render,
         verification_evidence=verification_evidence,
+        preservation=preservation,
     )
     filename = f"{record['id']}-v{version}.json"
     destination = database / "entries" / filename
@@ -3572,6 +4060,36 @@ def doctor(_: argparse.Namespace) -> int:
     auth = run(["gh", "auth", "status"], check=False)
     print("gh auth: ok" if auth.returncode == 0 else "gh auth: FAILED")
     failed |= auth.returncode != 0
+    if auth.returncode == 0:
+        try:
+            visibility = gh(
+                ["api", f"repos/{DATABASE_REPO}", "--jq", ".visibility"]
+            ).strip()
+            if visibility != "private":
+                print(f"database access: FAILED (expected private, found {visibility or 'unknown'})")
+                failed = True
+            else:
+                probe = run(
+                    ["git", "ls-remote", "--exit-code", f"https://github.com/{DATABASE_REPO}.git", "HEAD"],
+                    env=database_git_environment(),
+                    check=False,
+                )
+                print("database access: ok (private)" if probe.returncode == 0 else "database access: FAILED")
+                failed |= probe.returncode != 0
+        except ReviewerError as error:
+            print(f"database access: FAILED ({error})")
+            failed = True
+    archive_token = bool(os.environ.get("PALOMAR_ARCHIVE_TOKEN", "").strip())
+    if not archive_token:
+        print("archive token: MISSING")
+        failed = True
+    else:
+        try:
+            archive_user = validate_archive_token()
+            print(f"archive token: {archive_user['login']} (verified)")
+        except ReviewerError as error:
+            print(f"archive token: FAILED ({error})")
+            failed = True
     for engine in ("codex", "claude"):
         print(f"{engine}: {shutil.which(engine) or 'not installed'}")
     return int(failed)
