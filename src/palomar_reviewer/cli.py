@@ -1044,6 +1044,14 @@ def download_mechanical_artifact(
 def validate_mechanical_artifact(
     report: dict[str, Any], state: dict[str, Any], run_data: dict[str, Any]
 ) -> None:
+    # Said plainly before the schema says it in five hundred lines of diff. A
+    # submission whose verification failed should never reach review at all,
+    # so reaching here means something upstream let it through.
+    if report.get("status") != "pass":
+        problems = "; ".join(str(e) for e in report.get("errors", [])) or "no reason recorded"
+        raise ReviewerError(
+            f"mechanical verification did not pass ({report.get('status')}): {problems}"
+        )
     jsonschema.validate(
         report,
         MECHANICAL_REPORT_SCHEMA,
