@@ -52,6 +52,9 @@ SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
 MAX_CONTEXT_BYTES = 300_000
 _ENGINE_CREDENTIAL_DIR: Path | None = None
+CURRENT_RUBRIC_VERSION = 6
+REVIEW_SCHEMA_VERSION = 2
+REVIEW_DECISIONS = ("accept", "revise", "reject")
 
 # What a review cost, in tokens, is reported by the engine and is never a
 # guess. Money is a guess unless somebody keeps this table current, so a model
@@ -651,6 +654,25 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
     if any(not owners[key].get("required") for key in SYNTHESIS_SCORE_KEYS):
         raise ReviewerError("every registry score must be owned by a required pass")
     return version
+
+
+def validate_current_review_contract(
+    rubric: dict[str, Any], review_schema: dict[str, Any]
+) -> int:
+    """Reject a policy checkout that cannot produce a current review."""
+    rubric_version = validate_rubric(rubric)
+    properties = review_schema.get("properties", {})
+    schema_version = properties.get("schema_version", {}).get("const")
+    decisions = properties.get("decision", {}).get("enum")
+    if (
+        rubric_version != CURRENT_RUBRIC_VERSION
+        or schema_version != REVIEW_SCHEMA_VERSION
+        or decisions != list(REVIEW_DECISIONS)
+    ):
+        raise ReviewerError(
+            "policy commit predates the current review contract; rerun against current policy"
+        )
+    return rubric_version
 
 
 def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[str, Any]:
@@ -1614,14 +1636,22 @@ def prepare_workspace(
 
 
 def has_proof_account(source: Path, mechanical: dict[str, Any] | None = None) -> bool:
-    mechanical = mechanical or {"challenge": {}, "solution": {}, "comparator": {}}
-    path = mechanical_source_path(
-        source,
+    mechanical = mechanical or {
+        "source": {},
+        "challenge": {},
+        "solution": {},
+        "comparator": {},
+    }
+    paths = {
         mechanical_relative_path(mechanical, "formalization_metadata"),
-        "formalization metadata",
+        mechanical_relative_path(mechanical, "challenge_source"),
+        project_readme_relative(mechanical, source),
+    }
+    marker = re.compile(
+        r"(?im)(?:^\s*(?:informal_?proof|proof_?description|proof_?account)\s*:"
+        r"|\b(?:informal\s+proof|proof\s+(?:account|architecture|description|outline|sketch|strategy))\b)"
     )
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return bool(re.search(r"(?im)^\s*(informal_?proof|proof_?description|proof_?account)\s*:", text))
+    return any(marker.search(context_file(source, path)) for path in paths)
 
 
 def context_file(source: Path, relative: str) -> str:
@@ -2205,7 +2235,7 @@ def normalize_final(
     passes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     final = {
-        "schema_version": 2,
+        "schema_version": REVIEW_SCHEMA_VERSION,
         "submission_id": state["id"],
         "source": {
             "repository": mechanical["source"]["repository"],
@@ -2237,11 +2267,17 @@ def validate_stored_review(
     rubric: dict[str, Any] | None = None,
 ) -> None:
     """Bind an operator-inspected dry-run report to the current trusted inputs."""
+    if report.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        raise ReviewerError("stored review predates the current review contract and must be rerun")
+    if report.get("decision") not in REVIEW_DECISIONS:
+        raise ReviewerError(f"stored review has an unsupported decision: {report.get('decision')!r}")
     schema = (
         review_schema
         if review_schema is not None
         else load_json(work / "policy" / "schemas" / "review.schema.json")
     )
+    rubric_data = rubric if rubric is not None else load_json(work / "policy" / "rubric.json")
+    rubric_version = validate_current_review_contract(rubric_data, schema)
     jsonschema.validate(report, schema, format_checker=jsonschema.FormatChecker())
     expected_source = {
         "repository": mechanical["source"]["repository"],
@@ -2256,8 +2292,6 @@ def validate_stored_review(
     if report.get("policy_commit") != policy_commit:
         raise ReviewerError("stored review was produced under another policy commit")
 
-    rubric_data = rubric if rubric is not None else load_json(work / "policy" / "rubric.json")
-    rubric_version = validate_rubric(rubric_data)
     steps = {step["id"]: step for step in rubric_data["steps"] if step["id"] != "synthesis"}
     seen: set[str] = set()
     for result in report["passes"]:
@@ -2358,16 +2392,6 @@ def validate_synthesis_policy(
         )
 
 
-
-
-
-
-
-
-
-
-
-
 def run_review(args: argparse.Namespace) -> int:
     candidates = queue()
     if args.submission is None:
@@ -2421,7 +2445,8 @@ def run_review(args: argparse.Namespace) -> int:
     )
     model_id = reviewer_model(args.engine, args.model, args.command)
     rubric = load_json(work / "policy" / "rubric.json")
-    rubric_version = validate_rubric(rubric)
+    review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
+    rubric_version = validate_current_review_contract(rubric, review_schema)
     passes: list[dict[str, Any]] = []
     spend: list[dict[str, Any]] = []
     synthesis: dict[str, Any] | None = None
@@ -2439,8 +2464,10 @@ def run_review(args: argparse.Namespace) -> int:
         prompt_path = work / "prompts" / f"{step['id']}.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(prompt, encoding="utf-8")
-        schema = (
-            SYNTHESIS_SCHEMA if step["id"] == "synthesis" else step_schema_for_rubric(step, rubric_version)
+        result_schema = (
+            SYNTHESIS_SCHEMA
+            if step["id"] == "synthesis"
+            else step_schema_for_rubric(step, rubric_version)
         )
         result, usage = engine_result(
             prompt,
@@ -2448,7 +2475,7 @@ def run_review(args: argparse.Namespace) -> int:
             command=args.command,
             model=args.model,
             cwd=work / "source",
-            schema=schema,
+            schema=result_schema,
             raw_path=work / "raw" / f"{step['id']}.txt",
             allow_network=step["id"] == "literature_notability",
             reasoning_effort=args.reasoning_effort,
@@ -2483,8 +2510,7 @@ def run_review(args: argparse.Namespace) -> int:
         model_id=model_id,
         passes=passes,
     )
-    schema = load_json(work / "policy" / "schemas" / "review.schema.json")
-    jsonschema.validate(final, schema, format_checker=jsonschema.FormatChecker())
+    jsonschema.validate(final, review_schema, format_checker=jsonschema.FormatChecker())
     (work / "review-url").unlink(missing_ok=True)
     (work / "review-sha256").unlink(missing_ok=True)
     write_json(work / "review.json", final)
@@ -3020,9 +3046,7 @@ def register(args: argparse.Namespace) -> int:
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
     schema_path = database / "schema-v1.json"
     if not schema_path.is_file():
-        raise ReviewerError(
-            f"PalomarDatabase main does not register schema-v{record_schema_version}.json"
-        )
+        raise ReviewerError("PalomarDatabase main does not register schema-v1.json")
 
     existing_id = mechanical.get("existing_id")
     permanent_id, accepted_at, version = registration_identity(
@@ -3302,11 +3326,24 @@ def auto(args: argparse.Namespace) -> int:
     reaches this function's register arm only because its submitter asked.
     """
     to_review, to_register, to_finalize, exhausted = submissions_needing_work()
-    if not (to_review or to_register or to_finalize):
+    if not (to_review or to_register or to_finalize or exhausted):
         print("Nothing to do.")
         return 0
 
     failures = 0
+    for record in exhausted:
+        print(f"::group::Abandon review {record['id']}", flush=True)
+        try:
+            fresh = submission_state(record["id"])
+            if fresh is not None:
+                reason = str(fresh.get("review_error") or "review attempt limit reached")
+                abandon_review(fresh, reason)
+        except Exception as error:
+            failures += 1
+            print(f"error: abandoning review of {record['id']} failed: {error}", file=sys.stderr)
+        finally:
+            print("::endgroup::", flush=True)
+
     for record in to_review[: args.max_reviews]:
         print(f"::group::Review {record['id']}", flush=True)
         try:

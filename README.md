@@ -173,9 +173,11 @@ Use `--policy-ref <40-char-sha>` to review against a specific policy commit.
 Otherwise the tool resolves and records `PalomarRegistry/PalomarPolicy@main` at
 preparation time.
 
-Deploy reviewer support for a new rubric schema before merging a policy that
-uses it. The reviewer refuses unknown rubric versions and unknown evidence input
-roles.
+Treat a rubric or final-review schema bump as a coupled Policy and Reviewer
+deployment. Pause new review starts, confirm that no review is in flight, merge
+Policy and then Reviewer back-to-back, and resume the runner. A current reviewer
+refuses a policy checkout or stored review from another contract version rather
+than delivering or registering it.
 
 ## Audit trail
 

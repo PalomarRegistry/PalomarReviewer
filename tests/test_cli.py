@@ -376,6 +376,14 @@ class ReviewerTests(unittest.TestCase):
             root = Path(directory)
             (root / "formalization.yaml").write_text("proof_description: classical induction\n")
             self.assertTrue(has_proof_account(root))
+            (root / "formalization.yaml").write_text("project: {name: example}\n")
+            (root / "Challenge.lean").write_text("/-! Informal proof: induct on n. -/\n")
+            self.assertTrue(has_proof_account(root))
+            (root / "Challenge.lean").write_text("theorem example : True := by trivial\n")
+            (root / "README.md").write_text("## Proof outline\n\nInduct on n.\n")
+            self.assertTrue(has_proof_account(root))
+            (root / "README.md").write_text("## Result\n\nAn induction theorem.\n")
+            self.assertFalse(has_proof_account(root))
 
     def test_model_id(self):
         self.assertEqual(reviewer_model("codex", "gpt-test", None), "codex:gpt-test")
@@ -1534,7 +1542,16 @@ class ReviewerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "policy" / "schemas").mkdir(parents=True)
-            (work / "policy" / "schemas" / "review.schema.json").write_text(json.dumps({"type": "object"}))
+            review_schema = {
+                "type": "object",
+                "properties": {
+                    "schema_version": {"const": 2},
+                    "decision": {"enum": ["accept", "revise", "reject"]},
+                },
+            }
+            (work / "policy" / "schemas" / "review.schema.json").write_text(
+                json.dumps(review_schema)
+            )
             (work / "policy" / "rubric.json").write_text(json.dumps(rubric))
             mechanical = {
                 "status": "pass",
@@ -1542,6 +1559,7 @@ class ReviewerTests(unittest.TestCase):
             }
             report = {
                 **synthesis,
+                "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
                 "source": mechanical["source"],
                 "mechanical_report": "https://example.test/mechanical",
@@ -1568,9 +1586,52 @@ class ReviewerTests(unittest.TestCase):
                     policy_commit=report["policy_commit"],
                 )
 
+    def test_stored_review_refuses_obsolete_contracts(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        mechanical = {
+            "status": "pass",
+            "source": {"repository": "example/repo", "commit": "1" * 40},
+        }
+        report = {
+            **synthesis,
+            "schema_version": 2,
+            "submission_id": "a1b2c3d4e5f6",
+            "source": mechanical["source"],
+            "mechanical_report": "https://example.test/mechanical",
+            "policy_commit": "2" * 40,
+            "passes": passes,
+        }
+        review_schema = {
+            "type": "object",
+            "properties": {
+                "schema_version": {"const": 2},
+                "decision": {"enum": ["accept", "revise", "reject"]},
+            },
+        }
+        common = {
+            "work": Path("."),
+            "state": {"id": report["submission_id"]},
+            "mechanical": mechanical,
+            "mechanical_url": report["mechanical_report"],
+            "policy_commit": report["policy_commit"],
+            "review_schema": review_schema,
+            "rubric": rubric,
+        }
 
+        old_report = json.loads(json.dumps(report))
+        old_report["schema_version"] = 1
+        with self.assertRaisesRegex(ReviewerError, "must be rerun"):
+            validate_stored_review(old_report, **common)
 
+        unknown_report = json.loads(json.dumps(report))
+        unknown_report["decision"] = "unknown"
+        with self.assertRaisesRegex(ReviewerError, "unsupported decision"):
+            validate_stored_review(unknown_report, **common)
 
+        old_rubric = json.loads(json.dumps(rubric))
+        old_rubric["schema_version"] = 5
+        with self.assertRaisesRegex(ReviewerError, "current policy"):
+            validate_stored_review(report, **{**common, "rubric": old_rubric})
 
     def test_render_result_is_bound_to_source_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1996,6 +2057,14 @@ class AutomaticLoopTests(unittest.TestCase):
             to_review, _, _, exhausted = cli.submissions_needing_work()
         self.assertEqual([r["id"] for r in to_review], [])
         self.assertEqual([r["id"] for r in exhausted], ["aaaaaaaaaaaa"])
+
+        listing, state = self.records(row)
+        with listing, state, mock.patch.object(cli, "abandon_review") as abandoned:
+            self.assertEqual(cli.auto(SimpleNamespace(
+                max_reviews=5, policy_ref="main", engine="codex", model=None,
+                reasoning_effort=None, command=None, work_dir=".palomar-reviews",
+            )), 0)
+        abandoned.assert_called_once_with(row, "review attempt limit reached")
 
     def test_the_attempt_is_counted_when_it_starts_not_when_it_fails(self):
         """A runner that dies recording nothing would otherwise never count."""
