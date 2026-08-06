@@ -967,7 +967,7 @@ class ReviewerTests(unittest.TestCase):
                 }
             )
             review = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
                 "source": {
                     "repository": mechanical["source"]["repository"],
