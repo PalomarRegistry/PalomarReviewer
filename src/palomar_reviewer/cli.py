@@ -2693,6 +2693,33 @@ def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
     raise ReviewerError("could not allocate a free permanent identifier")
 
 
+def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
+    """The provenance a record carries, from the one the report carries.
+
+    The report tracks which provenance fields the submitter actually stated,
+    so that silence and an explicit answer can be told apart. A record cannot
+    be silent: its schema admits no `unspecified` value for any of them, so
+    `declared` in a record would be three trues and no information.
+
+    It is dropped rather than allowed through, and only after checking that it
+    says what a record requires. Dropping it unread would turn a submission
+    that declared nothing into a record asserting defaults.
+    """
+    provenance = copy.deepcopy(mechanical["provenance"])
+    declared = provenance.pop("declared", None)
+    if declared is not None:
+        missing = sorted(field for field, said in declared.items() if not said)
+        if missing:
+            raise ReviewerError(
+                "cannot register a submission that declared no "
+                + ", ".join(missing)
+            )
+    for field in ("result_origin", "repository_role"):
+        if provenance.get(field) == "unspecified":
+            raise ReviewerError(f"cannot register a submission whose {field} is unspecified")
+    return provenance
+
+
 def registry_record(
     *,
     state: dict[str, Any],
@@ -2779,7 +2806,7 @@ def registry_record(
         "abstract": str(abstract),
         "authors": authors_from_metadata(metadata, mechanical),
         "classification": validated_classification(mechanical, metadata),
-        "provenance": copy.deepcopy(mechanical["provenance"]),
+        "provenance": entry_provenance(mechanical),
         "source": source_record,
         "formalization": formalization_record,
         "verification": {

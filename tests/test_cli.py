@@ -2668,3 +2668,62 @@ class FailedVerificationTests(unittest.TestCase):
         state = {"id": "a1b2c3d4e5f6", "run": {"id": 1}}
         with self.assertRaisesRegex(ReviewerError, "did not pass.*project must be a mapping"):
             cli.validate_mechanical_artifact(report, state, {"url": "x", "headSha": "9" * 40})
+
+
+class EntryProvenanceTests(unittest.TestCase):
+    """What the mechanical report carries is not what a record carries.
+
+    Registration failed on its first real use because the report's provenance
+    was copied into the record wholesale, and the report has a `declared`
+    block that schema-v1 does not allow. Nothing caught it: the record is
+    validated against a schema cloned from PalomarDatabase at registration
+    time, and registration had never run.
+    """
+
+    def provenance(self, **overrides):
+        block = {
+            "result_origin": "source-based",
+            "repository_role": "thin-wrapper",
+            "responsible_maintainers": [{"name": "Example Maintainer"}],
+            "mathematical_sources": [],
+            "related_formalizations": [],
+            "declared": {
+                "result_origin": True,
+                "repository_role": True,
+                "responsible_maintainers": True,
+            },
+        }
+        block.update(overrides)
+        return {"provenance": block}
+
+    def test_the_bookkeeping_the_report_needs_is_not_registered(self):
+        result = cli.entry_provenance(self.provenance())
+        self.assertNotIn("declared", result)
+        # schema-v1 admits exactly these, and `additionalProperties` is false,
+        # so anything else would be refused at the last step of a submission.
+        self.assertLessEqual(
+            set(result),
+            {"result_origin", "repository_role", "responsible_maintainers",
+             "mathematical_sources", "related_formalizations",
+             "substantive_formalization"},
+        )
+        # And the report itself is untouched: it is archived as evidence.
+        report = self.provenance()
+        cli.entry_provenance(report)
+        self.assertIn("declared", report["provenance"])
+
+    def test_a_submission_that_declared_nothing_is_not_registered(self):
+        """Dropping the block unread would publish defaults as assertions."""
+        for field in ("result_origin", "repository_role", "responsible_maintainers"):
+            with self.subTest(field):
+                declared = {"result_origin": True, "repository_role": True,
+                            "responsible_maintainers": True}
+                declared[field] = False
+                with self.assertRaisesRegex(ReviewerError, f"declared no.*{field}"):
+                    cli.entry_provenance(self.provenance(declared=declared))
+
+    def test_an_unspecified_provenance_is_not_registered(self):
+        for field in ("result_origin", "repository_role"):
+            with self.subTest(field):
+                with self.assertRaisesRegex(ReviewerError, f"{field} is unspecified"):
+                    cli.entry_provenance(self.provenance(**{field: "unspecified"}))
