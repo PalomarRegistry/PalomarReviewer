@@ -1570,6 +1570,15 @@ def clone_at(repository_url: str, revision: str, destination: Path) -> str:
     return resolved
 
 
+def unshallow(checkout: Path) -> None:
+    """Give a shallow checkout enough history to be pushed from."""
+    shallow = run(
+        ["git", "rev-parse", "--is-shallow-repository"], cwd=checkout
+    ).stdout.strip()
+    if shallow == "true":
+        run(["git", "fetch", "--unshallow", "origin"], cwd=checkout)
+
+
 def resolve_remote_commit(repository: str, revision: str) -> str:
     output = gh(["api", f"repos/{repository}/commits/{revision}", "--jq", ".sha"]).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", output):
@@ -3066,6 +3075,11 @@ def register(args: argparse.Namespace) -> int:
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
+    # The branch built here is pushed, and a shallow history cannot be pushed
+    # honestly: with the parent commit absent, the new commit reads as though
+    # it introduced every file in the tree, workflows included, and GitHub
+    # refuses a token that may not touch workflows. Nothing here writes one.
+    unshallow(database)
     schema_path = database / "schema-v1.json"
     if not schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register schema-v1.json")

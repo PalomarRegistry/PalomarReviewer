@@ -2763,3 +2763,69 @@ class EntryProvenanceTests(unittest.TestCase):
             with self.subTest(field):
                 with self.assertRaisesRegex(ReviewerError, f"{field} is unspecified"):
                     cli.entry_provenance(self.provenance(**{field: "unspecified"}))
+
+
+class UnshallowTests(unittest.TestCase):
+    """A branch is pushed from this checkout, so its history has to be real.
+
+    Registration failed against a shallow clone: with the parent commit
+    absent, the new commit reads as though it introduced every file in the
+    tree, and GitHub refused the push for creating `.github/workflows/`
+    entries that the reviewer never touches.
+    """
+
+    def repository(self, directory):
+        origin = Path(directory) / "origin"
+        origin.mkdir()
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+        subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
+        (origin / ".github" / "workflows").mkdir(parents=True)
+        (origin / ".github" / "workflows" / "pages.yml").write_text("on: push\n")
+        subprocess.run([*git, "-C", str(origin), "add", "-A"], check=True)
+        subprocess.run([*git, "-C", str(origin), "commit", "-qm", "workflows"], check=True)
+        (origin / "index.json").write_text("{}\n")
+        subprocess.run([*git, "-C", str(origin), "add", "-A"], check=True)
+        subprocess.run([*git, "-C", str(origin), "commit", "-qm", "index"], check=True)
+        return origin
+
+    def test_a_shallow_checkout_is_given_its_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            origin = self.repository(directory)
+            checkout = Path(directory) / "checkout"
+            subprocess.run(
+                ["git", "clone", "-q", "--depth=1", f"file://{origin}", str(checkout)],
+                check=True,
+            )
+            self.assertEqual(
+                subprocess.run(["git", "rev-parse", "--is-shallow-repository"],
+                               cwd=checkout, capture_output=True, text=True).stdout.strip(),
+                "true",
+            )
+            cli.unshallow(checkout)
+            self.assertEqual(
+                subprocess.run(["git", "rev-parse", "--is-shallow-repository"],
+                               cwd=checkout, capture_output=True, text=True).stdout.strip(),
+                "false",
+            )
+            # And the parent is now there, so a commit added on top can be
+            # seen for what it is: no workflow file among its changes.
+            (checkout / "entries").mkdir()
+            (checkout / "entries" / "probe.json").write_text("{}\n")
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+            subprocess.run([*git, "-C", str(checkout), "add", "-A"], check=True)
+            subprocess.run([*git, "-C", str(checkout), "commit", "-qm", "entry"], check=True)
+            changed = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD^", "HEAD"],
+                cwd=checkout, capture_output=True, text=True, check=True,
+            ).stdout.split()
+            self.assertEqual(changed, ["entries/probe.json"])
+
+    def test_a_complete_checkout_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            origin = self.repository(directory)
+            checkout = Path(directory) / "checkout"
+            subprocess.run(["git", "clone", "-q", f"file://{origin}", str(checkout)], check=True)
+            with mock.patch.object(cli, "run", wraps=cli.run) as runner:
+                cli.unshallow(checkout)
+            fetched = [c for c in runner.call_args_list if "fetch" in c.args[0]]
+            self.assertEqual(fetched, [], "an unshallow fetch was run on a complete checkout")
