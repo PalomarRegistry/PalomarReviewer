@@ -19,6 +19,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: PalomarRegistry/PalomarDatabase
+          # Keep the coordinated database/schema change under test until it
+          # lands; this is returned to main before this pull request merges.
+          ref: codex/private-filtered-registry
           persist-credentials: false
           path: palomar-database
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
