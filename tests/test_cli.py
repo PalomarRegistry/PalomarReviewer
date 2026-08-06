@@ -1,4 +1,5 @@
 import contextlib
+import datetime as dt
 import hashlib
 import io
 import json
@@ -1905,6 +1906,25 @@ class AutomaticLoopTests(unittest.TestCase):
             [["aaaaaaaaaaaa"], ["bbbbbbbbbbbb"], ["cccccccccccc"]],
         )
 
+    def test_a_review_already_running_is_not_started_again(self):
+        recent = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(
+            self.split(self.row("aaaaaaaaaaaa", status="reviewing", review_started_at=recent)),
+            [[], [], []],
+        )
+
+    def test_a_review_whose_runner_died_is_picked_up_again(self):
+        """Otherwise a submission stays marked as running for ever."""
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        for started in (old, None, "not a timestamp"):
+            with self.subTest(started):
+                row = self.row("aaaaaaaaaaaa", status="reviewing")
+                if started is not None:
+                    row["review_started_at"] = started
+                self.assertEqual(self.split(row)[0], ["aaaaaaaaaaaa"])
+
     def test_a_submission_without_consent_is_never_picked_up(self):
         """The loop must not be the thing that decides to register."""
         self.assertEqual(
@@ -1931,7 +1951,12 @@ class AutomaticLoopTests(unittest.TestCase):
         rows = [self.row(f"{n:012d}".replace("0", "a"), status="awaiting-review") for n in range(5)]
         listing, state = self.records(*rows)
         seen = []
-        with listing, state, mock.patch.object(cli, "run_review", side_effect=lambda a: seen.append((a.submission, a.apply)) or 0):
+        with (
+            listing, state,
+            mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "run_review", side_effect=lambda a: seen.append((a.submission, a.apply)) or 0),
+        ):
             cli.auto(SimpleNamespace(max_reviews=2, policy_ref="main", engine="codex",
                                      model=None, reasoning_effort=None, command=None,
                                      work_dir=".palomar-reviews"))
@@ -1951,7 +1976,12 @@ class AutomaticLoopTests(unittest.TestCase):
                 raise ReviewerError("engine exploded")
             return 0
 
-        with listing, state, mock.patch.object(cli, "run_review", side_effect=flaky):
+        with (
+            listing, state,
+            mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "run_review", side_effect=flaky),
+        ):
             self.assertEqual(cli.auto(SimpleNamespace(
                 max_reviews=5, policy_ref="main", engine="codex", model=None,
                 reasoning_effort=None, command=None, work_dir=".palomar-reviews")), 1)
@@ -2024,6 +2054,29 @@ class AutomaticLoopTests(unittest.TestCase):
                                      work_dir=".palomar-reviews"))
         self.assertEqual(finalized.call_args.args[0].pr, 7)
 
+
+
+class ReviewTimingTests(unittest.TestCase):
+    def test_beginning_a_review_says_so_and_stamps_the_time(self):
+        """The review is private, so unlike verification there is no public run
+        to point a waiting submitter at."""
+        state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": []}
+        with mock.patch.object(cli, "put_state") as write:
+            updated = cli.begin_review(state)
+        self.assertEqual(updated["status"], "reviewing")
+        self.assertRegex(updated["review_started_at"], r"\A\d{4}-\d{2}-\d{2}T")
+        self.assertIn("running", write.call_args.args[2])
+
+    def test_durations_are_kept_recent_and_unattributed(self):
+        with (
+            mock.patch.object(cli, "state_json", return_value={"seconds": list(range(1, 25))}),
+            mock.patch.object(cli, "put_state") as write,
+        ):
+            cli.record_review_duration(300)
+        written = write.call_args.args[1]
+        self.assertEqual(written["seconds"][-1], 300)
+        self.assertEqual(len(written["seconds"]), 20, "only recent durations are kept")
+        self.assertEqual(set(written) - {"schema_version", "seconds"}, set())
 
 
 class SpendAccountingTests(unittest.TestCase):
