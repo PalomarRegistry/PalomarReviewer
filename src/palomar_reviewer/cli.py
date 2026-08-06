@@ -1579,6 +1579,53 @@ def unshallow(checkout: Path) -> None:
         run(["git", "fetch", "--unshallow", "origin"], cwd=checkout)
 
 
+def remote_branch_commit(branch: str) -> str | None:
+    """The commit a registration branch already points at, or None."""
+    try:
+        sha = gh(
+            ["api", f"repos/{DATABASE_REPO}/git/ref/heads/{branch}", "--jq", ".object.sha"]
+        ).strip()
+    except ReviewerError:
+        return None
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def open_registration_pr(branch: str) -> int | None:
+    """The open pull request for a registration branch, if one exists."""
+    listed = gh(
+        [
+            "pr", "list", "--repo", DATABASE_REPO, "--head", branch,
+            "--state", "open", "--json", "number", "--jq", ".[0].number // empty",
+        ]
+    ).strip()
+    return int(listed) if listed.isdigit() else None
+
+
+def push_registration_branch(database: Path, branch: str) -> None:
+    """Push the registration branch, replacing an abandoned attempt.
+
+    Registration is retried, and every attempt allocates a fresh identifier,
+    so the branch an earlier attempt left behind holds a different commit that
+    this one is not descended from. Without this, the first attempt to push and
+    then fail made every later attempt fail too, non-fast-forward, until
+    somebody deleted the branch by hand.
+
+    The replacement is leased against the commit that was actually observed, so
+    a branch that changed underneath this process is not overwritten.
+    """
+    remote = ["git", "push", f"https://github.com/{DATABASE_REPO}.git"]
+    existing = remote_branch_commit(branch)
+    if existing is None:
+        run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database)
+        return
+    print(f"replacing abandoned registration branch {branch} at {existing[:12]}")
+    run(
+        [*remote, f"--force-with-lease=refs/heads/{branch}:{existing}",
+         f"HEAD:refs/heads/{branch}"],
+        cwd=database,
+    )
+
+
 def resolve_remote_commit(repository: str, revision: str) -> str:
     output = gh(["api", f"repos/{repository}/commits/{revision}", "--jq", ".sha"]).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", output):
@@ -3201,16 +3248,16 @@ def register(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"Prepared {destination}; dry run, branch was not pushed.")
         return 0
-    run(
-        [
-            "git",
-            "push",
-            f"https://github.com/{DATABASE_REPO}.git",
-            f"HEAD:refs/heads/{branch}",
-        ],
-        cwd=database,
-    )
-    pr_url = gh(
+    push_registration_branch(database, branch)
+    open_pr = open_registration_pr(branch)
+    if open_pr is not None:
+        # An earlier attempt got this far and then failed. The branch now holds
+        # this attempt's record, and a second pull request for the same branch
+        # is not possible anyway.
+        print(f"{args.submission}: reusing open database PR #{open_pr}")
+        pr_url = f"https://github.com/{DATABASE_REPO}/pull/{open_pr}"
+    else:
+        pr_url = gh(
         [
             "pr",
             "create",
@@ -3232,7 +3279,7 @@ def register(args: argparse.Namespace) -> int:
                 "This PR was prepared by PalomarReviewer. Merging is the registration event."
             ),
         ]
-    ).strip()
+        ).strip()
     # Recorded so the next pass knows a PR is already open for this submission
     # and does not build a second one.
     fresh = submission_state(args.submission)
