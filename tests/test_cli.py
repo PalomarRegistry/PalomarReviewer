@@ -2624,6 +2624,53 @@ def database_gh(view, validation="success", calls=None):
     return answer
 
 
+class SubmissionListingTests(unittest.TestCase):
+    """An unreadable queue is not an empty queue."""
+
+    def listing(self, returncode=0, stdout="", stderr=""):
+        return mock.patch.object(
+            cli, "run",
+            return_value=SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr),
+        )
+
+    def test_a_readable_listing_is_returned(self):
+        with self.listing(stdout="aaaaaaaaaaaa\nbbbbbbbbbbbb\n"):
+            self.assertEqual(cli.state_directory_names(), ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+
+    def test_a_failed_listing_is_not_an_empty_queue(self):
+        """This is how the reviewer could stop reviewing everything and still
+        report success: the failure looked exactly like a healthy empty
+        registry, so the pass said "Nothing to do." and exited zero."""
+        with self.listing(returncode=1, stderr="HTTP 403: rate limit exceeded"):
+            with self.assertRaises(ReviewerError) as raised:
+                cli.state_directory_names()
+        self.assertIn("403", str(raised.exception))
+
+    def test_a_listing_at_the_api_limit_is_refused(self):
+        """The contents API answers at most a thousand names, so a listing of
+        exactly that length cannot be told apart from a truncated one."""
+        names = "\n".join(f"{index:012d}" for index in range(cli.CONTENTS_DIRECTORY_LIMIT))
+        with self.listing(stdout=names + "\n"):
+            with self.assertRaises(ReviewerError) as raised:
+                cli.state_directory_names()
+        self.assertIn("git trees", str(raised.exception))
+
+    def test_a_pass_does_not_report_success_when_the_queue_cannot_be_read(self):
+        with (
+            self.listing(returncode=1, stderr="HTTP 403"),
+            mock.patch.object(cli, "register") as registered,
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            with self.assertRaises(ReviewerError):
+                cli.auto(SimpleNamespace(
+                    max_reviews=5, policy_ref="main", engine="codex", model=None,
+                    reasoning_effort=None, command=None, work_dir=".palomar-reviews",
+                    pass_seconds=7200, self_dispatch=False, dispatch_depth=0,
+                ))
+        registered.assert_not_called()
+        finalized.assert_not_called()
+
+
 class AutomaticLoopTests(unittest.TestCase):
     """Each pass advances a submission by one step, and never past consent."""
 

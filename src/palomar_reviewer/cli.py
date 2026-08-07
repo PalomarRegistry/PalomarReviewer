@@ -2214,12 +2214,39 @@ def deliver_review(
     )
 
 
+# The contents API answers at most this many names for one directory, and says
+# to use the git trees API past it.
+CONTENTS_DIRECTORY_LIMIT = 1_000
+
+
 def state_directory_names() -> list[str]:
+    """Every submission directory in the private state repository.
+
+    A failure here used to read as "there are no submissions", which is exactly
+    what a healthy empty registry looks like: the pass printed "Nothing to do."
+    and exited zero. So an expired token, a rate limit or a listing too long to
+    return would stop the reviewer reviewing anything at all, with a green job
+    and nothing to look at. An unreadable queue is not an empty queue.
+
+    A listing of exactly the API's limit cannot be told apart from one that was
+    cut off at it, so both are refused rather than silently reviewing a prefix
+    of the queue for ever.
+    """
     listing = run(
         ["gh", "api", f"repos/{STATE_REPO}/contents/submissions", "--jq", ".[].name"],
         check=False,
     )
-    return listing.stdout.split() if listing.returncode == 0 else []
+    if listing.returncode:
+        detail = (listing.stderr or listing.stdout or "").strip()[:400]
+        raise ReviewerError(f"could not list the submissions in {STATE_REPO}: {detail}")
+    names = listing.stdout.split()
+    if len(names) >= CONTENTS_DIRECTORY_LIMIT:
+        raise ReviewerError(
+            f"{STATE_REPO} lists {len(names)} submissions, at or past the "
+            f"{CONTENTS_DIRECTORY_LIMIT} the contents API will return; the queue cannot be "
+            "enumerated this way any more and needs the git trees API"
+        )
+    return names
 
 
 def queue() -> list[dict[str, Any]]:
