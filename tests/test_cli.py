@@ -411,7 +411,7 @@ class ReviewerTests(unittest.TestCase):
         }
         by_id = {row["id"]: row for row in (pending, already_done)}
         with (
-            mock.patch.object(cli, "state_directory_names", return_value=list(by_id)),
+            mock.patch.object(cli, "open_index", return_value={"open": list(by_id)}),
             mock.patch.object(cli, "submission_state", side_effect=by_id.get),
             mock.patch.object(cli, "validate_archive_token") as validate_token,
             mock.patch.object(cli, "ensure_repository_star") as ensure_star,
@@ -2674,40 +2674,133 @@ def database_gh(view, validation="success", calls=None):
     return answer
 
 
+def submission_id(number):
+    return f"{number:012d}"
+
+
 class SubmissionListingTests(unittest.TestCase):
-    """An unreadable queue is not an empty queue."""
+    """An unreadable queue is not an empty queue.
 
-    def listing(self, returncode=0, stdout="", stderr=""):
-        return mock.patch.object(
-            cli, "run",
-            return_value=SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr),
-        )
+    The queue is an index of what still has work outstanding, so the two things
+    that matter are that a pass costs the queue rather than the registry, and
+    that an index which cannot be trusted is rebuilt rather than believed.
+    """
 
-    def test_a_readable_listing_is_returned(self):
-        with self.listing(stdout="aaaaaaaaaaaa\nbbbbbbbbbbbb\n"):
-            self.assertEqual(cli.state_directory_names(), ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+    def index(self, **fields):
+        return {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuild_after": cli.utc_after(3600),
+            "open": [],
+            "_blob_sha": "sha-index",
+            **fields,
+        }
 
-    def test_a_failed_listing_is_not_an_empty_queue(self):
-        """This is how the reviewer could stop reviewing everything and still
-        report success: the failure looked exactly like a healthy empty
-        registry, so the pass said "Nothing to do." and exited zero."""
-        with self.listing(returncode=1, stderr="HTTP 403: rate limit exceeded"):
-            with self.assertRaises(ReviewerError) as raised:
-                cli.state_directory_names()
-        self.assertIn("403", str(raised.exception))
+    @contextlib.contextmanager
+    def state_repository(self, records, index=None, stored_sha="sha-on-disk"):
+        """The state repository as the reviewer reaches it: index, clone, write.
 
-    def test_a_listing_at_the_api_limit_is_refused(self):
-        """The contents API answers at most a thousand names, so a listing of
-        exactly that length cannot be told apart from a truncated one."""
-        names = "\n".join(f"{index:012d}" for index in range(cli.CONTENTS_DIRECTORY_LIMIT))
-        with self.listing(stdout=names + "\n"):
-            with self.assertRaises(ReviewerError) as raised:
-                cli.state_directory_names()
-        self.assertIn("git trees", str(raised.exception))
+        `records` maps a submission id to its record, or to None for a
+        directory whose state.json cannot be read at all.
+        """
+        commands, written = [], []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if "clone" in command:
+                destination = Path(command[-1])
+                for name, record in records.items():
+                    directory = destination / "submissions" / name
+                    directory.mkdir(parents=True)
+                    if record is not None:
+                        (directory / "state.json").write_text(json.dumps(record))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout=f"{stored_sha}\n", stderr="")
+
+        def read_index(path):
+            self.assertEqual(path, cli.OPEN_INDEX_PATH)
+            if isinstance(index, Exception):
+                raise index
+            return index
+
+        with (
+            mock.patch.object(cli, "state_json", side_effect=read_index),
+            mock.patch.object(cli, "run", side_effect=fake_run),
+            mock.patch.object(cli, "registry_git_environment", return_value={}),
+            mock.patch.object(cli, "put_state",
+                              side_effect=lambda *args, **kw: written.append((args, kw))),
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+        ):
+            yield commands, written
+
+    def test_an_index_that_can_be_trusted_is_used_as_it_stands(self):
+        stored = self.index(open=["aaaaaaaaaaaa"])
+        with self.state_repository({}, index=stored) as (commands, written):
+            self.assertEqual(cli.open_index()["open"], ["aaaaaaaaaaaa"])
+        self.assertEqual([command for command in commands if "clone" in command], [])
+        self.assertEqual(written, [])
+
+    def test_an_index_that_cannot_be_trusted_is_rebuilt_from_every_record(self):
+        """Each of these once meant the pass reviewed nothing and said so as
+        "Nothing to do.": there is no shape of this file that may be believed
+        on its face, because the cost of rebuilding is one clone."""
+        records = {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
+            "bbbbbbbbbbbb": {"id": "bbbbbbbbbbbb", "status": "withdrawn"},
+        }
+        damaged = {
+            "absent": None,
+            "not JSON at all": ValueError("Expecting value"),
+            "stale": self.index(rebuild_after=cli.utc_after(-60)),
+            "undated": {"schema_version": 1, "open": []},
+            "from another contract": self.index(schema_version=99),
+            "holding something that is not an id": self.index(open=["../../etc"]),
+            "holding something that is not a list": self.index(open={"aaaaaaaaaaaa": True}),
+        }
+        for description, stored in damaged.items():
+            with self.subTest(description):
+                with self.state_repository(records, index=stored) as (_, written):
+                    self.assertEqual(cli.open_index()["open"], ["aaaaaaaaaaaa"])
+                (path, value, _), keywords = written[0]
+                self.assertEqual(path, cli.OPEN_INDEX_PATH)
+                self.assertEqual(value["open"], ["aaaaaaaaaaaa"])
+                # Written against the sha the damaged file had, not blind.
+                self.assertEqual(keywords["blob_sha"], "sha-on-disk")
+
+    def test_a_record_that_cannot_be_read_is_not_a_finished_one(self):
+        """A rebuild that dropped what it could not parse would quietly retire
+        the one submission most likely to need somebody to look at it."""
+        with self.state_repository({"aaaaaaaaaaaa": None}, index=None):
+            self.assertEqual(cli.rebuild_open_index()["open"], ["aaaaaaaaaaaa"])
+
+    def test_a_rebuild_reads_a_checkout_rather_than_a_capped_listing(self):
+        """The contents API answers at most a thousand names for one directory
+        and the trees API truncates a large answer, so a rebuilt index would
+        silently become a prefix of the queue. A clone cannot half-answer."""
+        records = {
+            submission_id(number): {"id": submission_id(number), "status": "awaiting-review"}
+            for number in range(1_200)
+        }
+        with self.state_repository(records, index=None) as (commands, _):
+            self.assertEqual(len(cli.rebuild_open_index()["open"]), 1_200)
+        listings = [
+            command for command in commands
+            if any("contents/submissions" in str(part) for part in command)
+        ]
+        self.assertEqual(listings, [])
+
+    def test_a_rebuild_that_cannot_be_recorded_still_enumerates_the_queue(self):
+        """The index is a cache of what the records already say. Failing to
+        write it costs the next pass a rebuild; refusing to review over it
+        would cost the queue."""
+        with self.state_repository(
+            {"aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"}}, index=None
+        ):
+            with mock.patch.object(cli, "put_state", side_effect=ReviewerError("HTTP 409")):
+                self.assertEqual(cli.open_index()["open"], ["aaaaaaaaaaaa"])
 
     def test_a_pass_does_not_report_success_when_the_queue_cannot_be_read(self):
         with (
-            self.listing(returncode=1, stderr="HTTP 403"),
+            mock.patch.object(cli, "open_index", side_effect=ReviewerError("HTTP 403")),
             mock.patch.object(cli, "register") as registered,
             mock.patch.object(cli, "finalize") as finalized,
         ):
@@ -2720,6 +2813,64 @@ class SubmissionListingTests(unittest.TestCase):
         registered.assert_not_called()
         finalized.assert_not_called()
 
+    def test_a_submission_the_reviewer_has_finished_with_leaves_the_index(self):
+        records = {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
+            "bbbbbbbbbbbb": {"id": "bbbbbbbbbbbb", "status": "review-failed"},
+            "cccccccccccc": {"id": "cccccccccccc", "status": "registered",
+                             "registered_entry": "PALOMAR-2026-08-01-000001-v1"},
+            "dddddddddddd": {"id": "dddddddddddd", "status": "registered",
+                             "registered_entry": "PALOMAR-2026-08-01-000002-v1",
+                             "source_star": {"repository": "example/project"}},
+        }
+        stored = self.index(open=list(records))
+        with (
+            self.state_repository(records, index=stored) as (_, written),
+            mock.patch.object(cli, "submission_state", side_effect=records.get),
+        ):
+            self.assertEqual(
+                [record["id"] for record in cli.open_submissions()], list(records)
+            )
+        (_, value, _), keywords = written[0]
+        # A registration is not the end of a submission: the accepted source is
+        # starred afterwards, by a step that may fail and be retried.
+        self.assertEqual(value["open"], ["aaaaaaaaaaaa", "cccccccccccc"])
+        # Under the sha the index was read at, so an admission the submission
+        # server made while this pass was reading refuses the write instead of
+        # being erased by it.
+        self.assertEqual(keywords["blob_sha"], "sha-index")
+
+    def test_a_pass_costs_the_open_queue_and_not_the_size_of_the_registry(self):
+        """This is the growth the index exists to remove. One submission is
+        open in each registry; the pass must read one record in each."""
+        cost = {}
+        for total in (2, 20):
+            with self.subTest(total=total):
+                records = {
+                    submission_id(number): {
+                        "id": submission_id(number),
+                        "status": "awaiting-review" if number == 0 else "withdrawn",
+                    }
+                    for number in range(total)
+                }
+                with self.state_repository(records, index=None):
+                    rebuilt = cli.rebuild_open_index()
+                reads = []
+
+                def read(name, corpus=records, seen=reads):
+                    seen.append(name)
+                    return corpus[name]
+
+                with (
+                    mock.patch.object(cli, "open_index", return_value=rebuilt),
+                    mock.patch.object(cli, "submission_state", side_effect=read),
+                    mock.patch.object(cli, "_write_open_index"),
+                ):
+                    cli.submissions_needing_work()
+                    cli.star_registered_sources(SimpleNamespace(dry_run=True))
+                cost[total] = len(reads)
+        self.assertEqual(cost[2], cost[20])
+
 
 class AutomaticLoopTests(unittest.TestCase):
     """Each pass advances a submission by one step, and never past consent."""
@@ -2727,7 +2878,7 @@ class AutomaticLoopTests(unittest.TestCase):
     def records(self, *rows):
         by_id = {row["id"]: row for row in rows}
         return (
-            mock.patch.object(cli, "state_directory_names", return_value=list(by_id)),
+            mock.patch.object(cli, "open_index", return_value={"open": list(by_id)}),
             mock.patch.object(cli, "submission_state", side_effect=by_id.get),
         )
 
@@ -2830,7 +2981,7 @@ class AutomaticLoopTests(unittest.TestCase):
 
         delivered = {**row, "status": "review-ready"}
         with (
-            mock.patch.object(cli, "state_directory_names", return_value=[row["id"]]),
+            mock.patch.object(cli, "open_index", return_value={"open": [row["id"]]}),
             mock.patch.object(cli, "submission_state", side_effect=[row, delivered]),
             mock.patch.object(cli, "abandon_review") as abandoned,
         ):
@@ -3007,7 +3158,7 @@ class AutomaticLoopTests(unittest.TestCase):
             return after if len(reads) > 1 else before
 
         with (
-            mock.patch.object(cli, "state_directory_names", return_value=["aaaaaaaaaaaa"]),
+            mock.patch.object(cli, "open_index", return_value={"open": ["aaaaaaaaaaaa"]}),
             mock.patch.object(cli, "submission_state", side_effect=read),
             mock.patch.object(cli, "register", return_value=0) as registered,
             mock.patch.object(
@@ -3366,7 +3517,7 @@ class SelfDispatchTests(unittest.TestCase):
     def records(self, *rows):
         by_id = {row["id"]: row for row in rows}
         return (
-            mock.patch.object(cli, "state_directory_names", return_value=list(by_id)),
+            mock.patch.object(cli, "open_index", return_value={"open": list(by_id)}),
             mock.patch.object(cli, "submission_state", side_effect=by_id.get),
         )
 
@@ -4124,7 +4275,7 @@ class RegistrationRetryTests(unittest.TestCase):
     """
 
     def test_a_new_branch_is_pushed_plainly(self):
-        with mock.patch.object(cli, "database_git_environment", return_value={}), \
+        with mock.patch.object(cli, "registry_git_environment", return_value={}), \
              mock.patch.object(cli, "remote_branch_commit", return_value=None), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
@@ -4133,7 +4284,7 @@ class RegistrationRetryTests(unittest.TestCase):
         self.assertFalse([part for part in command if part.startswith("--force")])
 
     def test_an_abandoned_branch_is_replaced_under_a_lease(self):
-        with mock.patch.object(cli, "database_git_environment", return_value={}), \
+        with mock.patch.object(cli, "registry_git_environment", return_value={}), \
              mock.patch.object(cli, "remote_branch_commit", return_value="a" * 40), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
@@ -4332,3 +4483,29 @@ class PushProofTests(unittest.TestCase):
         cli.verify_push_proof({"commit": "1" * 40, "created_at": "2026-08-07T00:00:00Z"})
         with self.assertRaisesRegex(ReviewerError, "no push_proof"):
             cli.verify_push_proof({"commit": "1" * 40, "created_at": "2026-08-09T00:00:00Z"})
+
+
+class OpenIndexFailureTests(unittest.TestCase):
+    def test_a_submission_that_cannot_be_read_keeps_its_place_in_the_queue(self):
+        """`state_json` answers None to a rate limit, an expired token and a
+        genuine 404 alike, and only one of those means there is nothing left to
+        do. Dropping the id on the other two loses a submission silently, in a
+        pass that then reports success."""
+        index = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-07T00:00:00Z",
+            "rebuild_after": "2099-01-01T00:00:00Z",
+            "open": ["aaaaaaaaaaaa", "bbbbbbbbbbbb"],
+            "_blob_sha": "sha",
+        }
+        written = []
+        with (
+            mock.patch.object(cli, "state_json", return_value=index),
+            mock.patch.object(cli, "submission_state", side_effect=[None, {"status": "awaiting-review"}]),
+            mock.patch.object(cli, "_write_open_index", side_effect=lambda i, blob_sha: written.append(i)),
+        ):
+            records = cli.open_submissions()
+
+        self.assertEqual(len(records), 1, "the readable one came through")
+        for entry in written:
+            self.assertIn("aaaaaaaaaaaa", entry["open"], "an unreadable submission was dropped")

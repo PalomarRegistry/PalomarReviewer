@@ -73,6 +73,16 @@ palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol
 The second command writes a complete packet and report under
 `.palomar-reviews/a1b2c3d4e5f6/` and changes nothing else.
 
+The queue itself is `index/open.json` in the private state repository: the
+submissions the reviewer is not yet finished with. The submission server adds an
+id when it admits one, and a pass drops one when the record says there is
+nothing left to do to it, so a pass costs the queue rather than the size of the
+registry. It is derived rather than authoritative: an index that is missing,
+damaged, from another contract, or more than six hours old is rebuilt from a
+checkout of every record, and deleting the file makes the next pass rebuild it
+at once. A pass that cannot enumerate its work fails; it never reports having
+found nothing.
+
 For rubric version 2 and later, the runner rejects an internally inconsistent
 positive review: synthesis must reproduce the evidence-pass scores exactly, acceptance
 cannot override a failed pass, and every completed evidence score
