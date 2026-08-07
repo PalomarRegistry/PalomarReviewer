@@ -2580,6 +2580,20 @@ class AutomaticLoopTests(unittest.TestCase):
             row.setdefault("review_schema_version", 2)
         return row
 
+    def opts(self, **overrides):
+        """Everything `auto` reads, so a new option does not break every test."""
+        return SimpleNamespace(**{
+            "max_reviews": 5,
+            "policy_ref": "main",
+            "engine": "codex",
+            "model": None,
+            "reasoning_effort": None,
+            "command": None,
+            "work_dir": ".palomar-reviews",
+            "pass_seconds": 0,
+            **overrides,
+        })
+
     def split(self, *rows):
         listing, state = self.records(*rows)
         current_review = {
@@ -2729,9 +2743,7 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(cli, "record_review_duration"),
             mock.patch.object(cli, "run_review", side_effect=lambda a: seen.append((a.submission, a.apply)) or 0),
         ):
-            cli.auto(SimpleNamespace(max_reviews=2, policy_ref="main", engine="codex",
-                                     model=None, reasoning_effort=None, command=None,
-                                     work_dir=".palomar-reviews"))
+            cli.auto(self.opts(max_reviews=2))
         # Two submissions, each dry-run then applied.
         self.assertEqual(len(seen), 4)
         self.assertEqual([apply_step for _, apply_step in seen], [False, True, False, True])
@@ -2755,9 +2767,7 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(cli, "advance_state", side_effect=lambda s, *a, **k: s),
             mock.patch.object(cli, "run_review", side_effect=flaky),
         ):
-            self.assertEqual(cli.auto(SimpleNamespace(
-                max_reviews=5, policy_ref="main", engine="codex", model=None,
-                reasoning_effort=None, command=None, work_dir=".palomar-reviews")), 1)
+            self.assertEqual(cli.auto(self.opts()), 1)
         self.assertIn("bbbbbbbbbbbb", attempted)
 
     def test_a_database_change_that_is_not_green_is_not_merged(self):
@@ -2777,9 +2787,7 @@ class AutomaticLoopTests(unittest.TestCase):
                     ),
                     mock.patch.object(cli, "finalize") as finalized,
                 ):
-                    cli.auto(SimpleNamespace(max_reviews=5, policy_ref="main", engine="codex",
-                                             model=None, reasoning_effort=None, command=None,
-                                             work_dir=".palomar-reviews"))
+                    cli.auto(self.opts())
                 finalized.assert_not_called()
                 self.assertNotIn("merge", [step for call in calls for step in call])
 
@@ -2793,15 +2801,76 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(
                 cli, "gh",
                 side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                    {"state": "OPEN", "mergeStateStatus": "CLEAN"}),
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "d" * 40}),
             ),
             mock.patch.object(cli, "finalize", return_value=0) as finalized,
         ):
-            cli.auto(SimpleNamespace(max_reviews=5, policy_ref="main", engine="codex",
-                                     model=None, reasoning_effort=None, command=None,
-                                     work_dir=".palomar-reviews"))
-        self.assertIn(["pr", "merge", "7", "--repo", cli.DATABASE_REPO, "--squash", "--delete-branch"], calls)
+            cli.auto(self.opts())
+        self.assertIn(
+            ["pr", "merge", "7", "--repo", cli.DATABASE_REPO, "--squash", "--delete-branch",
+             "--match-head-commit", "d" * 40],
+            calls,
+        )
         self.assertEqual(finalized.call_args.args[0].pr, 7)
+
+    def test_the_merge_names_the_commit_whose_checks_were_read(self):
+        """Nothing else makes "these checks passed" and "this is what merged"
+        the same statement: the database has no enforced branch protection."""
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+                         registration_pr=7)]
+        listing, state = self.records(*rows)
+        with (
+            listing, state,
+            mock.patch.object(
+                cli, "gh",
+                side_effect=lambda a, **k: json.dumps(
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN"}),
+            ),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1, "a head that cannot be read is not a merge")
+        finalized.assert_not_called()
+
+    def test_a_registration_is_finished_in_the_pass_that_made_it(self):
+        """The database change is the one transition nothing outside this job
+        observes. Leaving it for the next tick is what made the schedule the
+        clock rather than a backstop."""
+        before = self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True)
+        after = dict(before, registration_pr=7, registration_pr_at="2026-08-07T00:00:00Z")
+        reads = []
+
+        def read(ident):
+            reads.append(ident)
+            return after if len(reads) > 1 else before
+
+        with (
+            mock.patch.object(cli, "state_directory_names", return_value=["aaaaaaaaaaaa"]),
+            mock.patch.object(cli, "submission_state", side_effect=read),
+            mock.patch.object(cli, "register", return_value=0) as registered,
+            mock.patch.object(
+                cli, "gh",
+                side_effect=lambda a, **k: json.dumps(
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "a" * 40}),
+            ),
+            mock.patch.object(cli, "finalize", return_value=0) as finalized,
+        ):
+            cli.auto(self.opts(pass_seconds=600))
+        registered.assert_called_once()
+        self.assertEqual(finalized.call_args.args[0].pr, 7)
+
+    def test_only_one_registration_is_started_per_pass(self):
+        """A registration already waits on a render run and now waits on the
+        database too, so two in one pass can outlive the job carrying them."""
+        rows = [self.row(letter * 12, status="review-ready", registration_consent=True)
+                for letter in ("a", "b", "c")]
+        listing, state = self.records(*rows)
+        with (
+            listing, state,
+            mock.patch.object(cli, "register", return_value=0) as registered,
+            mock.patch.object(cli, "finalize"),
+        ):
+            cli.auto(self.opts())
+        self.assertEqual(registered.call_count, 1)
 
     def test_finalizing_waits_for_the_database_change_to_merge(self):
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
@@ -2812,9 +2881,7 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(cli, "gh", return_value=json.dumps({"state": "CLOSED"})),
             mock.patch.object(cli, "finalize") as finalized,
         ):
-            self.assertEqual(cli.auto(SimpleNamespace(
-                max_reviews=5, policy_ref="main", engine="codex", model=None,
-                reasoning_effort=None, command=None, work_dir=".palomar-reviews")), 0)
+            self.assertEqual(cli.auto(self.opts()), 0)
         finalized.assert_not_called()
 
         with (
@@ -2822,10 +2889,98 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(cli, "gh", return_value=json.dumps({"state": "MERGED"})),
             mock.patch.object(cli, "finalize", return_value=0) as finalized,
         ):
-            cli.auto(SimpleNamespace(max_reviews=5, policy_ref="main", engine="codex",
-                                     model=None, reasoning_effort=None, command=None,
-                                     work_dir=".palomar-reviews"))
+            cli.auto(self.opts())
         self.assertEqual(finalized.call_args.args[0].pr, 7)
+
+class DatabaseChangeWaitTests(unittest.TestCase):
+    """Waiting for the registry's own checks, and knowing when not to."""
+
+    def test_a_change_that_falls_behind_is_updated_once(self):
+        """BEHIND never becomes CLEAN on its own, and the database requires a
+        branch to be up to date, so this hung for ever before."""
+        views = [
+            {"state": "OPEN", "mergeStateStatus": "BEHIND"},
+            {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "e" * 40},
+        ]
+        calls = []
+
+        def fake_gh(args, **kwargs):
+            calls.append(args)
+            return json.dumps(views.pop(0)) if args[:2] == ["pr", "view"] else ""
+
+        with (
+            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli.time, "sleep"),
+        ):
+            view = cli.await_database_checks(7, 600)
+        updates = [call for call in calls if call[:2] == ["pr", "update-branch"]]
+        self.assertEqual(len(updates), 1, "the branch is updated once, not on every poll")
+        self.assertEqual(updates[0][2], "7")
+        self.assertEqual(view["mergeStateStatus"], "CLEAN")
+
+    def test_a_finished_and_failing_rollup_is_not_waited_for(self):
+        """UNSTABLE covers both "still running" and "already failed", so a wait
+        that reads only the merge state spends its whole budget on a lost
+        cause."""
+        view = json.dumps({
+            "state": "OPEN",
+            "mergeStateStatus": "UNSTABLE",
+            "headRefOid": "f" * 40,
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"status": "COMPLETED", "conclusion": "FAILURE"},
+            ],
+        })
+        slept = []
+        with (
+            mock.patch.object(cli, "gh", return_value=view),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            cli.await_database_checks(7, 3600)
+        self.assertEqual(slept, [], "a failed rollup was waited on anyway")
+
+    def test_a_rollup_that_has_not_finished_is_waited_for(self):
+        view = json.dumps({
+            "state": "OPEN",
+            "mergeStateStatus": "UNSTABLE",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "FAILURE"},
+                {"status": "IN_PROGRESS", "conclusion": None},
+            ],
+        })
+        slept = []
+        clock = iter(range(0, 100_000, 20))
+        with (
+            mock.patch.object(cli, "gh", return_value=view),
+            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            cli.await_database_checks(7, 40)
+        self.assertTrue(slept, "a rollup that has not finished is not a verdict")
+
+    def test_a_conflict_is_not_waited_for(self):
+        slept = []
+        with (
+            mock.patch.object(
+                cli, "gh",
+                return_value=json.dumps({"state": "OPEN", "mergeStateStatus": "DIRTY"}),
+            ),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            view = cli.await_database_checks(7, 3600)
+        self.assertEqual(view["mergeStateStatus"], "DIRTY")
+        self.assertEqual(slept, [], "a conflict needs a person, not patience")
+
+    def test_a_zero_wait_is_a_single_look(self):
+        """The recovery arm must stay cheap: it runs on every pass."""
+        calls = []
+        with mock.patch.object(
+            cli, "gh",
+            side_effect=lambda a, **k: calls.append(a) or json.dumps(
+                {"state": "OPEN", "mergeStateStatus": "UNKNOWN"}),
+        ):
+            cli.await_database_checks(7, 0)
+        self.assertEqual(len(calls), 1)
 
 
 
