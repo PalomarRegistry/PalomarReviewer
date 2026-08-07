@@ -16,19 +16,24 @@ jobs:
         with:
           persist-credentials: false
           path: reviewer
-      # PalomarDatabase is private. Public CI checks the public schema contract
-      # without granting a cross-repository credential; maintainers run the
-      # full publication integration with PALOMAR_DATABASE_CHECKOUT locally.
-      - name: Download the published schemas
+      # PalomarDatabase is private. Public CI checks the schema contract without
+      # granting a cross-repository credential; maintainers run the full
+      # publication integration with PALOMAR_DATABASE_CHECKOUT locally.
+      #
+      # The canonical schema, not the one served beside the data. A public
+      # record is a projection with no review.scores, so `schema-vN.json` is
+      # the schema of what is served; this builds a canonical record and has to
+      # satisfy the schema records are built against.
+      - name: Download the schema a record is built against
         env:
           PUBLIC_DATA_ORIGIN: https://palomar-data.palomar-server.workers.dev
         run: |
           mkdir palomar-schemas
           curl --fail --silent --show-error --retry 3 \
-            "$PUBLIC_DATA_ORIGIN/schema-v1.json" \
+            "$PUBLIC_DATA_ORIGIN/canonical-schema-v1.json" \
             --output palomar-schemas/schema-v1.json
           curl --fail --silent --show-error --retry 3 \
-            "$PUBLIC_DATA_ORIGIN/schema-v2.json" \
+            "$PUBLIC_DATA_ORIGIN/canonical-schema-v2.json" \
             --output palomar-schemas/schema-v2.json
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
