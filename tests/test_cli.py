@@ -2564,6 +2564,27 @@ class MechanicalReportContractTests(unittest.TestCase):
             ))
 
 
+def database_gh(view, validation="success", calls=None):
+    """Answer both calls advance_registration makes: the view, and Actions.
+
+    The validation is read from the workflow that actually validates a
+    registration, so a test that wants a merge has to show that workflow green
+    for the exact head commit.
+    """
+    runs = [] if validation is None else [{"status": "completed", "conclusion": validation}]
+
+    def answer(args, **kwargs):
+        if calls is not None:
+            calls.append(args)
+        if args and args[0] == "api":
+            return json.dumps({"workflow_runs": runs})
+        if args[:2] == ["pr", "view"]:
+            return json.dumps(view() if callable(view) else view)
+        return ""
+
+    return answer
+
+
 class AutomaticLoopTests(unittest.TestCase):
     """Each pass advances a submission by one step, and never past consent."""
 
@@ -2802,9 +2823,9 @@ class AutomaticLoopTests(unittest.TestCase):
             listing, state,
             mock.patch.object(
                 cli, "gh",
-                side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "d" * 40,
-                     "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]}),
+                side_effect=database_gh(
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "d" * 40},
+                    calls=calls),
             ),
             mock.patch.object(cli, "finalize", return_value=0) as finalized,
         ):
@@ -2816,24 +2837,26 @@ class AutomaticLoopTests(unittest.TestCase):
         )
         self.assertEqual(finalized.call_args.args[0].pr, 7)
 
-    def test_the_merge_names_the_commit_whose_checks_were_read(self):
-        """Nothing else makes "these checks passed" and "this is what merged"
-        the same statement: the database has no enforced branch protection."""
+    def test_a_change_with_no_head_commit_is_not_merged(self):
+        """Nothing else makes "this validation passed" and "this is what got
+        merged" the same statement: the database has no enforced branch
+        protection, so the merge has to name the commit it was told about."""
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
                          registration_pr=7)]
         listing, state = self.records(*rows)
+        calls = []
         with (
             listing, state,
             mock.patch.object(
                 cli, "gh",
-                side_effect=lambda a, **k: json.dumps(
-                    {"state": "OPEN", "mergeStateStatus": "CLEAN",
-                     "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]}),
+                side_effect=database_gh({"state": "OPEN", "mergeStateStatus": "CLEAN"},
+                                        calls=calls),
             ),
             mock.patch.object(cli, "finalize") as finalized,
         ):
-            self.assertEqual(cli.auto(self.opts()), 1, "a head that cannot be read is not a merge")
+            cli.auto(self.opts())
         finalized.assert_not_called()
+        self.assertNotIn("merge", [step for call in calls for step in call])
 
     def test_a_registration_is_finished_in_the_pass_that_made_it(self):
         """The database change is the one transition nothing outside this job
@@ -2853,9 +2876,8 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(cli, "register", return_value=0) as registered,
             mock.patch.object(
                 cli, "gh",
-                side_effect=lambda a, **k: json.dumps(
-                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "a" * 40,
-                     "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]}),
+                side_effect=database_gh(
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "a" * 40}),
             ),
             mock.patch.object(cli, "finalize", return_value=0) as finalized,
         ):
@@ -2875,8 +2897,9 @@ class AutomaticLoopTests(unittest.TestCase):
             listing, state,
             mock.patch.object(
                 cli, "gh",
-                side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "d" * 40}),
+                side_effect=database_gh(
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "d" * 40},
+                    validation=None, calls=calls),
             ),
             mock.patch.object(cli, "finalize") as finalized,
         ):
@@ -2935,46 +2958,65 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(finalized.call_args.args[0].pr, 7)
 
 class DatabaseChangeWaitTests(unittest.TestCase):
-    """Waiting for the registry's own checks, and knowing when not to."""
+    """Waiting for the registry's own validation, and knowing when not to."""
+
+    OPEN_CLEAN = {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "e" * 40}
+
+    def gh(self, views, runs):
+        """Answer the two calls: the pull request view, and its Actions runs.
+
+        `views` is a list consumed one per look, the last one repeating; `runs`
+        is what the validation workflow reports for the head commit.
+        """
+        seen = []
+
+        def answer(args, **kwargs):
+            seen.append(args)
+            if args and args[0] == "api":
+                return json.dumps({"workflow_runs": runs})
+            return json.dumps(views[min(len([a for a in seen if a[:2] == ["pr", "view"]]) - 1,
+                                        len(views) - 1)])
+
+        return answer, seen
+
+    def passed(self):
+        return [{"status": "completed", "conclusion": "success"}]
 
     def test_a_change_that_falls_behind_is_updated_once(self):
         """BEHIND never becomes CLEAN on its own, and the database requires a
         branch to be up to date, so this hung for ever before."""
-        views = [
-            {"state": "OPEN", "mergeStateStatus": "BEHIND"},
-            {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "e" * 40,
-             "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]},
-        ]
-        calls = []
-
-        def fake_gh(args, **kwargs):
-            calls.append(args)
-            return json.dumps(views.pop(0))
+        answer, seen = self.gh(
+            [{"state": "OPEN", "mergeStateStatus": "BEHIND", "headRefOid": "e" * 40},
+             self.OPEN_CLEAN],
+            self.passed(),
+        )
+        commands = []
 
         def fake_run(command, **kwargs):
-            calls.append(command[1:])
+            commands.append(command[1:])
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with (
-            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli, "gh", side_effect=answer),
             mock.patch.object(cli, "run", side_effect=fake_run),
             mock.patch.object(cli.time, "sleep"),
         ):
             view = cli.await_database_checks(7, 600)
-        updates = [call for call in calls if call[:2] == ["pr", "update-branch"]]
+        updates = [c for c in commands if c[:2] == ["pr", "update-branch"]]
         self.assertEqual(len(updates), 1, "the branch is updated once, not on every poll")
-        self.assertEqual(updates[0][2], "7")
         self.assertEqual(view["mergeStateStatus"], "CLEAN")
+        self.assertEqual(view["validation"], "passed")
 
     def test_a_branch_that_cannot_be_updated_stops_the_wait(self):
         """Watching an unchanged change for the rest of the budget would say
         nothing about why it never moved."""
+        answer, _ = self.gh(
+            [{"state": "OPEN", "mergeStateStatus": "BEHIND", "headRefOid": "e" * 40}],
+            self.passed(),
+        )
         slept = []
         with (
-            mock.patch.object(
-                cli, "gh",
-                return_value=json.dumps({"state": "OPEN", "mergeStateStatus": "BEHIND"}),
-            ),
+            mock.patch.object(cli, "gh", side_effect=answer),
             mock.patch.object(
                 cli, "run",
                 return_value=SimpleNamespace(returncode=1, stdout="", stderr="no permission"),
@@ -2985,109 +3027,59 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         self.assertEqual(view["mergeStateStatus"], "BEHIND")
         self.assertEqual(slept, [])
 
-    def test_a_green_state_without_finished_checks_is_still_waited_for(self):
-        """The database has no enforced branch protection, so there are no
-        required checks for GitHub to withhold CLEAN over. A change reads CLEAN
-        in the seconds after it is opened, before Actions has attached one."""
-        slept = []
-        clock = iter(range(0, 100_000, 20))
-        with (
-            mock.patch.object(
-                cli, "gh",
-                return_value=json.dumps(
-                    {"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "a" * 40}),
-            ),
-            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
-            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
-        ):
-            cli.await_database_checks(7, 40)
-        self.assertTrue(slept, "an empty rollup was read as success")
-
-    def test_a_finished_and_failing_rollup_is_not_waited_for(self):
-        """UNSTABLE covers both "still running" and "already failed", so a wait
-        that reads only the merge state spends its whole budget on a lost
-        cause."""
-        view = json.dumps({
-            "state": "OPEN",
-            "mergeStateStatus": "UNSTABLE",
-            "headRefOid": "f" * 40,
-            "statusCheckRollup": [
-                {"status": "COMPLETED", "conclusion": "SUCCESS"},
-                {"status": "COMPLETED", "conclusion": "FAILURE"},
-            ],
-        })
+    def test_a_failed_validation_is_not_waited_for(self):
+        """A failed validation needs a new commit, not more patience."""
+        answer, _ = self.gh(
+            [{"state": "OPEN", "mergeStateStatus": "UNSTABLE", "headRefOid": "f" * 40}],
+            [{"status": "completed", "conclusion": "failure"}],
+        )
         slept = []
         with (
-            mock.patch.object(cli, "gh", return_value=view),
-            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
-        ):
-            cli.await_database_checks(7, 3600)
-        self.assertEqual(slept, [], "a failed rollup was waited on anyway")
-
-    def test_a_rollup_that_has_not_finished_is_waited_for(self):
-        view = json.dumps({
-            "state": "OPEN",
-            "mergeStateStatus": "UNSTABLE",
-            "statusCheckRollup": [
-                {"status": "COMPLETED", "conclusion": "FAILURE"},
-                {"status": "IN_PROGRESS", "conclusion": None},
-            ],
-        })
-        slept = []
-        clock = iter(range(0, 100_000, 20))
-        with (
-            mock.patch.object(cli, "gh", return_value=view),
-            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
-            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
-        ):
-            cli.await_database_checks(7, 40)
-        self.assertTrue(slept, "a rollup that has not finished is not a verdict")
-
-    def test_checks_that_cannot_be_read_stop_the_wait_and_refuse_the_merge(self):
-        """Reading the rollup needs a permission reading the merge state does
-        not, and the credential without it fails the whole query. Waiting will
-        not grant a permission, and CLEAN alone is not evidence of anything."""
-        basic = json.dumps({"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "c" * 40})
-
-        def fake_gh(args, **kwargs):
-            if "statusCheckRollup" in " ".join(args):
-                raise ReviewerError("gh pr view failed (1): not accessible")
-            return basic
-
-        slept = []
-        with (
-            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli, "gh", side_effect=answer),
             mock.patch.object(cli.time, "sleep", side_effect=slept.append),
         ):
             view = cli.await_database_checks(7, 3600)
-        self.assertTrue(view["checksUnreadable"])
-        self.assertEqual(slept, [])
-        self.assertFalse(cli._checks_passed(view), "an unreadable rollup is not a pass")
+        self.assertEqual(view["validation"], "failed")
+        self.assertEqual(slept, [], "a failed validation was waited on anyway")
 
-    def test_a_pass_survives_a_credential_that_cannot_read_checks(self):
-        """A missing permission must not take the other arms down with it."""
-        basic = json.dumps({"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "c" * 40})
-
-        def fake_gh(args, **kwargs):
-            if "statusCheckRollup" in " ".join(args):
-                raise ReviewerError("gh pr view failed (1): not accessible")
-            return basic
-
-        record = {"id": "aaaaaaaaaaaa", "registration_pr": 7}
+    def test_a_validation_still_running_is_waited_for(self):
+        answer, _ = self.gh(
+            [{"state": "OPEN", "mergeStateStatus": "UNSTABLE", "headRefOid": "f" * 40}],
+            [{"status": "in_progress", "conclusion": None}],
+        )
+        slept = []
+        clock = iter(range(0, 100_000, 20))
         with (
-            mock.patch.object(cli, "gh", side_effect=fake_gh),
-            mock.patch.object(cli, "finalize") as finalized,
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
         ):
-            self.assertFalse(cli.advance_registration(record, 0))
-        finalized.assert_not_called()
+            cli.await_database_checks(7, 40)
+        self.assertTrue(slept, "a validation that has not finished is not a verdict")
+
+    def test_a_green_state_with_no_validation_yet_is_still_waited_for(self):
+        """The database has no enforced branch protection, so there are no
+        required checks for GitHub to withhold CLEAN over. A change reads CLEAN
+        in the seconds after it is opened, before Actions has started."""
+        answer, _ = self.gh([self.OPEN_CLEAN], [])
+        slept = []
+        clock = iter(range(0, 100_000, 20))
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            cli.await_database_checks(7, 40)
+        self.assertTrue(slept, "an absent validation was read as success")
 
     def test_a_conflict_is_not_waited_for(self):
+        answer, _ = self.gh(
+            [{"state": "OPEN", "mergeStateStatus": "DIRTY", "headRefOid": "e" * 40}],
+            self.passed(),
+        )
         slept = []
         with (
-            mock.patch.object(
-                cli, "gh",
-                return_value=json.dumps({"state": "OPEN", "mergeStateStatus": "DIRTY"}),
-            ),
+            mock.patch.object(cli, "gh", side_effect=answer),
             mock.patch.object(cli.time, "sleep", side_effect=slept.append),
         ):
             view = cli.await_database_checks(7, 3600)
@@ -3096,15 +3088,53 @@ class DatabaseChangeWaitTests(unittest.TestCase):
 
     def test_a_zero_wait_is_a_single_look(self):
         """The recovery arm must stay cheap: it runs on every pass."""
-        calls = []
-        with mock.patch.object(
-            cli, "gh",
-            side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                {"state": "OPEN", "mergeStateStatus": "UNKNOWN"}),
-        ):
+        answer, seen = self.gh(
+            [{"state": "OPEN", "mergeStateStatus": "UNKNOWN", "headRefOid": "e" * 40}], [])
+        with mock.patch.object(cli, "gh", side_effect=answer):
             cli.await_database_checks(7, 0)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([a for a in seen if a[:2] == ["pr", "view"]]), 1)
 
+    def test_a_validation_that_cannot_be_read_stops_the_wait(self):
+        """Reading the validation needs a permission the credential may not
+        have. Waiting cannot grant one, and a green merge state is not evidence
+        of anything here."""
+        def answer(args, **kwargs):
+            if args and args[0] == "api":
+                raise ReviewerError("gh api failed (1): Resource not accessible")
+            return json.dumps(self.OPEN_CLEAN)
+
+        slept = []
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            view = cli.await_database_checks(7, 3600)
+        self.assertEqual(view["validation"], "unreadable")
+        self.assertEqual(slept, [])
+
+    def test_a_registration_is_not_merged_without_a_readable_validation(self):
+        """A missing permission must refuse the merge, and must not take the
+        other arms of the pass down with it."""
+        def answer(args, **kwargs):
+            if args and args[0] == "api":
+                raise ReviewerError("gh api failed (1): Resource not accessible")
+            return json.dumps(self.OPEN_CLEAN)
+
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertFalse(cli.advance_registration({"id": "a" * 12, "registration_pr": 7}, 0))
+        finalized.assert_not_called()
+
+    def test_the_validation_is_asked_for_the_exact_head_commit(self):
+        """A validation of some other commit is not a validation of this one."""
+        answer, seen = self.gh([self.OPEN_CLEAN], self.passed())
+        with mock.patch.object(cli, "gh", side_effect=answer):
+            cli.await_database_checks(7, 0)
+        api = [a for a in seen if a and a[0] == "api"][0]
+        self.assertIn(f"head_sha={'e' * 40}", api[1])
+        self.assertIn(cli.DATABASE_VALIDATE_WORKFLOW, api[1])
 
 
 class SelfDispatchTests(unittest.TestCase):
