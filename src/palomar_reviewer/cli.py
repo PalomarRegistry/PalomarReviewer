@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import stat
@@ -3779,18 +3778,40 @@ def authorize_registration(
 
 
 def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
-    """Choose a free permanent identifier at random.
+    """The next serial for this date, so identifiers sort in registration order.
 
-    Sequential allocation would reveal the exact ordering and approximate
-    count of accepted private submissions, which is precisely what a private
-    intake exists to avoid. Six digits give 999,999 values; collisions are
-    retried against the identifiers already registered.
+    The serial used to be drawn at random, to hide how many reservations never
+    became records. That is no longer worth paying for, and what it cost was
+    this: with a random serial, the order two identifiers were registered in
+    cannot be read from the identifiers, so every surface that wants
+    registration order has to carry an ordinal beside the identifier -- and an
+    ordinal and an identifier that disagree is a failure nothing downstream can
+    detect or repair.
+
+    Serials run from 1 within a date and dates never go backwards, because a
+    new result takes today's date and a new version of an existing result
+    reuses its first version's identifier rather than allocating one. So
+    ordering identifiers as strings is registration order across the whole
+    registry, with nothing recorded separately to fall out of step.
+
+    `taken` is every identifier the database already holds, of every date. Only
+    this date's serials decide the next one; a date with none starts at 1.
     """
-    for _ in range(10_000):
-        candidate = f"PALOMAR-{accepted_at}-{secrets.randbelow(999_999) + 1:06d}"
-        if candidate not in taken:
-            return candidate
-    raise ReviewerError("could not allocate a free permanent identifier")
+    prefix = f"PALOMAR-{accepted_at}-"
+    serials = [
+        int(serial)
+        for identifier in taken
+        if identifier.startswith(prefix)
+        and (serial := identifier[len(prefix) :]).isdigit()
+        and len(serial) == 6
+    ]
+    serial = max(serials, default=0) + 1
+    if serial > 999_999:
+        raise ReviewerError(
+            f"could not allocate a free permanent identifier: {accepted_at} has used "
+            "all 999,999 serials"
+        )
+    return f"{prefix}{serial:06d}"
 
 
 def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:

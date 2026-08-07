@@ -1251,8 +1251,9 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["schema_version"], 2)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
-        # Identifiers are allocated at random, so publishing one reveals
-        # neither the order nor the number of accepted private submissions.
+        # The serial follows the last one registered on that date, so this is
+        # the shape of the identifier rather than the value: which serial it is
+        # depends on what the database under test already holds.
         self.assertRegex(record["id"], r"^PALOMAR-2026-08-01-[0-9]{6}$")
         self.assertEqual(record["accepted_at"], "2026-08-01")
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
@@ -1747,10 +1748,11 @@ class ReviewerTests(unittest.TestCase):
                 self.assertEqual(register(args), 0)
 
             database = work / "database"
-            # The permanent identifier is allocated at random, so the entry is
-            # found rather than named. It is found among whatever the real
-            # database already holds, too: this test clones it, and it stopped
-            # being empty the day the first record was registered.
+            # The permanent identifier follows whatever that date has already
+            # used, so the entry is found rather than named. It is found among
+            # whatever the real database already holds, too: this test clones
+            # it, and it stopped being empty the day the first record was
+            # registered.
             entries = sorted(
                 path for path in (database / "entries").glob("*.json")
                 if path.name.startswith("PALOMAR-2026-08-01-")
@@ -2430,23 +2432,59 @@ if __name__ == "__main__":
 
 
 class IdentifierAllocationTests(unittest.TestCase):
-    """Permanent identifiers must reveal nothing about submission volume."""
+    """Identifiers sort in registration order, with no ordinal to disagree."""
 
-    def test_an_allocated_identifier_avoids_the_ones_already_published(self):
+    def test_an_allocated_identifier_avoids_the_ones_already_registered(self):
         taken = {f"PALOMAR-2026-08-05-{n:06d}" for n in range(1, 400)}
         for _ in range(50):
             allocated = allocate_identifier("2026-08-05", taken)
             self.assertNotIn(allocated, taken)
             self.assertRegex(allocated, r"^PALOMAR-2026-08-05-[0-9]{6}$")
 
-    def test_allocation_is_not_sequential(self):
-        """Sequential allocation would reveal the exact ordering of accepts."""
-        seen = {allocate_identifier("2026-08-05", set()) for _ in range(40)}
-        self.assertGreater(len(seen), 30, "identifiers look sequential")
+    def test_a_date_with_nothing_registered_on_it_starts_at_one(self):
+        self.assertEqual(
+            allocate_identifier("2026-08-05", {"PALOMAR-2026-08-04-000009"}),
+            "PALOMAR-2026-08-05-000001",
+        )
+
+    def test_the_next_serial_follows_the_largest_already_taken_on_that_date(self):
+        """Largest and not count, so a serial is never handed out twice after a
+        record is withdrawn from the served release or a reservation lapses."""
+        taken = {"PALOMAR-2026-08-07-735171", "PALOMAR-2026-08-07-000004"}
+        self.assertEqual(
+            allocate_identifier("2026-08-07", taken), "PALOMAR-2026-08-07-735172"
+        )
+
+    def test_sorting_identifiers_as_strings_is_registration_order(self):
+        """The property every later surface reads registration order from.
+
+        Serials rise within a date and dates never go backwards, so no separate
+        ordinal has to be recorded and none can fall out of step with the
+        identifier it belongs to.
+        """
+        taken: set[str] = set()
+        registered = []
+        for date in ("2026-08-05", "2026-08-05", "2026-08-06", "2026-08-08"):
+            allocated = allocate_identifier(date, taken)
+            taken.add(allocated)
+            registered.append(allocated)
+        self.assertEqual(sorted(registered), registered)
+
+    def test_another_date_does_not_move_this_one_along(self):
+        taken = {f"PALOMAR-2026-08-06-{n:06d}" for n in range(1, 900)}
+        self.assertEqual(
+            allocate_identifier("2026-08-05", taken | {"PALOMAR-2026-08-05-000002"}),
+            "PALOMAR-2026-08-05-000003",
+        )
+
+    def test_a_date_that_has_used_every_serial_is_refused_rather_than_wrapped(self):
+        """Wrapping would hand out an identifier that is already someone's."""
+        with self.assertRaisesRegex(ReviewerError, "could not allocate"):
+            allocate_identifier("2026-08-05", {"PALOMAR-2026-08-05-999999"})
 
 
 class PublicationIdentityTests(unittest.TestCase):
-    """One submission gets one permanent identifier, and it is not guessable."""
+    """One submission gets one permanent identifier, and keeps it."""
 
     def database(self, *entries) -> Path:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -2479,31 +2517,15 @@ class PublicationIdentityTests(unittest.TestCase):
             },
         )
 
-    def test_a_new_submission_gets_a_random_dated_identifier(self):
+    def test_a_new_submission_gets_the_first_free_serial_for_its_date(self):
         identifier, accepted_at, version = self.resolve(self.database())
-        self.assertRegex(identifier, r"\APALOMAR-2026-08-01-[0-9]{6}\Z")
+        self.assertEqual(identifier, "PALOMAR-2026-08-01-000001")
         self.assertEqual((accepted_at, version), ("2026-08-01", 1))
 
-    def test_identifiers_are_not_sequential(self):
-        """A sequential serial would reveal the count of private acceptances."""
-        seen = {self.resolve(self.database())[0] for _ in range(25)}
-        self.assertGreater(len(seen), 1)
-
-    def test_a_collision_with_a_published_identifier_is_retried(self):
-        """Forced, not hoped for: a chance collision is far too rare to test."""
+    def test_a_new_submission_follows_the_last_one_registered_that_date(self):
         database = self.database(self.prior(identifier="PALOMAR-2026-08-01-000042"))
-        draws = iter([41, 41, 7])
-        with mock.patch.object(cli.secrets, "randbelow", side_effect=lambda _: next(draws)):
-            identifier, _, _ = self.resolve(
-                database, submission="b2c3d4e5f6a1"
-            )
-        self.assertEqual(identifier, "PALOMAR-2026-08-01-000008")
-
-    def test_allocation_gives_up_rather_than_reusing_an_identifier(self):
-        database = self.database(self.prior(identifier="PALOMAR-2026-08-01-000042"))
-        with mock.patch.object(cli.secrets, "randbelow", return_value=41):
-            with self.assertRaisesRegex(ReviewerError, "could not allocate"):
-                self.resolve(database, submission="b2c3d4e5f6a1")
+        identifier, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
+        self.assertEqual(identifier, "PALOMAR-2026-08-01-000043")
 
     def test_a_second_publication_of_one_submission_needs_an_update(self):
         database = self.database(self.prior())
