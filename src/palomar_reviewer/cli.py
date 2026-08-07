@@ -976,10 +976,7 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
         timeout=6000,
     )
     if watched.returncode:
-        raise ReviewerError(
-            "Challenge rendering failed as infrastructure; the acceptance remains valid and "
-            f"registration may be retried: {run_data['url']}"
-        )
+        raise ReviewerError(render_failure(work, run_id, request_id, run_data["url"]))
     download = work / "render-download"
     if download.exists():
         shutil.rmtree(download)
@@ -1623,6 +1620,40 @@ def push_registration_branch(database: Path, branch: str) -> None:
         [*remote, f"--force-with-lease=refs/heads/{branch}:{existing}",
          f"HEAD:refs/heads/{branch}"],
         cwd=database,
+    )
+
+
+def render_failure(work: Path, run_id: str, request_id: str, url: str) -> str:
+    """Say what a failed render run actually failed at.
+
+    Every failed render used to be reported as infrastructure whose retry might
+    work. The first real registration failed on a TypeError in the renderer,
+    which was reported that way and would have failed identically forever. The
+    run uploads its report whatever the outcome, and a report carrying errors
+    is this pipeline's own fault, not a passing condition.
+    """
+    report = work / "render-failure"
+    if report.exists():
+        shutil.rmtree(report)
+    report.mkdir(parents=True)
+    try:
+        gh([
+            "run", "download", run_id, "--repo", SUBMISSION_REPO,
+            "--name", f"challenge-render-{request_id}", "--dir", str(report),
+        ])
+        found = next(report.rglob("report.json"), None)
+        problems = json.loads(found.read_text())["errors"] if found else []
+    except Exception:  # noqa: BLE001 - the diagnosis must not replace the failure
+        problems = []
+    if problems:
+        return (
+            "Challenge rendering failed, and will fail the same way until it is fixed: "
+            + "; ".join(str(problem) for problem in problems)
+            + f" ({url})"
+        )
+    return (
+        "Challenge rendering did not complete, and no report says why, so this may be "
+        f"transient; the acceptance remains valid and registration may be retried: {url}"
     )
 
 

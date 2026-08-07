@@ -2893,3 +2893,45 @@ class RegistrationRetryTests(unittest.TestCase):
     def test_a_branch_that_is_not_there_is_not_a_failure(self):
         with mock.patch.object(cli, "gh", side_effect=ReviewerError("404")):
             self.assertIsNone(cli.remote_branch_commit("submission-abc-v1"))
+
+
+class RenderFailureTests(unittest.TestCase):
+    """A failed render has to say whether retrying it could ever help.
+
+    The first real registration failed on a TypeError in the renderer and was
+    reported as "failed as infrastructure; registration may be retried". It was
+    retried, repeatedly, and failed identically every time.
+    """
+
+    def report(self, directory, errors):
+        result = Path(directory) / "result"
+        result.mkdir(parents=True)
+        (result / "report.json").write_text(json.dumps({"status": "error", "errors": errors}))
+
+    def test_a_report_with_errors_says_retrying_will_not_help(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+
+            def download(command):
+                target = Path(command[command.index("--dir") + 1])
+                self.report(target, ["verify_filesystem_confinement() got an unexpected keyword argument 'readable_paths'"])
+                return ""
+
+            with mock.patch.object(cli, "gh", side_effect=download):
+                message = cli.render_failure(work, "101", "abc", "https://example.test/run")
+        self.assertIn("will fail the same way until it is fixed", message)
+        self.assertIn("unexpected keyword argument", message)
+        self.assertNotIn("may be retried", message)
+
+    def test_no_report_leaves_the_door_open_to_a_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(cli, "gh", return_value=""):
+                message = cli.render_failure(Path(directory), "101", "abc", "https://example.test/run")
+        self.assertIn("may be retried", message)
+        self.assertIn("no report says why", message)
+
+    def test_a_failure_to_diagnose_does_not_replace_the_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(cli, "gh", side_effect=ReviewerError("artifact expired")):
+                message = cli.render_failure(Path(directory), "101", "abc", "https://example.test/run")
+        self.assertIn("may be retried", message)
