@@ -4483,3 +4483,29 @@ class PushProofTests(unittest.TestCase):
         cli.verify_push_proof({"commit": "1" * 40, "created_at": "2026-08-07T00:00:00Z"})
         with self.assertRaisesRegex(ReviewerError, "no push_proof"):
             cli.verify_push_proof({"commit": "1" * 40, "created_at": "2026-08-09T00:00:00Z"})
+
+
+class OpenIndexFailureTests(unittest.TestCase):
+    def test_a_submission_that_cannot_be_read_keeps_its_place_in_the_queue(self):
+        """`state_json` answers None to a rate limit, an expired token and a
+        genuine 404 alike, and only one of those means there is nothing left to
+        do. Dropping the id on the other two loses a submission silently, in a
+        pass that then reports success."""
+        index = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-07T00:00:00Z",
+            "rebuild_after": "2099-01-01T00:00:00Z",
+            "open": ["aaaaaaaaaaaa", "bbbbbbbbbbbb"],
+            "_blob_sha": "sha",
+        }
+        written = []
+        with (
+            mock.patch.object(cli, "state_json", return_value=index),
+            mock.patch.object(cli, "submission_state", side_effect=[None, {"status": "awaiting-review"}]),
+            mock.patch.object(cli, "_write_open_index", side_effect=lambda i, blob_sha: written.append(i)),
+        ):
+            records = cli.open_submissions()
+
+        self.assertEqual(len(records), 1, "the readable one came through")
+        for entry in written:
+            self.assertIn("aaaaaaaaaaaa", entry["open"], "an unreadable submission was dropped")

@@ -2381,7 +2381,15 @@ def open_submissions() -> list[dict[str, Any]]:
     for submission_id in index["open"]:
         record = submission_state(submission_id)
         if record is None:
-            continue  # no record at all: do not keep a place in the queue for it
+            # Absent, or unreadable: `state_json` answers None to a rate limit,
+            # an expired token and a genuine 404 alike, and only one of those
+            # means there is nothing left to do. Keeping the id costs one call
+            # a pass and is corrected by the next rebuild; dropping it loses a
+            # submission on a transient failure, silently, in a pass that then
+            # reports success. That is the failure this index exists to avoid,
+            # not one to reintroduce inside it.
+            still_open.append(submission_id)
+            continue
         records.append(record)
         if not finished_with(record):
             still_open.append(submission_id)
