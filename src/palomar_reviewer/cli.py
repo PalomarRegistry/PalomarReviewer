@@ -44,6 +44,17 @@ VERIFY_WORKFLOW = "submission.yml"
 # be merged. Waiting costs job time, and registration already waits on a render
 # run, so both the whole pass and each individual wait are bounded: two queued
 # registrations would otherwise outlive the job that is carrying them.
+REVIEW_WORKFLOW = "reviewer.yml"
+# A pass that leaves unattempted work asks for another one rather than looping,
+# so each pass is a fresh job with its own budget and its own line in the run
+# list. The cap is on passes from a single trigger: until a spend budget exists,
+# MAX_PASSES times --max-reviews is the ceiling on what one submitter's click
+# can cost.
+MAX_PASSES = 5
+# A review that failed is retried, but not at once. The provider outage that
+# failed it would otherwise fail all three attempts inside a minute and abandon
+# a submission that nothing was wrong with.
+REVIEW_RETRY_BACKOFF_SECONDS = 1800
 REGISTRATIONS_PER_PASS = 1
 REGISTRATION_WAIT_SECONDS = 1800
 REGISTRATION_STALE_SECONDS = 6 * 3600
@@ -4245,6 +4256,42 @@ def finalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def request_another_pass(depth: int, max_reviews: int) -> bool:
+    """Ask for one more pass, because this one left work it never attempted.
+
+    Nothing is carried across but the depth: the next pass re-derives its work
+    from the private records, so a dispatch that is dropped costs latency and
+    never work. Failure here is deliberately not fatal, because the schedule is
+    still behind this and a pass that did its job should not go red.
+    """
+    if depth + 1 >= MAX_PASSES:
+        print(f"::warning::not asking for another pass: {MAX_PASSES} passes is the limit "
+              "from a single trigger, so the rest waits for the schedule")
+        return False
+    token = os.environ.get("PALOMAR_SELF_DISPATCH_TOKEN", "").strip()
+    if not token:
+        print("::warning::no self-dispatch credential; leaving the rest to the schedule")
+        return False
+    environment = os.environ.copy()
+    environment["GH_TOKEN"] = token
+    result = run(
+        [
+            "gh", "workflow", "run", REVIEW_WORKFLOW,
+            "--repo", STATE_REPO, "--ref", "main",
+            "-f", f"depth={depth + 1}",
+            "-f", f"max_reviews={max_reviews}",
+        ],
+        check=False,
+        env=environment,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()[:400]
+        print(f"::warning::could not ask for another pass: {detail}")
+        return False
+    print(f"asked for pass {depth + 2} of at most {MAX_PASSES}")
+    return True
+
+
 def _check_outcome(check: dict[str, Any]) -> str:
     """Whether one node of a status-check rollup is pending, passed or failed.
 
@@ -4412,6 +4459,11 @@ def _stale_review(record: dict[str, Any], limit_seconds: int = 7200) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - began).total_seconds() > limit_seconds
 
 
+def _cooling_review(record: dict[str, Any]) -> bool:
+    """Whether a failed review is still inside its retry backoff."""
+    return not _before_now(record.get("review_retry_after"))
+
+
 def _exhausted_review(record: dict[str, Any]) -> bool:
     status = record.get("status")
     eligible = status == "awaiting-review" or (
@@ -4433,10 +4485,11 @@ def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
 
 
 def submissions_needing_work() -> tuple[
-    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+    list[dict[str, Any]], list[dict[str, Any]],
 ]:
     """Split every live submission by what the next step for it would be."""
-    to_review, to_register, to_finalize, exhausted = [], [], [], []
+    to_review, to_register, to_finalize, exhausted, cooling = [], [], [], [], []
     for submission_id in state_directory_names():
         record = submission_state(submission_id)
         if record is None or record.get("registered_entry"):
@@ -4449,6 +4502,8 @@ def submissions_needing_work() -> tuple[
         ):
             if _exhausted_review(record):
                 exhausted.append(record)
+            elif _cooling_review(record):
+                cooling.append(record)
             else:
                 to_review.append(record)
         elif status == "review-ready":
@@ -4456,8 +4511,10 @@ def submissions_needing_work() -> tuple[
                 to_review.append(record)
             elif record.get("registration_consent") is True:
                 (to_finalize if record.get("registration_pr") else to_register).append(record)
-    order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))
-    return order(to_review), order(to_register), order(to_finalize), order(exhausted)
+    order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))  # noqa: E731
+    return (
+        order(to_review), order(to_register), order(to_finalize), order(exhausted), order(cooling)
+    )
 
 
 def auto(args: argparse.Namespace) -> int:
@@ -4468,7 +4525,14 @@ def auto(args: argparse.Namespace) -> int:
     private record says it is. Nothing here decides to register: a submission
     reaches this function's register arm only because its submitter asked.
     """
-    to_review, to_register, to_finalize, exhausted = submissions_needing_work()
+    depth = int(getattr(args, "dispatch_depth", 0) or 0)
+    if not 0 <= depth < MAX_PASSES:
+        raise ReviewerError(f"dispatch depth {depth} is outside 0..{MAX_PASSES - 1}")
+
+    to_review, to_register, to_finalize, exhausted, cooling = submissions_needing_work()
+    if cooling:
+        print(f"{len(cooling)} review(s) waiting out a retry backoff: "
+              f"{', '.join(record['id'] for record in cooling)}")
     if not (to_review or to_register or to_finalize or exhausted):
         print("Nothing to do.")
         return 0
@@ -4484,6 +4548,7 @@ def auto(args: argparse.Namespace) -> int:
 
     failures = 0
     unattempted: list[dict[str, Any]] = []
+    advanced = 0
     for record in exhausted:
         print(f"::group::Abandon review {record['id']}", flush=True)
         try:
@@ -4491,6 +4556,7 @@ def auto(args: argparse.Namespace) -> int:
             if fresh is not None and _exhausted_review(fresh):
                 reason = str(fresh.get("review_error") or "review attempt limit reached")
                 abandon_review(fresh, reason)
+                advanced += 1
         except Exception as error:
             failures += 1
             print(f"error: abandoning review of {record['id']} failed: {error}", file=sys.stderr)
@@ -4515,6 +4581,7 @@ def auto(args: argparse.Namespace) -> int:
                 step.policy_ref = args.policy_ref
                 run_review(step)
             record_review_duration(time.monotonic() - started)
+            advanced += 1
         except Exception as error:  # one bad submission must not stall the queue
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
@@ -4525,6 +4592,7 @@ def auto(args: argparse.Namespace) -> int:
                     "awaiting-review",
                     "The automated review did not complete; it will be tried again",
                     review_error=str(error)[:500],
+                    review_retry_after=utc_after(REVIEW_RETRY_BACKOFF_SECONDS),
                 )
         finally:
             print("::endgroup::", flush=True)
@@ -4552,6 +4620,7 @@ def auto(args: argparse.Namespace) -> int:
             # the submitter and a registered record, and it is the one
             # transition nothing outside this job observes. Finishing it here is
             # what lets the schedule be a backstop rather than the clock.
+            advanced += 1
             fresh = submission_state(record["id"])
             if fresh is not None and fresh.get("registration_pr"):
                 advance_registration(fresh, min(pass_remaining(), REGISTRATION_WAIT_SECONDS))
@@ -4570,10 +4639,21 @@ def auto(args: argparse.Namespace) -> int:
         # Recovery only: a registration whose job died between opening the
         # change and merging it. A pass that made one does not reach this arm.
         try:
-            advance_registration(record, 0)
+            if advance_registration(record, 0):
+                advanced += 1
         except Exception as error:
             failures += 1
             print(f"error: finalizing {record['id']} failed: {error}", file=sys.stderr)
+
+    # Only work this pass never attempted earns another pass, which is exactly
+    # what `unattempted` holds: what the review cap, the one-registration rule
+    # and the spent budget each left alone. A review that failed is deliberately
+    # not in it, because it is inside its retry backoff and a deterministically
+    # failing engine would otherwise ride the whole chain on some other
+    # submission's success. Requiring progress as well stops a pass that
+    # achieved nothing from asking for a repeat of itself.
+    if getattr(args, "self_dispatch", False) and advanced and unattempted:
+        request_another_pass(depth, args.max_reviews)
 
     return 1 if failures else 0
 
@@ -4669,6 +4749,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=PASS_BUDGET_SECONDS,
         help="how long one pass may spend before it stops waiting and leaves the rest",
+    )
+    auto_parser.add_argument(
+        "--self-dispatch",
+        action="store_true",
+        help="ask for another pass when this one leaves work it never attempted",
+    )
+    auto_parser.add_argument(
+        "--dispatch-depth",
+        type=int,
+        default=0,
+        help="how many passes this trigger has already run; the reviewer stops at MAX_PASSES",
     )
     auto_parser.set_defaults(func=auto)
     doctor_parser = commands.add_parser("doctor", help="check local prerequisites")

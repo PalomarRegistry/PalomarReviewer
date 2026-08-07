@@ -2591,6 +2591,8 @@ class AutomaticLoopTests(unittest.TestCase):
             "command": None,
             "work_dir": ".palomar-reviews",
             "pass_seconds": 7200,
+            "self_dispatch": False,
+            "dispatch_depth": 0,
             **overrides,
         })
 
@@ -2641,7 +2643,7 @@ class AutomaticLoopTests(unittest.TestCase):
             "decision": "accept",
         }
         with listing, state, mock.patch.object(cli, "state_json", return_value=obsolete):
-            to_review, to_register, to_finalize, exhausted = cli.submissions_needing_work()
+            to_review, to_register, to_finalize, exhausted, _ = cli.submissions_needing_work()
         self.assertEqual([record["id"] for record in to_review], [row["id"]])
         self.assertEqual((to_register, to_finalize, exhausted), ([], [], []))
 
@@ -2657,7 +2659,7 @@ class AutomaticLoopTests(unittest.TestCase):
         to_review, _, _, exhausted = None, None, None, None
         listing, state = self.records(row)
         with listing, state:
-            to_review, _, _, exhausted = cli.submissions_needing_work()
+            to_review, _, _, exhausted, _ = cli.submissions_needing_work()
         self.assertEqual([r["id"] for r in to_review], [])
         self.assertEqual([r["id"] for r in exhausted], ["aaaaaaaaaaaa"])
 
@@ -3065,6 +3067,191 @@ class DatabaseChangeWaitTests(unittest.TestCase):
             cli.await_database_checks(7, 0)
         self.assertEqual(len(calls), 1)
 
+
+
+class SelfDispatchTests(unittest.TestCase):
+    """A pass asks for the next one, and knows when asking would be a loop."""
+
+    def records(self, *rows):
+        by_id = {row["id"]: row for row in rows}
+        return (
+            mock.patch.object(cli, "state_directory_names", return_value=list(by_id)),
+            mock.patch.object(cli, "submission_state", side_effect=by_id.get),
+        )
+
+    def row(self, ident, **fields):
+        row = {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
+        if row.get("status") == "review-ready":
+            row.setdefault("review_schema_version", 2)
+        return row
+
+    def opts(self, **overrides):
+        return SimpleNamespace(**{
+            "max_reviews": 5, "policy_ref": "main", "engine": "codex", "model": None,
+            "reasoning_effort": None, "command": None, "work_dir": ".palomar-reviews",
+            "pass_seconds": 7200, "self_dispatch": True, "dispatch_depth": 0, **overrides,
+        })
+
+    def queued(self, count, **fields):
+        return [self.row(f"{index:012d}".replace("0", "a"), status="awaiting-review", **fields)
+                for index in range(count)]
+
+    @contextlib.contextmanager
+    def reviewing(self, rows, review=lambda a: 0):
+        """Everything a review pass touches, stubbed, as one context manager."""
+        listing, state = self.records(*rows)
+        with (
+            listing, state,
+            mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "advance_state", side_effect=lambda st, *a, **k: st),
+            mock.patch.object(cli, "run_review", side_effect=review),
+        ):
+            yield
+
+    def test_a_pass_that_left_work_it_never_tried_asks_for_another(self):
+        rows = self.queued(5)
+        with (
+            self.reviewing(rows),
+            mock.patch.object(cli, "request_another_pass") as again,
+        ):
+            cli.auto(self.opts(max_reviews=2))
+        again.assert_called_once_with(0, 2)
+
+    def test_a_pass_that_advanced_nothing_does_not_ask_for_another(self):
+        """Asking again would retry the same two at once and spend their whole
+        attempt budget on one provider outage."""
+        rows = self.queued(5)
+
+        def explode(namespace):
+            raise ReviewerError("engine exploded")
+
+        with (
+            self.reviewing(rows, review=explode),
+            mock.patch.object(cli, "request_another_pass") as again,
+        ):
+            self.assertEqual(cli.auto(self.opts(max_reviews=2)), 1)
+        again.assert_not_called()
+
+    def test_a_pass_that_attempted_everything_does_not_ask_for_another(self):
+        rows = self.queued(2)
+        with (
+            self.reviewing(rows),
+            mock.patch.object(cli, "request_another_pass") as again,
+        ):
+            cli.auto(self.opts(max_reviews=5))
+        again.assert_not_called()
+
+    def test_a_registration_that_is_not_green_does_not_ask_for_another(self):
+        """The database change is waiting on something this reviewer does not
+        control, so another pass would only look at it again."""
+        rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+                         registration_pr=7)]
+        listing, state = self.records(*rows)
+        with (
+            listing, state,
+            mock.patch.object(
+                cli, "gh",
+                return_value=json.dumps({"state": "OPEN", "mergeStateStatus": "UNSTABLE"}),
+            ),
+            mock.patch.object(cli, "finalize"),
+            mock.patch.object(cli, "request_another_pass") as again,
+        ):
+            cli.auto(self.opts())
+        again.assert_not_called()
+
+    def test_self_dispatch_is_off_unless_it_is_asked_for(self):
+        """An operator looking at the queue from a laptop must not start a
+        production run by doing so."""
+        rows = self.queued(5)
+        with (
+            self.reviewing(rows),
+            mock.patch.object(cli, "request_another_pass") as again,
+        ):
+            cli.auto(self.opts(max_reviews=2, self_dispatch=False))
+        again.assert_not_called()
+
+    def test_a_review_that_failed_is_not_offered_again_immediately(self):
+        """The retry backoff, not the schedule, is what paces a failed review;
+        three attempts inside a minute would abandon a healthy submission."""
+        cooling = self.row("aaaaaaaaaaaa", status="awaiting-review",
+                           review_retry_after=cli.utc_after(600))
+        ready = self.row("bbbbbbbbbbbb", status="awaiting-review",
+                         review_retry_after=cli.utc_after(-600))
+        listing, state = self.records(cooling, ready)
+        with listing, state:
+            to_review, _, _, _, waiting = cli.submissions_needing_work()
+        self.assertEqual([row["id"] for row in to_review], ["bbbbbbbbbbbb"])
+        self.assertEqual([row["id"] for row in waiting], ["aaaaaaaaaaaa"])
+
+    def test_a_failed_review_records_when_it_may_be_tried_again(self):
+        rows = self.queued(1)
+        written = []
+
+        def explode(namespace):
+            raise ReviewerError("engine exploded")
+
+        listing, state = self.records(*rows)
+        with (
+            listing, state,
+            mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "advance_state",
+                              side_effect=lambda st, *a, **k: written.append(k) or st),
+            mock.patch.object(cli, "run_review", side_effect=explode),
+        ):
+            cli.auto(self.opts())
+        self.assertTrue(written and "review_retry_after" in written[0])
+
+    def test_the_number_of_passes_from_one_trigger_is_capped(self):
+        with mock.patch.object(cli, "run") as ran:
+            self.assertFalse(request := cli.request_another_pass(cli.MAX_PASSES - 1, 3))
+        ran.assert_not_called()
+        self.assertFalse(request)
+
+    def test_a_depth_outside_the_cap_is_refused(self):
+        rows = self.queued(1)
+        listing, state = self.records(*rows)
+        with listing, state, self.assertRaises(ReviewerError):
+            cli.auto(self.opts(dispatch_depth=cli.MAX_PASSES))
+        with listing, state, self.assertRaises(ReviewerError):
+            cli.auto(self.opts(dispatch_depth=-1))
+
+    def test_the_next_pass_is_asked_for_with_the_depth_one_higher(self):
+        commands = []
+        with (
+            mock.patch.dict(os.environ, {"PALOMAR_SELF_DISPATCH_TOKEN": "job-token"}),
+            mock.patch.object(
+                cli, "run",
+                side_effect=lambda cmd, **kw: commands.append((cmd, kw))
+                or SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            self.assertTrue(cli.request_another_pass(1, 3))
+        command, keywords = commands[0]
+        self.assertEqual(command[:4], ["gh", "workflow", "run", cli.REVIEW_WORKFLOW])
+        self.assertIn("depth=2", command)
+        self.assertIn("max_reviews=3", command)
+        self.assertEqual(keywords["env"]["GH_TOKEN"], "job-token",
+                         "the reviewer credential must not be the one that dispatches")
+
+    def test_a_dispatch_that_fails_does_not_fail_the_pass(self):
+        with (
+            mock.patch.dict(os.environ, {"PALOMAR_SELF_DISPATCH_TOKEN": "job-token"}),
+            mock.patch.object(
+                cli, "run",
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr="no permission"),
+            ),
+        ):
+            self.assertFalse(cli.request_another_pass(0, 3))
+
+    def test_without_a_credential_the_schedule_is_left_to_it(self):
+        with (
+            mock.patch.dict(os.environ, {"PALOMAR_SELF_DISPATCH_TOKEN": ""}),
+            mock.patch.object(cli, "run") as ran,
+        ):
+            self.assertFalse(cli.request_another_pass(0, 3))
+        ran.assert_not_called()
 
 
 class ReviewTimingTests(unittest.TestCase):
