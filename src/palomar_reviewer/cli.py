@@ -61,6 +61,11 @@ REGISTRATION_STALE_SECONDS = 6 * 3600
 PASS_BUDGET_SECONDS = 5400
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid,statusCheckRollup"
+# The database workflows that must have run and passed before a registration is
+# merged. Named rather than inferred: "every workflow that happened to run was
+# fine" is satisfied by a change on which the validating workflow never started.
+# tests/test_cli.py checks this against the database's own workflow definitions.
+REQUIRED_DATABASE_WORKFLOWS = frozenset({"Validate database"})
 MAX_RENDER_FILES = 2_000
 MAX_RENDER_NODES = 4_000
 MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
@@ -4344,12 +4349,16 @@ def workflow_conclusions(head_sha: str) -> list[str] | None:
     for run in runs:
         if not isinstance(run, dict):
             continue
-        key = run.get("workflow_id")
+        key = run.get("name")
         attempt = run.get("run_attempt") or 0
         if key not in newest or attempt >= (newest[key].get("run_attempt") or 0):
             newest[key] = run
+    # A workflow that has not started yet is pending, not absent. Otherwise a
+    # change polled in the seconds before Actions picks it up reads as green.
+    for name in REQUIRED_DATABASE_WORKFLOWS - set(newest):
+        newest[name] = {"status": "queued"}
     return [
-        "pending" if run.get("status") != "completed" else str(run.get("conclusion") or "failed")
+        "pending" if run.get("status") != "completed" else str(run.get("conclusion") or "failure")
         for run in newest.values()
     ]
 

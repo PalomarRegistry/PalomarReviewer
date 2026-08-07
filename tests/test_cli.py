@@ -3996,9 +3996,34 @@ class WorkflowConclusionTests(unittest.TestCase):
 
     def runs(self, *rows):
         return json.dumps({"workflow_runs": [
-            {"workflow_id": w, "run_attempt": a, "status": s, "conclusion": c}
-            for w, a, s, c in rows
+            {"name": "Validate database", "run_attempt": a, "status": s, "conclusion": c}
+            for _, a, s, c in rows
         ]})
+
+    def test_the_required_workflows_match_the_database_pull_request_workflows(self):
+        """Named, so it fails here rather than by merging something unchecked.
+
+        "Every workflow that happened to run was fine" is satisfied by a change
+        on which the validating workflow never started at all.
+        """
+        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
+        if not database:
+            self.skipTest("no database checkout to compare against")
+        import yaml as _yaml
+
+        expected = set()
+        for path in sorted((Path(database) / ".github" / "workflows").glob("*.yml")):
+            document = _yaml.safe_load(path.read_text(encoding="utf-8"))
+            triggers = document.get(True) or document.get("on") or {}
+            if isinstance(triggers, dict) and "pull_request" in triggers:
+                expected.add(document.get("name"))
+        self.assertEqual(set(cli.REQUIRED_DATABASE_WORKFLOWS), expected)
+
+    def test_a_required_workflow_that_never_started_is_pending(self):
+        # Not absent. A change polled before Actions picks it up is not green.
+        with mock.patch.object(cli, "gh", return_value=json.dumps({"workflow_runs": []})):
+            self.assertEqual(cli.workflow_conclusions("a" * 40), ["pending"])
+        self.assertFalse(cli._checks_passed({"headRefOid": "a" * 40}))
 
     def test_the_newest_attempt_of_each_workflow_is_what_counts(self):
         # A re-run supersedes the failure that prompted it.
@@ -4008,9 +4033,13 @@ class WorkflowConclusionTests(unittest.TestCase):
             self.assertEqual(cli.workflow_conclusions("a" * 40), ["success"])
 
     def test_a_run_still_going_is_pending(self):
-        with mock.patch.object(cli, "gh", return_value=self.runs(
-            (1, 1, "completed", "success"), (2, 1, "in_progress", None),
-        )):
+        runs = json.dumps({"workflow_runs": [
+            {"name": "Validate database", "run_attempt": 1, "status": "completed",
+             "conclusion": "success"},
+            {"name": "Some other workflow", "run_attempt": 1, "status": "in_progress",
+             "conclusion": None},
+        ]})
+        with mock.patch.object(cli, "gh", return_value=runs):
             self.assertEqual(sorted(cli.workflow_conclusions("a" * 40)), ["pending", "success"])
 
     def test_an_unreadable_answer_is_not_an_empty_one(self):
