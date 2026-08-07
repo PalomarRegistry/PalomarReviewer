@@ -90,6 +90,11 @@ policy requires every distinct material criticism to survive synthesis, and
 the runner checks that the final AI-comment list reproduces every warning and
 error from the evidence passes in order.
 
+One review consumes the single Comparator configuration path explicitly chosen
+at intake. Different configuration paths at the same repository and commit are
+different Palomar entries. Registration also binds an existing Palomar ID to
+its configuration path, so an update cannot silently switch result sets.
+
 The policy may also designate a low score as a fundamental editorial failure.
 Currently, notability below the minimum requires `reject`; it cannot be
 softened to a request for revisions. Other failed passes may lead to `revise`

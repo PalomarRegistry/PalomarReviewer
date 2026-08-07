@@ -3655,7 +3655,7 @@ def registration_identity(
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
 
     by_submission: set[str] = set()
-    by_id: dict[str, list[tuple[int, str, str, str]]] = {}
+    by_id: dict[str, list[tuple[int, str, str, str, str, str]]] = {}
     for path in (database / "entries").glob("*.json"):
         prior = load_json(path)
         identifier = str(prior.get("id", ""))
@@ -3664,15 +3664,29 @@ def registration_identity(
         prior_source = prior.get("source", {})
         repository = prior_source.get("repository")
         project_path = prior_source.get("project_path") or ""
+        comparator_config_path = prior.get("formalization", {}).get(
+            "comparator_config_path"
+        )
         prior_submission = prior.get("submission", {}).get("submission_id")
         if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
             raise ReviewerError(f"database entry has invalid registration identity: {path.name}")
         if not isinstance(prior_submission, str):
             raise ReviewerError(f"database entry names no submission: {path.name}")
-        if not isinstance(accepted_at, str) or not isinstance(repository, str):
+        if (
+            not isinstance(accepted_at, str)
+            or not isinstance(repository, str)
+            or not isinstance(comparator_config_path, str)
+        ):
             raise ReviewerError(f"database entry has incomplete registration identity: {path.name}")
         by_id.setdefault(identifier, []).append(
-            (version, prior_submission, accepted_at, repository, project_path)
+            (
+                version,
+                prior_submission,
+                accepted_at,
+                repository,
+                project_path,
+                comparator_config_path,
+            )
         )
         if prior_submission == submission_id:
             by_submission.add(identifier)
@@ -3697,6 +3711,12 @@ def registration_identity(
             raise ReviewerError(
                 f"update to {identifier} comes from project {submitted_project or 'the repository root'}, "
                 f"not {current[4] or 'the repository root'}"
+            )
+        submitted_config = mechanical["comparator"]["path"]
+        if current[5] != submitted_config:
+            raise ReviewerError(
+                f"update to {identifier} uses Comparator configuration {submitted_config}, "
+                f"not {current[5]}"
             )
         resolved = (identifier, current[2], current[0] + 1)
         if reserved is not None and reserved != resolved:

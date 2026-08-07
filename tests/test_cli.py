@@ -2385,6 +2385,7 @@ class PublicationIdentityTests(unittest.TestCase):
             "version": version,
             "accepted_at": "2026-08-01",
             "source": {"repository": "example/project"},
+            "formalization": {"comparator_config_path": "comparator.json"},
             "submission": {"submission_id": submission},
         }
 
@@ -2394,7 +2395,10 @@ class PublicationIdentityTests(unittest.TestCase):
             submission_id=submission,
             existing_id=existing_id,
             reviewed_at="2026-08-01T12:00:00Z",
-            mechanical={"source": {"repository": "example/project"}},
+            mechanical={
+                "source": {"repository": "example/project"},
+                "comparator": {"path": "comparator.json"},
+            },
         )
 
     def test_a_new_submission_gets_a_random_dated_identifier(self):
@@ -2465,6 +2469,22 @@ class PublicationIdentityTests(unittest.TestCase):
                 self.database(prior),
                 submission="b2c3d4e5f6a1",
                 existing_id="PALOMAR-2026-08-01-000012",
+            )
+
+    def test_an_update_from_another_comparator_configuration_is_refused(self):
+        """Distinct Comparator paths in one project are distinct Palomar entries."""
+        prior = self.prior()
+        prior["formalization"]["comparator_config_path"] = "ComparatorChallenges/first.json"
+        with self.assertRaisesRegex(ReviewerError, "uses Comparator configuration"):
+            registration_identity(
+                self.database(prior),
+                submission_id="b2c3d4e5f6a1",
+                existing_id="PALOMAR-2026-08-01-000012",
+                reviewed_at="2026-08-01T12:00:00Z",
+                mechanical={
+                    "source": {"repository": "example/project"},
+                    "comparator": {"path": "ComparatorChallenges/second.json"},
+                },
             )
 
     def test_a_submission_cannot_be_moved_onto_a_second_identifier(self):
