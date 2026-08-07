@@ -3455,6 +3455,68 @@ def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any
     return result
 
 
+# How a submitter may prove they can write to the repository they are
+# submitting. Adding a route to the submission server is not enough to admit a
+# new one: it has to be named here, which is the point. Each entry says what the
+# method actually establishes, because they do not all establish the same thing.
+PUSH_PROOF_METHODS = {
+    # The submitter authorised Palomar and GitHub answered `permissions.push`
+    # for that same authenticated account. One account, both facts.
+    "oauth": "same-account",
+    # A tag created at the submitted commit proves someone holds `contents:
+    # write`; a gist proves an account named itself. Nothing ties the two
+    # together, so two colluding accounts could separate the credential that
+    # can push from the identity on the record. Weaker than `oauth`, knowingly.
+    "tag-and-gist": "separately-attested",
+}
+
+# Records written before proofs were described. Anything created after this is
+# required to carry one, so absence never becomes permanently acceptable.
+PUSH_PROOF_REQUIRED_FROM = "2026-08-08T00:00:00Z"
+
+
+def verify_push_proof(state: dict[str, Any]) -> None:
+    """Require a described proof, not merely a boolean somebody set.
+
+    `push_verified` is a hardcoded literal in the submission server: it records
+    that a code path ran, not what it observed. That was adequate while one
+    path could set it. With more than one, the record has to say which, so that
+    admitting a new method is a decision taken here rather than a side effect
+    of deploying a server.
+    """
+    proof = state.get("push_proof")
+    if proof is None:
+        created = str(state.get("created_at") or "")
+        if created and created >= PUSH_PROOF_REQUIRED_FROM:
+            raise ReviewerError(
+                "the submission record carries no push_proof, and records this "
+                "recent are required to describe how write access was proved"
+            )
+        return
+
+    if not isinstance(proof, dict):
+        raise ReviewerError("push_proof is not an object")
+    method = proof.get("method")
+    if method not in PUSH_PROOF_METHODS:
+        raise ReviewerError(
+            f"push_proof names an unrecognised method: {method!r}. A method must be "
+            "described in PUSH_PROOF_METHODS before a record relying on it registers."
+        )
+    if proof.get("binding") != PUSH_PROOF_METHODS[method]:
+        raise ReviewerError(
+            f"push_proof method {method!r} claims binding {proof.get('binding')!r}, "
+            f"but that method establishes {PUSH_PROOF_METHODS[method]!r}"
+        )
+    for field in ("verified_at", "repository_id", "commit"):
+        if not proof.get(field):
+            raise ReviewerError(f"push_proof is missing {field}")
+    if proof.get("commit") != state.get("commit"):
+        raise ReviewerError("push_proof was made against a different commit")
+    principal = proof.get("principal")
+    if not isinstance(principal, dict) or not principal.get("id"):
+        raise ReviewerError("push_proof does not identify who proved it")
+
+
 def authorize_registration(
     submission_id: str, mechanical: dict[str, Any], review: dict[str, Any]
 ) -> dict[str, Any]:
@@ -3499,6 +3561,7 @@ def authorize_registration(
         raise ReviewerError("mechanical report and state disagree on the update intent")
     if state.get("push_verified") is not True:
         raise ReviewerError("the submitter never proved write access to the repository")
+    verify_push_proof(state)
     # A positive status, not merely "not withdrawn": a stale consent flag on a
     # record that has gone back to any other state must not authorize anything.
     if state.get("status") != "review-ready":

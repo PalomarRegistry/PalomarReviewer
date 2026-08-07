@@ -3826,6 +3826,31 @@ class PublicationAuthorizationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ReviewerError, expected):
                     self.authorize(mechanical, review, state)
 
+    def test_a_record_whose_proof_nobody_described_is_refused(self):
+        """The predicate must actually consult the proof.
+
+        Testing `verify_push_proof` alone leaves it possible to stop calling it,
+        which is the only thing standing between a new intake path and the
+        registry.
+        """
+        mechanical, review, state = self.parts(
+            created_at="2026-08-09T00:00:00Z",
+            push_proof={
+                "schema_version": 1, "method": "trust-me", "binding": "same-account",
+                "verified_at": "2026-08-09T00:00:00Z", "repository_id": 1,
+                "commit": "1" * 40, "principal": {"login": "someone", "id": 1},
+            },
+        )
+        with mock.patch.object(cli, "submission_state", return_value=state):
+            with self.assertRaisesRegex(ReviewerError, "unrecognised method"):
+                cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+
+    def test_a_recent_record_with_no_proof_at_all_is_refused(self):
+        mechanical, review, state = self.parts(created_at="2026-08-09T00:00:00Z")
+        with mock.patch.object(cli, "submission_state", return_value=state):
+            with self.assertRaisesRegex(ReviewerError, "no push_proof"):
+                cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+
     def test_a_report_claiming_a_different_authorization_is_refused(self):
         mechanical, review, state = self.parts()
         mechanical["submission"]["authorization"] = {"relationship": "approved"}
@@ -4192,3 +4217,68 @@ class ArchivedReviewTests(unittest.TestCase):
         cli.public_review(original)
         self.assertIn("scores", original)
         self.assertIn("severity", original["passes"][0]["findings"][0])
+
+
+class PushProofTests(unittest.TestCase):
+    """A record has to say how write access was proved, not merely that it was.
+
+    `push_verified` is a hardcoded literal in the submission server: it records
+    that a code path ran. That was adequate while one path could set it. With a
+    second, admitting a method must be a decision taken in the reviewer rather
+    than a side effect of deploying a server that sets the same boolean.
+    """
+
+    def proof(self, **overrides):
+        value = {
+            "schema_version": 1,
+            "method": "tag-and-gist",
+            "binding": "separately-attested",
+            "verified_at": "2026-08-08T00:00:00Z",
+            "repository_id": 987654321,
+            "commit": "1" * 40,
+            "challenge_sha256": "a" * 64,
+            "principal": {"login": "someone", "id": 12345},
+        }
+        value.update(overrides)
+        return value
+
+    def state(self, **overrides):
+        value = {"commit": "1" * 40, "created_at": "2026-08-09T00:00:00Z",
+                 "push_proof": self.proof()}
+        value.update(overrides)
+        return value
+
+    def test_a_described_proof_is_accepted(self):
+        cli.verify_push_proof(self.state())
+        cli.verify_push_proof(self.state(
+            push_proof=self.proof(method="oauth", binding="same-account")))
+
+    def test_a_method_nobody_described_is_refused(self):
+        with self.assertRaisesRegex(ReviewerError, "unrecognised method"):
+            cli.verify_push_proof(self.state(push_proof=self.proof(method="trust-me")))
+
+    def test_a_method_cannot_overstate_what_it_establishes(self):
+        # tag-and-gist proves someone can push and that an account named
+        # itself, not that they are the same account. A record must not claim
+        # otherwise, whatever wrote it.
+        with self.assertRaisesRegex(ReviewerError, "establishes"):
+            cli.verify_push_proof(self.state(
+                push_proof=self.proof(method="tag-and-gist", binding="same-account")))
+
+    def test_a_proof_of_another_commit_is_refused(self):
+        with self.assertRaisesRegex(ReviewerError, "different commit"):
+            cli.verify_push_proof(self.state(push_proof=self.proof(commit="2" * 40)))
+
+    def test_a_proof_that_names_nobody_is_refused(self):
+        with self.assertRaisesRegex(ReviewerError, "does not identify"):
+            cli.verify_push_proof(self.state(push_proof=self.proof(principal={})))
+        with self.assertRaisesRegex(ReviewerError, "does not identify"):
+            cli.verify_push_proof(self.state(
+                push_proof=self.proof(principal={"login": "someone"})))
+
+    def test_absence_is_tolerated_only_for_records_that_predate_the_rule(self):
+        # The three records registered before proofs existed must stay
+        # registrable; nothing written afterwards may omit one.
+        cli.verify_push_proof({"commit": "1" * 40, "created_at": "2026-08-07T00:00:00Z"})
+        with self.assertRaisesRegex(ReviewerError, "no push_proof"):
+            cli.verify_push_proof({"commit": "1" * 40, "created_at": "2026-08-09T00:00:00Z"})
