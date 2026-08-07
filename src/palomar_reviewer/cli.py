@@ -35,6 +35,8 @@ ARCHIVE_OWNER = "PalomarArchive"
 ARCHIVE_USER = "PalomarArchivist"
 ARCHIVE_RULESET_NAME = "Palomar immutable preservation tags"
 ARCHIVE_TAG_PATTERN = "refs/tags/palomar/**/*"
+ARCHIVE_READY_ATTEMPTS = 60
+ARCHIVE_RETRY_SECONDS = 5
 RENDER_WORKFLOW = "render-challenge.yml"
 VERIFY_WORKFLOW = "submission.yml"
 MAX_RENDER_FILES = 2_000
@@ -1076,47 +1078,88 @@ def _push_archive_ref(source_repository: str, commit: str, fork_repository: str,
 
 
 def _ensure_archive_ref(source_repository: str, commit: str, fork_repository: str, ref: str) -> None:
-    existing = _archive_get(
-        _archive_ref_endpoint(fork_repository, ref),
-        f"checking archive ref {fork_repository}:{ref}",
-    )
-    if existing is not None:
-        if (
-            existing.get("object", {}).get("type") != "commit"
-            or existing.get("object", {}).get("sha") != commit
-        ):
-            raise ReviewerError(f"archive ref conflict: {fork_repository}:{ref}")
-        return
+    """Create and read back one preservation ref after an asynchronous fork.
 
-    commit_object = _archive_get(
-        f"repos/{fork_repository}/git/commits/{commit}",
-        f"checking archived commit {fork_repository}@{commit}",
-    )
-    if commit_object is None:
-        _push_archive_ref(source_repository, commit, fork_repository, ref)
-    else:
-        archive_api(
-            f"repos/{fork_repository}/git/refs",
-            method="POST",
-            body={"ref": ref, "sha": commit},
+    GitHub reports a newly created fork before every Git object and ref-writing
+    endpoint is necessarily ready. A 404/409/422 during that window is a
+    readiness result, not proof that the token lacks access. Retry the complete
+    observation/create/read-back cycle so a request that actually succeeded is
+    discovered before another create is attempted.
+    """
+    ref_endpoint = _archive_ref_endpoint(fork_repository, ref)
+    commit_endpoint = f"repos/{fork_repository}/git/commits/{commit}"
+    create_endpoint = f"repos/{fork_repository}/git/refs"
+    last_detail = "the fork's Git objects were not visible"
+
+    for attempt in range(ARCHIVE_READY_ATTEMPTS):
+        existing = _archive_get(
+            ref_endpoint,
+            f"checking archive ref {fork_repository}:{ref}",
         )
+        if existing is not None:
+            if (
+                existing.get("object", {}).get("type") != "commit"
+                or existing.get("object", {}).get("sha") != commit
+            ):
+                raise ReviewerError(f"archive ref conflict: {fork_repository}:{ref}")
+            return
 
-    verified_ref = _archive_get(
-        _archive_ref_endpoint(fork_repository, ref),
-        f"verifying archive ref {fork_repository}:{ref}",
+        commit_object = _archive_get(
+            commit_endpoint,
+            f"checking archived commit {fork_repository}@{commit}",
+        )
+        try:
+            if commit_object is None:
+                _push_archive_ref(source_repository, commit, fork_repository, ref)
+            else:
+                created = archive_api(
+                    create_endpoint,
+                    method="POST",
+                    body={"ref": ref, "sha": commit},
+                    check=False,
+                )
+                if created.returncode:
+                    detail = f"{created.stderr}\n{created.stdout}".strip()[-1000:]
+                    if not any(
+                        marker in detail
+                        for marker in ("HTTP 404", "404 Not Found", "HTTP 409", "HTTP 422")
+                    ):
+                        raise ReviewerError(
+                            f"GitHub API failed while creating archive ref "
+                            f"{fork_repository}:{ref}: {detail}"
+                        )
+                    last_detail = detail or "GitHub had not made the fork writable"
+        except ReviewerError as error:
+            detail = str(error)
+            if not any(
+                marker in detail.casefold()
+                for marker in ("404", "not found", "repository is empty", "does not exist")
+            ):
+                raise
+            last_detail = detail[-1000:]
+
+        verified_ref = _archive_get(
+            ref_endpoint,
+            f"verifying archive ref {fork_repository}:{ref}",
+        )
+        verified_commit = _archive_get(
+            commit_endpoint,
+            f"verifying archived commit {fork_repository}@{commit}",
+        )
+        if (
+            verified_ref is not None
+            and verified_ref.get("object", {}).get("sha") == commit
+            and verified_ref.get("object", {}).get("type") == "commit"
+            and verified_commit is not None
+            and verified_commit.get("sha") == commit
+        ):
+            return
+        if attempt + 1 < ARCHIVE_READY_ATTEMPTS:
+            time.sleep(ARCHIVE_RETRY_SECONDS)
+
+    raise ReviewerError(
+        f"archive ref {fork_repository}:{ref} was not ready after five minutes: {last_detail}"
     )
-    verified_commit = _archive_get(
-        f"repos/{fork_repository}/git/commits/{commit}",
-        f"verifying archived commit {fork_repository}@{commit}",
-    )
-    if (
-        verified_ref is None
-        or verified_ref.get("object", {}).get("sha") != commit
-        or verified_ref.get("object", {}).get("type") != "commit"
-        or verified_commit is None
-        or verified_commit.get("sha") != commit
-    ):
-        raise ReviewerError(f"archive verification failed for {fork_repository}@{commit}")
 
 
 def preserve_sources(
@@ -1966,6 +2009,7 @@ def deliver_review(
         review_schema_version=review["schema_version"],
         registration_consent=False,
         registration_consent_review_sha256=None,
+        registration_attempt=None,
         spend=[*previous, spend] if spend else previous,
     )
 
@@ -3432,8 +3476,14 @@ def registration_identity(
     existing_id: object,
     reviewed_at: object,
     mechanical: dict[str, Any],
+    reserved: tuple[str, str, int] | None = None,
 ) -> tuple[str, str, int]:
-    """Resolve one submission to one permanent ID and its next append-only version."""
+    """Resolve one submission to one permanent ID and its next append-only version.
+
+    A reserved identity was committed to private submission state before an
+    earlier attempt made public side effects. It must be reused exactly: a
+    retry must complete those archive refs, not allocate a second public ID.
+    """
     if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
 
@@ -3481,7 +3531,10 @@ def registration_identity(
                 f"update to {identifier} comes from project {submitted_project or 'the repository root'}, "
                 f"not {current[4] or 'the repository root'}"
             )
-        return identifier, current[2], current[0] + 1
+        resolved = (identifier, current[2], current[0] + 1)
+        if reserved is not None and reserved != resolved:
+            raise ReviewerError("saved registration attempt disagrees with the requested update")
+        return resolved
 
     if by_submission:
         identifiers = ", ".join(sorted(by_submission))
@@ -3492,7 +3545,93 @@ def registration_identity(
         accepted_at = dt.date.fromisoformat(str(reviewed_at)[:10]).isoformat()
     except ValueError as error:
         raise ReviewerError("accepted review has no valid review date") from error
+    if reserved is not None:
+        identifier, reserved_at, version = reserved
+        match = PALOMAR_ID_RE.fullmatch(identifier)
+        if (
+            match is None
+            or match.group("date") != accepted_at
+            or reserved_at != accepted_at
+            or version != 1
+        ):
+            raise ReviewerError("saved registration attempt has an invalid permanent identity")
+        if identifier in by_id:
+            raise ReviewerError(
+                f"saved registration attempt {identifier} is already used by another submission"
+            )
+        return reserved
     return allocate_identifier(accepted_at, set(by_id)), accepted_at, 1
+
+
+def registration_attempt_identity(
+    database: Path,
+    *,
+    state: dict[str, Any],
+    mechanical: dict[str, Any],
+    review: dict[str, Any],
+    dry_run: bool,
+) -> tuple[str, str, int]:
+    """Reserve one retry-stable identity before archive side effects begin."""
+    review_sha256 = review_digest(review)
+    source_repository = mechanical["source"]["repository"]
+    source_commit = mechanical["source"]["commit"]
+    existing_id = mechanical.get("existing_id") or None
+    attempt = state.get("registration_attempt")
+    reserved: tuple[str, str, int] | None = None
+
+    if attempt is not None:
+        if not isinstance(attempt, dict) or attempt.get("schema_version") != 1:
+            raise ReviewerError("saved registration attempt is malformed")
+        bindings = {
+            "review_sha256": review_sha256,
+            "source_repository": source_repository,
+            "source_commit": source_commit,
+            "existing_id": existing_id,
+        }
+        if any(attempt.get(field) != value for field, value in bindings.items()):
+            raise ReviewerError("saved registration attempt belongs to different accepted evidence")
+        identifier = attempt.get("id")
+        accepted_at = attempt.get("accepted_at")
+        version = attempt.get("version")
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(accepted_at, str)
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+        ):
+            raise ReviewerError("saved registration attempt has an invalid permanent identity")
+        reserved = (identifier, accepted_at, version)
+
+    resolved = registration_identity(
+        database,
+        submission_id=state["id"],
+        existing_id=existing_id,
+        reviewed_at=review.get("reviewed_at"),
+        mechanical=mechanical,
+        reserved=reserved,
+    )
+    if attempt is not None or dry_run:
+        return resolved
+
+    identifier, accepted_at, version = resolved
+    updated = dict(state)
+    updated["registration_attempt"] = {
+        "schema_version": 1,
+        "id": identifier,
+        "version": version,
+        "accepted_at": accepted_at,
+        "review_sha256": review_sha256,
+        "source_repository": source_repository,
+        "source_commit": source_commit,
+        "existing_id": existing_id,
+    }
+    put_state(
+        f"submissions/{state['id']}/state.json",
+        updated,
+        f"Reserve registration identity for {state['id']}",
+        blob_sha=state.get("_blob_sha"),
+    )
+    return resolved
 
 
 def delivered_review(submission_id: str) -> dict[str, Any]:
@@ -3643,13 +3782,12 @@ def register(args: argparse.Namespace) -> int:
     if not schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register schema-v2.json")
 
-    existing_id = mechanical.get("existing_id")
-    permanent_id, accepted_at, version = registration_identity(
+    permanent_id, accepted_at, version = registration_attempt_identity(
         database,
-        existing_id=existing_id,
+        state=state,
         mechanical=mechanical,
-        reviewed_at=str(review["reviewed_at"]),
-        submission_id=args.submission,
+        review=review,
+        dry_run=args.dry_run,
     )
     preservation = preserve_sources(
         work,
