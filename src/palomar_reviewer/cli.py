@@ -614,23 +614,28 @@ def verify_repository_license(
 def public_review(review: dict[str, Any]) -> dict[str, Any]:
     """The review as it is archived and served, without the internal arithmetic.
 
-    Scores decide the outcome and stay in the private submission record and in
-    the canonical database, because the decision has to remain reconstructable.
-    They are not archived, because they do not mean what a reader would take
-    them to mean: the same repository at the same commit scored 5 and then 4
-    for statement alignment across two runs of the same policy, with the same
-    verdict both times.
+    Three things go. The scores decide the outcome and stay in the private
+    record and the canonical database, because they do not mean what a reader
+    would take them to mean: the same repository at the same commit scored 5
+    and then 4 on one dimension across two runs of the same policy, with the
+    same verdict both times. The severity on each finding goes because it ranks
+    comments in a way the review did not intend. And the top-level repetition
+    of every finding message goes because it is a repetition: with it, a reader
+    could recover the severity that had just been removed by comparing the two
+    lists, and without it the comments are still all here, once, where they
+    were made.
 
-    Finding severities go the same way. The review sorts its remarks for its
-    own purposes, and that sorting is not something a reader can act on
-    differently, and once it is out in the open it invites a ranking of
-    comments that the review did not intend.
+    What survives is the decision, the summary, the requested changes, and
+    every remark the review made with the evidence it made it on.
 
-    What survives is the decision, the summary, the requested changes and every
-    remark the review made.
+    This does not by itself keep the scores private. A finding that says "this
+    prevents a literature score of 5 but not 4" states one exactly, and no
+    projection can take that back out of the prose; the policy forbids writing
+    it in the first place.
     """
     archived = json.loads(json.dumps(review))
     archived.pop("scores", None)
+    archived.pop("warnings", None)
     for step in archived.get("passes") or []:
         if isinstance(step, dict):
             step.pop("scores", None)
@@ -3893,11 +3898,21 @@ def register(args: argparse.Namespace) -> int:
             root=root,
             policy_ref=str(review.get("policy_commit", "main")),
         )
-    # The archived copy is the one anyone can read, so it is the redacted one.
-    # The
-    # digest beside it stays the digest of what the submitter actually read,
-    # which is what consent was given to.
-    write_json(work / "review.json", public_review(review))
+    # The archived copy is the one anyone can read, so it is the redacted one,
+    # and it is checked against the schema that describes what is served
+    # rather than the one describing what the submitter was shown. Serving a
+    # document that fails its own declared schema is exactly the sort of thing
+    # this registry exists not to do.
+    #
+    # The digest written beside it stays the digest of what the submitter read,
+    # because that is what consent was given to.
+    served = public_review(review)
+    public_schema = work / "policy" / "schemas" / "public-review.schema.json"
+    if public_schema.is_file():
+        jsonschema.validate(
+            served, load_json(public_schema), format_checker=jsonschema.FormatChecker()
+        )
+    write_json(work / "review.json", served)
     (work / "review-sha256").write_text(review_digest(review) + "\n")
     state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")

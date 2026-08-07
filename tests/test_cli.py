@@ -4112,10 +4112,13 @@ class ArchivedReviewTests(unittest.TestCase):
         for finding in archived["passes"][0]["findings"]:
             self.assertNotIn("severity", finding)
 
-    def test_every_remark_survives(self):
+    def test_every_remark_survives_once(self):
         archived = cli.public_review(self.review())
         self.assertEqual(archived["decision"], "accept")
-        self.assertEqual(archived["warnings"], ["a remark the review made"])
+        # `warnings` repeated the finding messages, and the repetition was how
+        # a reader could recover the severity that had just been removed: the
+        # list was exactly the warning-and-error subset.
+        self.assertNotIn("warnings", archived)
         messages = [f["message"] for f in archived["passes"][0]["findings"]]
         self.assertEqual(messages, ["an observation", "a concern"])
         self.assertEqual(archived["passes"][0]["verdict"], "pass")
@@ -4128,8 +4131,12 @@ class ArchivedReviewTests(unittest.TestCase):
         document gets written there.
         """
         source = Path(cli.__file__).read_text()
-        self.assertIn('write_json(work / "review.json", public_review(review))', source)
+        self.assertIn("served = public_review(review)", source)
+        self.assertIn('write_json(work / "review.json", served)', source)
         self.assertNotIn('write_json(work / "review.json", review)', source)
+        # And checked against the schema for what is published, not the one
+        # describing what the submitter was shown.
+        self.assertIn("public-review.schema.json", source)
 
     def test_the_review_the_submitter_read_is_untouched(self):
         # Consent is to those bytes, and the digest of them is what the
