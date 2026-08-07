@@ -368,6 +368,35 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual({rule["type"] for rule in desired["rules"]}, {"update", "deletion"})
         self.assertEqual(desired["bypass_actors"], [])
 
+    def test_demoted_archivist_verifies_rules_when_github_redacts_bypass_actors(self):
+        fork = "PalomarArchive/example--fixture"
+        desired = cli._archive_ruleset_body()
+        ruleset_id = 42
+        redacted = {key: value for key, value in desired.items() if key != "bypass_actors"}
+
+        def archive_api(endpoint, *, method="GET", body=None, check=True):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(body)
+            value = [{"name": desired["name"], "id": ruleset_id}]
+            if endpoint.endswith(f"/rulesets/{ruleset_id}"):
+                value = {**redacted, "id": ruleset_id}
+            return subprocess.CompletedProcess(["gh", "api"], 0, json.dumps(value), "")
+
+        with (
+            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(
+                cli,
+                "_archive_get",
+                return_value={"full_name": fork, "permissions": {"admin": False, "push": True}},
+            ),
+        ):
+            cli._ensure_archive_ruleset(fork)
+
+        tampered = {**redacted, "enforcement": "disabled"}
+        self.assertFalse(
+            cli._archive_ruleset_matches(tampered, require_visible_bypass_actors=False)
+        )
+
     def test_archive_creator_drops_to_the_organization_write_role(self):
         fork = "PalomarArchive/example--fixture"
         metadata = [

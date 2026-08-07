@@ -943,7 +943,16 @@ def _archive_ruleset_body() -> dict[str, Any]:
     }
 
 
-def _archive_ruleset_matches(ruleset: dict[str, Any]) -> bool:
+def _archive_ruleset_matches(
+    ruleset: dict[str, Any], *, require_visible_bypass_actors: bool = True
+) -> bool:
+    """Check the immutable rules a credential is allowed to observe.
+
+    GitHub deliberately omits ``bypass_actors`` unless the caller has
+    Administration permission on the ruleset. The archive account has that
+    permission only while creating a fork; after it is demoted to Write, the
+    other fields remain observable but this one disappears from the response.
+    """
     expected = _archive_ruleset_body()
     actual_rules = {
         (
@@ -957,7 +966,10 @@ def _archive_ruleset_matches(ruleset: dict[str, Any]) -> bool:
         ruleset.get("name") == expected["name"]
         and ruleset.get("target") == expected["target"]
         and ruleset.get("enforcement") == expected["enforcement"]
-        and ruleset.get("bypass_actors") == []
+        and (
+            ruleset.get("bypass_actors") == []
+            or (not require_visible_bypass_actors and "bypass_actors" not in ruleset)
+        )
         and ruleset.get("conditions") == expected["conditions"]
         and actual_rules == {("update", False), ("deletion", None)}
     )
@@ -984,7 +996,9 @@ def _ensure_archive_ruleset(fork_repository: str) -> None:
             archive_api(f"repos/{fork_repository}/rulesets/{ruleset_id}"),
             f"checking the immutable-tag ruleset on {fork_repository}",
         )
-        if not _archive_ruleset_matches(current):
+        if not _archive_ruleset_matches(
+            current, require_visible_bypass_actors=is_admin
+        ):
             if not is_admin:
                 raise ReviewerError(
                     f"immutable-tag ruleset on {fork_repository} is incorrect and the archive "
@@ -1013,7 +1027,9 @@ def _ensure_archive_ruleset(fork_repository: str) -> None:
         archive_api(f"repos/{fork_repository}/rulesets/{ruleset_id}"),
         f"verifying the immutable-tag ruleset on {fork_repository}",
     )
-    if not _archive_ruleset_matches(verified):
+    if not _archive_ruleset_matches(
+        verified, require_visible_bypass_actors=is_admin
+    ):
         raise ReviewerError(f"immutable-tag ruleset verification failed for {fork_repository}")
 
 
