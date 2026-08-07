@@ -2592,6 +2592,16 @@ class MechanicalReportContractTests(unittest.TestCase):
             ))
 
 
+def validation_run(head, conclusion="success", **overrides):
+    """A workflow run shaped like the ones the selection actually filters on."""
+    return {
+        "status": "completed", "conclusion": conclusion,
+        "head_sha": head, "event": "pull_request",
+        "run_number": 1, "run_attempt": 1,
+        **overrides,
+    }
+
+
 def database_gh(view, validation="success", calls=None):
     """Answer both calls advance_registration makes: the view, and Actions.
 
@@ -2599,7 +2609,8 @@ def database_gh(view, validation="success", calls=None):
     registration, so a test that wants a merge has to show that workflow green
     for the exact head commit.
     """
-    runs = [] if validation is None else [{"status": "completed", "conclusion": validation}]
+    head = (view() if callable(view) else view).get("headRefOid") or ""
+    runs = [] if validation is None else [validation_run(head, validation)]
 
     def answer(args, **kwargs):
         if calls is not None:
@@ -3007,8 +3018,8 @@ class DatabaseChangeWaitTests(unittest.TestCase):
 
         return answer, seen
 
-    def passed(self):
-        return [{"status": "completed", "conclusion": "success"}]
+    def passed(self, head="e" * 40):
+        return [validation_run(head)]
 
     def test_a_change_that_falls_behind_is_updated_once(self):
         """BEHIND never becomes CLEAN on its own, and the database requires a
@@ -3059,7 +3070,7 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         """A failed validation needs a new commit, not more patience."""
         answer, _ = self.gh(
             [{"state": "OPEN", "mergeStateStatus": "UNSTABLE", "headRefOid": "f" * 40}],
-            [{"status": "completed", "conclusion": "failure"}],
+            [validation_run("f" * 40, "failure")],
         )
         slept = []
         with (
@@ -3073,7 +3084,7 @@ class DatabaseChangeWaitTests(unittest.TestCase):
     def test_a_validation_still_running_is_waited_for(self):
         answer, _ = self.gh(
             [{"state": "OPEN", "mergeStateStatus": "UNSTABLE", "headRefOid": "f" * 40}],
-            [{"status": "in_progress", "conclusion": None}],
+            [validation_run("f" * 40, None, status="in_progress")],
         )
         slept = []
         clock = iter(range(0, 100_000, 20))
@@ -3140,6 +3151,51 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         self.assertEqual(view["validation"], "unreadable")
         self.assertEqual(slept, [])
 
+    def test_a_withdrawn_submission_is_not_merged(self):
+        """A submitter can withdraw while the render and the database checks
+        are still running, and registering left the status it found alone, so a
+        withdrawn record still carries a registration change."""
+        answer, seen = self.gh([self.OPEN_CLEAN], self.passed())
+        withdrawn = {"id": "a" * 12, "registration_pr": 7, "status": "withdrawn",
+                     "registration_consent": True}
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli, "submission_state", return_value=withdrawn),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertFalse(cli.advance_registration(dict(withdrawn), 0))
+        finalized.assert_not_called()
+        self.assertNotIn("merge", [step for call in seen for step in call])
+
+    def test_consent_withdrawn_after_the_change_was_opened_is_not_merged(self):
+        stale = {"id": "a" * 12, "registration_pr": 7, "status": "review-ready",
+                 "registration_consent": True}
+        answer, seen = self.gh([self.OPEN_CLEAN], self.passed())
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli, "submission_state",
+                              return_value=dict(stale, registration_consent=False)),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertFalse(cli.advance_registration(stale, 0))
+        finalized.assert_not_called()
+        self.assertNotIn("merge", [step for call in seen for step in call])
+
+    def test_consent_that_still_stands_is_merged(self):
+        standing = {"id": "a" * 12, "registration_pr": 7, "status": "review-ready",
+                    "registration_consent": True}
+        answer, seen = self.gh([self.OPEN_CLEAN], self.passed())
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli, "submission_state", return_value=dict(standing)),
+            mock.patch.object(cli, "finalize", return_value=0) as finalized,
+        ):
+            self.assertTrue(cli.advance_registration(standing, 0))
+        finalized.assert_called_once()
+        merges = [c for c in seen if c[:2] == ["pr", "merge"]]
+        self.assertEqual(len(merges), 1)
+        self.assertIn("--match-head-commit", merges[0])
+
     def test_a_registration_is_not_merged_without_a_readable_validation(self):
         """A missing permission must refuse the merge, and must not take the
         other arms of the pass down with it."""
@@ -3154,6 +3210,48 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         ):
             self.assertFalse(cli.advance_registration({"id": "a" * 12, "registration_pr": 7}, 0))
         finalized.assert_not_called()
+
+    def test_a_run_for_another_commit_or_event_is_not_this_validation(self):
+        """The query is a filter, not a promise: the endpoint documents no
+        ordering, and the workflow also runs on push."""
+        answer, _ = self.gh([self.OPEN_CLEAN], [
+            validation_run("d" * 40),                       # a different commit
+            validation_run("e" * 40, event="push"),         # a different event
+        ])
+        slept = []
+        clock = iter(range(0, 100_000, 20))
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            cli.await_database_checks(7, 40)
+        self.assertTrue(slept, "someone else's run was read as this validation")
+
+    def test_the_newest_run_and_attempt_win(self):
+        """An older green attempt must never outrank a newer one still going."""
+        answer, _ = self.gh([self.OPEN_CLEAN], [
+            validation_run("e" * 40, "success", run_number=1, run_attempt=1),
+            validation_run("e" * 40, None, run_number=2, run_attempt=1,
+                           status="in_progress"),
+        ])
+        slept = []
+        clock = iter(range(0, 100_000, 20))
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            cli.await_database_checks(7, 40)
+        self.assertTrue(slept, "a superseded green run was read as the verdict")
+
+        answer, _ = self.gh([self.OPEN_CLEAN], [
+            validation_run("e" * 40, "failure", run_number=1, run_attempt=1),
+            validation_run("e" * 40, "success", run_number=1, run_attempt=2),
+        ])
+        with mock.patch.object(cli, "gh", side_effect=answer):
+            view = cli.await_database_checks(7, 0)
+        self.assertEqual(view["validation"], "passed", "a re-run's later attempt is the verdict")
 
     def test_the_validation_is_asked_for_the_exact_head_commit(self):
         """A validation of some other commit is not a validation of this one."""
