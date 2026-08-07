@@ -3378,3 +3378,67 @@ class RenderFailureTests(unittest.TestCase):
             with mock.patch.object(cli, "gh", side_effect=ReviewerError("artifact expired")):
                 message = cli.render_failure(Path(directory), "101", "abc", "https://example.test/run")
         self.assertIn("may be retried", message)
+
+
+class ArchivedReviewTests(unittest.TestCase):
+    """What is archived is what anyone may read, so it carries no scores.
+
+    The numbers decide the outcome and stay in the private record and the
+    canonical database. They are not published: the same repository at the same
+    commit scored 5 and then 4 for statement alignment across two runs of the
+    same policy, with accept both times.
+    """
+
+    def review(self):
+        return {
+            "decision": "accept",
+            "summary": "Editorially accepted.",
+            "warnings": ["a remark the review made"],
+            "requested_changes": [],
+            "scores": {"statement_alignment": 4, "clarity": 4},
+            "passes": [
+                {
+                    "step": "metadata",
+                    "verdict": "pass",
+                    "scores": {"provenance": 4},
+                    "findings": [
+                        {"severity": "info", "message": "an observation", "evidence": "e"},
+                        {"severity": "warning", "message": "a concern", "evidence": "e"},
+                    ],
+                }
+            ],
+        }
+
+    def test_no_scores_and_no_severities_survive(self):
+        archived = cli.public_review(self.review())
+        self.assertNotIn("scores", archived)
+        self.assertNotIn("scores", archived["passes"][0])
+        for finding in archived["passes"][0]["findings"]:
+            self.assertNotIn("severity", finding)
+
+    def test_every_remark_survives(self):
+        archived = cli.public_review(self.review())
+        self.assertEqual(archived["decision"], "accept")
+        self.assertEqual(archived["warnings"], ["a remark the review made"])
+        messages = [f["message"] for f in archived["passes"][0]["findings"]]
+        self.assertEqual(messages, ["an observation", "a concern"])
+        self.assertEqual(archived["passes"][0]["verdict"], "pass")
+
+    def test_the_copy_that_is_archived_is_the_redacted_one(self):
+        """A redaction nothing calls is not a redaction.
+
+        The evidence bundle copies whatever `review.json` is in the workspace,
+        so the only thing standing between the scores and the public is which
+        document gets written there.
+        """
+        source = Path(cli.__file__).read_text()
+        self.assertIn('write_json(work / "review.json", public_review(review))', source)
+        self.assertNotIn('write_json(work / "review.json", review)', source)
+
+    def test_the_review_the_submitter_read_is_untouched(self):
+        # Consent is to those bytes, and the digest of them is what the
+        # registration predicate compares.
+        original = self.review()
+        cli.public_review(original)
+        self.assertIn("scores", original)
+        self.assertIn("severity", original["passes"][0]["findings"][0])

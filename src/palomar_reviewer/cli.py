@@ -583,6 +583,35 @@ def verify_repository_license(
     return record
 
 
+def public_review(review: dict[str, Any]) -> dict[str, Any]:
+    """The review as it is archived and served, without the internal arithmetic.
+
+    Scores decide the outcome and stay in the private submission record and in
+    the canonical database, because the decision has to remain reconstructable.
+    They are not archived, because they do not mean what a reader would take
+    them to mean: the same repository at the same commit scored 5 and then 4
+    for statement alignment across two runs of the same policy, with the same
+    verdict both times.
+
+    Finding severities go the same way. The review sorts its remarks for its
+    own purposes, and that sorting is not something a reader can act on
+    differently, and once it is out in the open it invites a ranking of
+    comments that the review did not intend.
+
+    What survives is the decision, the summary, the requested changes and every
+    remark the review made.
+    """
+    archived = json.loads(json.dumps(review))
+    archived.pop("scores", None)
+    for step in archived.get("passes") or []:
+        if isinstance(step, dict):
+            step.pop("scores", None)
+            for finding in step.get("findings") or []:
+                if isinstance(finding, dict):
+                    finding.pop("severity", None)
+    return archived
+
+
 def review_digest(report: dict[str, Any]) -> str:
     encoded = json.dumps(
         report,
@@ -3741,7 +3770,11 @@ def register(args: argparse.Namespace) -> int:
             root=root,
             policy_ref=str(review.get("policy_commit", "main")),
         )
-    write_json(work / "review.json", review)
+    # The archived copy is the one anyone can read, so it is the redacted one.
+    # The
+    # digest beside it stays the digest of what the submitter actually read,
+    # which is what consent was given to.
+    write_json(work / "review.json", public_review(review))
     (work / "review-sha256").write_text(review_digest(review) + "\n")
     state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")
