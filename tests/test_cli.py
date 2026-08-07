@@ -3944,3 +3944,42 @@ class ArchivedReviewTests(unittest.TestCase):
         cli.public_review(original)
         self.assertIn("scores", original)
         self.assertIn("severity", original["passes"][0]["findings"][0])
+
+
+class DatabasePrViewTests(unittest.TestCase):
+    """A merged change must be finalizable without permission to read checks.
+
+    Reading `statusCheckRollup` needs a permission the registration credential
+    may not carry, and GitHub fails the whole query rather than omitting the
+    field. The first real registration reached a merged database change and
+    could not be finalized: the state saying there was nothing left to wait for
+    could not be read without also asking about checks.
+    """
+
+    def test_the_ordinary_case_costs_one_call(self):
+        with mock.patch.object(
+            cli, "gh", return_value=json.dumps({"state": "OPEN", "statusCheckRollup": []})
+        ) as view:
+            cli.view_database_pr(51)
+        self.assertEqual(view.call_count, 1)
+        self.assertIn("statusCheckRollup", view.call_args.args[0][-1])
+
+    def test_a_refused_query_falls_back_to_what_can_be_read(self):
+        asked = []
+
+        def view(command):
+            asked.append(command[-1])
+            if "statusCheckRollup" in command[-1]:
+                raise ReviewerError("Resource not accessible by personal access token")
+            return json.dumps({"state": "MERGED", "mergeStateStatus": "UNKNOWN"})
+
+        with mock.patch.object(cli, "gh", side_effect=view):
+            result = cli.view_database_pr(51)
+        self.assertEqual(len(asked), 2)
+        self.assertNotIn("statusCheckRollup", asked[1])
+        self.assertEqual(result["state"], "MERGED")
+
+    def test_a_view_without_checks_is_never_green(self):
+        # A change whose checks cannot be seen is not one to merge.
+        self.assertFalse(cli._checks_passed({"state": "OPEN"}))
+        self.assertFalse(cli._checks_failed({"state": "OPEN"}))

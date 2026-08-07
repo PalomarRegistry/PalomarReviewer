@@ -4350,9 +4350,30 @@ def _checks_passed(view: dict[str, Any]) -> bool:
 
 
 def view_database_pr(pr: int) -> dict[str, Any]:
-    return json.loads(
-        gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS])
-    )
+    """The database change, and the checks on it where they can be read.
+
+    Reading `statusCheckRollup` needs a permission the registration credential
+    may not carry, and GitHub answers a request it cannot satisfy by failing
+    the whole query rather than by omitting the field. A merged change was
+    therefore impossible to finalize: the state that would have shown there was
+    nothing left to wait for could not be read without also asking about checks
+    that no longer mattered.
+
+    The full question is asked first, so the ordinary case costs one call. Only
+    when it is refused does this fall back to what can be read. A view with no
+    rollup is treated as not green, which is the safe reading: a change whose
+    checks cannot be seen is not one to merge.
+    """
+    fields = ["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json"]
+    try:
+        return json.loads(gh([*fields, DATABASE_PR_FIELDS]))
+    except ReviewerError:
+        reduced = ",".join(
+            part for part in DATABASE_PR_FIELDS.split(",") if part != "statusCheckRollup"
+        )
+        view = json.loads(gh([*fields, reduced]))
+        print(f"database PR #{pr}: checks are not readable with this credential")
+        return view
 
 
 def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
