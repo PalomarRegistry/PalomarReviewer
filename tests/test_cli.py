@@ -833,7 +833,7 @@ class ReviewerTests(unittest.TestCase):
             {"severity": "error", "evidence": "Example.result", "message": "Fix result B."},
         ]
         synthesis["warnings"] = ["Fix result A."]
-        with self.assertRaisesRegex(ReviewerError, "every material pass finding"):
+        with self.assertRaisesRegex(ReviewerError, "every required pass finding"):
             validate_synthesis_policy(
                 synthesis,
                 passes=passes,
@@ -841,6 +841,34 @@ class ReviewerTests(unittest.TestCase):
                 mechanical={"status": "pass"},
             )
         synthesis["warnings"] = ["Fix result A.", "Fix result B."]
+        validate_synthesis_policy(
+            synthesis,
+            passes=passes,
+            rubric=rubric,
+            mechanical={"status": "pass"},
+        )
+
+    def test_all_finding_policy_preserves_informational_comments(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        rubric["finding_comment_policy"] = "all"
+        passes[1]["findings"] = [
+            {"severity": "info", "evidence": "Example.result", "message": "Useful context."},
+            {"severity": "warning", "evidence": "Example.result", "message": "Fix result."},
+        ]
+        all_comments = [
+            finding["message"]
+            for result in passes
+            for finding in result["findings"]
+        ]
+        synthesis["warnings"] = [comment for comment in all_comments if comment != "Useful context."]
+        with self.assertRaisesRegex(ReviewerError, "every required pass finding"):
+            validate_synthesis_policy(
+                synthesis,
+                passes=passes,
+                rubric=rubric,
+                mechanical={"status": "pass"},
+            )
+        synthesis["warnings"] = all_comments
         validate_synthesis_policy(
             synthesis,
             passes=passes,
