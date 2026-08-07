@@ -1104,7 +1104,6 @@ def _ensure_archive_ref(source_repository: str, commit: str, fork_repository: st
     """
     ref_endpoint = _archive_ref_endpoint(fork_repository, ref)
     commit_endpoint = f"repos/{fork_repository}/git/commits/{commit}"
-    create_endpoint = f"repos/{fork_repository}/git/refs"
     last_detail = "the fork's Git objects were not visible"
 
     for attempt in range(ARCHIVE_READY_ATTEMPTS):
@@ -1120,31 +1119,13 @@ def _ensure_archive_ref(source_repository: str, commit: str, fork_repository: st
                 raise ReviewerError(f"archive ref conflict: {fork_repository}:{ref}")
             return
 
-        commit_object = _archive_get(
-            commit_endpoint,
-            f"checking archived commit {fork_repository}@{commit}",
-        )
         try:
-            if commit_object is None:
-                _push_archive_ref(source_repository, commit, fork_repository, ref)
-            else:
-                created = archive_api(
-                    create_endpoint,
-                    method="POST",
-                    body={"ref": ref, "sha": commit},
-                    check=False,
-                )
-                if created.returncode:
-                    detail = f"{created.stderr}\n{created.stdout}".strip()[-1000:]
-                    if not any(
-                        marker in detail
-                        for marker in ("HTTP 404", "404 Not Found", "HTTP 409", "HTTP 422")
-                    ):
-                        raise ReviewerError(
-                            f"GitHub API failed while creating archive ref "
-                            f"{fork_repository}:{ref}: {detail}"
-                        )
-                    last_detail = detail or "GitHub had not made the fork writable"
+            # Use one write path whether or not GitHub has copied this commit
+            # into the fork yet. The REST create-ref endpoint returned 404 for
+            # commits already visible in two real forks, while an authenticated
+            # Git push successfully created every other preservation ref and
+            # also transfers an object that the fork does not yet contain.
+            _push_archive_ref(source_repository, commit, fork_repository, ref)
         except ReviewerError as error:
             detail = str(error)
             if not any(

@@ -131,7 +131,9 @@ accepted commit receives a record-specific
 cannot be created and read back exactly, registration stops before a database
 branch is published. GitHub creates forks asynchronously, so the reviewer waits
 for their Git objects and ref-writing endpoint to become ready before treating
-a preservation operation as failed.
+a preservation operation as failed. Preservation refs are written with an
+authenticated Git push, which also transfers a commit that GitHub has not yet
+copied into the new fork.
 
 The generated record and render bundle are then validated against the database
 schema. It archives the exact mechanical-report

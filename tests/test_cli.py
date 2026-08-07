@@ -418,38 +418,35 @@ class ReviewerTests(unittest.TestCase):
         fork = "PalomarArchive/example--fixture"
         commit = "1" * 40
         ref = f"refs/tags/palomar/PALOMAR-2026-08-01-000012-v1/{commit}"
-        creates = 0
+        pushes = 0
 
         def archive_get(endpoint, _context):
             if "/git/ref/" in endpoint:
-                if creates < 2:
+                if pushes < 2:
                     return None
                 return {"object": {"type": "commit", "sha": commit}}
             if "/git/commits/" in endpoint:
+                if pushes < 2:
+                    return None
                 return {"sha": commit}
             raise AssertionError(f"unexpected archive endpoint: {endpoint}")
 
-        def archive_api(endpoint, *, method="GET", body=None, check=True):
-            nonlocal creates
-            self.assertEqual(endpoint, f"repos/{fork}/git/refs")
-            self.assertEqual(method, "POST")
-            self.assertEqual(body, {"ref": ref, "sha": commit})
-            self.assertFalse(check)
-            creates += 1
-            if creates == 1:
-                return subprocess.CompletedProcess(
-                    ["gh", "api"], 1, "", "gh: Not Found (HTTP 404)"
-                )
-            return subprocess.CompletedProcess(["gh", "api"], 0, "{}", "")
+        def push_archive_ref(source, pushed_commit, pushed_fork, pushed_ref):
+            nonlocal pushes
+            self.assertEqual((source, pushed_commit), ("example/project", commit))
+            self.assertEqual((pushed_fork, pushed_ref), (fork, ref))
+            pushes += 1
+            if pushes == 1:
+                raise ReviewerError("remote: Repository not found")
 
         with (
             mock.patch.object(cli, "_archive_get", side_effect=archive_get),
-            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(cli, "_push_archive_ref", side_effect=push_archive_ref),
             mock.patch.object(cli.time, "sleep") as sleep,
         ):
             cli._ensure_archive_ref("example/project", commit, fork, ref)
 
-        self.assertEqual(creates, 2)
+        self.assertEqual(pushes, 2)
         sleep.assert_called_once_with(cli.ARCHIVE_RETRY_SECONDS)
 
     def test_registration_attempt_reserves_and_reuses_one_identity(self):
