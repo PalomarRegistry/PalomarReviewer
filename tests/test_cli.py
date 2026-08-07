@@ -45,6 +45,7 @@ from palomar_reviewer.cli import (
     review_digest,
     reviewer_model,
     step_schema_for_rubric,
+    validate_declaration_coverage,
     validate_mechanical_artifact,
     validate_render_result,
     validate_rubric,
@@ -733,6 +734,7 @@ class ReviewerTests(unittest.TestCase):
             "scores": all_scores,
             "trust_level": "high" if step == "definition_fidelity" else None,
             "sources_checked": ["fixture"],
+            "declarations_checked": ["Example.result"],
         }
 
     def review_policy_fixture(self):
@@ -750,7 +752,7 @@ class ReviewerTests(unittest.TestCase):
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
         ]
         rubric = {
-            "schema_version": 6,
+            "schema_version": 7,
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
@@ -763,21 +765,32 @@ class ReviewerTests(unittest.TestCase):
                 },
                 {
                     "id": "statement_alignment",
+                    "requires_declaration_coverage": True,
                     "required": True,
                     "score_keys": ["statement_alignment"],
                 },
                 {
                     "id": "definition_fidelity",
+                    "requires_declaration_coverage": True,
                     "required": True,
                     "score_keys": ["definition_fidelity", "auditability"],
                 },
                 {
                     "id": "literature_notability",
+                    "requires_declaration_coverage": True,
                     "required": True,
                     "score_keys": ["notability", "literature"],
                 },
             ]
-            + [{"id": "synthesis", "required": True}],
+            + [
+                {
+                    "id": "proof_account",
+                    "requires_declaration_coverage": True,
+                    "required": False,
+                    "score_keys": ["proof_alignment"],
+                },
+                {"id": "synthesis", "required": True},
+            ],
         }
         synthesis = {
             "decision": "accept",
@@ -794,6 +807,46 @@ class ReviewerTests(unittest.TestCase):
     def test_json_fence_fallback(self):
         value = parse_engine_json('result\n```json\n{"step":"metadata"}\n```')
         self.assertEqual(value["step"], "metadata")
+
+    def test_substantive_pass_requires_every_comparator_declaration_in_order(self):
+        step = {
+            "id": "statement_alignment",
+            "score_keys": ["statement_alignment"],
+            "requires_declaration_coverage": True,
+        }
+        mechanical = self.mechanical_fixture()
+        mechanical["comparator"]["theorem_names"] = ["Example.first", "Example.second"]
+        mechanical["comparator"]["definition_names"] = ["Example.input"]
+        result = self.step_result("statement_alignment", {"statement_alignment": 4})
+        result["declarations_checked"] = ["Example.first", "Example.second", "Example.input"]
+        jsonschema.validate(result, step_schema_for_rubric(step, 7))
+        validate_declaration_coverage(result, step, mechanical)
+
+        result["declarations_checked"] = ["Example.first", "Example.input"]
+        with self.assertRaisesRegex(ReviewerError, "exactly match every Comparator-selected"):
+            validate_declaration_coverage(result, step, mechanical)
+
+    def test_synthesis_cannot_drop_material_findings(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        passes[1]["findings"] = [
+            {"severity": "warning", "evidence": "Example.result", "message": "Fix result A."},
+            {"severity": "error", "evidence": "Example.result", "message": "Fix result B."},
+        ]
+        synthesis["warnings"] = ["Fix result A."]
+        with self.assertRaisesRegex(ReviewerError, "every material pass finding"):
+            validate_synthesis_policy(
+                synthesis,
+                passes=passes,
+                rubric=rubric,
+                mechanical={"status": "pass"},
+            )
+        synthesis["warnings"] = ["Fix result A.", "Fix result B."]
+        validate_synthesis_policy(
+            synthesis,
+            passes=passes,
+            rubric=rubric,
+            mechanical={"status": "pass"},
+        )
 
     def test_authors(self):
         data = {"project": {"authors": ["Ada", {"name": "Emmy", "github": "@emmy"}]}}
@@ -1873,9 +1926,9 @@ class ReviewerTests(unittest.TestCase):
         rubric["schema_version"] = 3
         self.assertEqual(validate_rubric(rubric), 3)
 
-    def test_version_six_rubric_requires_current_verdicts(self):
+    def test_version_seven_rubric_requires_current_verdicts(self):
         _, _, rubric = self.review_policy_fixture()
-        self.assertEqual(validate_rubric(rubric), 6)
+        self.assertEqual(validate_rubric(rubric), 7)
         rubric["step_result"]["verdicts"] = ["pass", "warn", "unknown"]
         with self.assertRaisesRegex(ReviewerError, "supported pass verdicts"):
             validate_rubric(rubric)
@@ -2037,6 +2090,10 @@ class ReviewerTests(unittest.TestCase):
             mechanical = {
                 "status": "pass",
                 "source": {"repository": "example/repo", "commit": "1" * 40},
+                "comparator": {
+                    "theorem_names": ["Example.result"],
+                    "definition_names": [],
+                },
             }
             report = {
                 **synthesis,
@@ -2328,6 +2385,7 @@ class PublicationIdentityTests(unittest.TestCase):
             "version": version,
             "accepted_at": "2026-08-01",
             "source": {"repository": "example/project"},
+            "formalization": {"comparator_config_path": "comparator.json"},
             "submission": {"submission_id": submission},
         }
 
@@ -2337,7 +2395,10 @@ class PublicationIdentityTests(unittest.TestCase):
             submission_id=submission,
             existing_id=existing_id,
             reviewed_at="2026-08-01T12:00:00Z",
-            mechanical={"source": {"repository": "example/project"}},
+            mechanical={
+                "source": {"repository": "example/project"},
+                "comparator": {"path": "comparator.json"},
+            },
         )
 
     def test_a_new_submission_gets_a_random_dated_identifier(self):
@@ -2408,6 +2469,22 @@ class PublicationIdentityTests(unittest.TestCase):
                 self.database(prior),
                 submission="b2c3d4e5f6a1",
                 existing_id="PALOMAR-2026-08-01-000012",
+            )
+
+    def test_an_update_from_another_comparator_configuration_is_refused(self):
+        """Distinct Comparator paths in one project are distinct Palomar entries."""
+        prior = self.prior()
+        prior["formalization"]["comparator_config_path"] = "ComparatorChallenges/first.json"
+        with self.assertRaisesRegex(ReviewerError, "uses Comparator configuration"):
+            registration_identity(
+                self.database(prior),
+                submission_id="b2c3d4e5f6a1",
+                existing_id="PALOMAR-2026-08-01-000012",
+                reviewed_at="2026-08-01T12:00:00Z",
+                mechanical={
+                    "source": {"repository": "example/project"},
+                    "comparator": {"path": "ComparatorChallenges/second.json"},
+                },
             )
 
     def test_a_submission_cannot_be_moved_onto_a_second_identifier(self):

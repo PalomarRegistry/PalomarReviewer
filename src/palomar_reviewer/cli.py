@@ -53,7 +53,7 @@ SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
 MAX_CONTEXT_BYTES = 300_000
 _ENGINE_CREDENTIAL_DIR: Path | None = None
-CURRENT_RUBRIC_VERSION = 6
+CURRENT_RUBRIC_VERSION = 7
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_DECISIONS = ("accept", "revise", "reject")
 
@@ -108,6 +108,7 @@ STEP_SCHEMA = {
         "scores",
         "trust_level",
         "sources_checked",
+        "declarations_checked",
     ],
     "properties": {
         "step": {"type": "string"},
@@ -135,6 +136,10 @@ STEP_SCHEMA = {
         },
         "trust_level": {"enum": ["high", "qualified", None]},
         "sources_checked": {"type": "array", "items": {"type": "string"}},
+        "declarations_checked": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
     },
 }
 SYNTHESIS_SCORE_KEYS = (
@@ -624,7 +629,7 @@ def review_digest(report: dict[str, Any]) -> str:
 
 def validate_rubric(rubric: dict[str, Any]) -> int:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5, 6}:
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5, 6, 7}:
         raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -654,6 +659,22 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
     if version >= 6 and rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
         raise ReviewerError("rubric v6 must declare exactly the supported pass verdicts")
+    if version >= 7:
+        coverage_steps = {
+            step.get("id")
+            for step in steps
+            if step.get("requires_declaration_coverage") is True
+        }
+        required_coverage = {
+            "statement_alignment",
+            "definition_fidelity",
+            "literature_notability",
+            "proof_account",
+        }
+        if coverage_steps != required_coverage:
+            raise ReviewerError(
+                "rubric v7 must require declaration coverage for every substantive pass"
+            )
     allowed_step_scores = set(STEP_SCORE_KEYS)
     if version < 4:
         allowed_step_scores.remove("classification")
@@ -725,7 +746,28 @@ def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[st
         score_properties[key] = (
             {"type": "integer", "minimum": 1, "maximum": 5} if key in owned else {"type": "null"}
         )
+    if rubric_version >= 7 and step.get("requires_declaration_coverage"):
+        schema["properties"]["declarations_checked"]["minItems"] = 1
+        schema["properties"]["findings"].pop("minItems", None)
     return schema
+
+
+def validate_declaration_coverage(
+    result: dict[str, Any], step: dict[str, Any], mechanical: dict[str, Any]
+) -> None:
+    """Require an explicit, complete audit manifest for substantive passes."""
+    if not step.get("requires_declaration_coverage"):
+        return
+    expected = [
+        *mechanical["comparator"].get("theorem_names", []),
+        *mechanical["comparator"].get("definition_names", []),
+    ]
+    actual = result.get("declarations_checked")
+    if actual != expected:
+        raise ReviewerError(
+            f"{step['id']} declaration coverage must exactly match every Comparator-selected "
+            "theorem and definition, in configuration order"
+        )
 
 
 def utc_now() -> str:
@@ -2452,7 +2494,8 @@ def render_prompt(
                     f"This pass assesses only these score keys: {owned}. The enforced output "
                     "schema includes every score key; set every score not owned by this pass "
                     "to null. Always include trust_level and sources_checked, using null or an "
-                    "empty list when they do not apply."
+                    "empty list when they do not apply. Always include declarations_checked; "
+                    "use an empty list unless this pass requires declaration coverage."
                 ),
             ]
         )
@@ -3011,6 +3054,7 @@ def validate_stored_review(
         if step_id not in steps or step_id in seen:
             raise ReviewerError(f"stored review has an unknown or duplicate pass: {step_id!r}")
         jsonschema.validate(result, step_schema_for_rubric(steps[step_id], rubric_version))
+        validate_declaration_coverage(result, steps[step_id], mechanical)
         seen.add(step_id)
     if rubric_version >= 2:
         synthesis = {
@@ -3054,6 +3098,18 @@ def validate_synthesis_policy(
     evidence_scores = pass_scores(passes, rubric)
     if synthesis["scores"] != evidence_scores:
         raise ReviewerError("synthesis scores must reproduce the evidence-pass scores without inflating them")
+
+    if rubric.get("schema_version", 1) >= 7:
+        material_comments = [
+            finding["message"]
+            for result in passes
+            for finding in result["findings"]
+            if finding["severity"] in {"warning", "error"}
+        ]
+        if synthesis["warnings"] != material_comments:
+            raise ReviewerError(
+                "synthesis warnings must reproduce every material pass finding in pass order"
+            )
 
     minimum = rubric.get("minimum_accept_score")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
@@ -3198,6 +3254,7 @@ def run_review(args: argparse.Namespace) -> int:
         else:
             if result["step"] != step["id"]:
                 raise ReviewerError(f"engine returned step {result['step']!r}, expected {step['id']!r}")
+            validate_declaration_coverage(result, step, mechanical)
             passes.append(result)
             write_json(work / "passes" / f"{step['id']}.json", result)
     if synthesis is None:
@@ -3598,7 +3655,7 @@ def registration_identity(
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
 
     by_submission: set[str] = set()
-    by_id: dict[str, list[tuple[int, str, str, str]]] = {}
+    by_id: dict[str, list[tuple[int, str, str, str, str, str]]] = {}
     for path in (database / "entries").glob("*.json"):
         prior = load_json(path)
         identifier = str(prior.get("id", ""))
@@ -3607,15 +3664,29 @@ def registration_identity(
         prior_source = prior.get("source", {})
         repository = prior_source.get("repository")
         project_path = prior_source.get("project_path") or ""
+        comparator_config_path = prior.get("formalization", {}).get(
+            "comparator_config_path"
+        )
         prior_submission = prior.get("submission", {}).get("submission_id")
         if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
             raise ReviewerError(f"database entry has invalid registration identity: {path.name}")
         if not isinstance(prior_submission, str):
             raise ReviewerError(f"database entry names no submission: {path.name}")
-        if not isinstance(accepted_at, str) or not isinstance(repository, str):
+        if (
+            not isinstance(accepted_at, str)
+            or not isinstance(repository, str)
+            or not isinstance(comparator_config_path, str)
+        ):
             raise ReviewerError(f"database entry has incomplete registration identity: {path.name}")
         by_id.setdefault(identifier, []).append(
-            (version, prior_submission, accepted_at, repository, project_path)
+            (
+                version,
+                prior_submission,
+                accepted_at,
+                repository,
+                project_path,
+                comparator_config_path,
+            )
         )
         if prior_submission == submission_id:
             by_submission.add(identifier)
@@ -3640,6 +3711,12 @@ def registration_identity(
             raise ReviewerError(
                 f"update to {identifier} comes from project {submitted_project or 'the repository root'}, "
                 f"not {current[4] or 'the repository root'}"
+            )
+        submitted_config = mechanical["comparator"]["path"]
+        if current[5] != submitted_config:
+            raise ReviewerError(
+                f"update to {identifier} uses Comparator configuration {submitted_config}, "
+                f"not {current[5]}"
             )
         resolved = (identifier, current[2], current[0] + 1)
         if reserved is not None and reserved != resolved:
