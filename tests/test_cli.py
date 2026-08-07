@@ -3234,9 +3234,16 @@ class AutomaticLoopTests(unittest.TestCase):
                         at[0] += 1.0
                         return corpus.get(name)
 
+                    index = {
+                        "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+                        "rebuilt_at": "2026-08-07T00:00:00Z",
+                        "rebuild_after": "2099-01-01T00:00:00Z",
+                        "open": list(by_id),
+                        "_blob_sha": "sha",
+                    }
                     with (
-                        mock.patch.object(cli, "state_directory_names",
-                                          return_value=list(by_id)),
+                        mock.patch.object(cli, "open_index", return_value=index),
+                        mock.patch.object(cli, "_write_open_index"),
                         mock.patch.object(cli, "submission_state", side_effect=read),
                         mock.patch.object(cli.time, "monotonic", lambda at=clock: at[0]),
                         mock.patch.object(cli, "begin_review") as began,
