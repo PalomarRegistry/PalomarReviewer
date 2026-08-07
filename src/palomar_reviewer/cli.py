@@ -61,6 +61,10 @@ REGISTRATION_STALE_SECONDS = 6 * 3600
 PASS_BUDGET_SECONDS = 5400
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid,statusCheckRollup"
+# Reading the check rollup needs a permission that reading the merge state does
+# not, and a credential without it fails the whole query rather than omitting
+# the field. These are the fields any credential can see.
+DATABASE_PR_FIELDS_BASIC = "state,mergeStateStatus,headRefOid"
 MAX_RENDER_FILES = 2_000
 MAX_RENDER_NODES = 4_000
 MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
@@ -4342,6 +4346,8 @@ def _checks_passed(view: dict[str, Any]) -> bool:
     alone would register a record whose validation had not started. An empty or
     unreadable rollup is therefore treated as pending, not as success.
     """
+    if view.get("checksUnreadable"):
+        return False
     rollup = view.get("statusCheckRollup")
     if not isinstance(rollup, list) or not rollup:
         return False
@@ -4350,9 +4356,28 @@ def _checks_passed(view: dict[str, Any]) -> bool:
 
 
 def view_database_pr(pr: int) -> dict[str, Any]:
-    return json.loads(
-        gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS])
-    )
+    """The change's state, with its checks when the credential can see them.
+
+    A credential that cannot read the rollup fails the whole query, so falling
+    back keeps a missing permission from stalling every other arm of the pass.
+    The view is marked instead, and a view whose checks were never seen refuses
+    the merge rather than guessing at them.
+    """
+    try:
+        return json.loads(
+            gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS])
+        )
+    except ReviewerError as error:
+        view = json.loads(
+            gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS_BASIC])
+        )
+        view["checksUnreadable"] = True
+        print(
+            f"::error::cannot read the checks on database PR #{pr}: {str(error)[:200]} -- the "
+            f"reviewer credential needs Checks: read on {DATABASE_REPO}. "
+            "Refusing to merge without seeing them."
+        )
+        return view
 
 
 def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
@@ -4371,6 +4396,7 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
         if (
             str(view.get("state") or "").upper() != "OPEN"
             or merge_state == "DIRTY"
+            or view.get("checksUnreadable")  # waiting will not grant a permission
             or _checks_failed(view)
             or (merge_state == "CLEAN" and _checks_passed(view))
         ):
@@ -4411,7 +4437,9 @@ def advance_registration(record: dict[str, Any], wait_seconds: float) -> bool:
     if state == "OPEN":
         merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
         if merge_state != "CLEAN" or not _checks_passed(view):
-            if _checks_failed(view):
+            if view.get("checksUnreadable"):
+                detail = "its checks cannot be read"
+            elif _checks_failed(view):
                 detail = "checks failed"
             elif merge_state == "CLEAN":
                 detail = "checks have not finished"

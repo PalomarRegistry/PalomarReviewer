@@ -3043,6 +3043,44 @@ class DatabaseChangeWaitTests(unittest.TestCase):
             cli.await_database_checks(7, 40)
         self.assertTrue(slept, "a rollup that has not finished is not a verdict")
 
+    def test_checks_that_cannot_be_read_stop_the_wait_and_refuse_the_merge(self):
+        """Reading the rollup needs a permission reading the merge state does
+        not, and the credential without it fails the whole query. Waiting will
+        not grant a permission, and CLEAN alone is not evidence of anything."""
+        basic = json.dumps({"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "c" * 40})
+
+        def fake_gh(args, **kwargs):
+            if "statusCheckRollup" in " ".join(args):
+                raise ReviewerError("gh pr view failed (1): not accessible")
+            return basic
+
+        slept = []
+        with (
+            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            view = cli.await_database_checks(7, 3600)
+        self.assertTrue(view["checksUnreadable"])
+        self.assertEqual(slept, [])
+        self.assertFalse(cli._checks_passed(view), "an unreadable rollup is not a pass")
+
+    def test_a_pass_survives_a_credential_that_cannot_read_checks(self):
+        """A missing permission must not take the other arms down with it."""
+        basic = json.dumps({"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "c" * 40})
+
+        def fake_gh(args, **kwargs):
+            if "statusCheckRollup" in " ".join(args):
+                raise ReviewerError("gh pr view failed (1): not accessible")
+            return basic
+
+        record = {"id": "aaaaaaaaaaaa", "registration_pr": 7}
+        with (
+            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertFalse(cli.advance_registration(record, 0))
+        finalized.assert_not_called()
+
     def test_a_conflict_is_not_waited_for(self):
         slept = []
         with (
