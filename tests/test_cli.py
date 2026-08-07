@@ -314,6 +314,40 @@ class ReviewerTests(unittest.TestCase):
             {"PalomarArchive/upstream--network-root--fixture"},
         )
 
+    def test_preservation_forks_the_canonical_name_after_a_repository_transfer(self):
+        mechanical = self.mechanical_fixture()
+
+        def archive_get(endpoint, _context):
+            if "/git/commits/" in endpoint:
+                return {"sha": endpoint.rsplit("/", 1)[-1]}
+            return {
+                "full_name": "new-owner/project",
+                "source": {"full_name": "new-owner/project"},
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+            mock.patch.object(cli, "validate_archive_token"),
+            mock.patch.object(
+                cli, "_ensure_archive_fork", return_value="PalomarArchive/new-owner--project"
+            ) as ensure_fork,
+            mock.patch.object(cli, "_ensure_archive_ruleset"),
+            mock.patch.object(cli, "_drop_archive_admin"),
+            mock.patch.object(cli, "_ensure_archive_ref") as ensure_ref,
+        ):
+            preservation = preserve_sources(
+                Path(directory),
+                mechanical,
+                permanent_id="PALOMAR-2026-08-01-000012",
+                version=1,
+                dry_run=False,
+            )
+
+        ensure_fork.assert_called_once_with("new-owner/project", "new-owner/project")
+        self.assertEqual(ensure_ref.call_args.args[0], "new-owner/project")
+        self.assertEqual(preservation["repositories"][0]["source_repository"], "example/project")
+
     def test_archive_token_must_belong_to_the_dedicated_machine_user(self):
         def completed(value):
             return subprocess.CompletedProcess(["gh", "api"], 0, json.dumps(value), "")
