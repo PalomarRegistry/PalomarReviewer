@@ -129,7 +129,9 @@ in the same GitHub fork network share one native fork in `PalomarArchive`; each
 accepted commit receives a record-specific
 `refs/tags/palomar/PALOMAR-…-vN/<sha>` ref. If any source, fork, commit, or ref
 cannot be created and read back exactly, registration stops before a database
-branch is published.
+branch is published. GitHub creates forks asynchronously, so the reviewer waits
+for their Git objects and ref-writing endpoint to become ready before treating
+a preservation operation as failed.
 
 The generated record and render bundle are then validated against the database
 schema. It archives the exact mechanical-report
@@ -150,8 +152,12 @@ to the organization's base Write role. The account exists only to make native
 forks and add new preservation refs. Organizations cannot star repositories,
 so registration does not attempt to star accepted sources.
 
-A renderer or infrastructure failure does not undo acceptance: rerun `register`,
-or pass a previously downloaded trusted result with `--render-result PATH`.
+A renderer or infrastructure failure does not undo acceptance. Before making
+any public archive changes, `register` reserves the permanent ID and version in
+the private submission state. A retry reuses that identity and verifies or
+finishes the same archive refs instead of allocating an orphaned second ID.
+Rerun `register`, or pass a previously downloaded trusted result with
+`--render-result PATH`.
 
 Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`, where the serial is drawn
 at random and retried against the identifiers already registered. A sequential

@@ -34,6 +34,7 @@ from palomar_reviewer.cli import (
     parse_engine_json,
     preserve_sources,
     register,
+    registration_attempt_identity,
     registration_entry_path,
     registration_identity,
     registry_record,
@@ -383,6 +384,124 @@ class ReviewerTests(unittest.TestCase):
             f"repos/{fork}/collaborators/PalomarArchivist",
             method="DELETE",
         )
+
+    def test_archive_ref_retries_until_an_asynchronous_fork_is_ready(self):
+        fork = "PalomarArchive/example--fixture"
+        commit = "1" * 40
+        ref = f"refs/tags/palomar/PALOMAR-2026-08-01-000012-v1/{commit}"
+        creates = 0
+
+        def archive_get(endpoint, _context):
+            if "/git/ref/" in endpoint:
+                if creates < 2:
+                    return None
+                return {"object": {"type": "commit", "sha": commit}}
+            if "/git/commits/" in endpoint:
+                return {"sha": commit}
+            raise AssertionError(f"unexpected archive endpoint: {endpoint}")
+
+        def archive_api(endpoint, *, method="GET", body=None, check=True):
+            nonlocal creates
+            self.assertEqual(endpoint, f"repos/{fork}/git/refs")
+            self.assertEqual(method, "POST")
+            self.assertEqual(body, {"ref": ref, "sha": commit})
+            self.assertFalse(check)
+            creates += 1
+            if creates == 1:
+                return subprocess.CompletedProcess(
+                    ["gh", "api"], 1, "", "gh: Not Found (HTTP 404)"
+                )
+            return subprocess.CompletedProcess(["gh", "api"], 0, "{}", "")
+
+        with (
+            mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(cli.time, "sleep") as sleep,
+        ):
+            cli._ensure_archive_ref("example/project", commit, fork, ref)
+
+        self.assertEqual(creates, 2)
+        sleep.assert_called_once_with(cli.ARCHIVE_RETRY_SECONDS)
+
+    def test_registration_attempt_reserves_and_reuses_one_identity(self):
+        mechanical = self.mechanical_fixture()
+        review = {
+            "submission_id": "a1b2c3d4e5f6",
+            "reviewed_at": "2026-08-01T12:34:56Z",
+        }
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "_blob_sha": "state-blob",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            (database / "entries").mkdir()
+            with (
+                mock.patch.object(
+                    cli,
+                    "allocate_identifier",
+                    return_value="PALOMAR-2026-08-01-123456",
+                ) as allocate,
+                mock.patch.object(cli, "put_state") as write,
+            ):
+                identity = registration_attempt_identity(
+                    database,
+                    state=state,
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
+                )
+
+            self.assertEqual(identity, ("PALOMAR-2026-08-01-123456", "2026-08-01", 1))
+            allocate.assert_called_once()
+            saved = write.call_args.args[1]
+            self.assertEqual(saved["registration_attempt"]["id"], identity[0])
+            self.assertEqual(saved["registration_attempt"]["review_sha256"], review_digest(review))
+            self.assertEqual(write.call_args.kwargs["blob_sha"], "state-blob")
+
+            with (
+                mock.patch.object(cli, "allocate_identifier") as allocate_again,
+                mock.patch.object(cli, "put_state") as write_again,
+            ):
+                retried = registration_attempt_identity(
+                    database,
+                    state={**state, "registration_attempt": saved["registration_attempt"]},
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
+                )
+            self.assertEqual(retried, identity)
+            allocate_again.assert_not_called()
+            write_again.assert_not_called()
+
+    def test_registration_attempt_cannot_be_reused_for_changed_evidence(self):
+        mechanical = self.mechanical_fixture()
+        review = {
+            "submission_id": "a1b2c3d4e5f6",
+            "reviewed_at": "2026-08-01T12:34:56Z",
+        }
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "registration_attempt": {
+                "schema_version": 1,
+                "id": "PALOMAR-2026-08-01-123456",
+                "version": 1,
+                "accepted_at": "2026-08-01",
+                "review_sha256": "0" * 64,
+                "source_repository": mechanical["source"]["repository"],
+                "source_commit": mechanical["source"]["commit"],
+                "existing_id": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ReviewerError, "different accepted evidence"):
+                registration_attempt_identity(
+                    Path(directory),
+                    state=state,
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
+                )
 
     def test_accepted_files_must_lie_inside_the_selected_project(self):
         """A report cannot name files outside the project it says it verified."""
@@ -2710,6 +2829,7 @@ class DeliveredReviewChainTests(unittest.TestCase):
         # A second review must not inherit consent given to the first.
         self.assertIs(updated["registration_consent"], False)
         self.assertIsNone(updated["registration_consent_review_sha256"])
+        self.assertIsNone(updated["registration_attempt"])
         self.assertEqual(written["submissions/a1b2c3d4e5f6/review.json"][0], review)
         self.assertEqual(written["submissions/a1b2c3d4e5f6/state.json"][1], "blob-1")
 
