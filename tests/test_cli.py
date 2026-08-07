@@ -2627,15 +2627,15 @@ class AutomaticLoopTests(unittest.TestCase):
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
                          registration_pr=7)]
         listing, state = self.records(*rows)
-        for rollup in ([], [{"conclusion": "FAILURE"}], [{"conclusion": "SUCCESS"}, {"state": "PENDING"}]):
-            with self.subTest(rollup):
+        for merge_state in (None, "UNKNOWN", "BLOCKED", "UNSTABLE"):
+            with self.subTest(merge_state):
                 calls = []
                 with (
                     listing, state,
                     mock.patch.object(
                         cli, "gh",
                         side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                            {"state": "OPEN", "statusCheckRollup": rollup}),
+                            {"state": "OPEN", "mergeStateStatus": merge_state}),
                     ),
                     mock.patch.object(cli, "finalize") as finalized,
                 ):
@@ -2655,7 +2655,7 @@ class AutomaticLoopTests(unittest.TestCase):
             mock.patch.object(
                 cli, "gh",
                 side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                    {"state": "OPEN", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}),
+                    {"state": "OPEN", "mergeStateStatus": "CLEAN"}),
             ),
             mock.patch.object(cli, "finalize", return_value=0) as finalized,
         ):

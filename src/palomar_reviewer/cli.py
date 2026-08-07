@@ -4163,20 +4163,19 @@ def auto(args: argparse.Namespace) -> int:
         view = json.loads(
             gh([
                 "pr", "view", str(pr), "--repo", DATABASE_REPO,
-                "--json", "state,statusCheckRollup",
+                "--json", "state,mergeStateStatus",
             ])
         )
         if view.get("state") == "OPEN":
             # Merging is the registration event, and no person signs it. The
             # database's own checks are what stand between an accepted review
-            # and the registry, so a change that has not passed them waits.
-            checks = view.get("statusCheckRollup") or []
-            outcomes = {
-                str(check.get("conclusion") or check.get("state") or "").upper()
-                for check in checks
-            }
-            if not checks or outcomes - {"SUCCESS", "SKIPPED", "NEUTRAL"}:
-                print(f"{record['id']}: database PR #{pr} is not green yet ({sorted(outcomes)})")
+            # and the registry. GitHub reports UNSTABLE while any check is
+            # pending or failed and CLEAN only after the complete rollup is
+            # green. Reading each check-run node separately requires a broader
+            # token permission and adds no safety here.
+            merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
+            if merge_state != "CLEAN":
+                print(f"{record['id']}: database PR #{pr} is not green yet ({merge_state})")
                 continue
             print(f"{record['id']}: merging database PR #{pr}")
             gh(["pr", "merge", str(pr), "--repo", DATABASE_REPO, "--squash", "--delete-branch"])

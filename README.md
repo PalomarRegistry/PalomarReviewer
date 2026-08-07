@@ -146,6 +146,11 @@ single tree hash covers everything justifying the record; raw Actions logs are
 deliberately not retained. It pushes a branch to
 `PalomarRegistry/PalomarDatabase` and opens a PR.
 
+The automatic finalizer reads GitHub's aggregate mergeability state and merges
+only when it is `CLEAN`; pending or failed database checks remain `UNSTABLE`.
+This avoids granting the reviewer separate access to individual check-run
+details while preserving the all-green publication gate.
+
 `PalomarArchive` and its `PalomarArchivist` machine account are operator-created
 GitHub resources; the workflow does not sign up an account. Add the account as
 an ordinary organization member and store its credential as
