@@ -150,7 +150,11 @@ creates a repository-level ruleset on each new public fork that permits new
 and then removes the machine account's repository-admin grant so it falls back
 to the organization's base Write role. The account exists only to make native
 forks and add new preservation refs. Organizations cannot star repositories,
-so registration does not attempt to star accepted sources.
+so registration does not attempt to star accepted sources. GitHub redacts a
+ruleset's bypass-actor list after that demotion; the reviewer verifies every
+remaining ruleset field on later registrations, while creation verifies the
+complete rule, including its empty bypass list, before dropping administrator
+access.
 
 A renderer or infrastructure failure does not undo acceptance. Before making
 any public archive changes, `register` reserves the permanent ID and version in
