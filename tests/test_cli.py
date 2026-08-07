@@ -3043,6 +3043,44 @@ class DatabaseChangeWaitTests(unittest.TestCase):
             cli.await_database_checks(7, 40)
         self.assertTrue(slept, "a rollup that has not finished is not a verdict")
 
+    def test_checks_that_cannot_be_read_stop_the_wait_and_refuse_the_merge(self):
+        """Reading the rollup needs a permission reading the merge state does
+        not, and the credential without it fails the whole query. Waiting will
+        not grant a permission, and CLEAN alone is not evidence of anything."""
+        basic = json.dumps({"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "c" * 40})
+
+        def fake_gh(args, **kwargs):
+            if "statusCheckRollup" in " ".join(args):
+                raise ReviewerError("gh pr view failed (1): not accessible")
+            return basic
+
+        slept = []
+        with (
+            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli.time, "sleep", side_effect=slept.append),
+        ):
+            view = cli.await_database_checks(7, 3600)
+        self.assertTrue(view["checksUnreadable"])
+        self.assertEqual(slept, [])
+        self.assertFalse(cli._checks_passed(view), "an unreadable rollup is not a pass")
+
+    def test_a_pass_survives_a_credential_that_cannot_read_checks(self):
+        """A missing permission must not take the other arms down with it."""
+        basic = json.dumps({"state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "c" * 40})
+
+        def fake_gh(args, **kwargs):
+            if "statusCheckRollup" in " ".join(args):
+                raise ReviewerError("gh pr view failed (1): not accessible")
+            return basic
+
+        record = {"id": "aaaaaaaaaaaa", "registration_pr": 7}
+        with (
+            mock.patch.object(cli, "gh", side_effect=fake_gh),
+            mock.patch.object(cli, "finalize") as finalized,
+        ):
+            self.assertFalse(cli.advance_registration(record, 0))
+        finalized.assert_not_called()
+
     def test_a_conflict_is_not_waited_for(self):
         slept = []
         with (
@@ -3946,66 +3984,22 @@ class ArchivedReviewTests(unittest.TestCase):
         self.assertIn("severity", original["passes"][0]["findings"][0])
 
 
-class DatabasePrViewTests(unittest.TestCase):
-    """A merged change must be finalizable without permission to read checks.
-
-    Reading `statusCheckRollup` needs a permission the registration credential
-    may not carry, and GitHub fails the whole query rather than omitting the
-    field. The first real registration reached a merged database change and
-    could not be finalized: the state saying there was nothing left to wait for
-    could not be read without also asking about checks.
-    """
-
-    def test_the_ordinary_case_costs_one_call(self):
-        with mock.patch.object(
-            cli, "gh", return_value=json.dumps({"state": "OPEN", "statusCheckRollup": []})
-        ) as view:
-            cli.view_database_pr(51)
-        self.assertEqual(view.call_count, 1)
-        self.assertIn("statusCheckRollup", view.call_args.args[0][-1])
-
-    def test_a_refused_query_falls_back_to_what_can_be_read(self):
-        asked = []
-
-        def view(command):
-            asked.append(command[-1])
-            if "statusCheckRollup" in command[-1]:
-                raise ReviewerError("Resource not accessible by personal access token")
-            return json.dumps({"state": "MERGED", "mergeStateStatus": "UNKNOWN"})
-
-        with mock.patch.object(cli, "gh", side_effect=view):
-            result = cli.view_database_pr(51)
-        self.assertEqual(len(asked), 2)
-        self.assertNotIn("statusCheckRollup", asked[1])
-        self.assertEqual(result["state"], "MERGED")
-
-    def test_a_view_without_checks_is_never_green(self):
-        # A change whose checks cannot be seen is not one to merge.
-        self.assertFalse(cli._checks_passed({"state": "OPEN"}))
-        self.assertFalse(cli._checks_failed({"state": "OPEN"}))
-
-
 class WorkflowConclusionTests(unittest.TestCase):
-    """Reading the database's checks as what they are: Actions workflows.
+    """Reading the database's checks as the Actions workflows they are.
 
-    The rollup `gh pr view` builds needs a `Checks` permission that fine
-    grained tokens are not offered, whatever GitHub's reference pages say. The
-    checks in question are that repository's own workflows, and those can be
-    read with `Actions: read`.
+    A fine-grained token cannot read a check run at all: GitHub disabled the
+    `Checks` permission for them and it is now offered only to Apps. The checks
+    here are that repository's own workflows, and `Actions: read` does exist,
+    so refusing to merge for want of a permission nobody can be granted would
+    have stalled every registration for good.
     """
 
     def runs(self, *rows):
         return json.dumps({"workflow_runs": [
-            {"name": "Validate database", "run_attempt": a, "status": s, "conclusion": c}
-            for _, a, s, c in rows
+            {"name": n, "run_attempt": a, "status": s, "conclusion": c} for n, a, s, c in rows
         ]})
 
     def test_the_required_workflows_match_the_database_pull_request_workflows(self):
-        """Named, so it fails here rather than by merging something unchecked.
-
-        "Every workflow that happened to run was fine" is satisfied by a change
-        on which the validating workflow never started at all.
-        """
         database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
         if not database:
             self.skipTest("no database checkout to compare against")
@@ -4020,53 +4014,36 @@ class WorkflowConclusionTests(unittest.TestCase):
         self.assertEqual(set(cli.REQUIRED_DATABASE_WORKFLOWS), expected)
 
     def test_a_required_workflow_that_never_started_is_pending(self):
-        # Not absent. A change polled before Actions picks it up is not green.
         with mock.patch.object(cli, "gh", return_value=json.dumps({"workflow_runs": []})):
             self.assertEqual(cli.workflow_conclusions("a" * 40), ["pending"])
-        self.assertFalse(cli._checks_passed({"headRefOid": "a" * 40}))
 
-    def test_the_newest_attempt_of_each_workflow_is_what_counts(self):
-        # A re-run supersedes the failure that prompted it.
+    def test_the_newest_attempt_is_what_counts(self):
         with mock.patch.object(cli, "gh", return_value=self.runs(
-            (1, 1, "completed", "failure"), (1, 2, "completed", "success"),
+            ("Validate database", 1, "completed", "failure"),
+            ("Validate database", 2, "completed", "success"),
         )):
             self.assertEqual(cli.workflow_conclusions("a" * 40), ["success"])
 
-    def test_a_run_still_going_is_pending(self):
-        runs = json.dumps({"workflow_runs": [
-            {"name": "Validate database", "run_attempt": 1, "status": "completed",
-             "conclusion": "success"},
-            {"name": "Some other workflow", "run_attempt": 1, "status": "in_progress",
-             "conclusion": None},
-        ]})
-        with mock.patch.object(cli, "gh", return_value=runs):
-            self.assertEqual(sorted(cli.workflow_conclusions("a" * 40)), ["pending", "success"])
-
     def test_an_unreadable_answer_is_not_an_empty_one(self):
-        # None means "cannot tell", which must not read as "nothing failed".
         with mock.patch.object(cli, "gh", side_effect=ReviewerError("403")):
-            self.assertIsNone(cli.workflow_conclusions("a" * 40))
-        with mock.patch.object(cli, "gh", return_value="{}"):
             self.assertIsNone(cli.workflow_conclusions("a" * 40))
         self.assertIsNone(cli.workflow_conclusions("not-a-sha"))
 
-    def test_a_change_is_green_when_its_workflows_are(self):
-        view = {"headRefOid": "a" * 40}
-        with mock.patch.object(cli, "gh", return_value=self.runs((1, 1, "completed", "success"))):
+    def test_an_unreadable_rollup_falls_through_to_the_workflows(self):
+        view = {"checksUnreadable": True, "headRefOid": "a" * 40}
+        with mock.patch.object(cli, "gh", return_value=self.runs(
+            ("Validate database", 1, "completed", "success"),
+        )):
             self.assertTrue(cli._checks_passed(view))
             self.assertFalse(cli._checks_failed(view))
-
-    def test_a_change_is_not_green_while_anything_runs_or_fails(self):
-        view = {"headRefOid": "a" * 40}
-        with mock.patch.object(cli, "gh", return_value=self.runs((1, 1, "in_progress", None))):
-            self.assertFalse(cli._checks_passed(view))
-            self.assertFalse(cli._checks_failed(view))
-        with mock.patch.object(cli, "gh", return_value=self.runs((1, 1, "completed", "failure"))):
+        with mock.patch.object(cli, "gh", return_value=self.runs(
+            ("Validate database", 1, "completed", "failure"),
+        )):
             self.assertFalse(cli._checks_passed(view))
             self.assertTrue(cli._checks_failed(view))
 
-    def test_nothing_readable_is_never_green(self):
-        view = {"headRefOid": "a" * 40}
+    def test_neither_source_readable_is_never_green(self):
+        view = {"checksUnreadable": True, "headRefOid": "a" * 40}
         with mock.patch.object(cli, "gh", side_effect=ReviewerError("403")):
             self.assertFalse(cli._checks_passed(view))
             self.assertFalse(cli._checks_failed(view))

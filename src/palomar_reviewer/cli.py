@@ -61,6 +61,10 @@ REGISTRATION_STALE_SECONDS = 6 * 3600
 PASS_BUDGET_SECONDS = 5400
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid,statusCheckRollup"
+# Reading the check rollup needs a permission that reading the merge state does
+# not, and a credential without it fails the whole query rather than omitting
+# the field. These are the fields any credential can see.
+DATABASE_PR_FIELDS_BASIC = "state,mergeStateStatus,headRefOid"
 # The database workflows that must have run and passed before a registration is
 # merged. Named rather than inferred: "every workflow that happened to run was
 # fine" is satisfied by a change on which the validating workflow never started.
@@ -4318,18 +4322,19 @@ def _check_outcome(check: dict[str, Any]) -> str:
 def workflow_conclusions(head_sha: str) -> list[str] | None:
     """What the database's own workflows made of a commit, or None if unknown.
 
-    The rollup that `gh pr view` builds needs a `Checks` permission that fine
-    grained tokens are not offered. GitHub's own reference pages say otherwise,
-    which is a documentation bug rather than a way in: the permission catalogue
-    has no such entry, so no fine grained token can read a check run.
+    The rollup `gh pr view` builds cannot be read by a fine-grained token at
+    all. GitHub disabled the `Checks` permission for them and it is now offered
+    only to Apps; the endpoint reference saying otherwise is a documentation
+    bug. See https://github.com/orgs/community/discussions/129512.
 
-    The checks here are this repository's own Actions workflows, and those can
-    be read with `Actions: read`, which fine grained tokens do have. So they are
-    read as what they are.
+    The checks in question are that repository's own Actions workflows, and
+    those can be read with `Actions: read`, which fine-grained tokens do have.
+    So where the rollup is refused, they are read as what they are, and the
+    credential does not have to be widened to a classic token to see them.
 
-    Returns the conclusion of the newest attempt of every workflow that ran on
-    the commit; an empty list where none has started; and None where the answer
-    cannot be had at all, which is not the same as "nothing ran".
+    Returns the conclusion of the newest attempt of each workflow, with a
+    required workflow that has not started counted as pending; or None where
+    the answer cannot be had, which is not the same as nothing having failed.
     """
     if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha or "")):
         return None
@@ -4353,14 +4358,17 @@ def workflow_conclusions(head_sha: str) -> list[str] | None:
         attempt = run.get("run_attempt") or 0
         if key not in newest or attempt >= (newest[key].get("run_attempt") or 0):
             newest[key] = run
-    # A workflow that has not started yet is pending, not absent. Otherwise a
-    # change polled in the seconds before Actions picks it up reads as green.
     for name in REQUIRED_DATABASE_WORKFLOWS - set(newest):
         newest[name] = {"status": "queued"}
     return [
         "pending" if run.get("status") != "completed" else str(run.get("conclusion") or "failure")
         for run in newest.values()
     ]
+
+
+def _unreadable_checks(view: dict[str, Any]) -> bool:
+    """Whether nothing at all can be learned about this change's checks."""
+    return workflow_conclusions(str(view.get("headRefOid") or "")) is None
 
 
 def _checks_failed(view: dict[str, Any]) -> bool:
@@ -4370,14 +4378,16 @@ def _checks_failed(view: dict[str, Any]) -> bool:
     has failed, so a wait that reads only `mergeStateStatus` spends its whole
     budget on a change that was never going to go green.
     """
-    rollup = view.get("statusCheckRollup")
-    if not isinstance(rollup, list) or not rollup:
+    if view.get("checksUnreadable"):
         conclusions = workflow_conclusions(str(view.get("headRefOid") or ""))
         if not conclusions:
             return False
         return "pending" not in conclusions and any(
             outcome not in {"success", "skipped", "neutral"} for outcome in conclusions
         )
+    rollup = view.get("statusCheckRollup")
+    if not isinstance(rollup, list) or not rollup:
+        return False
     outcomes = [_check_outcome(node) for node in rollup if isinstance(node, dict)]
     return "pending" not in outcomes and "failed" in outcomes
 
@@ -4400,40 +4410,38 @@ def _checks_passed(view: dict[str, Any]) -> bool:
     alone would register a record whose validation had not started. An empty or
     unreadable rollup is therefore treated as pending, not as success.
     """
+    if view.get("checksUnreadable"):
+        conclusions = workflow_conclusions(str(view.get("headRefOid") or ""))
+        return bool(conclusions) and set(conclusions) <= {"success", "skipped", "neutral"}
     rollup = view.get("statusCheckRollup")
     if not isinstance(rollup, list) or not rollup:
-        conclusions = workflow_conclusions(str(view.get("headRefOid") or ""))
-        if not conclusions:
-            return False
-        return set(conclusions) <= {"success", "skipped", "neutral"}
+        return False
     outcomes = [_check_outcome(node) for node in rollup if isinstance(node, dict)]
     return bool(outcomes) and set(outcomes) == {"passed"}
 
 
 def view_database_pr(pr: int) -> dict[str, Any]:
-    """The database change, and the checks on it where they can be read.
+    """The change's state, with its checks when the credential can see them.
 
-    Reading `statusCheckRollup` needs a permission the registration credential
-    may not carry, and GitHub answers a request it cannot satisfy by failing
-    the whole query rather than by omitting the field. A merged change was
-    therefore impossible to finalize: the state that would have shown there was
-    nothing left to wait for could not be read without also asking about checks
-    that no longer mattered.
-
-    The full question is asked first, so the ordinary case costs one call. Only
-    when it is refused does this fall back to what can be read. A view with no
-    rollup is treated as not green, which is the safe reading: a change whose
-    checks cannot be seen is not one to merge.
+    A credential that cannot read the rollup fails the whole query, so falling
+    back keeps a missing permission from stalling every other arm of the pass.
+    The view is marked instead, and a view whose checks were never seen refuses
+    the merge rather than guessing at them.
     """
-    fields = ["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json"]
     try:
-        return json.loads(gh([*fields, DATABASE_PR_FIELDS]))
-    except ReviewerError:
-        reduced = ",".join(
-            part for part in DATABASE_PR_FIELDS.split(",") if part != "statusCheckRollup"
+        return json.loads(
+            gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS])
         )
-        view = json.loads(gh([*fields, reduced]))
-        print(f"database PR #{pr}: checks are not readable with this credential")
+    except ReviewerError as error:
+        view = json.loads(
+            gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS_BASIC])
+        )
+        view["checksUnreadable"] = True
+        print(
+            f"::error::cannot read the checks on database PR #{pr}: {str(error)[:200]} -- the "
+            f"reviewer credential needs Checks: read on {DATABASE_REPO}. "
+            "Refusing to merge without seeing them."
+        )
         return view
 
 
@@ -4453,6 +4461,10 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
         if (
             str(view.get("state") or "").upper() != "OPEN"
             or merge_state == "DIRTY"
+            # Neither source can say anything, and waiting will not grant a
+            # permission. Where the workflows can be read, waiting is worth it:
+            # they may simply not have finished.
+            or (view.get("checksUnreadable") and _unreadable_checks(view))
             or _checks_failed(view)
             or (merge_state == "CLEAN" and _checks_passed(view))
         ):
@@ -4493,7 +4505,11 @@ def advance_registration(record: dict[str, Any], wait_seconds: float) -> bool:
     if state == "OPEN":
         merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
         if merge_state != "CLEAN" or not _checks_passed(view):
-            if _checks_failed(view):
+            if view.get("checksUnreadable") and not workflow_conclusions(
+                str(view.get("headRefOid") or "")
+            ):
+                detail = "its checks cannot be read"
+            elif _checks_failed(view):
                 detail = "checks failed"
             elif merge_state == "CLEAN":
                 detail = "checks have not finished"
