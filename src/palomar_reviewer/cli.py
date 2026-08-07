@@ -1185,34 +1185,44 @@ def preserve_sources(
             )
     else:
         validate_archive_token()
-        resolved: list[tuple[str, str, str]] = []
+        resolved: list[tuple[str, str, str, str]] = []
         for repository, commit in sources:
             metadata = _archive_get(f"repos/{repository}", f"resolving source repository {repository}")
             if metadata is None:
                 raise ReviewerError(f"source repository disappeared before preservation: {repository}")
+            canonical_repository = metadata.get("full_name")
+            if not isinstance(canonical_repository, str) or not re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", canonical_repository
+            ):
+                raise ReviewerError(f"GitHub returned no canonical name for source repository {repository}")
             if _archive_get(
                 f"repos/{repository}/git/commits/{commit}",
                 f"checking source commit {repository}@{commit}",
             ) is None:
                 raise ReviewerError(f"source commit disappeared before preservation: {repository}@{commit}")
-            resolved.append((repository, commit, _network_root(metadata)))
+            resolved.append((repository, commit, canonical_repository, _network_root(metadata)))
 
-        groups: dict[str, list[tuple[str, str]]] = {}
+        groups: dict[str, list[tuple[str, str, str]]] = {}
         roots: dict[str, str] = {}
-        for repository, commit, root in resolved:
+        for repository, commit, canonical_repository, root in resolved:
             key = root.casefold()
             roots.setdefault(key, root)
-            groups.setdefault(key, []).append((repository, commit))
+            groups.setdefault(key, []).append((repository, commit, canonical_repository))
 
         def preserve_group(key: str) -> list[dict[str, str]]:
             items = sorted(groups[key], key=lambda item: (item[0].casefold(), item[1]))
-            fork = _ensure_archive_fork(items[0][0], roots[key])
+            # Repository endpoints redirect after a transfer or rename. GitHub
+            # follows that redirect for reads, but does not follow a POST to
+            # the old `/forks` endpoint. Fork the canonical name returned by
+            # the metadata read while retaining the submitted name in the
+            # public preservation receipt.
+            fork = _ensure_archive_fork(items[0][2], roots[key])
             _ensure_archive_ruleset(fork)
             _drop_archive_admin(fork)
             result = []
-            for repository, commit in items:
+            for repository, commit, canonical_repository in items:
                 ref = ref_for(commit)
-                _ensure_archive_ref(repository, commit, fork, ref)
+                _ensure_archive_ref(canonical_repository, commit, fork, ref)
                 result.append(
                     {
                         "source_repository": repository,

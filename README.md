@@ -133,7 +133,10 @@ branch is published. GitHub creates forks asynchronously, so the reviewer waits
 for their Git objects and ref-writing endpoint to become ready before treating
 a preservation operation as failed. Preservation refs are written with an
 authenticated Git push, which also transfers a commit that GitHub has not yet
-copied into the new fork.
+copied into the new fork. If a source repository has been renamed or
+transferred since verification, the reviewer uses GitHub's returned canonical
+name for archive operations while retaining the submitted location in the
+preservation receipt.
 
 The generated record and render bundle are then validated against the database
 schema. It archives the exact mechanical-report
