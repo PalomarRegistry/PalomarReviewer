@@ -72,7 +72,21 @@ OPEN_INDEX_SCHEMA_VERSION = 1
 # The index is derivable, so it is rebuilt on a clock as well as on damage: a
 # record edited by hand, or an index write the server lost, is picked up within
 # this rather than never. Deleting index/open.json forces one immediately.
-OPEN_INDEX_REBUILD_SECONDS = 6 * 3600
+#
+# Weekly, not six-hourly. A rebuild is the one thing here that costs the size
+# of the whole registry: it clones the state repository and reads every record,
+# which at a hundred thousand submissions is hundreds of megabytes. Six-hourly
+# against a two-hourly pass meant paying that several times a day to catch two
+# anomalies that are already unlikely, since the server records an admission
+# under a compare-and-swap and a pass drops an entry only after reading the
+# record that says it is finished.
+#
+# This is the shape used everywhere else in the registry: per-event work
+# proportional to what changed, with an infrequent full sweep where integrity
+# needs one. `palomar-review rebuild-queue` is that sweep, and it runs on its
+# own schedule rather than falling out of whichever pass happens to cross the
+# window.
+OPEN_INDEX_REBUILD_SECONDS = 7 * 24 * 3600
 # Statuses the reviewer will never act on again. A registered submission is
 # absent because it is not finished at that point: the accepted source is
 # starred afterwards, as a separate step that may fail and be retried.
@@ -2362,6 +2376,26 @@ def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> None:
         )
     except ReviewerError as error:
         print(f"::warning::could not record the open-submission index: {error}")
+
+
+def rebuild_queue(_: argparse.Namespace) -> int:
+    """Derive the open set from every record, whatever the index currently says.
+
+    The sweep. A rebuild is the one thing the reviewer does that costs the size
+    of the whole registry, so it happens here on its own schedule rather than
+    falling out of whichever pass happens to cross the staleness window. That
+    is the same division the rest of the registry uses: per-event work
+    proportional to what changed, and an infrequent full sweep where integrity
+    needs one.
+
+    It catches the two things an incrementally maintained index cannot: a
+    record somebody edited by hand, and an admission the server failed to
+    record. Both are unlikely and neither is urgent, which is why a week is
+    long enough and six hours was several clones a day for nothing.
+    """
+    index = rebuild_open_index()
+    print(f"the queue holds {len(index['open'])} open submission(s)")
+    return 0
 
 
 def open_submissions() -> list[dict[str, Any]]:
@@ -5154,6 +5188,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     star_parser.add_argument("--dry-run", action="store_true")
     star_parser.set_defaults(func=star_registered_sources)
+    rebuild_parser = commands.add_parser(
+        "rebuild-queue",
+        help="derive the open-submission index from every record and record it",
+    )
+    rebuild_parser.set_defaults(func=rebuild_queue)
     return parser
 
 

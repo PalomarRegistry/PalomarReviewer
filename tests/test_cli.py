@@ -4554,3 +4554,51 @@ class OpenIndexFailureTests(unittest.TestCase):
         self.assertEqual(len(records), 1, "the readable one came through")
         for entry in written:
             self.assertIn("aaaaaaaaaaaa", entry["open"], "an unreadable submission was dropped")
+
+
+class QueueSweepTests(unittest.TestCase):
+    """A rebuild costs the size of the whole registry, so it is a sweep.
+
+    It used to fall out of whichever pass happened to cross a six-hour window,
+    against a two-hourly pass: several clones of the state repository a day, to
+    catch two anomalies that are already unlikely. The registry does this the
+    other way everywhere else, with per-event work proportional to what changed
+    and an infrequent full sweep where integrity needs one.
+    """
+
+    def test_a_pass_does_not_rebuild_a_fresh_index(self):
+        fresh = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-07T00:00:00Z",
+            "rebuild_after": "2099-01-01T00:00:00Z",
+            "open": ["aaaaaaaaaaaa"],
+            "_blob_sha": "sha",
+        }
+        with (
+            mock.patch.object(cli, "state_json", return_value=fresh),
+            mock.patch.object(cli, "rebuild_open_index") as rebuilt,
+        ):
+            self.assertEqual(cli.open_index()["open"], ["aaaaaaaaaaaa"])
+        rebuilt.assert_not_called()
+
+    def test_the_sweep_derives_the_set_even_when_the_index_looks_fresh(self):
+        """Otherwise the sweep is a no-op exactly when nothing has gone wrong,
+        which is when it is meant to be checking."""
+        fresh = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-07T00:00:00Z",
+            "rebuild_after": "2099-01-01T00:00:00Z",
+            "open": ["aaaaaaaaaaaa"],
+            "_blob_sha": "sha",
+        }
+        derived = {**fresh, "open": ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]}
+        with (
+            mock.patch.object(cli, "state_json", return_value=fresh),
+            mock.patch.object(cli, "rebuild_open_index", return_value=derived) as rebuilt,
+        ):
+            self.assertEqual(cli.rebuild_queue(SimpleNamespace()), 0)
+        rebuilt.assert_called_once()
+
+    def test_the_window_is_long_enough_to_be_a_sweep(self):
+        """Six hours against a two-hourly pass was several clones a day."""
+        self.assertGreaterEqual(cli.OPEN_INDEX_REBUILD_SECONDS, 24 * 3600)
