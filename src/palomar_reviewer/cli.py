@@ -59,6 +59,24 @@ REGISTRATIONS_PER_PASS = 1
 REGISTRATION_WAIT_SECONDS = 1800
 REGISTRATION_STALE_SECONDS = 6 * 3600
 PASS_BUDGET_SECONDS = 5400
+# The queue, kept as an index rather than rediscovered from scratch.
+#
+# A pass used to list every directory under `submissions/` and read every record
+# in it, which is one API call per submission per pass however few of them have
+# anything outstanding, and which stops working altogether at the thousand names
+# the contents API will list. This holds only the submissions the reviewer is
+# not yet finished with: the submission server adds an id when it admits one,
+# and a pass drops one when the record says there is nothing left to do to it.
+OPEN_INDEX_PATH = "index/open.json"
+OPEN_INDEX_SCHEMA_VERSION = 1
+# The index is derivable, so it is rebuilt on a clock as well as on damage: a
+# record edited by hand, or an index write the server lost, is picked up within
+# this rather than never. Deleting index/open.json forces one immediately.
+OPEN_INDEX_REBUILD_SECONDS = 6 * 3600
+# Statuses the reviewer will never act on again. A registered submission is
+# absent because it is not finished at that point: the accepted source is
+# starred afterwards, as a separate step that may fail and be retried.
+FINISHED_STATUSES = frozenset({"verification-failed", "review-failed", "withdrawn"})
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
 DATABASE_VALIDATE_WORKFLOW = "validate.yml"
@@ -1026,15 +1044,11 @@ def star_registered_sources(args: argparse.Namespace) -> int:
     The PUT itself is idempotent. State is marked only after a GET verifies the
     star, so an API or state-write failure is safe to retry on the next pass.
     """
-    pending = []
-    for submission_id in state_directory_names():
-        state = submission_state(submission_id)
-        if (
-            state is not None
-            and state.get("registered_entry")
-            and not isinstance(state.get("source_star"), dict)
-        ):
-            pending.append(state)
+    pending = [
+        state
+        for state in open_submissions()
+        if state.get("registered_entry") and not isinstance(state.get("source_star"), dict)
+    ]
     if not pending:
         print("All registered source repositories are starred.")
         return 0
@@ -2214,56 +2228,185 @@ def deliver_review(
     )
 
 
-# The contents API answers at most this many names for one directory, and says
-# to use the git trees API past it.
-CONTENTS_DIRECTORY_LIMIT = 1_000
+def finished_with(record: dict[str, Any]) -> bool:
+    """Whether the reviewer will never act on this submission again.
 
+    A registration is not the end of one. The accepted source is starred
+    afterwards, by a separate step with its own credential that may fail and be
+    retried, so a registered record is finished only once that star is recorded.
 
-def state_directory_names() -> list[str]:
-    """Every submission directory in the private state repository.
-
-    A failure here used to read as "there are no submissions", which is exactly
-    what a healthy empty registry looks like: the pass printed "Nothing to do."
-    and exited zero. So an expired token, a rate limit or a listing too long to
-    return would stop the reviewer reviewing anything at all, with a green job
-    and nothing to look at. An unreadable queue is not an empty queue.
-
-    A listing of exactly the API's limit cannot be told apart from one that was
-    cut off at it, so both are refused rather than silently reviewing a prefix
-    of the queue for ever.
+    A review that has been given up on needs a person. Somebody who revives one
+    by hand waits for the next rebuild, or deletes the index to have it sooner.
     """
-    listing = run(
-        ["gh", "api", f"repos/{STATE_REPO}/contents/submissions", "--jq", ".[].name"],
-        check=False,
-    )
-    if listing.returncode:
-        detail = (listing.stderr or listing.stdout or "").strip()[:400]
-        raise ReviewerError(f"could not list the submissions in {STATE_REPO}: {detail}")
-    names = listing.stdout.split()
-    if len(names) >= CONTENTS_DIRECTORY_LIMIT:
-        raise ReviewerError(
-            f"{STATE_REPO} lists {len(names)} submissions, at or past the "
-            f"{CONTENTS_DIRECTORY_LIMIT} the contents API will return; the queue cannot be "
-            "enumerated this way any more and needs the git trees API"
+    if record.get("status") in FINISHED_STATUSES:
+        return True
+    if record.get("registered_entry"):
+        return isinstance(record.get("source_star"), dict)
+    return False
+
+
+def _usable_open_index(index: dict[str, Any] | None) -> bool:
+    """Whether an index can be trusted to name every submission with work left.
+
+    Anything unrecognised is refused rather than read optimistically: an index
+    that is quietly wrong is a reviewer that quietly reviews nothing, and the
+    cost of being wrong here is one rebuild.
+    """
+    if not isinstance(index, dict) or index.get("schema_version") != OPEN_INDEX_SCHEMA_VERSION:
+        return False
+    ids = index.get("open")
+    if not isinstance(ids, list) or not all(
+        isinstance(name, str) and SUBMISSION_ID_RE.fullmatch(name) for name in ids
+    ):
+        return False
+    # An unreadable or absent instant counts as passed, so an index that does
+    # not say when it next needs rebuilding is rebuilt now.
+    return not _before_now(index.get("rebuild_after"))
+
+
+def open_index() -> dict[str, Any]:
+    """The ids of every submission the reviewer may still have work for.
+
+    Falls back to a rebuild whenever the index cannot be trusted, because the
+    failure this is guarding against is not an exception: it is a pass that
+    enumerates nothing, reports "Nothing to do.", and exits zero while the queue
+    fills up behind it. An unreadable queue is not an empty queue.
+    """
+    try:
+        index = state_json(OPEN_INDEX_PATH)
+    except ValueError:
+        index = None  # not JSON at all; the rebuild replaces it wholesale
+    if _usable_open_index(index):
+        return index
+    return rebuild_open_index()
+
+
+def rebuild_open_index() -> dict[str, Any]:
+    """Derive the open set from every record there is, and record it.
+
+    This is the only thing the reviewer does that costs the size of the whole
+    registry, which is why it happens when the index cannot be trusted and on a
+    slow clock, rather than every pass.
+
+    It reads a checkout rather than the API. The contents API answers at most a
+    thousand names for one directory, and the git trees API that replaces it
+    truncates a large answer and would do so well before a hundred thousand
+    submissions; a clone cannot half-answer, and it is one request rather than
+    one per submission.
+    """
+    ids: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="palomar-state-") as work:
+        checkout = Path(work) / "state"
+        run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "clone",
+                "--depth=1",
+                "--quiet",
+                f"https://github.com/{STATE_REPO}.git",
+                str(checkout),
+            ],
+            env=registry_git_environment(),
         )
-    return names
+        for directory in sorted((checkout / "submissions").glob("*")):
+            if not SUBMISSION_ID_RE.fullmatch(directory.name):
+                continue
+            try:
+                record = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # A record that cannot be read here is not a record that is
+                # finished with. Keeping it means the pass reads it through the
+                # API and says out loud what is wrong with it.
+                ids.append(directory.name)
+                continue
+            if not finished_with(record):
+                ids.append(directory.name)
+    index = {
+        "schema_version": OPEN_INDEX_SCHEMA_VERSION,
+        "rebuilt_at": utc_now(),
+        "rebuild_after": utc_after(OPEN_INDEX_REBUILD_SECONDS),
+        "open": ids,
+    }
+    print(f"rebuilt the open-submission index: {len(ids)} open")
+    _write_open_index(index, blob_sha=_state_blob_sha(OPEN_INDEX_PATH))
+    return index
+
+
+def _state_blob_sha(path: str) -> str | None:
+    """The sha a write must be conditional on, for a file too damaged to parse."""
+    raw = run(
+        ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".sha"], check=False
+    )
+    return raw.stdout.strip() or None
+
+
+def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> None:
+    """Record the index, treating every refusal as something to try again later.
+
+    The index is a cache of what the records already say, so nothing is lost by
+    failing to write it and nothing is gained by stopping a pass over it. A
+    refused write is usually the submission server having admitted something in
+    between, which is exactly what the read sha is here to catch: an admission
+    must not be erased by a pass that never saw it.
+    """
+    if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
+        return  # a read-only invocation, such as `list`, maintains nothing
+    try:
+        put_state(
+            OPEN_INDEX_PATH,
+            {key: value for key, value in index.items() if key != "_blob_sha"},
+            f"Record {len(index['open'])} open submission(s)",
+            blob_sha=blob_sha,
+        )
+    except ReviewerError as error:
+        print(f"::warning::could not record the open-submission index: {error}")
+
+
+def open_submissions() -> list[dict[str, Any]]:
+    """Every submission record the reviewer may still have work for.
+
+    Reading `submissions/` instead cost an API call per submission per pass
+    however few of them were moving, so the price of one pass was the size of
+    the registry rather than the size of the queue.
+
+    Submissions the reviewer has finished with are dropped from the index here,
+    under the sha it was read at, so an admission that landed while this pass
+    was reading refuses the write instead of being erased by it.
+    """
+    index = open_index()
+    records: list[dict[str, Any]] = []
+    still_open: list[str] = []
+    for submission_id in index["open"]:
+        record = submission_state(submission_id)
+        if record is None:
+            continue  # no record at all: do not keep a place in the queue for it
+        records.append(record)
+        if not finished_with(record):
+            still_open.append(submission_id)
+    if still_open != index["open"]:
+        _write_open_index({**index, "open": still_open}, blob_sha=index.get("_blob_sha"))
+    return records
 
 
 def queue() -> list[dict[str, Any]]:
     """Submissions whose verification passed and which have no review yet."""
-    waiting = []
-    for submission_id in state_directory_names():
-        record = submission_state(submission_id)
-        if record and record.get("status") == "awaiting-review":
-            waiting.append(record)
-    return waiting
+    return [
+        record for record in open_submissions() if record.get("status") == "awaiting-review"
+    ]
 
 
-def database_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Authenticate Git over HTTPS without putting the private token in argv."""
+def registry_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Authenticate Git over HTTPS without putting the private token in argv.
+
+    The registry's own credential, which reads the private state repository and
+    writes the database. Deliberately not the archive account's: that one is
+    scoped to public forks and must never touch either of these.
+    """
     token = gh(["auth", "token"]).strip()
     if not token or "\n" in token or "\r" in token:
-        raise ReviewerError("gh auth did not provide a usable token for PalomarDatabase")
+        raise ReviewerError("gh auth did not provide a usable token for the private repositories")
     credential = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     environment = dict(base or os.environ)
     environment.update(
@@ -2290,7 +2433,7 @@ def clone_at(repository_url: str, revision: str, destination: Path) -> str:
         }
     )
     if repository_url.rstrip("/").removesuffix(".git") == f"https://github.com/{DATABASE_REPO}":
-        git_env = database_git_environment(git_env)
+        git_env = registry_git_environment(git_env)
     git = [
         "git",
         "-c",
@@ -2356,7 +2499,7 @@ def push_registration_branch(database: Path, branch: str) -> None:
     a branch that changed underneath this process is not overwritten.
     """
     remote = ["git", "push", f"https://github.com/{DATABASE_REPO}.git"]
-    git_env = database_git_environment()
+    git_env = registry_git_environment()
     existing = remote_branch_commit(branch)
     if existing is None:
         run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
@@ -4685,9 +4828,8 @@ def submissions_needing_work() -> tuple[
 ]:
     """Split every live submission by what the next step for it would be."""
     to_review, to_register, to_finalize, exhausted, cooling = [], [], [], [], []
-    for submission_id in state_directory_names():
-        record = submission_state(submission_id)
-        if record is None or record.get("registered_entry"):
+    for record in open_submissions():
+        if record.get("registered_entry"):
             continue
         status = record.get("status")
         if status == "awaiting-review" or (
@@ -4876,7 +5018,7 @@ def doctor(_: argparse.Namespace) -> int:
             else:
                 probe = run(
                     ["git", "ls-remote", "--exit-code", f"https://github.com/{DATABASE_REPO}.git", "HEAD"],
-                    env=database_git_environment(),
+                    env=registry_git_environment(),
                     check=False,
                 )
                 print("database access: ok (private)" if probe.returncode == 0 else "database access: FAILED")
