@@ -614,8 +614,8 @@ def verify_repository_license(
 def public_review(review: dict[str, Any]) -> dict[str, Any]:
     """The review as it is archived and served, without the internal arithmetic.
 
-    Three things go. The scores decide the outcome and stay in the private
-    record and the canonical database, because they do not mean what a reader
+    Three things go. The scores decide the outcome and are recorded beside the
+    canonical database, in `scores/`, because they do not mean what a reader
     would take them to mean: the same repository at the same commit scored 5
     and then 4 on one dimension across two runs of the same policy, with the
     same verdict both times. The severity on each finding goes because it ranks
@@ -3756,7 +3756,6 @@ def registry_record(
             "verdict": "accept",
             "report": {"sha256": verification_evidence["review_sha256"]},
             "reviewer_models": review["reviewer_models"],
-            "scores": review["scores"],
             "warnings": review["warnings"],
         },
         "trust": {
@@ -3774,6 +3773,36 @@ def registry_record(
             "submission_id": state["id"],
             "authorization": copy.deepcopy(mechanical["submission"]["authorization"]),
         },
+    }
+
+
+def registry_scores(
+    *,
+    permanent_id: str,
+    version: int,
+    review: dict[str, Any],
+) -> dict[str, Any]:
+    """The scores that decided this version, for `scores/<id>-vN.json`.
+
+    They used to sit in the record, and the release tooling stripped them on
+    the way out. That made a registered record a projection: its bytes were a
+    function of that tooling rather than of the commit, so the record could not
+    be treated as immutable or cached however firmly the database froze the
+    file in git.
+
+    They are still recorded, because the decision has to stay reconstructable,
+    and they are bound to the review they explain by `reviewed_at` and
+    `policy_commit` -- without that a later pass could leave an earlier pass's
+    numbers standing beside a new verdict, and the database would see nothing
+    wrong. `scores/` is append-only, and the database never stages it.
+    """
+    return {
+        "schema_version": 1,
+        "id": permanent_id,
+        "version": version,
+        "reviewed_at": review["reviewed_at"],
+        "policy_commit": review["policy_commit"],
+        "scores": {key: review["scores"][key] for key in SYNTHESIS_SCORE_KEYS},
     }
 
 
@@ -4123,6 +4152,9 @@ def register(args: argparse.Namespace) -> int:
     schema_path = database / "schema-v2.json"
     if not schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register schema-v2.json")
+    scores_schema_path = database / "scores-v1.json"
+    if not scores_schema_path.is_file():
+        raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
 
     permanent_id, accepted_at, version = registration_attempt_identity(
         database,
@@ -4201,6 +4233,13 @@ def register(args: argparse.Namespace) -> int:
     evidence_destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(evidence_bundle, evidence_destination)
     write_json(destination, record)
+    scores_destination = database / "scores" / filename
+    if scores_destination.exists():
+        raise ReviewerError(f"database scores already exist: {filename}")
+    write_json(
+        scores_destination,
+        registry_scores(permanent_id=record["id"], version=version, review=review),
+    )
 
     entries = []
     for path in sorted((database / "entries").glob("*.json")):
@@ -4220,6 +4259,11 @@ def register(args: argparse.Namespace) -> int:
     )
     schema = load_json(schema_path)
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
+    jsonschema.validate(
+        load_json(scores_destination),
+        load_json(scores_schema_path),
+        format_checker=jsonschema.FormatChecker(),
+    )
     run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.submission}-v{version}"
     run(["git", "checkout", "-b", branch], cwd=database)
@@ -4228,6 +4272,7 @@ def register(args: argparse.Namespace) -> int:
             "git",
             "add",
             f"entries/{filename}",
+            f"scores/{filename}",
             "index.json",
             artifact_path.rstrip("/"),
             evidence_path.rstrip("/"),
