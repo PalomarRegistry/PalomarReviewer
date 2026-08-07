@@ -203,10 +203,17 @@ finishes the same archive refs instead of allocating an orphaned second ID.
 Rerun `register`, or pass a previously downloaded trusted result with
 `--render-result PATH`.
 
-Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`, where the serial is drawn
-at random and retried against the identifiers already registered. A sequential
-serial would register the ordering and approximate count of accepted private
-submissions, which is precisely what a private intake exists to avoid.
+Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`, where the serial follows
+the largest one that date has already used, starting at 1 for a date with none.
+The serial was drawn at random until 2026-08-07, to hide how many reservations
+never became records. What that cost was the ordering: with a random serial, the
+order two identifiers were registered in cannot be read from the identifiers, so
+anything wanting registration order has to carry an ordinal beside the
+identifier, and an ordinal that disagrees with its identifier is a failure
+nothing downstream can detect or repair. Serials rise within a date and dates
+never go backwards, because a new version of an existing result reuses its first
+version's identifier rather than allocating one, so ordering identifiers as
+strings is registration order across the whole registry.
 
 Once the PR is merged, verify the immutable record and close out the private
 submission:
