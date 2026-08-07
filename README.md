@@ -78,9 +78,12 @@ submissions the reviewer is not yet finished with. The submission server adds an
 id when it admits one, and a pass drops one when the record says there is
 nothing left to do to it, so a pass costs the queue rather than the size of the
 registry. It is derived rather than authoritative: an index that is missing,
-damaged, from another contract, or more than six hours old is rebuilt from a
+damaged, from another contract, or more than a week old is rebuilt from a
 checkout of every record, and deleting the file makes the next pass rebuild it
-at once. A pass that cannot enumerate its work fails; it never reports having
+at once. `palomar-review rebuild-queue` derives it on demand, which is what the
+weekly sweep runs: a rebuild is the one thing here that costs the size of the
+whole registry, so it belongs on a schedule rather than falling out of whichever
+pass crosses the window. A pass that cannot enumerate its work fails; it never reports having
 found nothing.
 
 For rubric version 2 and later, the runner rejects an internally inconsistent
