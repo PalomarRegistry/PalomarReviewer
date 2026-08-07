@@ -370,6 +370,67 @@ class ReviewerTests(unittest.TestCase):
         ):
             cli.validate_archive_token()
 
+    def test_original_source_star_is_idempotent_and_verified(self):
+        calls = []
+
+        def archive_api(endpoint, *, method="GET", body=None, check=True):
+            calls.append((endpoint, method, body, check))
+            return subprocess.CompletedProcess(["gh", "api"], 0, "", "")
+
+        with mock.patch.object(cli, "archive_api", side_effect=archive_api):
+            cli.ensure_repository_star("example/project")
+        self.assertEqual(
+            calls,
+            [
+                ("user/starred/example/project", "PUT", None, True),
+                ("user/starred/example/project", "GET", None, False),
+            ],
+        )
+        with self.assertRaisesRegex(ReviewerError, "invalid GitHub repository"):
+            cli.ensure_repository_star("https://github.com/example/project")
+
+    def test_registered_source_stars_are_recorded_only_after_verification(self):
+        pending = {
+            "id": "a1b2c3d4e5f6",
+            "status": "registered",
+            "registered_entry": "PALOMAR-2026-08-01-000012-v1",
+            "registration_attempt": {"source_repository": "example/project"},
+            "_blob_sha": "blob",
+        }
+        already_done = {
+            **pending,
+            "id": "b2c3d4e5f6a1",
+            "source_star": {
+                "account": "PalomarArchivist",
+                "repository": "example/project",
+                "starred_at": "2026-08-01T13:00:00Z",
+            },
+        }
+        by_id = {row["id"]: row for row in (pending, already_done)}
+        with (
+            mock.patch.object(cli, "state_directory_names", return_value=list(by_id)),
+            mock.patch.object(cli, "submission_state", side_effect=by_id.get),
+            mock.patch.object(cli, "validate_archive_token") as validate_token,
+            mock.patch.object(cli, "ensure_repository_star") as ensure_star,
+            mock.patch.object(cli, "put_state") as put_state,
+            mock.patch.object(cli, "utc_now", return_value="2026-08-01T13:01:00Z"),
+        ):
+            self.assertEqual(cli.star_registered_sources(SimpleNamespace(dry_run=False)), 0)
+        validate_token.assert_called_once_with()
+        ensure_star.assert_called_once_with("example/project")
+        path, updated, message = put_state.call_args.args
+        self.assertEqual(path, "submissions/a1b2c3d4e5f6/state.json")
+        self.assertEqual(message, "Record source star for a1b2c3d4e5f6")
+        self.assertEqual(put_state.call_args.kwargs, {"blob_sha": "blob"})
+        self.assertEqual(
+            updated["source_star"],
+            {
+                "account": "PalomarArchivist",
+                "repository": "example/project",
+                "starred_at": "2026-08-01T13:01:00Z",
+            },
+        )
+
     def test_archive_fork_gets_an_immutable_tag_ruleset(self):
         fork = "PalomarArchive/example--fixture"
         desired = cli._archive_ruleset_body()

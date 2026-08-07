@@ -770,7 +770,7 @@ def archive_api(
     """Call GitHub as the dedicated, least-privilege archive machine user."""
     token = os.environ.get("PALOMAR_ARCHIVE_TOKEN", "").strip()
     if not token:
-        raise ReviewerError("PALOMAR_ARCHIVE_TOKEN is required to preserve registered sources")
+        raise ReviewerError("PALOMAR_ARCHIVE_TOKEN is required for archive-account operations")
     command = [
         "gh",
         "api",
@@ -903,6 +903,80 @@ def validate_archive_token() -> dict[str, Any]:
     if str(organization.get("login") or "").casefold() != ARCHIVE_OWNER.casefold():
         raise ReviewerError(f"archive organization {ARCHIVE_OWNER} is unavailable")
     return user
+
+
+def ensure_repository_star(repository: str) -> None:
+    """Idempotently star one original source as the archive machine user."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ReviewerError(f"cannot star an invalid GitHub repository: {repository!r}")
+    endpoint = f"user/starred/{repository}"
+    archive_api(endpoint, method="PUT")
+    verified = archive_api(endpoint, check=False)
+    if verified.returncode:
+        detail = (verified.stderr or verified.stdout).strip()[-1000:]
+        raise ReviewerError(f"PalomarArchivist's star on {repository} could not be verified: {detail}")
+
+
+def registered_source_repository(state: dict[str, Any]) -> str:
+    """The original top-level source named by a completed registration."""
+    attempt = state.get("registration_attempt")
+    repository = attempt.get("source_repository") if isinstance(attempt, dict) else None
+    if not isinstance(repository, str):
+        repository = state.get("repository")
+    if not isinstance(repository, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+    ):
+        raise ReviewerError(f"registered submission {state.get('id')} has no valid source repository")
+    return repository
+
+
+def star_registered_sources(args: argparse.Namespace) -> int:
+    """Star every accepted registered source not already recorded as starred.
+
+    The PUT itself is idempotent. State is marked only after a GET verifies the
+    star, so an API or state-write failure is safe to retry on the next pass.
+    """
+    pending = []
+    for submission_id in state_directory_names():
+        state = submission_state(submission_id)
+        if (
+            state is not None
+            and state.get("registered_entry")
+            and not isinstance(state.get("source_star"), dict)
+        ):
+            pending.append(state)
+    if not pending:
+        print("All registered source repositories are starred.")
+        return 0
+    if args.dry_run:
+        for state in pending:
+            print(f"Would star {registered_source_repository(state)} for {state['registered_entry']}")
+        return 0
+
+    validate_archive_token()
+    failures = 0
+    for state in sorted(pending, key=lambda row: row["id"]):
+        try:
+            repository = registered_source_repository(state)
+            ensure_repository_star(repository)
+            starred_at = utc_now()
+            updated = dict(state)
+            updated["source_star"] = {
+                "account": ARCHIVE_USER,
+                "repository": repository,
+                "starred_at": starred_at,
+            }
+            put_state(
+                f"submissions/{state['id']}/state.json",
+                updated,
+                f"Record source star for {state['id']}",
+                blob_sha=state.get("_blob_sha"),
+            )
+            print(f"Starred and verified {repository} as {ARCHIVE_USER}.")
+        except Exception as error:
+            failures += 1
+            print(f"error: starring registered source for {state['id']} failed: {error}", file=sys.stderr)
+    return 1 if failures else 0
 
 
 def _archive_get(endpoint: str, context: str) -> dict[str, Any] | None:
@@ -4346,6 +4420,12 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--pr", type=int, required=True)
     finalize_parser.add_argument("--dry-run", action="store_true")
     finalize_parser.set_defaults(func=finalize)
+    star_parser = commands.add_parser(
+        "star-registered",
+        help="star accepted registered source repositories as PalomarArchivist",
+    )
+    star_parser.add_argument("--dry-run", action="store_true")
+    star_parser.set_defaults(func=star_registered_sources)
     return parser
 
 
