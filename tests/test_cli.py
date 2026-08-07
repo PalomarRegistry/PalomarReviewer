@@ -21,6 +21,7 @@ from palomar_reviewer.cli import (
     MECHANICAL_REPORT_SCHEMA,
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
+    SYNTHESIS_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
     SYSTEM_RESOLUTION_PATHS,
     ReviewerError,
@@ -38,6 +39,7 @@ from palomar_reviewer.cli import (
     registration_entry_path,
     registration_identity,
     registry_record,
+    registry_scores,
     registry_title,
     render_bundle_manifest,
     render_prompt,
@@ -1262,6 +1264,54 @@ class ReviewerTests(unittest.TestCase):
             jsonschema.validate(
                 record,
                 schema,
+                format_checker=jsonschema.FormatChecker(),
+            )
+
+    def test_the_record_carries_the_verdict_and_not_the_scores(self):
+        """The record is served exactly as it is committed, so anything the
+        public must not see has to be somewhere else entirely.
+
+        While the release tooling stripped them on the way out, a registered
+        record's bytes were a function of that tooling rather than of the
+        commit -- and forgetting one call was enough to serve the numbers.
+        """
+        record = self.example_record()
+        self.assertNotIn("scores", record["review"])
+        self.assertEqual(record["review"]["verdict"], "accept")
+        self.assertNotIn("statement_alignment", json.dumps(record))
+
+    def test_the_scores_are_recorded_beside_the_record(self):
+        """The decision still has to be reconstructable."""
+        review = {
+            "reviewed_at": "2026-08-01T12:34:56Z",
+            "policy_commit": "9" * 40,
+            "reviewer_models": ["codex:test"],
+            "scores": {
+                "statement_alignment": 4, "definition_fidelity": 5,
+                "notability": 4, "literature": 3, "clarity": 5,
+                "provenance": 4,
+            },
+            "warnings": [],
+        }
+        scores = registry_scores(
+            permanent_id="PALOMAR-2026-08-01-000012", version=2, review=review
+        )
+        self.assertEqual(scores["id"], "PALOMAR-2026-08-01-000012")
+        self.assertEqual(scores["version"], 2)
+        self.assertEqual(scores["scores"]["literature"], 3)
+        # Bound to the review it explains: without this a later pass could
+        # leave an earlier pass's numbers standing beside a new verdict.
+        self.assertEqual(scores["reviewed_at"], review["reviewed_at"])
+        self.assertEqual(scores["policy_commit"], review["policy_commit"])
+        # Only the five the registry records. `provenance` is scored during
+        # review and is not one of them.
+        self.assertEqual(set(scores["scores"]), set(SYNTHESIS_SCORE_KEYS))
+
+        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
+        if database:
+            jsonschema.validate(
+                scores,
+                json.loads((Path(database) / "scores-v1.json").read_text()),
                 format_checker=jsonschema.FormatChecker(),
             )
 

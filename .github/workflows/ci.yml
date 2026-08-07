@@ -20,20 +20,22 @@ jobs:
       # granting a cross-repository credential; maintainers run the full
       # publication integration with PALOMAR_DATABASE_CHECKOUT locally.
       #
-      # The canonical schema, not the one served beside the data. A public
-      # record is a projection with no review.scores, so `schema-vN.json` is
-      # the schema of what is served; this builds a canonical record and has to
-      # satisfy the schema records are built against.
+      # One schema. It was briefly two, while a record was rewritten on the way
+      # into the release and the served document had to describe the result;
+      # now a record is published exactly as it was committed, so the contract
+      # this builds against and the schema served beside the data are the same
+      # file. `scores-v1.json` is not fetched because it is not published: the
+      # database validates `scores/` itself, at registration.
       - name: Download the schema a record is built against
         env:
           PUBLIC_DATA_ORIGIN: https://palomar-data.palomar-server.workers.dev
         run: |
           mkdir palomar-schemas
           curl --fail --silent --show-error --retry 3 \
-            "$PUBLIC_DATA_ORIGIN/canonical-schema-v1.json" \
+            "$PUBLIC_DATA_ORIGIN/schema-v1.json" \
             --output palomar-schemas/schema-v1.json
           curl --fail --silent --show-error --retry 3 \
-            "$PUBLIC_DATA_ORIGIN/canonical-schema-v2.json" \
+            "$PUBLIC_DATA_ORIGIN/schema-v2.json" \
             --output palomar-schemas/schema-v2.json
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
