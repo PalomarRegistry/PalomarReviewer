@@ -4310,6 +4310,50 @@ def _check_outcome(check: dict[str, Any]) -> str:
     return "pending"
 
 
+def workflow_conclusions(head_sha: str) -> list[str] | None:
+    """What the database's own workflows made of a commit, or None if unknown.
+
+    The rollup that `gh pr view` builds needs a `Checks` permission that fine
+    grained tokens are not offered. GitHub's own reference pages say otherwise,
+    which is a documentation bug rather than a way in: the permission catalogue
+    has no such entry, so no fine grained token can read a check run.
+
+    The checks here are this repository's own Actions workflows, and those can
+    be read with `Actions: read`, which fine grained tokens do have. So they are
+    read as what they are.
+
+    Returns the conclusion of the newest attempt of every workflow that ran on
+    the commit; an empty list where none has started; and None where the answer
+    cannot be had at all, which is not the same as "nothing ran".
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha or "")):
+        return None
+    try:
+        payload = json.loads(
+            gh([
+                "api",
+                f"repos/{DATABASE_REPO}/actions/runs?head_sha={head_sha}&per_page=100",
+            ])
+        )
+    except ReviewerError:
+        return None
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list):
+        return None
+    newest: dict[Any, dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        key = run.get("workflow_id")
+        attempt = run.get("run_attempt") or 0
+        if key not in newest or attempt >= (newest[key].get("run_attempt") or 0):
+            newest[key] = run
+    return [
+        "pending" if run.get("status") != "completed" else str(run.get("conclusion") or "failed")
+        for run in newest.values()
+    ]
+
+
 def _checks_failed(view: dict[str, Any]) -> bool:
     """Whether the rollup has finished and something in it did not pass.
 
@@ -4319,7 +4363,12 @@ def _checks_failed(view: dict[str, Any]) -> bool:
     """
     rollup = view.get("statusCheckRollup")
     if not isinstance(rollup, list) or not rollup:
-        return False
+        conclusions = workflow_conclusions(str(view.get("headRefOid") or ""))
+        if not conclusions:
+            return False
+        return "pending" not in conclusions and any(
+            outcome not in {"success", "skipped", "neutral"} for outcome in conclusions
+        )
     outcomes = [_check_outcome(node) for node in rollup if isinstance(node, dict)]
     return "pending" not in outcomes and "failed" in outcomes
 
@@ -4344,7 +4393,10 @@ def _checks_passed(view: dict[str, Any]) -> bool:
     """
     rollup = view.get("statusCheckRollup")
     if not isinstance(rollup, list) or not rollup:
-        return False
+        conclusions = workflow_conclusions(str(view.get("headRefOid") or ""))
+        if not conclusions:
+            return False
+        return set(conclusions) <= {"success", "skipped", "neutral"}
     outcomes = [_check_outcome(node) for node in rollup if isinstance(node, dict)]
     return bool(outcomes) and set(outcomes) == {"passed"}
 

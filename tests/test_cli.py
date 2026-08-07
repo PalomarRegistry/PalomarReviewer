@@ -3983,3 +3983,61 @@ class DatabasePrViewTests(unittest.TestCase):
         # A change whose checks cannot be seen is not one to merge.
         self.assertFalse(cli._checks_passed({"state": "OPEN"}))
         self.assertFalse(cli._checks_failed({"state": "OPEN"}))
+
+
+class WorkflowConclusionTests(unittest.TestCase):
+    """Reading the database's checks as what they are: Actions workflows.
+
+    The rollup `gh pr view` builds needs a `Checks` permission that fine
+    grained tokens are not offered, whatever GitHub's reference pages say. The
+    checks in question are that repository's own workflows, and those can be
+    read with `Actions: read`.
+    """
+
+    def runs(self, *rows):
+        return json.dumps({"workflow_runs": [
+            {"workflow_id": w, "run_attempt": a, "status": s, "conclusion": c}
+            for w, a, s, c in rows
+        ]})
+
+    def test_the_newest_attempt_of_each_workflow_is_what_counts(self):
+        # A re-run supersedes the failure that prompted it.
+        with mock.patch.object(cli, "gh", return_value=self.runs(
+            (1, 1, "completed", "failure"), (1, 2, "completed", "success"),
+        )):
+            self.assertEqual(cli.workflow_conclusions("a" * 40), ["success"])
+
+    def test_a_run_still_going_is_pending(self):
+        with mock.patch.object(cli, "gh", return_value=self.runs(
+            (1, 1, "completed", "success"), (2, 1, "in_progress", None),
+        )):
+            self.assertEqual(sorted(cli.workflow_conclusions("a" * 40)), ["pending", "success"])
+
+    def test_an_unreadable_answer_is_not_an_empty_one(self):
+        # None means "cannot tell", which must not read as "nothing failed".
+        with mock.patch.object(cli, "gh", side_effect=ReviewerError("403")):
+            self.assertIsNone(cli.workflow_conclusions("a" * 40))
+        with mock.patch.object(cli, "gh", return_value="{}"):
+            self.assertIsNone(cli.workflow_conclusions("a" * 40))
+        self.assertIsNone(cli.workflow_conclusions("not-a-sha"))
+
+    def test_a_change_is_green_when_its_workflows_are(self):
+        view = {"headRefOid": "a" * 40}
+        with mock.patch.object(cli, "gh", return_value=self.runs((1, 1, "completed", "success"))):
+            self.assertTrue(cli._checks_passed(view))
+            self.assertFalse(cli._checks_failed(view))
+
+    def test_a_change_is_not_green_while_anything_runs_or_fails(self):
+        view = {"headRefOid": "a" * 40}
+        with mock.patch.object(cli, "gh", return_value=self.runs((1, 1, "in_progress", None))):
+            self.assertFalse(cli._checks_passed(view))
+            self.assertFalse(cli._checks_failed(view))
+        with mock.patch.object(cli, "gh", return_value=self.runs((1, 1, "completed", "failure"))):
+            self.assertFalse(cli._checks_passed(view))
+            self.assertTrue(cli._checks_failed(view))
+
+    def test_nothing_readable_is_never_green(self):
+        view = {"headRefOid": "a" * 40}
+        with mock.patch.object(cli, "gh", side_effect=ReviewerError("403")):
+            self.assertFalse(cli._checks_passed(view))
+            self.assertFalse(cli._checks_failed(view))
