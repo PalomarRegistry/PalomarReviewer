@@ -46,6 +46,7 @@ VERIFY_WORKFLOW = "submission.yml"
 # registrations would otherwise outlive the job that is carrying them.
 REGISTRATIONS_PER_PASS = 1
 REGISTRATION_WAIT_SECONDS = 1800
+REGISTRATION_STALE_SECONDS = 6 * 3600
 PASS_BUDGET_SECONDS = 5400
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid,statusCheckRollup"
@@ -782,6 +783,22 @@ def validate_declaration_coverage(
 
 def utc_now() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def utc_after(seconds: float) -> str:
+    moment = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)
+    return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _before_now(stamp: object) -> bool:
+    """Whether an ISO instant has passed. An unreadable one counts as passed."""
+    if not isinstance(stamp, str):
+        return True
+    try:
+        moment = dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
+    except ValueError:
+        return True
+    return dt.datetime.now(dt.UTC) >= moment
 
 
 def run(
@@ -4260,6 +4277,31 @@ def _checks_failed(view: dict[str, Any]) -> bool:
     return "pending" not in outcomes and "failed" in outcomes
 
 
+def _seconds_since(stamp: str) -> float:
+    try:
+        moment = dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
+    except ValueError:
+        return 0.0
+    return (dt.datetime.now(dt.UTC) - moment).total_seconds()
+
+
+def _checks_passed(view: dict[str, Any]) -> bool:
+    """Whether every check on the change has finished, and passed.
+
+    A green merge state is not enough on its own. The database has no enforced
+    branch protection, so there are no required checks for GitHub to withhold
+    CLEAN over, and a change reads CLEAN in the seconds after it is opened,
+    before Actions has attached a single check run. Merging on the merge state
+    alone would register a record whose validation had not started. An empty or
+    unreadable rollup is therefore treated as pending, not as success.
+    """
+    rollup = view.get("statusCheckRollup")
+    if not isinstance(rollup, list) or not rollup:
+        return False
+    outcomes = [_check_outcome(node) for node in rollup if isinstance(node, dict)]
+    return bool(outcomes) and set(outcomes) == {"passed"}
+
+
 def view_database_pr(pr: int) -> dict[str, Any]:
     return json.loads(
         gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS])
@@ -4281,8 +4323,9 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
         merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
         if (
             str(view.get("state") or "").upper() != "OPEN"
-            or merge_state in {"CLEAN", "DIRTY"}
+            or merge_state == "DIRTY"
             or _checks_failed(view)
+            or (merge_state == "CLEAN" and _checks_passed(view))
         ):
             return view
         if merge_state == "BEHIND" and not updated_branch:
@@ -4291,8 +4334,16 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
             # registration merges while another is open. Left alone the
             # submission waits for ever while every pass rediscovers it.
             print(f"database PR #{pr} is behind main; updating the branch")
-            gh(["pr", "update-branch", str(pr), "--repo", DATABASE_REPO], check=False)
             updated_branch = True
+            update = run(
+                ["gh", "pr", "update-branch", str(pr), "--repo", DATABASE_REPO], check=False
+            )
+            if update.returncode:
+                # Waiting out the rest of the budget watching an unchanged
+                # change would say nothing about why it never moved.
+                detail = (update.stderr or update.stdout or "").strip()[:300]
+                print(f"::warning::could not update database PR #{pr}: {detail}")
+                return view
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return view
@@ -4312,9 +4363,19 @@ def advance_registration(record: dict[str, Any], wait_seconds: float) -> bool:
     state = str(view.get("state") or "").upper()
     if state == "OPEN":
         merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
-        if merge_state != "CLEAN":
-            detail = "checks failed" if _checks_failed(view) else merge_state
-            print(f"{record['id']}: database PR #{pr} is not green yet ({detail})")
+        if merge_state != "CLEAN" or not _checks_passed(view):
+            if _checks_failed(view):
+                detail = "checks failed"
+            elif merge_state == "CLEAN":
+                detail = "checks have not finished"
+            else:
+                detail = merge_state
+            opened = record.get("registration_pr_at")
+            if isinstance(opened, str) and _seconds_since(opened) >= REGISTRATION_STALE_SECONDS:
+                print(f"::error::{record['id']}: database PR #{pr} has been open since "
+                      f"{opened} and is still not mergeable ({detail}); it needs a person")
+            else:
+                print(f"{record['id']}: database PR #{pr} is not green yet ({detail})")
             return False
         head = view.get("headRefOid")
         if not isinstance(head, str) or not head:
@@ -4415,11 +4476,14 @@ def auto(args: argparse.Namespace) -> int:
     # A pass now waits on things rather than only starting them, so it has to
     # know how much of the job it has already spent. Without this a registration
     # could wait out the runner while holding work nothing else will pick up.
-    budget = getattr(args, "pass_seconds", None) or PASS_BUDGET_SECONDS
+    budget = getattr(args, "pass_seconds", None)
+    if budget is None:  # an explicit zero is a real answer, not a missing one
+        budget = PASS_BUDGET_SECONDS
     deadline = time.monotonic() + float(budget)
     pass_remaining = lambda: max(0.0, deadline - time.monotonic())  # noqa: E731
 
     failures = 0
+    unattempted: list[dict[str, Any]] = []
     for record in exhausted:
         print(f"::group::Abandon review {record['id']}", flush=True)
         try:
@@ -4434,6 +4498,12 @@ def auto(args: argparse.Namespace) -> int:
             print("::endgroup::", flush=True)
 
     for record in to_review[: args.max_reviews]:
+        if pass_remaining() <= 0:
+            # Starting a review here would run past the job's own timeout and
+            # be killed part-way, which costs the attempt and tells nobody why.
+            print(f"pass budget spent; leaving {record['id']} for a later pass")
+            unattempted.append(record)
+            continue
         print(f"::group::Review {record['id']}", flush=True)
         try:
             started = time.monotonic()
@@ -4462,7 +4532,14 @@ def auto(args: argparse.Namespace) -> int:
     if len(to_register) > REGISTRATIONS_PER_PASS:
         deferred = [record["id"] for record in to_register[REGISTRATIONS_PER_PASS:]]
         print(f"deferring {len(deferred)} registration(s) to a later pass: {', '.join(deferred)}")
+        unattempted.extend(to_register[REGISTRATIONS_PER_PASS:])
     for record in to_register[:REGISTRATIONS_PER_PASS]:
+        if pass_remaining() <= REGISTRATION_WAIT_SECONDS:
+            # A registration waits on a render run and then on the database. It
+            # needs most of a pass, so it starts at the beginning of one.
+            print(f"pass budget too short to register {record['id']}; leaving it")
+            unattempted.append(record)
+            continue
         print(f"::group::Register {record['id']}", flush=True)
         try:
             register(argparse.Namespace(
@@ -4483,6 +4560,11 @@ def auto(args: argparse.Namespace) -> int:
             print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
         finally:
             print("::endgroup::", flush=True)
+
+    unattempted.extend(to_review[args.max_reviews:])
+    if unattempted:
+        print(f"{len(unattempted)} item(s) left for a later pass: "
+              f"{', '.join(record['id'] for record in unattempted)}")
 
     for record in to_finalize:
         # Recovery only: a registration whose job died between opening the
