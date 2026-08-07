@@ -4315,7 +4315,7 @@ def _validation_outcome(head_sha: str) -> str:
     """
     query = (
         f"repos/{DATABASE_REPO}/actions/workflows/{DATABASE_VALIDATE_WORKFLOW}"
-        f"/runs?head_sha={head_sha}&per_page=10"
+        f"/runs?event=pull_request&head_sha={head_sha}&per_page=100"
     )
     try:
         runs = json.loads(gh(["api", query])).get("workflow_runs", [])
@@ -4326,9 +4326,26 @@ def _validation_outcome(head_sha: str) -> str:
             f"{DATABASE_REPO}. Refusing to merge without seeing the validation."
         )
         return "unreadable"
-    if not runs:
+    # The query is a filter, not a promise: the endpoint documents no ordering,
+    # the workflow also runs on push, and a commit can carry more than one run.
+    # So the run is chosen rather than taken, and every field it was filtered on
+    # is checked again on the run itself.
+    candidates = [
+        run for run in runs
+        if isinstance(run, dict)
+        and run.get("head_sha") == head_sha
+        and run.get("event") == "pull_request"
+        and isinstance(run.get("run_number"), int)
+    ]
+    if not candidates:
         return "pending"  # Actions has not attached a run to this commit yet
-    latest = runs[0]
+    # A new run advances run_number; re-running one keeps the number and
+    # advances run_attempt. The newest of both is the one that counts, and an
+    # older green attempt must never outrank a newer one that is still going.
+    latest = max(
+        candidates,
+        key=lambda run: (run["run_number"], run.get("run_attempt") or 0),
+    )
     if latest.get("status") != "completed":
         return "pending"
     return "passed" if latest.get("conclusion") == "success" else "failed"
@@ -4437,7 +4454,25 @@ def advance_registration(record: dict[str, Any], wait_seconds: float) -> bool:
         head = view.get("headRefOid")
         if not isinstance(head, str) or not head:
             raise ReviewerError(f"database PR #{pr} reported no head commit to merge")
-        # Pinned to the commit whose checks were just read. "These checks
+        # Merging is the registration, and there is no taking it back, so
+        # consent is re-read here rather than trusted from the top of the pass.
+        # A submitter can withdraw while the render and the database checks are
+        # still running, and registering opened this change without disturbing
+        # the status it found, so a withdrawn record still carries one.
+        fresh = submission_state(record["id"])
+        if (
+            fresh is None
+            or fresh.get("status") != "review-ready"
+            or fresh.get("registration_consent") is not True
+            or fresh.get("registered_entry")
+        ):
+            standing = (fresh or {}).get("status") or "unreadable"
+            print(
+                f"::warning::{record['id']}: consent no longer stands ({standing}); "
+                f"leaving database PR #{pr} unmerged"
+            )
+            return False
+        # Pinned to the commit whose validation was just read. "This validation
         # passed" and "this is what gets merged" are only the same statement if
         # the merge names the head, and the database has no enforced branch
         # protection to make them the same statement on our behalf.
@@ -4528,12 +4563,14 @@ def submissions_needing_work() -> tuple[
 
 
 def auto(args: argparse.Namespace) -> int:
-    """One pass of the loop: advance every submission by exactly one step.
+    """One pass of the loop: advance every live submission as far as it goes.
 
     Idempotent and state-driven, so a failed or interrupted pass costs at most
     the step it was in, and the next pass picks the submission up where the
-    private record says it is. Nothing here decides to register: a submission
-    reaches this function's register arm only because its submitter asked.
+    private record says it is. A registration runs to completion inside the
+    pass that opened it; everything else advances by one step. Nothing here
+    decides to register: a submission reaches that arm only because its
+    submitter asked, and that consent is re-read before anything is merged.
     """
     depth = int(getattr(args, "dispatch_depth", 0) or 0)
     if not 0 <= depth < MAX_PASSES:
@@ -4627,9 +4664,10 @@ def auto(args: argparse.Namespace) -> int:
                 dry_run=False,
             ))
             # The change the registration just opened is the only thing between
-            # the submitter and a registered record, and it is the one
-            # transition nothing outside this job observes. Finishing it here is
-            # what lets the schedule be a backstop rather than the clock.
+            # the submitter and a registered record, and until now the only
+            # thing that noticed was the next scheduled pass. Finishing it here
+            # is what lets the schedule be a backstop rather than the clock; the
+            # recovery arm below still picks it up if this job dies first.
             advanced += 1
             fresh = submission_state(record["id"])
             if fresh is not None and fresh.get("registration_pr"):
