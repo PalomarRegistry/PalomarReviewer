@@ -683,6 +683,10 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
     if version >= 6 and rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
         raise ReviewerError("rubric v6 must declare exactly the supported pass verdicts")
     if version >= 7:
+        if rubric.get("finding_comment_policy", "material") not in {"material", "all"}:
+            raise ReviewerError(
+                "rubric v7 finding_comment_policy must be 'material' or 'all'"
+            )
         coverage_steps = {
             step.get("id")
             for step in steps
@@ -3139,15 +3143,18 @@ def validate_synthesis_policy(
         raise ReviewerError("synthesis scores must reproduce the evidence-pass scores without inflating them")
 
     if rubric.get("schema_version", 1) >= 7:
-        material_comments = [
+        comment_policy = rubric.get("finding_comment_policy", "material")
+        if comment_policy not in {"material", "all"}:
+            raise ReviewerError(f"unsupported finding_comment_policy: {comment_policy!r}")
+        comments = [
             finding["message"]
             for result in passes
             for finding in result["findings"]
-            if finding["severity"] in {"warning", "error"}
+            if comment_policy == "all" or finding["severity"] in {"warning", "error"}
         ]
-        if synthesis["warnings"] != material_comments:
+        if synthesis["warnings"] != comments:
             raise ReviewerError(
-                "synthesis warnings must reproduce every material pass finding in pass order"
+                "synthesis warnings must reproduce every required pass finding in pass order"
             )
 
     minimum = rubric.get("minimum_accept_score")
