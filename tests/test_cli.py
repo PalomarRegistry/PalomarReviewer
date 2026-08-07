@@ -3210,6 +3210,44 @@ class AutomaticLoopTests(unittest.TestCase):
         began.assert_not_called()
         registered.assert_not_called()
 
+    def test_reading_the_queue_is_paid_for_out_of_the_pass_budget(self):
+        """The deadline was taken after the queue had been read, so reading it
+        was free and everything behind it got a whole budget on top of it. At
+        six thousand submissions that overrun was the job's own timeout, which
+        kills a pass part-way through a review; `begin_review` counts an attempt
+        when it starts, so three of those abandon a submission nothing was wrong
+        with.
+
+        The clock here advances a second per record read, so the budget at which
+        a pass can no longer start anything is exactly what the scan cost, and
+        it has to move with the size of the queue rather than stay put."""
+        started = {}
+        for total in (2, 20):
+            for budget in (total - 1, total + 1):
+                with self.subTest(total=total, budget=budget):
+                    rows = [self.row(f"{index:012d}", status="awaiting-review")
+                            for index in range(total)]
+                    by_id = {row["id"]: row for row in rows}
+                    clock = [0.0]
+
+                    def read(name, corpus=by_id, at=clock):
+                        at[0] += 1.0
+                        return corpus.get(name)
+
+                    with (
+                        mock.patch.object(cli, "state_directory_names",
+                                          return_value=list(by_id)),
+                        mock.patch.object(cli, "submission_state", side_effect=read),
+                        mock.patch.object(cli.time, "monotonic", lambda at=clock: at[0]),
+                        mock.patch.object(cli, "begin_review") as began,
+                        mock.patch.object(cli, "run_review"),
+                        mock.patch.object(cli, "record_review_duration"),
+                    ):
+                        cli.auto(self.opts(pass_seconds=budget))
+                    started[(total, budget)] = began.called
+        self.assertEqual(started, {(2, 1): False, (2, 3): True,
+                                   (20, 19): False, (20, 21): True})
+
     def test_only_one_registration_is_started_per_pass(self):
         """A registration already waits on a render run and now waits on the
         database too, so two in one pass can outlive the job carrying them."""

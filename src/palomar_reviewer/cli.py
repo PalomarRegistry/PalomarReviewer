@@ -4876,6 +4876,22 @@ def auto(args: argparse.Namespace) -> int:
     if not 0 <= depth < MAX_PASSES:
         raise ReviewerError(f"dispatch depth {depth} is outside 0..{MAX_PASSES - 1}")
 
+    # A pass now waits on things rather than only starting them, so it has to
+    # know how much of the job it has already spent. Without this a registration
+    # could wait out the runner while holding work nothing else will pick up.
+    #
+    # Started before the scan, and not after it, because the scan is part of
+    # what the pass spends. Reading the queue used to be free of the budget, so
+    # a slow one bought the reviews behind it a full budget on top of it, and
+    # the job's own timeout killed the pass part-way through a review it had
+    # already counted: `begin_review` counts an attempt when it starts, so three
+    # such kills abandon a submission nothing was wrong with.
+    budget = getattr(args, "pass_seconds", None)
+    if budget is None:  # an explicit zero is a real answer, not a missing one
+        budget = PASS_BUDGET_SECONDS
+    deadline = time.monotonic() + float(budget)
+    pass_remaining = lambda: max(0.0, deadline - time.monotonic())  # noqa: E731
+
     to_review, to_register, to_finalize, exhausted, cooling = submissions_needing_work()
     if cooling:
         print(f"{len(cooling)} review(s) waiting out a retry backoff: "
@@ -4883,15 +4899,6 @@ def auto(args: argparse.Namespace) -> int:
     if not (to_review or to_register or to_finalize or exhausted):
         print("Nothing to do.")
         return 0
-
-    # A pass now waits on things rather than only starting them, so it has to
-    # know how much of the job it has already spent. Without this a registration
-    # could wait out the runner while holding work nothing else will pick up.
-    budget = getattr(args, "pass_seconds", None)
-    if budget is None:  # an explicit zero is a real answer, not a missing one
-        budget = PASS_BUDGET_SECONDS
-    deadline = time.monotonic() + float(budget)
-    pass_remaining = lambda: max(0.0, deadline - time.monotonic())  # noqa: E731
 
     failures = 0
     unattempted: list[dict[str, Any]] = []
