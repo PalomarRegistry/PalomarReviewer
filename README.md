@@ -158,9 +158,12 @@ an ordinary organization member and store its credential as
 creates a repository-level ruleset on each new public fork that permits new
 `refs/tags/palomar/**/*` tags but prevents updating or deleting existing ones,
 and then removes the machine account's repository-admin grant so it falls back
-to the organization's base Write role. The account exists only to make native
-forks and add new preservation refs. Organizations cannot star repositories,
-so registration does not attempt to star accepted sources. GitHub redacts a
+to the organization's base Write role. The account makes native forks, adds
+new preservation refs, and stars the original top-level source after its
+registration completes. `palomar-review star-registered` is idempotent: it
+verifies each star before recording it in private state, and an interrupted or
+failed pass is retried without affecting the accepted record. Dependencies and
+archive forks are not starred. GitHub redacts a
 ruleset's bypass-actor list after that demotion; the reviewer verifies every
 remaining ruleset field on later registrations, while creation verifies the
 complete rule, including its empty bypass list, before dropping administrator
