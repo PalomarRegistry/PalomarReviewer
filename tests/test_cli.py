@@ -7,9 +7,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +24,8 @@ from palomar_reviewer.cli import (
     MECHANICAL_REPORT_SCHEMA,
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
-    SYNTHESIS_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
+    SYNTHESIS_SCORE_KEYS,
     SYSTEM_RESOLUTION_PATHS,
     ReviewerError,
     allocate_identifier,
@@ -5365,6 +5367,8 @@ class DatabaseCheckoutTests(unittest.TestCase):
         (source / ".github" / "workflows" / "validate.yml").write_text("on: push\n")
         (source / "tools").mkdir()
         (source / "tools" / "validate.py").write_text("print('ok')\n")
+        subprocess.run([*git, "-C", str(source), "add", "-A"], check=True)
+        subprocess.run([*git, "-C", str(source), "commit", "-qm", "policy"], check=True)
         (source / "entries").mkdir()
         (source / "scores").mkdir()
         payload_blobs = set()
@@ -5409,16 +5413,48 @@ class DatabaseCheckoutTests(unittest.TestCase):
         ).stdout.strip()
         return source, remote, revision, payload_blobs
 
+    @contextlib.contextmanager
+    def serve(self, remote):
+        """Serve a filter-capable fixture without weakening file transport."""
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        process = subprocess.Popen(
+            [
+                "git", "daemon", "--reuseaddr", "--export-all",
+                f"--base-path={remote.parent}", "--listen=127.0.0.1", f"--port={port}",
+                str(remote.parent),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        url = f"git://127.0.0.1:{port}/{remote.name}"
+        try:
+            for _attempt in range(100):
+                ready = subprocess.run(
+                    ["git", "ls-remote", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if ready.returncode == 0:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("test Git daemon did not become ready")
+            yield url
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
     def sparse_clone(self, remote, revision, checkout):
-        # Production forbids local transports. This test-only protocol
-        # whitelist lets the real clone_at implementation talk to the bare
-        # fixture without weakening the production command.
-        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+        # If clone_at accidentally inherits this whitelist, git:// is refused.
+        # Scrubbing it proves the command's protocol.file.allow=never pin is
+        # real instead of relying on a cooperative parent environment.
+        with self.serve(remote) as url, mock.patch.dict(
+            os.environ, {"GIT_ALLOW_PROTOCOL": "file"}
+        ):
             resolved = cli.clone_at(
-                f"file://{remote}",
-                revision,
-                checkout,
-                sparse_patterns=cli.DATABASE_SPARSE_PATTERNS,
+                url, revision, checkout, sparse_patterns=cli.DATABASE_SPARSE_PATTERNS
             )
         self.assertEqual(resolved, revision)
 
@@ -5451,6 +5487,27 @@ class DatabaseCheckoutTests(unittest.TestCase):
                         text=True,
                     ).stdout.strip(),
                     "true",
+                )
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "config", "--get", "core.repositoryformatversion"],
+                        cwd=checkout, check=True, capture_output=True, text=True,
+                    ).stdout.strip(),
+                    "1",
+                )
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "config", "--get", "remote.origin.promisor"],
+                        cwd=checkout, check=True, capture_output=True, text=True,
+                    ).stdout.strip(),
+                    "true",
+                )
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "config", "--get", "remote.origin.partialclonefilter"],
+                        cwd=checkout, check=True, capture_output=True, text=True,
+                    ).stdout.strip(),
+                    "blob:none",
                 )
                 self.assertEqual(len(list((checkout / "entries").glob("*.json"))), payload_count)
                 missing = {
@@ -5542,6 +5599,213 @@ class DatabaseCheckoutTests(unittest.TestCase):
             )
             self.assertFalse((checkout / "after-resolution.txt").exists())
 
+    def test_the_final_filtered_unshallow_keeps_payload_blobs_promised(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _source, remote, revision, payload_blobs = self.repository(directory, 3)
+            checkout = Path(directory) / "checkout"
+            with self.serve(remote) as url:
+                cli.clone_at(
+                    url, revision, checkout, sparse_patterns=cli.DATABASE_SPARSE_PATTERNS
+                )
+                subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "registration"],
+                               check=True, capture_output=True)
+                subprocess.run(
+                    ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                     "-C", str(checkout), "commit", "--allow-empty", "-qm", "registration"],
+                    check=True,
+                )
+                with mock.patch.object(
+                    cli, "registry_git_environment", return_value=os.environ.copy()
+                ):
+                    cli.complete_database_history_for_push(checkout)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "--is-shallow-repository"], cwd=checkout,
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(),
+                "false",
+            )
+            missing = {
+                line[1:]
+                for line in subprocess.run(
+                    ["git", "rev-list", "--objects", "--missing=print", "HEAD"],
+                    cwd=checkout, check=True, capture_output=True, text=True,
+                ).stdout.splitlines()
+                if line.startswith("?")
+            }
+            self.assertLessEqual(payload_blobs, missing)
+
+    def test_current_database_validator_accepts_a_real_sparse_depth_one_checkout(self):
+        """Exercise current Database scope code with historical bundles absent."""
+        database_source = capability_source("database")
+        if database_source is None:
+            _variables, _executable, what = TEST_CAPABILITIES["database"]
+            wanted = capability_wanted("database")
+            if running_under_ci() and "database" not in _DECLARED_ABSENT:
+                self.fail(
+                    f"{wanted} is absent, so this job is not {what}. Provide it, or add "
+                    "'database' to PALOMAR_TESTS_WITHOUT in the workflow."
+                )
+            _UNEXERCISED["database"] = f"{what} (needs {wanted})"
+            self.skipTest(f"needs {wanted}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "database.git"
+            subprocess.run(
+                ["git", "clone", "--quiet", "--bare", str(database_source), str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", f"--git-dir={remote}", "config", "uploadpack.allowFilter", "true"],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", str(database_source), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            payload_blobs = {
+                line.split()[2]
+                for line in subprocess.run(
+                    ["git", "-C", str(database_source), "ls-tree", "-r", "HEAD",
+                     "renders", "evidence"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.splitlines()
+            }
+            self.assertTrue(payload_blobs, "current Database fixture has no historical bundle")
+            checkout = root / "checkout"
+            self.sparse_clone(remote, revision, checkout)
+            self.assertFalse((checkout / "renders").exists())
+            self.assertFalse((checkout / "evidence").exists())
+            self.assertEqual(
+                (checkout / "tools" / "validate.py").read_bytes(),
+                (database_source / "tools" / "validate.py").read_bytes(),
+            )
+            missing = {
+                line[1:]
+                for line in subprocess.run(
+                    ["git", "rev-list", "--objects", "--missing=print", "HEAD"],
+                    cwd=checkout, check=True, capture_output=True, text=True,
+                ).stdout.splitlines()
+                if line.startswith("?")
+            }
+            # Some tiny JSON/text payloads may share an object id with an
+            # in-sparse file and are therefore present for an unrelated path.
+            # The historical worktrees are wholly absent, and at least one of
+            # their current real blobs must remain behind the promisor.
+            self.assertTrue(payload_blobs & missing)
+
+            index_path = checkout / "index.json"
+            index = json.loads(index_path.read_text())
+            index["generated_at"] = "2026-08-08T01:00:00Z"
+            index_path.write_text(json.dumps(index, indent=2) + "\n")
+            subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "validation"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "add", "index.json"], check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                 "-C", str(checkout), "commit", "-qm", "change current index timestamp"],
+                check=True,
+            )
+            validated = cli.validate_sparse_database(checkout, revision)
+            self.assertIn("checking all entry metadata and 0 changed record bundle(s)",
+                          validated.stdout)
+            self.assertIn("database is valid", validated.stdout)
+
+            readme = checkout / "README.md"
+            readme.write_text(readme.read_text() + "\nScope fallback probe.\n")
+            subprocess.run(["git", "-C", str(checkout), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                 "-C", str(checkout), "commit", "-qm", "force validator fallback"],
+                check=True,
+            )
+            with self.assertRaisesRegex(
+                ReviewerError,
+                "refusing unscoped validation.*omits historical renders/evidence",
+            ):
+                cli.validate_sparse_database(checkout, revision)
+
+
+class RegistrationStagingTests(unittest.TestCase):
+    def repository(self, directory):
+        database = Path(directory) / "database"
+        database.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(database)], check=True)
+        (database / ".gitignore").write_text("*~\n")
+        (database / "index.json").write_text("{\"old\": true}\n")
+        subprocess.run(["git", "-C", str(database), "add", ".gitignore", "index.json"],
+                       check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+             "-C", str(database), "commit", "-qm", "base"],
+            check=True,
+        )
+        return database
+
+    def built_paths(self, database):
+        entry = database / "entries" / "new.json"
+        scores = database / "scores" / "new.json"
+        render = database / "renders" / "new" / "hash"
+        evidence = database / "evidence" / "new" / "hash"
+        for path in (entry, scores, render / "index.html", evidence / "report.json"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n")
+        (database / "index.json").write_text("{\"new\": true}\n")
+        return entry, scores, render, evidence
+
+    def test_ignored_bundle_files_are_explicitly_staged_at_mode_100644(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = self.repository(directory)
+            entry, scores, render, evidence = self.built_paths(database)
+            # This is repository-local and invisible to the worktree diff. A
+            # directory-level `git add renders/...` may omit the file; the
+            # production helper must force the exact enumerated path instead.
+            (database / ".git" / "info" / "exclude").write_text("renders/**\n")
+            (render / "index.html").chmod(0o755)
+            additions = cli.stage_registration_change(
+                database,
+                entry=entry,
+                scores=scores,
+                render_bundle=render,
+                evidence_bundle=evidence,
+            )
+            self.assertIn("renders/new/hash/index.html", additions)
+            staged = subprocess.run(
+                ["git", "-C", str(database), "diff", "--cached", "--name-only"],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            self.assertEqual(
+                staged,
+                [
+                    "entries/new.json",
+                    "evidence/new/hash/report.json",
+                    "index.json",
+                    "renders/new/hash/index.html",
+                    "scores/new.json",
+                ],
+            )
+            modes = subprocess.run(
+                ["git", "-C", str(database), "ls-files", "--stage", *additions],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            self.assertTrue(modes)
+            self.assertTrue(all(line.startswith("100644 ") for line in modes))
+
+    def test_a_bundle_symlink_is_rejected_before_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = self.repository(directory)
+            entry, scores, render, evidence = self.built_paths(database)
+            (evidence / "report.json").unlink()
+            (evidence / "report.json").symlink_to(database / "index.json")
+            with self.assertRaisesRegex(ReviewerError, "evidence bundle contains a symbolic link"):
+                cli.stage_registration_change(
+                    database,
+                    entry=entry,
+                    scores=scores,
+                    render_bundle=render,
+                    evidence_bundle=evidence,
+                )
+
 
 class RegistrationIndexTests(unittest.TestCase):
     def test_extending_the_index_reads_no_entry_files_as_it_grows(self):
@@ -5586,6 +5850,7 @@ class RegistrationRetryTests(unittest.TestCase):
 
     def test_a_new_branch_is_pushed_plainly(self):
         with mock.patch.object(cli, "registry_git_environment", return_value={}), \
+             mock.patch.object(cli, "complete_database_history_for_push"), \
              mock.patch.object(cli, "remote_branch_commit", return_value=None), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
@@ -5595,6 +5860,7 @@ class RegistrationRetryTests(unittest.TestCase):
 
     def test_an_abandoned_branch_is_replaced_under_a_lease(self):
         with mock.patch.object(cli, "registry_git_environment", return_value={}), \
+             mock.patch.object(cli, "complete_database_history_for_push"), \
              mock.patch.object(cli, "remote_branch_commit", return_value="a" * 40), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
@@ -5605,6 +5871,26 @@ class RegistrationRetryTests(unittest.TestCase):
             f"--force-with-lease=refs/heads/submission-abc-v1:{'a' * 40}", command
         )
         self.assertNotIn("--force", command)
+
+    def test_only_a_branch_that_will_be_pushed_completes_filtered_history(self):
+        shallow = SimpleNamespace(stdout="true\n")
+        parent = SimpleNamespace(stdout="a" * 40 + "\n")
+        fetched = SimpleNamespace(stdout="")
+        with mock.patch.object(cli, "registry_git_environment", return_value={"auth": "token"}), \
+             mock.patch.object(cli, "run", side_effect=[shallow, parent, fetched]) as runner:
+            cli.complete_database_history_for_push(Path("/tmp/database"))
+        self.assertEqual(
+            runner.call_args_list[2].args[0],
+            ["git", "fetch", "--filter=blob:none", "--unshallow", "origin", "a" * 40],
+        )
+        self.assertEqual(runner.call_args_list[2].kwargs["env"], {"auth": "token"})
+
+    def test_a_complete_push_checkout_does_not_fetch_history_again(self):
+        with mock.patch.object(
+            cli, "run", return_value=SimpleNamespace(stdout="false\n")
+        ) as runner:
+            cli.complete_database_history_for_push(Path("/tmp/database"))
+        self.assertEqual(len(runner.call_args_list), 1)
 
     def test_an_open_pull_request_is_found_rather_than_duplicated(self):
         with mock.patch.object(cli, "gh", return_value="34\n"):
