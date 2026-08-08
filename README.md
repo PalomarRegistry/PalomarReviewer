@@ -217,14 +217,23 @@ they have, and the review was an acceptance:
 palomar-review register --submission a1b2c3d4e5f6
 ```
 
-`register` authorises first, before anything public happens. It requires the
-private record to hold a delivered review, to say how push access was proved and
-not merely that it was, to name
-no previous registration, to carry the submitter's consent, and for the digest
-delivered, the digest consented to, and the review about to be archived to be
-the same bytes. Only then does it dispatch the pinned Challenge renderer, which
-is a public Actions run naming the repository and commit and would otherwise
-signal an acceptance the submitter never agreed to register.
+`register` first reads the private delivered review and refuses anything but an
+acceptance, before it clones a policy or source, downloads an artifact, or
+writes a workspace. It then checks the exact reviewed policy and evidence. No
+submission is grandfathered past authorization: every registration requires
+the private record to describe how push access was proved and not merely assert
+that it was, to name no previous registration, to carry the submitter's
+consent, and for the digest delivered, the digest consented to, and the review
+about to be archived to be the same bytes. Only then does it dispatch the
+pinned Challenge renderer, which is a public Actions run naming the repository
+and commit and would otherwise signal an acceptance the submitter never agreed
+to register.
+
+The submission server records the proof method and its GitHub repository and
+principal observations. The reviewer requires schema version 1, validates the
+method's claimed binding, and binds the proof to the reviewed commit and
+principal. It does not independently ask GitHub to resolve the stored
+`repository_id` back to the submitted repository.
 
 An acceptance normally remains an offer to register for 24 hours after the
 review is delivered. A review-contract or security change may require immediate
