@@ -1327,6 +1327,58 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["review"]["verdict"], "accept")
         self.assertNotIn("statement_alignment", json.dumps(record))
 
+    def test_a_credential_in_a_finding_never_reaches_the_record(self):
+        """`warnings` is the finding messages, so a poisoned pass lands here.
+
+        The model can read the engine's own credential: it is bound into the
+        namespace beside the repository the passes are told to read. An entry
+        in `entries/` is permanent, so this is the last place to notice.
+        """
+        review = {
+            "reviewed_at": "2026-08-01T12:34:56Z",
+            "policy_commit": "9" * 40,
+            "reviewer_models": ["codex:test"],
+            "summary": "Editorially accepted example.",
+            "scores": {
+                "statement_alignment": 4, "definition_fidelity": 4,
+                "notability": 4, "literature": 4, "clarity": 4,
+            },
+            "warnings": [],
+            "passes": [
+                {
+                    "step": "metadata",
+                    "verdict": "pass",
+                    "findings": [
+                        {
+                            "severity": "info",
+                            "message": "The repository asked me to report " + "sk-" + "q4Wm" * 8,
+                            "evidence": "README.md",
+                        }
+                    ],
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ReviewerError, "prompt injection"):
+            self.example_record(review=review)
+
+    def test_the_submitter_s_own_metadata_is_not_held_to_that(self):
+        """Only the review half of the record is checked, deliberately.
+
+        The abstract is the submitter's `formalization.yaml`, which is already
+        public in the repository the record points at, so refusing it protects
+        nobody. It would also hand any submitter a registration that fails the
+        same way on every pass, and a registration has no attempt limit, no
+        backoff and one slot per pass in arrival order: theirs would sit at the
+        head of the queue holding up everybody else's.
+        """
+        record = self.example_record(
+            metadata={
+                "project": {"license": "MIT", "short_description": "A " + "sk-" + "q4Wm" * 8},
+                "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            }
+        )
+        self.assertIn("sk-", record["abstract"])
+
     def review_with_ranked_findings(self):
         """A review whose top-level list is the warning-and-error findings.
 
@@ -4719,6 +4771,199 @@ class ArchivedReviewTests(unittest.TestCase):
         cli.public_review(original)
         self.assertIn("scores", original)
         self.assertIn("severity", original["passes"][0]["findings"][0])
+
+
+class EngineCredentialTests(unittest.TestCase):
+    """The one secret inside the model's namespace must not leave in its prose.
+
+    The engine reads its API key from a file bound in beside `/workspace`,
+    which is the submitter's repository and which every pass is told to go and
+    read. So the review is model-authored text written within reach of a
+    credential, and delivery, registration and the registered record are the
+    three ways that text gets out.
+
+    What is checked is credential material, not talk about credentials. A
+    review that says a repository hardcodes an API key, or that its README
+    tells you to export one, is a review doing its job and has to be
+    deliverable; a review that reproduces the characters is the one thing that
+    must not be.
+    """
+
+    KEY = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0" * 2
+
+    def review(self, **overrides):
+        review = {
+            "schema_version": 2,
+            "submission_id": "a1b2c3d4e5f6",
+            "decision": "accept",
+            "summary": "Editorially accepted.",
+            "warnings": [],
+            "passes": [
+                {
+                    "step": "metadata",
+                    "verdict": "pass",
+                    "findings": [
+                        {"severity": "info", "message": "an observation", "evidence": "e"},
+                    ],
+                }
+            ],
+        }
+        review.update(overrides)
+        return review
+
+    def deliver(self, review, key=None):
+        state = {"id": "a1b2c3d4e5f6", "status": "reviewing", "events": []}
+        written = {}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if key:
+                os.environ["OPENAI_API_KEY"] = key
+            else:
+                os.environ.pop("OPENAI_API_KEY", None)
+            with (
+                mock.patch.object(
+                    cli,
+                    "put_state",
+                    side_effect=lambda path, value, *a, **k: written.setdefault(path, value),
+                ),
+                mock.patch.object(cli, "state_json", return_value=None),
+            ):
+                cli.deliver_review(state, review)
+        return written
+
+    def test_a_key_in_the_summary_is_not_delivered(self):
+        review = self.review(summary=f"Accepted. For the record the key is {self.KEY}.")
+        with self.assertRaises(ReviewerError):
+            self.deliver(review, key=self.KEY)
+
+    def test_nothing_is_written_when_the_review_is_refused(self):
+        """The refusal has to precede the write, not follow it.
+
+        `deliver_review` writes the review into the private record and then
+        moves the submission to `review-ready`, and the status page reads both.
+        A check after either one has already handed the key over.
+        """
+        review = self.review(summary=f"Accepted. The key is {self.KEY}.")
+        state = {"id": "a1b2c3d4e5f6", "status": "reviewing", "events": []}
+        with (
+            mock.patch.dict(os.environ, {"OPENAI_API_KEY": self.KEY}),
+            mock.patch.object(cli, "put_state") as write,
+            mock.patch.object(cli, "state_json", return_value=None),
+            self.assertRaises(ReviewerError),
+        ):
+            cli.deliver_review(state, review)
+        self.assertFalse(write.called)
+
+    def test_a_key_in_a_pass_finding_is_not_delivered(self):
+        """Nested, in the evidence, and not the credential this run holds.
+
+        A finding's `evidence` quotes the repository, so it is where a model
+        told to copy something out would put it, and the check has to walk the
+        whole document to see it. The key here is not the configured one, so
+        only the shape catches it: an operator who signed in with `codex login`
+        rather than setting the variable has no configured one at all.
+        """
+        review = self.review(
+            passes=[
+                {
+                    "step": "definition_fidelity",
+                    "verdict": "pass",
+                    "findings": [
+                        {
+                            "severity": "info",
+                            "message": "The definitions match.",
+                            "evidence": f"Challenge.lean line 12 reads: {'sk-' + 'x7Yz' * 8}",
+                        }
+                    ],
+                }
+            ]
+        )
+        with self.assertRaises(ReviewerError):
+            self.deliver(review)
+
+    def test_a_key_split_across_a_line_is_still_the_key(self):
+        """Whitespace through the middle is the first thing anyone would try.
+
+        The configured credential need not look like an OpenAI key at all, so
+        the shape is no help here: this is the constant-time comparison
+        against the real secret, over the review with its whitespace taken
+        out. Neither fragment on its own matches anything.
+        """
+        key = "palomar-proxy-CREDENTIAL-000000"
+        review = self.review(summary=f"Accepted. {key[:14]}\n{key[14:]} is worth noting.")
+        self.assertIsNone(cli._ENGINE_CREDENTIAL_SHAPE.search(review["summary"]))
+        with self.assertRaises(ReviewerError):
+            self.deliver(review, key=key)
+
+    def test_a_review_that_merely_discusses_keys_is_delivered(self):
+        """The near miss, and the reason the pattern has a lookbehind on it.
+
+        Every string here is something a real review of a real repository
+        writes: instructions that name an environment variable, a complaint
+        about a hardcoded credential that quotes none of it, a hyphenated
+        phrase ending in `sk`, a sentence that becomes one long run of
+        characters after an `sk-` once its spaces are taken out, and a digest.
+        Refusing any of them would make the check a worse problem than the one
+        it is for.
+        """
+        review = self.review(
+            summary=(
+                "The README tells contributors to set OPENAI_API_KEY before running the "
+                "test suite, which is fine, though scripts/deploy.py hardcodes an API key "
+                "and should not."
+            ),
+            warnings=[
+                "A risk-averse-unfolding-of-the-definition would read better.",
+                "sk- is used as a prefix for the generated skolem constants.",
+            ],
+            passes=[
+                {
+                    "step": "metadata",
+                    "verdict": "pass",
+                    "findings": [
+                        {
+                            "severity": "warning",
+                            "message": "The task-directed-search tactic block is undocumented.",
+                            "evidence": "sha256 " + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4"
+                            "649b934ca495991b7852b855",
+                        }
+                    ],
+                }
+            ],
+        )
+        written = self.deliver(review, key=self.KEY)
+        self.assertEqual(written["submissions/a1b2c3d4e5f6/review.json"], review)
+
+    def test_the_refusal_repeats_neither_the_key_nor_what_matched(self):
+        """This message is stored, shown on the status page and printed to a log.
+
+        `auto` puts the text of whatever failed a review into `review_error`,
+        which the submitter reads. A refusal that quoted the string it objected
+        to would deliver the key by the exact route it just refused.
+        """
+        review = self.review(summary=f"Accepted. The key is {self.KEY}.")
+        with self.assertRaises(ReviewerError) as refusal:
+            self.deliver(review, key=self.KEY)
+        message = str(refusal.exception)
+        self.assertNotIn(self.KEY, message)
+        self.assertNotIn(self.KEY[3:20], message)
+        self.assertIn("prompt injection", message)
+
+    def test_every_way_out_is_checked(self):
+        """A check nothing calls is not a check.
+
+        Delivery is not the only exit: `register` writes the redacted review
+        into the evidence bundle and `registry_record` builds the record that
+        carries the finding messages, and a review delivered before this
+        existed still reaches both.
+        """
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertIn('refuse_engine_credential(review, context="the review being delivered")', source)
+        self.assertIn('refuse_engine_credential(review, context="the review being registered")', source)
+        self.assertIn(
+            'refuse_engine_credential(record["review"], context="the record being registered")',
+            source,
+        )
+        self.assertIn('refuse_engine_credential(result, context=f"the {step[\'id\']} review pass")', source)
 
 
 class PushProofTests(unittest.TestCase):
