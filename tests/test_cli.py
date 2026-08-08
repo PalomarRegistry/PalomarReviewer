@@ -1361,6 +1361,24 @@ class ReviewerTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "prompt injection"):
             self.example_record(review=review)
 
+    def test_the_submitter_s_own_metadata_is_not_held_to_that(self):
+        """Only the review half of the record is checked, deliberately.
+
+        The abstract is the submitter's `formalization.yaml`, which is already
+        public in the repository the record points at, so refusing it protects
+        nobody. It would also hand any submitter a registration that fails the
+        same way on every pass, and a registration has no attempt limit, no
+        backoff and one slot per pass in arrival order: theirs would sit at the
+        head of the queue holding up everybody else's.
+        """
+        record = self.example_record(
+            metadata={
+                "project": {"license": "MIT", "short_description": "A " + "sk-" + "q4Wm" * 8},
+                "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            }
+        )
+        self.assertIn("sk-", record["abstract"])
+
     def review_with_ranked_findings(self):
         """A review whose top-level list is the warning-and-error findings.
 
@@ -4882,8 +4900,10 @@ class EngineCredentialTests(unittest.TestCase):
         Every string here is something a real review of a real repository
         writes: instructions that name an environment variable, a complaint
         about a hardcoded credential that quotes none of it, a hyphenated
-        phrase ending in `sk`, and a digest. Refusing any of them would make
-        the check a worse problem than the one it is for.
+        phrase ending in `sk`, a sentence that becomes one long run of
+        characters after an `sk-` once its spaces are taken out, and a digest.
+        Refusing any of them would make the check a worse problem than the one
+        it is for.
         """
         review = self.review(
             summary=(
@@ -4891,7 +4911,10 @@ class EngineCredentialTests(unittest.TestCase):
                 "test suite, which is fine, though scripts/deploy.py hardcodes an API key "
                 "and should not."
             ),
-            warnings=["A risk-averse-unfolding-of-the-definition would read better."],
+            warnings=[
+                "A risk-averse-unfolding-of-the-definition would read better.",
+                "sk- is used as a prefix for the generated skolem constants.",
+            ],
             passes=[
                 {
                     "step": "metadata",
@@ -4936,7 +4959,10 @@ class EngineCredentialTests(unittest.TestCase):
         source = Path(cli.__file__).read_text(encoding="utf-8")
         self.assertIn('refuse_engine_credential(review, context="the review being delivered")', source)
         self.assertIn('refuse_engine_credential(review, context="the review being registered")', source)
-        self.assertIn('refuse_engine_credential(record, context="the record being registered")', source)
+        self.assertIn(
+            'refuse_engine_credential(record["review"], context="the record being registered")',
+            source,
+        )
         self.assertIn('refuse_engine_credential(result, context=f"the {step[\'id\']} review pass")', source)
 
 

@@ -754,11 +754,15 @@ def _strings_in(value: Any) -> list[str]:
 
 
 def _holds_configured_key(text: str, key: bytes) -> bool:
-    """Whether `text` contains the configured key, without timing on its bytes.
+    """Whether `text` contains the configured key.
 
-    A window at a time, so no comparison stops early on the first byte that
-    differs. Encoded first because the review is model-authored and may hold
-    anything; a key is ASCII, so this only ever compares like with like.
+    A window at a time, so that no single comparison stops early on the first
+    byte that differs and the bytes of the key are never what decides how long
+    one takes. The search around them is not constant-time and is not claimed
+    to be: it stops at the first window that matches, which says where a match
+    was and nothing about what the key is. Encoded first because a review is
+    model-authored and may hold anything, while a key is ASCII, so this only
+    ever compares like with like.
     """
     haystack = text.encode("utf-8", "surrogatepass")
     return any(
@@ -788,6 +792,15 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
     learn from it, that a repository in the queue tried this, is precisely what
     the redaction erases. Failing costs the review and tells somebody.
 
+    What is looked for is credential material and not talk about credentials.
+    A review that says the README asks you to export `OPENAI_API_KEY`, or that
+    `deploy.py` has a key hardcoded in it, is a review doing its job and is
+    delivered. The one honest review this does refuse is the one that quotes
+    the characters of such a key to show which one it means, and that review
+    has to be rewritten without the quotation: the reviewed repository is going
+    to be named in a registered record, so putting the key in the review as
+    well would spread it rather than report it.
+
     Read it as a backstop and not as containment. It catches the credential
     written out plainly, which is what an injection that works at all produces
     first, and it does not catch one that base64s the key, reverses it, spells
@@ -797,15 +810,23 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
     """
     key = os.environ.get("OPENAI_API_KEY", "").strip().encode("utf-8")
     for text in _strings_in(document):
-        # Whitespace removed as well as raw, because a key with a newline
-        # through the middle of it is the first thing to try against a check
-        # like this one, and joining words up cannot invent a `sk-` at the
-        # start of one: it can only put another letter in front of it.
-        packed = "".join(text.split())
+        # The configured key is looked for with the whitespace taken out as
+        # well as in the text as it stands, because a key with a newline
+        # through the middle of it is the first thing anyone would try against
+        # a check like this one. The shape is looked for only in the text as it
+        # stands: taking the spaces out of "sk- is used as a prefix for
+        # generated names" leaves twenty-odd characters after an `sk-` and a
+        # sentence that was never a credential, which is a review refused for
+        # nothing.
         if (
             _ENGINE_CREDENTIAL_SHAPE.search(text)
-            or _ENGINE_CREDENTIAL_SHAPE.search(packed)
-            or (key and (_holds_configured_key(text, key) or _holds_configured_key(packed, key)))
+            or (
+                key
+                and (
+                    _holds_configured_key(text, key)
+                    or _holds_configured_key("".join(text.split()), key)
+                )
+            )
         ):
             # One message for both findings, and no quotation of what matched.
             # This text is stored in the private record, shown on the status
@@ -4252,13 +4273,20 @@ def registry_record(
             "authorization": copy.deepcopy(mechanical["submission"]["authorization"]),
         },
     }
-    # Whole, and after assembly. The review has been checked already and
-    # `warnings` comes out of it, but the title and the abstract come from the
-    # submitter's own `formalization.yaml` by a route no check on the review
-    # covers. What lands in `entries/` is permanent and readable by anyone, so
-    # a credential-shaped token in any part of it is worth stopping for,
-    # whoever put it there.
-    refuse_engine_credential(record, context="the record being registered")
+    # The review half of the record, and not the record. This is where the
+    # model's own prose lands, and it lands here having been through
+    # `registered_comments` rather than being copied, so it is worth its own
+    # look even though `register` checked the review it came from.
+    #
+    # Not the whole record, because the rest of it is the submitter's
+    # `formalization.yaml` and their repository metadata. A credential-shaped
+    # title there is already public in their own repository, so refusing it
+    # protects nobody, and refusing it would hand any submitter a registration
+    # that fails identically on every pass: registrations have no attempt
+    # limit and no backoff, one is attempted per pass, and the queue is in
+    # arrival order, so one permanently failing registration at the head of it
+    # stops everybody else's.
+    refuse_engine_credential(record["review"], context="the record being registered")
     return record
 
 
