@@ -561,7 +561,7 @@ class ReviewerTests(unittest.TestCase):
             database = Path(directory)
             (database / "entries").mkdir()
             with (
-                mock.patch.object(cli, "utc_today", return_value="2026-08-11"),
+                mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
                 mock.patch.object(
                     cli,
                     "allocate_identifier",
@@ -577,15 +577,23 @@ class ReviewerTests(unittest.TestCase):
                     dry_run=False,
                 )
 
-            self.assertEqual(identity, ("PALOMAR-2026-08-11-123456", "2026-08-11", 1))
+            self.assertEqual(
+                identity,
+                ("PALOMAR-2026-08-11-123456", "2026-08-11", "2026-08-11T09:30:00Z", 1),
+            )
             allocate.assert_called_once()
             saved = write.call_args.args[1]
             self.assertEqual(saved["registration_attempt"]["id"], identity[0])
+            # The instant is reserved with the identity, because it is what a
+            # retry has to reuse and what the record is dated by.
+            self.assertEqual(
+                saved["registration_attempt"]["registered_at"], "2026-08-11T09:30:00Z"
+            )
             self.assertEqual(saved["registration_attempt"]["review_sha256"], review_digest(review))
             self.assertEqual(write.call_args.kwargs["blob_sha"], "state-blob")
 
             with (
-                mock.patch.object(cli, "utc_today", return_value="2026-08-11"),
+                mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:31:00Z"),
                 mock.patch.object(cli, "allocate_identifier") as allocate_again,
                 mock.patch.object(cli, "put_state") as write_again,
             ):
@@ -616,7 +624,7 @@ class ReviewerTests(unittest.TestCase):
             database = Path(directory)
             (database / "entries").mkdir()
             with (
-                mock.patch.object(cli, "utc_today", return_value="2026-08-11"),
+                mock.patch.object(cli, "utc_now", return_value="2026-08-11T23:59:00Z"),
                 mock.patch.object(cli, "put_state") as write,
             ):
                 reserved = registration_attempt_identity(
@@ -626,11 +634,14 @@ class ReviewerTests(unittest.TestCase):
                     review=review,
                     dry_run=False,
                 )
-            self.assertEqual(reserved, ("PALOMAR-2026-08-11-000001", "2026-08-11", 1))
+            self.assertEqual(
+                reserved,
+                ("PALOMAR-2026-08-11-000001", "2026-08-11", "2026-08-11T23:59:00Z", 1),
+            )
             attempt = write.call_args.args[1]["registration_attempt"]
 
             with (
-                mock.patch.object(cli, "utc_today", return_value="2026-08-12") as tomorrow,
+                mock.patch.object(cli, "utc_now", return_value="2026-08-12T00:01:00Z") as tomorrow,
                 mock.patch.object(cli, "put_state") as write_again,
             ):
                 retried = registration_attempt_identity(
@@ -657,6 +668,7 @@ class ReviewerTests(unittest.TestCase):
                 "id": "PALOMAR-2026-08-01-123456",
                 "version": 1,
                 "accepted_at": "2026-08-01",
+                "registered_at": "2026-08-01T09:00:00Z",
                 "review_sha256": "0" * 64,
                 "source_repository": mechanical["source"]["repository"],
                 "source_commit": mechanical["source"]["commit"],
@@ -1268,6 +1280,9 @@ class ReviewerTests(unittest.TestCase):
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             },
             accepted_at="2026-08-01",
+            # A review of the morning, acted on later the same day. The record
+            # is dated by the day of this and not by the day of the review.
+            registered_at="2026-08-01T17:05:11Z",
             version=1,
             challenge_render={
                 "format": "verso-html",
@@ -1313,6 +1328,42 @@ class ReviewerTests(unittest.TestCase):
                 schema,
                 format_checker=jsonschema.FormatChecker(),
             )
+
+    def test_the_record_is_dated_by_its_registration_and_not_by_its_review(self):
+        """Every ordering surface in the database reads `registered_at`.
+
+        The review's verdict is a different moment and can be days earlier:
+        nothing is registered until the submitter has read their review and
+        consented, and they may take as long as they like over that. A record
+        dated by the review orders behind everything reviewed since, so a
+        submitter who waited can be registered and yet absent from the page of
+        what is new.
+        """
+        record = self.example_record()
+
+        self.assertEqual(record["registered_at"], "2026-08-01T17:05:11Z")
+        self.assertNotEqual(record["registered_at"], record["review"]["reviewed_at"])
+
+    def test_the_result_date_is_the_day_the_first_version_was_registered(self):
+        """The two are one fact written twice, and the database refuses a
+        record where they have come apart. Checked here as well, because by the
+        time the database sees it the registration has already pushed an
+        archive tag and dispatched a render."""
+        record = self.example_record()
+        self.assertEqual(record["accepted_at"], record["registered_at"][:10])
+
+        with self.assertRaisesRegex(ReviewerError, "was registered on 2026-08-02"):
+            self.example_record(registered_at="2026-08-02T00:30:00Z")
+
+    def test_a_later_version_keeps_the_result_date_and_brings_its_own_instant(self):
+        """A v2 is a new registration and is news, so it carries the moment it
+        was registered. Its result's date is inherited, because the identifier
+        carries that and the identifier belongs to the result: it is also what
+        keeps the v2 on its v1's browse page."""
+        record = self.example_record(version=2, registered_at="2027-04-01T09:00:00Z")
+
+        self.assertEqual(record["accepted_at"], "2026-08-01")
+        self.assertEqual(record["registered_at"], "2027-04-01T09:00:00Z")
 
     def test_the_record_carries_the_verdict_and_not_the_scores(self):
         """The record is served exactly as it is committed, so anything the
@@ -1588,6 +1639,7 @@ class ReviewerTests(unittest.TestCase):
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             },
             accepted_at="2026-08-01",
+            registered_at="2026-08-01T17:05:11Z",
             version=1,
             challenge_render={
                 "format": "verso-html",
@@ -2695,7 +2747,7 @@ class PublicationIdentityTests(unittest.TestCase):
         *,
         submission="a1b2c3d4e5f6",
         existing_id=None,
-        today="2026-08-11",
+        registered_at="2026-08-11T09:00:00Z",
         reviewed_at="2026-08-01T12:00:00Z",
     ):
         """Resolve an identity for a review of the first, acted on ten days later.
@@ -2705,28 +2757,32 @@ class PublicationIdentityTests(unittest.TestCase):
         date registration happened, and either could have been the one the
         identifier carried without a test noticing.
         """
-        with mock.patch.object(cli, "utc_today", return_value=today):
-            return registration_identity(
-                database,
-                submission_id=submission,
-                existing_id=existing_id,
-                reviewed_at=reviewed_at,
-                mechanical={
-                    "source": {"repository": "example/project"},
-                    "comparator": {"path": "comparator.json"},
-                },
-            )
+        return registration_identity(
+            database,
+            submission_id=submission,
+            existing_id=existing_id,
+            reviewed_at=reviewed_at,
+            registered_at=registered_at,
+            mechanical={
+                "source": {"repository": "example/project"},
+                "comparator": {"path": "comparator.json"},
+            },
+        )
 
     def test_a_new_submission_gets_the_first_free_serial_for_the_day_it_is_registered(self):
-        identifier, accepted_at, version = self.resolve(self.database())
+        identifier, accepted_at, registered_at, version = self.resolve(self.database())
         self.assertEqual(identifier, "PALOMAR-2026-08-11-000001")
         self.assertEqual((accepted_at, version), ("2026-08-11", 1))
+        # The result's date is the day of the instant, from one reading of the
+        # clock: two readings a moment apart can straddle midnight.
+        self.assertEqual(registered_at, "2026-08-11T09:00:00Z")
+        self.assertEqual(accepted_at, registered_at[:10])
 
     def test_a_new_submission_follows_the_last_one_registered_that_day(self):
         earlier_today = self.prior(identifier="PALOMAR-2026-08-11-000042")
         earlier_today["accepted_at"] = "2026-08-11"
         database = self.database(earlier_today)
-        identifier, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
+        identifier, _, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
         self.assertEqual(identifier, "PALOMAR-2026-08-11-000043")
 
     def test_holding_consent_back_does_not_buy_an_earlier_identifier(self):
@@ -2743,7 +2799,7 @@ class PublicationIdentityTests(unittest.TestCase):
         database. The waiting submitter must land behind it, not in front.
         """
         database = self.database(self.registered_on("PALOMAR-2026-08-05-000001"))
-        identifier, accepted_at, _ = self.resolve(database, submission="b2c3d4e5f6a1")
+        identifier, accepted_at, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
         self.assertEqual((identifier, accepted_at), ("PALOMAR-2026-08-11-000001", "2026-08-11"))
         self.assertGreater(identifier, "PALOMAR-2026-08-05-000001")
 
@@ -2760,12 +2816,16 @@ class PublicationIdentityTests(unittest.TestCase):
         identifier, so it would also move the whole result to another day.
         """
         database = self.database(self.prior())
-        identifier, accepted_at, version = self.resolve(
+        identifier, accepted_at, registered_at, version = self.resolve(
             database, submission="b2c3d4e5f6a1", existing_id="PALOMAR-2026-08-01-000012"
         )
         self.assertEqual(
             (identifier, accepted_at, version), ("PALOMAR-2026-08-01-000012", "2026-08-01", 2)
         )
+        # The result's date is inherited and the version's instant is not: a v2
+        # is a new registration, and every ordering surface has to see it as
+        # one rather than filing it beside its v1.
+        self.assertEqual(registered_at, "2026-08-11T09:00:00Z")
 
     def test_an_update_to_an_unpublished_identifier_is_refused(self):
         with self.assertRaisesRegex(ReviewerError, "not in the database"):
@@ -2781,6 +2841,7 @@ class PublicationIdentityTests(unittest.TestCase):
                 submission_id="b2c3d4e5f6a1",
                 existing_id="PALOMAR-2026-08-01-000012",
                 reviewed_at="2026-08-01T12:00:00Z",
+                registered_at="2026-08-11T09:00:00Z",
                 mechanical={
                     "source": {"repository": "example/project", "project_path": "projects/second"}
                 },
@@ -2807,6 +2868,7 @@ class PublicationIdentityTests(unittest.TestCase):
                 submission_id="b2c3d4e5f6a1",
                 existing_id="PALOMAR-2026-08-01-000012",
                 reviewed_at="2026-08-01T12:00:00Z",
+                registered_at="2026-08-11T09:00:00Z",
                 mechanical={
                     "source": {"repository": "example/project"},
                     "comparator": {"path": "ComparatorChallenges/second.json"},
