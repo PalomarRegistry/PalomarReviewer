@@ -120,8 +120,9 @@ whole registry, so it belongs on a schedule rather than falling out of whichever
 pass crosses the window. A pass that cannot enumerate its work fails; it never reports having
 found nothing.
 
-For rubric version 2 and later, the runner rejects an internally inconsistent
-positive review: synthesis must reproduce the evidence-pass scores exactly, acceptance
+The reviewer accepts only the current rubric contract (schema version 7). It
+rejects an internally inconsistent positive review: synthesis must reproduce
+the evidence-pass scores exactly, acceptance
 cannot override a failed pass, and every completed evidence score
 must meet the policy's acceptance minimum. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
@@ -129,7 +130,7 @@ substantive judgments is not separately confirmed. The private State workflow
 uploads the complete packet as operator evidence with a requested 90-day
 artifact lifetime; that operational setting is not an author-access promise.
 
-Rubric version 7 additionally rejects a substantive pass unless its
+The current contract also rejects a substantive pass unless its
 `declarations_checked` manifest exactly matches every theorem and definition in
 the mechanically verified Comparator configuration, in configuration order.
 This prevents a multi-declaration submission from being reduced to a
