@@ -2271,7 +2271,10 @@ class ReviewerTests(unittest.TestCase):
                         return record
                 return None
 
-            def clone_database(_url, _revision, destination):
+            database_clone_options = []
+
+            def clone_database(_url, _revision, destination, **options):
+                database_clone_options.append(options)
                 # An update must see the version it supersedes, so once the
                 # first record is published the clone comes from that branch.
                 published = work / "database"
@@ -2295,7 +2298,6 @@ class ReviewerTests(unittest.TestCase):
                         ["git", "-C", str(destination), "checkout", "--quiet", branch],
                         check=True,
                     )
-                shutil.copy(database_source / "schema-v1.json", destination / "schema-v1.json")
                 shutil.copy(database_source / "schema-v2.json", destination / "schema-v2.json")
                 shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
                 return subprocess.run(
@@ -2346,14 +2348,31 @@ class ReviewerTests(unittest.TestCase):
             with self.assertRaisesRegex(ReviewerError, "no longer matches the mechanical report"):
                 register(args)
             formalization_path.write_bytes(formalization_bytes)
+            validation_commands = []
+            real_run = cli.run
+
+            def record_validation(command, *run_args, **run_kwargs):
+                if len(command) >= 2 and command[1] == "tools/validate.py":
+                    validation_commands.append(command)
+                return real_run(command, *run_args, **run_kwargs)
+
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+                mock.patch("palomar_reviewer.cli.run", side_effect=record_validation),
             ):
                 self.assertEqual(register(args), 0)
+            self.assertEqual(
+                validation_commands,
+                [[sys.executable, "tools/validate.py", "--since", database_head]],
+            )
+            self.assertEqual(
+                database_clone_options[-1],
+                {"sparse_patterns": cli.DATABASE_SPARSE_PATTERNS},
+            )
 
             database = work / "database"
-            # The entry is found rather than named, twice over. The serial
+            # The entry is found rather than named. The serial
             # follows whatever the real database already holds for that day,
             # and this test clones the real database; and since a result is
             # dated by when it entered the registry rather than by when it was
@@ -2534,8 +2553,17 @@ class ReviewerTests(unittest.TestCase):
                 render_result=str(update_render),
                 dry_run=True,
             )
+            updated_database_head = subprocess.run(
+                ["git", "-C", str(work / "database"), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             with (
-                mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
+                mock.patch(
+                    "palomar_reviewer.cli.resolve_remote_commit",
+                    return_value=updated_database_head,
+                ),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
             ):
                 self.assertEqual(register(update_args), 0)
@@ -5324,70 +5352,226 @@ class EntryProvenanceTests(unittest.TestCase):
                     cli.entry_provenance(self.provenance(**{field: "unspecified"}))
 
 
-class UnshallowTests(unittest.TestCase):
-    """A branch is pushed from this checkout, so its history has to be real.
+class DatabaseCheckoutTests(unittest.TestCase):
+    """Registration carries metadata, not every immutable public payload."""
 
-    Registration failed against a shallow clone: with the parent commit
-    absent, the new commit reads as though it introduced every file in the
-    tree, and GitHub refused the push for creating `.github/workflows/`
-    entries that the reviewer never touches.
-    """
-
-    def repository(self, directory):
-        origin = Path(directory) / "origin"
-        origin.mkdir()
+    def repository(self, directory, payload_count):
+        source = Path(directory) / "source"
+        remote = Path(directory) / "remote.git"
+        source.mkdir()
         git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
-        subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
-        (origin / ".github" / "workflows").mkdir(parents=True)
-        (origin / ".github" / "workflows" / "pages.yml").write_text("on: push\n")
-        subprocess.run([*git, "-C", str(origin), "add", "-A"], check=True)
-        subprocess.run([*git, "-C", str(origin), "commit", "-qm", "workflows"], check=True)
-        (origin / "index.json").write_text("{}\n")
-        subprocess.run([*git, "-C", str(origin), "add", "-A"], check=True)
-        subprocess.run([*git, "-C", str(origin), "commit", "-qm", "index"], check=True)
-        return origin
+        subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+        (source / ".github" / "workflows").mkdir(parents=True)
+        (source / ".github" / "workflows" / "validate.yml").write_text("on: push\n")
+        (source / "tools").mkdir()
+        (source / "tools" / "validate.py").write_text("print('ok')\n")
+        (source / "entries").mkdir()
+        (source / "scores").mkdir()
+        payload_blobs = set()
+        entries = []
+        for number in range(payload_count):
+            identifier = f"PALOMAR-2026-08-08-{number + 1:06d}"
+            filename = f"{identifier}-v1.json"
+            (source / "entries" / filename).write_text(json.dumps({"id": identifier}) + "\n")
+            (source / "scores" / filename).write_text("{}\n")
+            entries.append({"path": f"entries/{filename}"})
+            for directory_name in ("renders", "evidence"):
+                payload = source / directory_name / identifier / "hash" / "payload"
+                payload.parent.mkdir(parents=True)
+                payload.write_text(f"{directory_name}-{number}\n")
+                payload_blobs.add(
+                    subprocess.run(
+                        ["git", "hash-object", str(payload)],
+                        cwd=source,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                )
+        (source / "index.json").write_text(
+            json.dumps({"schema_version": 2, "generated_at": "2026-08-08T00:00:00Z",
+                        "entries": entries}) + "\n"
+        )
+        subprocess.run([*git, "-C", str(source), "add", "-A"], check=True)
+        subprocess.run([*git, "-C", str(source), "commit", "-qm", "database"], check=True)
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "main"], check=True)
+        subprocess.run(["git", f"--git-dir={remote}", "symbolic-ref", "HEAD", "refs/heads/main"],
+                       check=True)
+        subprocess.run(["git", f"--git-dir={remote}", "config", "uploadpack.allowFilter", "true"],
+                       check=True)
+        revision = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return source, remote, revision, payload_blobs
 
-    def test_a_shallow_checkout_is_given_its_history(self):
+    def sparse_clone(self, remote, revision, checkout):
+        # Production forbids local transports. This test-only protocol
+        # whitelist lets the real clone_at implementation talk to the bare
+        # fixture without weakening the production command.
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+            resolved = cli.clone_at(
+                f"file://{remote}",
+                revision,
+                checkout,
+                sparse_patterns=cli.DATABASE_SPARSE_PATTERNS,
+            )
+        self.assertEqual(resolved, revision)
+
+    def test_historical_payload_blobs_stay_missing_as_the_registry_grows(self):
+        for payload_count in (1, 12):
+            with self.subTest(payload_count=payload_count), tempfile.TemporaryDirectory() as directory:
+                _source, remote, revision, payload_blobs = self.repository(
+                    directory, payload_count
+                )
+                checkout = Path(directory) / "checkout"
+                self.sparse_clone(remote, revision, checkout)
+                self.assertFalse((checkout / "renders").exists())
+                self.assertFalse((checkout / "evidence").exists())
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "rev-list", "--count", "--all"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
+                    "1",
+                )
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "rev-parse", "--is-shallow-repository"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
+                    "true",
+                )
+                self.assertEqual(len(list((checkout / "entries").glob("*.json"))), payload_count)
+                missing = {
+                    line[1:]
+                    for line in subprocess.run(
+                        ["git", "rev-list", "--objects", "--missing=print", "HEAD"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    if line.startswith("?")
+                }
+                self.assertLessEqual(payload_blobs, missing)
+
+    def test_a_sparse_shallow_child_pushes_only_the_new_record_paths(self):
         with tempfile.TemporaryDirectory() as directory:
-            origin = self.repository(directory)
+            _source, remote, revision, _payload_blobs = self.repository(directory, 3)
             checkout = Path(directory) / "checkout"
+            self.sparse_clone(remote, revision, checkout)
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=checkout, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            new_paths = [
+                "entries/new.json",
+                "scores/new.json",
+                "renders/new/hash/index.html",
+                "evidence/new/hash/report.json",
+            ]
+            for relative in new_paths:
+                path = checkout / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
             subprocess.run(
-                ["git", "clone", "-q", "--depth=1", f"file://{origin}", str(checkout)],
+                ["git", "-C", str(checkout), "add", "--sparse", *new_paths], check=True,
+            )
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                 "-C", str(checkout), "commit", "-qm", "registration"],
                 check=True,
             )
             self.assertEqual(
-                subprocess.run(["git", "rev-parse", "--is-shallow-repository"],
-                               cwd=checkout, capture_output=True, text=True).stdout.strip(),
+                subprocess.run(
+                    ["git", "rev-parse", "--is-shallow-repository"], cwd=checkout,
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(),
                 "true",
             )
-            cli.unshallow(checkout)
             self.assertEqual(
-                subprocess.run(["git", "rev-parse", "--is-shallow-repository"],
-                               cwd=checkout, capture_output=True, text=True).stdout.strip(),
-                "false",
+                subprocess.run(["git", "merge-base", "--is-ancestor", base, "HEAD"],
+                               cwd=checkout).returncode,
+                0,
             )
-            # And the parent is now there, so a commit added on top can be
-            # seen for what it is: no workflow file among its changes.
-            (checkout / "entries").mkdir()
-            (checkout / "entries" / "probe.json").write_text("{}\n")
-            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
-            subprocess.run([*git, "-C", str(checkout), "add", "-A"], check=True)
-            subprocess.run([*git, "-C", str(checkout), "commit", "-qm", "entry"], check=True)
+            subprocess.run(
+                ["git", "-C", str(checkout), "push", "-q", f"file://{remote}",
+                 "HEAD:refs/heads/registration"],
+                check=True,
+            )
             changed = subprocess.run(
-                ["git", "diff", "--name-only", "HEAD^", "HEAD"],
-                cwd=checkout, capture_output=True, text=True, check=True,
-            ).stdout.split()
-            self.assertEqual(changed, ["entries/probe.json"])
+                ["git", f"--git-dir={remote}", "diff-tree", "--no-commit-id", "--name-only",
+                 "-r", "registration"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(changed, sorted(new_paths))
 
-    def test_a_complete_checkout_is_left_alone(self):
+    def test_the_exact_resolved_commit_wins_if_main_advances(self):
         with tempfile.TemporaryDirectory() as directory:
-            origin = self.repository(directory)
+            source, remote, resolved_main, _payload_blobs = self.repository(directory, 1)
+            (source / "after-resolution.txt").write_text("new tip\n")
+            subprocess.run(["git", "-C", str(source), "add", "after-resolution.txt"], check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                 "-C", str(source), "commit", "-qm", "advance main"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "main"],
+                           check=True)
             checkout = Path(directory) / "checkout"
-            subprocess.run(["git", "clone", "-q", f"file://{origin}", str(checkout)], check=True)
-            with mock.patch.object(cli, "run", wraps=cli.run) as runner:
-                cli.unshallow(checkout)
-            fetched = [c for c in runner.call_args_list if "fetch" in c.args[0]]
-            self.assertEqual(fetched, [], "an unshallow fetch was run on a complete checkout")
+            self.sparse_clone(remote, resolved_main, checkout)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip(),
+                resolved_main,
+            )
+            self.assertFalse((checkout / "after-resolution.txt").exists())
+
+
+class RegistrationIndexTests(unittest.TestCase):
+    def test_extending_the_index_reads_no_entry_files_as_it_grows(self):
+        for entry_count in (1, 1_000):
+            with self.subTest(entry_count=entry_count), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory)
+                entries = [
+                    {"id": f"old-{number}", "version": 1, "title": "old", "status": "accepted",
+                     "path": f"entries/old-{number:06d}.json"}
+                    for number in range(entry_count)
+                ]
+                (database / "index.json").write_text(
+                    json.dumps({"schema_version": 2, "generated_at": "old", "entries": entries})
+                )
+                reads = []
+                real_load_json = cli.load_json
+
+                def counted(path, reads=reads, real_load_json=real_load_json):
+                    reads.append(Path(path))
+                    return real_load_json(path)
+
+                record = {"id": "new", "version": 1, "title": "new", "status": "accepted"}
+                with mock.patch.object(cli, "load_json", side_effect=counted), \
+                     mock.patch.object(cli, "utc_now", return_value="2026-08-08T01:00:00Z"):
+                    result = cli.extend_registration_index(
+                        database, record=record, filename="new-v1.json"
+                    )
+                self.assertEqual(reads, [database / "index.json"])
+                self.assertEqual(len(result["entries"]), entry_count + 1)
+                self.assertEqual(result["entries"], sorted(result["entries"], key=lambda item: item["path"]))
 
 
 class RegistrationRetryTests(unittest.TestCase):

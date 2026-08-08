@@ -275,6 +275,20 @@ single tree hash covers everything justifying the record; raw Actions logs are
 deliberately not retained. It pushes a branch to
 `PalomarRegistry/PalomarDatabase` and opens a PR.
 
+That registration checkout is blob-filtered, depth one, and sparse: it checks
+out the schemas, tools, entries, scores and index, but does not materialize or
+download historical `renders/` and `evidence/` payload blobs. New payloads are
+added explicitly outside the sparse shape. The proposed commit is validated
+with `tools/validate.py --since` the exact Database `main` commit it extends, so
+the validator hashes the new immutable bundles while still checking every
+entry's metadata and the complete index. A shallow child can be pushed because
+the Database remote already holds that exact parent; any disagreement still
+makes the Git push fail. Registration therefore no longer grows with immutable
+payload bytes or Git history, but it remains O(A) in active entry metadata: ID
+allocation/update identity and the Database's absolute entry/index agreement
+both inspect the current entries. Replacing those scans requires one separately
+validated identity projection, not another local cache.
+
 The automatic finalizer merges only when GitHub reports the change `CLEAN` and
 the database's own `validate.yml` run for that exact head commit completed
 successfully. `CLEAN` alone is not enough and was believed for a while: the
