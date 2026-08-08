@@ -26,9 +26,13 @@ jobs:
       # this builds against and the schema served beside the data are the same
       # file. `scores-v1.json` is not fetched because it is not published: the
       # database validates `scores/` itself, at registration.
+      # The custom domain, not the workers.dev name. That second hostname is
+      # being turned off: it was a whole second front door onto the production
+      # bucket, outside anything scoped to the zone and able to lag the Worker's
+      # path allowlist indefinitely. This is the origin readers use.
       - name: Download the schema a record is built against
         env:
-          PUBLIC_DATA_ORIGIN: https://palomar-data.palomar-server.workers.dev
+          PUBLIC_DATA_ORIGIN: https://data.palomar-registry.org
         run: |
           mkdir palomar-schemas
           curl --fail --silent --show-error --retry 3 \
