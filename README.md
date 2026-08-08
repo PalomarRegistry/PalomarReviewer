@@ -64,11 +64,13 @@ claude auth
 
 ```bash
 python -m unittest discover -s tests
-uv run --locked --only-group dev ruff check .
+uv run --isolated --python 3.11.10 --locked --only-group dev ruff check .
 ```
 
 The lint command uses the exact Ruff release and artifact hashes recorded in
-`uv.lock`; CI runs the same locked command.
+`uv.lock` in a temporary environment, so it does not replace packages in a
+project `.venv`; CI runs the same locked command. `--locked` also refuses any
+dependency edit whose lockfile has not been regenerated with `uv lock`.
 
 Some of what the suite checks is not in this repository, and it will tell you
 at the end of the run exactly what it therefore did not check:

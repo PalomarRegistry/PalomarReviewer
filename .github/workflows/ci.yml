@@ -56,7 +56,7 @@ jobs:
           enable-cache: false
       - name: Lint
         working-directory: reviewer
-        run: uv run --locked --only-group dev ruff check .
+        run: uv run --isolated --python 3.11.10 --locked --only-group dev ruff check .
       - name: Install
         working-directory: reviewer
         run: |
