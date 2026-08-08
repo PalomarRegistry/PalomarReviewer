@@ -786,6 +786,86 @@ class ReviewerTests(unittest.TestCase):
             allocate_again.assert_not_called()
             write_again.assert_not_called()
 
+    def test_an_attempt_reserved_before_the_instant_existed_is_reserved_again(self):
+        """That version reserved an identifier and a date and no more, and this
+        one cannot finish from that: the instant is half of what was reserved.
+
+        Refusing left every retry failing on a reservation nothing could
+        complete, with a hand edit of private state the only way out. The
+        identifier is only ever spent by a registration that merged, so one the
+        database has never heard of was never spent.
+        """
+        mechanical = self.mechanical_fixture()
+        review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}
+        stale = {
+            "schema_version": 1,
+            "id": "PALOMAR-2026-08-08-000001",
+            "version": 1,
+            "accepted_at": "2026-08-08",
+            "review_sha256": review_digest(review),
+            "source_repository": mechanical["source"]["repository"],
+            "source_commit": mechanical["source"]["commit"],
+            "existing_id": None,
+        }
+        state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob", "registration_attempt": stale}
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            (database / "entries").mkdir()
+            with (
+                mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
+                mock.patch.object(
+                    cli, "allocate_identifier", return_value="PALOMAR-2026-08-11-123456",
+                ) as allocate,
+                mock.patch.object(cli, "put_state") as write,
+            ):
+                identity = registration_attempt_identity(
+                    database, state=state, mechanical=mechanical, review=review, dry_run=False,
+                )
+
+            allocate.assert_called_once()
+            self.assertEqual(
+                identity,
+                ("PALOMAR-2026-08-11-123456", "2026-08-11", "2026-08-11T09:30:00Z", 1),
+            )
+            saved = write.call_args.args[1]["registration_attempt"]
+            self.assertEqual(saved["registered_at"], "2026-08-11T09:30:00Z")
+
+    def test_an_attempt_without_an_instant_whose_identifier_is_public_needs_a_person(self):
+        """A registration that got further than this one did. Allocating around
+        it would invent a second answer to a question already answered."""
+        mechanical = self.mechanical_fixture()
+        review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}
+        stale = {
+            "schema_version": 1,
+            "id": "PALOMAR-2026-08-08-000001",
+            "version": 1,
+            "accepted_at": "2026-08-08",
+            "review_sha256": review_digest(review),
+            "source_repository": mechanical["source"]["repository"],
+            "source_commit": mechanical["source"]["commit"],
+            "existing_id": None,
+        }
+        state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob", "registration_attempt": stale}
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            (database / "entries").mkdir()
+            (database / "entries" / "PALOMAR-2026-08-08-000001-v1.json").write_text(
+                json.dumps({"id": "PALOMAR-2026-08-08-000001"}), encoding="utf-8",
+            )
+            with (
+                mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
+                mock.patch.object(cli, "allocate_identifier") as allocate,
+                mock.patch.object(cli, "put_state"),
+                self.assertRaises(ReviewerError) as raised,
+            ):
+                registration_attempt_identity(
+                    database, state=state, mechanical=mechanical, review=review, dry_run=False,
+                )
+            self.assertIn("needs a person", str(raised.exception))
+            allocate.assert_not_called()
+
     def test_a_registration_retried_after_midnight_keeps_the_date_it_reserved(self):
         """The reservation is what makes a retry finish the attempt it started.
 
@@ -5619,3 +5699,4 @@ class StarRaceTests(unittest.TestCase):
         ):
             self.assertEqual(cli.star_registered_sources(SimpleNamespace(dry_run=False)), 1)
         put_state.assert_not_called()
+

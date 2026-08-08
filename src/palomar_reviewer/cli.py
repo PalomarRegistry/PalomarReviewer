@@ -4584,15 +4584,48 @@ def registration_attempt_identity(
         accepted_at = attempt.get("accepted_at")
         registered_at = attempt.get("registered_at")
         version = attempt.get("version")
-        if (
-            not isinstance(identifier, str)
-            or not isinstance(accepted_at, str)
-            or not isinstance(registered_at, str)
-            or not isinstance(version, int)
-            or isinstance(version, bool)
-        ):
-            raise ReviewerError("saved registration attempt has an invalid permanent identity")
-        reserved = (identifier, accepted_at, registered_at, version)
+
+        # An attempt from before the instant was part of the identity. That
+        # version reserved an identifier and a date and no more, and this one
+        # cannot finish the job from that: the instant is half of what was being
+        # reserved. Discarding it and reserving again is safe for exactly the
+        # reason the reservation exists to be checked -- the identifier is only
+        # ever spent by a registration that merged, so an identifier the
+        # database has never heard of was never spent, and re-reserving takes
+        # nothing from anybody.
+        #
+        # Not tolerated when the database does know the identifier. That is a
+        # registration that got further than this one did, and quietly
+        # allocating around it would be inventing a second answer to a question
+        # already answered publicly.
+        if registered_at is None and isinstance(identifier, str):
+            known = {
+                str(load_json(path).get("id", ""))
+                for path in (database / "entries").glob("*.json")
+            }
+            if identifier in known:
+                raise ReviewerError(
+                    f"saved registration attempt {identifier} predates the registration "
+                    "instant and is already in the database; it needs a person"
+                )
+            print(
+                f"discarding a registration attempt for {identifier} that predates the "
+                "registration instant; reserving again",
+            )
+            attempt = None
+            reserved = None
+            identifier = accepted_at = version = None
+
+        if attempt is not None:
+            if (
+                not isinstance(identifier, str)
+                or not isinstance(accepted_at, str)
+                or not isinstance(registered_at, str)
+                or not isinstance(version, int)
+                or isinstance(version, bool)
+            ):
+                raise ReviewerError("saved registration attempt has an invalid permanent identity")
+            reserved = (identifier, accepted_at, registered_at, version)
 
     resolved = registration_identity(
         database,
