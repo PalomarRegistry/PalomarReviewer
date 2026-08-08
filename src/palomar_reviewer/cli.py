@@ -841,13 +841,12 @@ def _holds_configured_key(text: str, key: bytes) -> bool:
 def refuse_engine_credential(document: Any, *, context: str) -> None:
     """Refuse a model-authored document that carries the engine's own credential.
 
-    The reviewer's API key has to be inside the namespace the passes run in,
-    because the engine reads it: it is bound in at
-    `/home/reviewer/.codex/auth.json` under a sandbox whose read-only setting
-    permits reads, in the same namespace as `/workspace`, which is the
-    submitter's repository and is attacker-authored text every pass is told to
-    go and read. Everything else the host holds is out of reach in there. This
-    one thing cannot be.
+    A selected model engine's authentication has to be inside the namespace the
+    pass runs in because the engine reads it: Codex receives
+    `/home/reviewer/.codex/auth.json`, and Claude receives its credential file,
+    in the same namespace as the attacker-authored `/workspace`. A custom
+    command receives no model credential. Everything else the host holds is out
+    of reach in there; the selected engine credential cannot be.
 
     The other end of that is already built: finding messages become the
     `warnings` a registered record carries, and the review document goes whole
@@ -860,6 +859,8 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
     the redaction erases. Failing costs the review and tells somebody.
 
     What is looked for is credential material and not talk about credentials.
+    The exact configured value is available for comparison only for an
+    `OPENAI_API_KEY`; key-shaped output is checked for Codex and Claude.
     A review that says the README asks you to export `OPENAI_API_KEY`, or that
     `deploy.py` has a key hardcoded in it, is a review doing its job and is
     delivered. The one honest review this does refuse is the one that quotes
@@ -4222,13 +4223,13 @@ def allocate_identifier(registered_on: str, taken: set[str]) -> str:
 
     A date on a Palomar identifier is a priority claim, so it has to be a date
     the submitter cannot choose. Nothing is registered until they consent.
-    Palomar guarantees an accepted offer for 24 hours after delivery; after
-    that it may expire the offer and require reverification, though an offer
-    may remain usable longer without a promise. Whenever registration happens,
-    taking the date from the review would let waiting buy an earlier position
-    ahead of results registered meanwhile. Waiting instead costs a later
-    position, because the identifier uses the date registration actually
-    happens.
+    The normal offer window is 24 hours after delivery, but a review-contract
+    or security change may require immediate reverification rather than retain
+    an obsolete validator. After the window Palomar may expire the offer,
+    though it may remain usable longer without a promise. Whenever registration
+    happens, taking the date from the review would let waiting buy an earlier
+    position ahead of results registered meanwhile. Waiting instead costs a
+    later position, because the identifier uses the registration date.
 
     Fixed at first registration, and never recomputed after it. A later version
     reuses its v1's identifier and therefore its v1's date, because the
@@ -4393,7 +4394,7 @@ def registry_record(
         # `accepted_at` would file it among the results registered in the year
         # of its v1. It is not `review.reviewed_at`, which is when the verdict
         # was reached and can be days earlier, because nothing is registered
-        # until the submitter has read their review and consented.
+        # until the submitter has consented to registration.
         "registered_at": registered_at,
         "version": version,
         "status": "accepted",
