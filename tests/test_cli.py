@@ -3537,7 +3537,9 @@ class SubmissionListingTests(unittest.TestCase):
         }
 
     @contextlib.contextmanager
-    def state_repository(self, records, index=None, stored_sha="sha-on-disk"):
+    def state_repository(
+        self, records, index=None, stored_sha="sha-on-disk", during_clone=None
+    ):
         """The state repository as the reviewer reaches it: index, clone, write.
 
         `records` maps a submission id to its record, or to None for a
@@ -3554,14 +3556,22 @@ class SubmissionListingTests(unittest.TestCase):
                     directory.mkdir(parents=True)
                     if record is not None:
                         (directory / "state.json").write_text(json.dumps(record))
+                if during_clone is not None:
+                    during_clone()
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
-            return SimpleNamespace(returncode=0, stdout=f"{stored_sha}\n", stderr="")
+            sha = stored_sha() if callable(stored_sha) else stored_sha
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"HTTP/2.0 200 OK\nContent-Type: application/json\n\n{sha}\n",
+                stderr="",
+            )
 
         def read_index(path):
             self.assertEqual(path, cli.OPEN_INDEX_PATH)
-            if isinstance(index, Exception):
-                raise index
-            return index
+            current = index() if callable(index) else index
+            if isinstance(current, Exception):
+                raise current
+            return current
 
         with (
             mock.patch.object(cli, "state_json", side_effect=read_index),
@@ -3606,6 +3616,67 @@ class SubmissionListingTests(unittest.TestCase):
                 self.assertEqual(value["open"], ["aaaaaaaaaaaa"])
                 # Written against the sha the damaged file had, not blind.
                 self.assertEqual(keywords["blob_sha"], "sha-on-disk")
+
+    def test_a_rebuild_captures_the_index_identity_before_deriving(self):
+        records = {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
+        }
+        with self.state_repository(records, index=None) as (commands, written):
+            cli.rebuild_open_index()
+
+        self.assertTrue(
+            any(f"contents/{cli.OPEN_INDEX_PATH}" in str(part) for part in commands[0])
+        )
+        self.assertIn("clone", commands[1])
+        (_, _, _), keywords = written[0]
+        self.assertEqual(keywords["blob_sha"], "sha-on-disk")
+
+    def test_a_queue_writer_during_derivation_refuses_the_stale_rebuild(self):
+        records = {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
+        }
+        races = {
+            "server admission": ["aaaaaaaaaaaa", "bbbbbbbbbbbb"],
+            "reviewer pass": [],
+        }
+        for description, concurrent_open in races.items():
+            with self.subTest(description=description):
+                live = {
+                    "sha": "sha-before-rebuild",
+                    "index": self.index(open=["aaaaaaaaaaaa"], _blob_sha="sha-before-rebuild"),
+                }
+                attempts = []
+
+                def concurrent_write(current=live, open_ids=concurrent_open):
+                    current["sha"] = "sha-from-concurrent-writer"
+                    current["index"] = self.index(
+                        open=open_ids,
+                        _blob_sha="sha-from-concurrent-writer",
+                    )
+
+                def conditional_put(
+                    _path, value, _message, blob_sha=None, current=live, seen=attempts
+                ):
+                    seen.append(blob_sha)
+                    if blob_sha != current["sha"]:
+                        raise ReviewerError("HTTP 409: index changed")
+                    current["sha"] = "sha-from-rebuild"
+                    current["index"] = {**value, "_blob_sha": "sha-from-rebuild"}
+                    return "sha-from-rebuild"
+
+                with self.state_repository(
+                    records,
+                    index=lambda current=live: current["index"],
+                    stored_sha=lambda current=live: current["sha"],
+                    during_clone=concurrent_write,
+                ):
+                    with mock.patch.object(cli, "put_state", side_effect=conditional_put):
+                        with self.assertRaisesRegex(ReviewerError, "not recorded"):
+                            cli.rebuild_queue(SimpleNamespace())
+
+                self.assertEqual(attempts, ["sha-before-rebuild"])
+                self.assertEqual(live["sha"], "sha-from-concurrent-writer")
+                self.assertEqual(live["index"]["open"], concurrent_open)
 
     def test_the_first_drop_after_a_rebuild_names_the_sha_the_rebuild_left(self):
         """A rebuild writes the index and the pass over it writes again.
@@ -6416,6 +6487,7 @@ class QueueSweepTests(unittest.TestCase):
         with (
             mock.patch.object(cli, "state_json", return_value=derived),
             mock.patch.object(cli, "rebuild_open_index", return_value=derived) as rebuilt,
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
         ):
             self.assertEqual(cli.rebuild_queue(SimpleNamespace()), 0)
         rebuilt.assert_called_once()
@@ -6426,6 +6498,19 @@ class QueueSweepTests(unittest.TestCase):
 
 
 class QueueSweepFailureTests(unittest.TestCase):
+    def setUp(self):
+        writes = mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"})
+        writes.start()
+        self.addCleanup(writes.stop)
+
+    def test_a_sweep_without_write_authority_fails_before_deriving(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            cli, "rebuild_open_index"
+        ) as rebuilt:
+            with self.assertRaisesRegex(cli.ReviewerError, "PALOMAR_ALLOW_STATE_WRITES=1"):
+                cli.rebuild_queue(SimpleNamespace())
+        rebuilt.assert_not_called()
+
     def test_a_sweep_that_could_not_record_the_queue_fails(self):
         """A pass shrugs off a refused write, because the index is a cache and
         the next pass tries again. For the sweep the write is the whole errand,
@@ -6449,12 +6534,53 @@ class QueueSweepFailureTests(unittest.TestCase):
             "rebuilt_at": "2026-08-08T00:00:00Z",
             "rebuild_after": "2026-08-15T00:00:00Z",
             "open": ["aaaaaaaaaaaa"],
+            "_blob_sha": "sha-from-sweep",
         }
         with (
             mock.patch.object(cli, "rebuild_open_index", return_value=derived),
-            mock.patch.object(cli, "state_json", return_value={**derived, "_blob_sha": "x"}),
+            mock.patch.object(cli, "state_json", return_value=derived),
         ):
             self.assertEqual(cli.rebuild_queue(SimpleNamespace()), 0)
+
+    def test_a_semantically_equal_but_different_blob_fails_exact_readback(self):
+        """A reserialization can preserve every parsed field but change the
+        git blob identity; the scheduled sweep promises an exact read-back."""
+        derived = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-08T00:00:00Z",
+            "rebuild_after": "2026-08-15T00:00:00Z",
+            "open": ["aaaaaaaaaaaa"],
+            "_blob_sha": "sha-from-sweep",
+        }
+        recorded = {**derived, "_blob_sha": "sha-from-later-writer"}
+        with (
+            mock.patch.object(cli, "rebuild_open_index", return_value=derived),
+            mock.patch.object(cli, "state_json", return_value=recorded),
+        ):
+            with self.assertRaisesRegex(ReviewerError, "not recorded"):
+                cli.rebuild_queue(SimpleNamespace())
+
+
+class StateBlobIdentityTests(unittest.TestCase):
+    def response(self, status, body="", returncode=0):
+        return SimpleNamespace(
+            returncode=returncode,
+            stdout=f"HTTP/2.0 {status} Result\r\nContent-Type: application/json\r\n\r\n{body}",
+            stderr="",
+        )
+
+    def test_a_live_blob_identity_is_returned(self):
+        with mock.patch.object(cli, "run", return_value=self.response(200, "sha-on-disk\n")):
+            self.assertEqual(cli._state_blob_sha(cli.OPEN_INDEX_PATH), "sha-on-disk")
+
+    def test_a_genuine_missing_index_has_no_base_identity(self):
+        with mock.patch.object(cli, "run", return_value=self.response(404, returncode=1)):
+            self.assertIsNone(cli._state_blob_sha(cli.OPEN_INDEX_PATH))
+
+    def test_an_api_failure_cannot_be_mistaken_for_a_missing_index(self):
+        with mock.patch.object(cli, "run", return_value=self.response(503, returncode=1)):
+            with self.assertRaisesRegex(cli.ReviewerError, "live identity.*HTTP 503"):
+                cli._state_blob_sha(cli.OPEN_INDEX_PATH)
 
 
 class StarRaceTests(unittest.TestCase):

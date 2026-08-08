@@ -2566,8 +2566,15 @@ def rebuild_open_index() -> dict[str, Any]:
     thousand names for one directory, and the git trees API that replaces it
     truncates a large answer and would do so well before a hundred thousand
     submissions; a clone cannot half-answer, and it is one request rather than
-    one per submission.
+    one per submission. The live index identity is captured before that clone,
+    so a queue writer arriving between that capture and the conditional write
+    makes the rebuild refuse its stale snapshot instead of overwriting the live
+    queue.
     """
+    # This has to precede the clone. Reading the sha after deriving the queue
+    # authorized a stale snapshot to replace an admission or pass that landed
+    # during the clone, refresh rebuild_after, and hide live work for a week.
+    base_blob_sha = _state_blob_sha(OPEN_INDEX_PATH)
     ids: list[str] = []
     with tempfile.TemporaryDirectory(prefix="palomar-state-") as work:
         checkout = Path(work) / "state"
@@ -2609,16 +2616,39 @@ def rebuild_open_index() -> dict[str, Any]:
     # unconditional, the contents API refused it, and `_write_open_index`
     # swallowed the refusal as a warning: the first submission the reviewer
     # finished with after any rebuild was silently never dropped.
-    index["_blob_sha"] = _write_open_index(index, blob_sha=_state_blob_sha(OPEN_INDEX_PATH))
+    index["_blob_sha"] = _write_open_index(index, blob_sha=base_blob_sha)
     return index
 
 
 def _state_blob_sha(path: str) -> str | None:
-    """The sha a write must be conditional on, for a file too damaged to parse."""
+    """The sha a write must be conditional on, for a file too damaged to parse.
+
+    A genuine 404 means the conditional create must name no sha. Every other
+    failure is uncertainty, not absence: treating a rate limit or server error
+    as a missing file would turn the rebuild into an unconditional write.
+    """
     raw = run(
-        ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".sha"], check=False
+        [
+            "gh",
+            "api",
+            "--include",
+            f"repos/{STATE_REPO}/contents/{path}",
+            "--jq",
+            ".sha",
+        ],
+        check=False,
     )
-    return raw.stdout.strip() or None
+    response = raw.stdout.replace("\r\n", "\n")
+    statuses = re.findall(r"(?m)^HTTP/\S+\s+(\d{3})\b", response)
+    status = int(statuses[-1]) if statuses else None
+    if status == 404:
+        return None
+    _, separator, body = response.rpartition("\n\n")
+    blob_sha = body.strip() if separator else ""
+    if raw.returncode != 0 or status != 200 or not blob_sha or "\n" in blob_sha:
+        detail = f"HTTP {status}" if status is not None else "an unreadable response"
+        raise ReviewerError(f"could not establish the live identity of {path}: {detail}")
+    return blob_sha
 
 
 def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> str | None:
@@ -2630,9 +2660,9 @@ def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> str | None
     between, which is exactly what the read sha is here to catch: an admission
     must not be erased by a pass that never saw it.
 
-    Returns the sha the index now stands at, for the next write in this pass:
-    the new one when the write landed, and the one it was asked for otherwise,
-    because a refused or skipped write leaves the file exactly as it was.
+    Returns the new sha when the write lands. On a refused or skipped write it
+    returns the supplied base sha; that is deliberately not a claim about the
+    live file after a race, and any follow-on conditional write will be refused.
     """
     if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
         return blob_sha  # a read-only invocation, such as `list`, maintains nothing
@@ -2663,6 +2693,11 @@ def rebuild_queue(_: argparse.Namespace) -> int:
     record. Both are unlikely and neither is urgent, which is why a week is
     long enough and six hours was several clones a day for nothing.
     """
+    if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
+        raise ReviewerError(
+            "rebuild-queue must record its sweep: set PALOMAR_ALLOW_STATE_WRITES=1 "
+            f"to change {OPEN_INDEX_PATH} in {STATE_REPO}"
+        )
     index = rebuild_open_index()
     # A pass treats a refused write as nothing much, because the index is a
     # cache of what the records already say and the next pass will try again.
@@ -2670,11 +2705,24 @@ def rebuild_queue(_: argparse.Namespace) -> int:
     # right set and failed to record it has done nothing, and saying so
     # quietly is how a weekly check becomes a weekly no-op nobody notices.
     recorded = state_json(OPEN_INDEX_PATH)
-    if not isinstance(recorded, dict) or recorded.get("open") != index["open"]:
+    written_sha = index.get("_blob_sha")
+    expected = {key: value for key, value in index.items() if key != "_blob_sha"}
+    actual = (
+        {key: value for key, value in recorded.items() if key != "_blob_sha"}
+        if isinstance(recorded, dict)
+        else None
+    )
+    if (
+        not isinstance(written_sha, str)
+        or not written_sha
+        or not isinstance(recorded, dict)
+        or recorded.get("_blob_sha") != written_sha
+        or actual != expected
+    ):
         raise ReviewerError(
-            "the queue was derived but not recorded, so nothing was swept. The "
-            "usual cause is a pass writing the index in between, which is why "
-            "this runs in its own concurrency group."
+            "the queue was derived but its exact conditional write was not recorded, "
+            "so nothing was safely swept. A concurrent admission or pass may have "
+            "changed the index while the queue was being derived or read back."
         )
     print(f"the queue holds {len(index['open'])} open submission(s)")
     return 0
