@@ -663,6 +663,11 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     prevents a literature score of 5 but not 4" states one exactly, and no
     projection can take that back out of the prose; the policy forbids writing
     it in the first place.
+
+    Nor does it by itself keep the severities private. The record is served
+    beside this document and carries the review's remarks too, so it has to
+    carry a list that no severity can be read out of; `registered_comments`
+    below is the half of this decision that lives there.
     """
     archived = json.loads(json.dumps(review))
     archived.pop("scores", None)
@@ -674,6 +679,46 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(finding, dict):
                     finding.pop("severity", None)
     return archived
+
+
+def registered_comments(review: dict[str, Any]) -> list[str]:
+    """The remarks a record carries, in the order the review made them.
+
+    Not `review["warnings"]`, and this is the other half of `public_review`
+    above. What that list holds is decided by the rubric's
+    `finding_comment_policy`, in another repository: `all` makes it every
+    finding message, and `material` makes it the messages of the findings
+    whose severity is `warning` or `error`. Under `material` it is a
+    severity-ranked selection from the findings, and the archived review
+    carries every finding with its severity removed. Both are served, from the
+    same origin, so a record repeating that selection lets a reader subtract
+    one list from the other and read back exactly the ranking `public_review`
+    had just taken out. The policy says `all` today, so nothing has leaked;
+    what leaks is one word changed in a file this code never reads.
+
+    Every finding message, once, in pass order, partitions nothing: it is the
+    same set the archived review already shows. A top-level remark that
+    matches no finding is kept as well, because a rubric older than
+    `finding_comment_policy` ties the two lists together not at all, and
+    dropping such a remark would lose something the review said rather than
+    something it ranked.
+
+    These two functions are one decision written in two places, a long way
+    apart. Changing either alone puts the severities back.
+    """
+    comments: list[str] = []
+    for step in review.get("passes") or []:
+        if not isinstance(step, dict):
+            continue
+        for finding in step.get("findings") or []:
+            if isinstance(finding, dict) and isinstance(finding.get("message"), str):
+                comments.append(finding["message"])
+    seen = set(comments)
+    for warning in review.get("warnings") or []:
+        if isinstance(warning, str) and warning not in seen:
+            comments.append(warning)
+            seen.add(warning)
+    return comments
 
 
 def review_digest(report: dict[str, Any]) -> str:
@@ -3974,7 +4019,11 @@ def registry_record(
             "verdict": "accept",
             "report": {"sha256": verification_evidence["review_sha256"]},
             "reviewer_models": review["reviewer_models"],
-            "warnings": review["warnings"],
+            # Every remark, not the review's own top-level list: that list is
+            # the warning-and-error findings, and a record carrying it beside
+            # the archived review undoes the severity redaction. See
+            # `registered_comments`.
+            "warnings": registered_comments(review),
         },
         "trust": {
             "level": challenge["trust_level"],

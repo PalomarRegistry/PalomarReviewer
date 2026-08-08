@@ -1281,6 +1281,86 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(record["review"]["verdict"], "accept")
         self.assertNotIn("statement_alignment", json.dumps(record))
 
+    def review_with_ranked_findings(self):
+        """A review whose top-level list is the warning-and-error findings.
+
+        Which is what `finding_comment_policy: material` asks the synthesis
+        for, and what `validate_synthesis_policy` then checks it against. The
+        rubric says `all` today, so this is the shape the redaction has to hold
+        against rather than the shape it is currently handed.
+        """
+        return {
+            "reviewed_at": "2026-08-01T12:34:56Z",
+            "policy_commit": "9" * 40,
+            "reviewer_models": ["codex:test"],
+            "summary": "Editorially accepted example.",
+            "scores": {
+                "statement_alignment": 4, "definition_fidelity": 4,
+                "notability": 4, "literature": 4, "clarity": 4,
+            },
+            "warnings": ["a concern", "a second concern"],
+            "passes": [
+                {
+                    "step": "metadata",
+                    "verdict": "pass",
+                    "findings": [
+                        {"severity": "info", "message": "an observation", "evidence": "e"},
+                        {"severity": "warning", "message": "a concern", "evidence": "e"},
+                    ],
+                },
+                {
+                    "step": "literature_notability",
+                    "verdict": "pass",
+                    "findings": [
+                        {"severity": "error", "message": "a second concern", "evidence": "e"},
+                        {"severity": "info", "message": "a second observation", "evidence": "e"},
+                    ],
+                },
+            ],
+        }
+
+    def test_a_record_does_not_return_the_severities_the_archived_review_removed(self):
+        """The record and the archived review are served to the same reader.
+
+        `public_review` removes each finding's severity, and removes the
+        top-level list because it is the warning-and-error subset of those same
+        findings. The record was carrying that subset, so subtracting it from
+        the archived review's findings named every material one and handed the
+        ranking straight back.
+        """
+        review = self.review_with_ranked_findings()
+        record = self.example_record(review=review)
+        archived = cli.public_review(review)
+        findings = [
+            finding["message"]
+            for step in archived["passes"]
+            for finding in step["findings"]
+        ]
+        self.assertEqual(record["review"]["warnings"], findings)
+        self.assertEqual(
+            [message for message in findings if message not in record["review"]["warnings"]],
+            [],
+            "what the record leaves out is exactly the findings that were not material",
+        )
+
+    def test_a_record_keeps_a_remark_that_belongs_to_no_finding(self):
+        """A rubric that predates `finding_comment_policy` ties the two lists
+        together not at all, and a remark the synthesis wrote itself is
+        something the review said rather than something it ranked."""
+        review = self.review_with_ranked_findings()
+        review["warnings"] = ["a synthesis remark"]
+        record = self.example_record(review=review)
+        self.assertEqual(
+            record["review"]["warnings"],
+            [
+                "an observation",
+                "a concern",
+                "a second concern",
+                "a second observation",
+                "a synthesis remark",
+            ],
+        )
+
     def test_the_scores_are_recorded_beside_the_record(self):
         """The decision still has to be reconstructable."""
         review = {
