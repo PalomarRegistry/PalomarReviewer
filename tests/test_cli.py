@@ -4824,7 +4824,7 @@ class ArchivedReviewTests(unittest.TestCase):
         document gets written there.
         """
         source = Path(cli.__file__).read_text()
-        self.assertIn("served = public_review(review)", source)
+        self.assertIn('served = served_review(review, work / "policy")', source)
         self.assertIn('write_json(work / "review.json", served)', source)
         self.assertNotIn('write_json(work / "review.json", review)', source)
         # And checked against the schema for what is published, not the one
@@ -5031,6 +5031,101 @@ class EngineCredentialTests(unittest.TestCase):
             source,
         )
         self.assertIn('refuse_engine_credential(result, context=f"the {step[\'id\']} review pass")', source)
+
+
+class ServedReviewTests(unittest.TestCase):
+    """The other half of the redaction, which does not work by name.
+
+    `public_review` drops the fields it was taught to drop, and a rubric is
+    free to grow one it was not: `confidence`, `raw_score`, a model's
+    rationale. The schema is closed at every level and is what catches those.
+    It lives in PalomarPolicy, so what is checked here is that this code
+    applies whatever the policy checkout carries, and refuses to register at
+    all when the checkout carries nothing.
+    """
+
+    # Closed where it matters, and nothing else: the real document is in
+    # another repository and at a commit this test cannot pin.
+    CLOSED = {
+        "type": "object",
+        "properties": {
+            "passes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "verdict": {"enum": ["pass", "warn", "fail"]},
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {"message": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+            }
+        },
+    }
+
+    def policy(self, directory, schema=None):
+        policy = Path(directory) / "policy"
+        (policy / "schemas").mkdir(parents=True)
+        if schema is not None:
+            (policy / "schemas" / "public-review.schema.json").write_text(
+                json.dumps(schema), encoding="utf-8"
+            )
+        return policy
+
+    def test_a_policy_carrying_no_schema_stops_the_registration(self):
+        """Skipping the check used to look exactly like passing it."""
+        review = {"policy_commit": "a" * 40, "passes": []}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ReviewerError) as caught:
+                cli.served_review(review, self.policy(directory))
+        self.assertIn("public-review.schema.json", str(caught.exception))
+        self.assertIn("a" * 40, str(caught.exception))
+
+    def test_a_pass_field_nobody_taught_the_projection_about_fails(self):
+        review = {
+            "policy_commit": "a" * 40,
+            "passes": [{"verdict": "pass", "confidence": 0.9, "findings": []}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(jsonschema.ValidationError):
+                cli.served_review(review, self.policy(directory, self.CLOSED))
+
+    def test_a_finding_field_nobody_taught_the_projection_about_fails(self):
+        review = {
+            "policy_commit": "a" * 40,
+            "passes": [
+                {"verdict": "pass", "findings": [{"message": "m", "raw_score": 3}]}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(jsonschema.ValidationError):
+                cli.served_review(review, self.policy(directory, self.CLOSED))
+
+    def test_a_redacted_review_passes_and_comes_back_redacted(self):
+        """It passes because it was redacted: the schema allows no severity."""
+        review = {
+            "policy_commit": "a" * 40,
+            "scores": {"clarity": 4},
+            "passes": [
+                {
+                    "verdict": "pass",
+                    "scores": {"provenance": 4},
+                    "findings": [{"severity": "info", "message": "an observation"}],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            served = cli.served_review(review, self.policy(directory, self.CLOSED))
+        self.assertNotIn("scores", served)
+        self.assertNotIn("scores", served["passes"][0])
+        self.assertNotIn("severity", served["passes"][0]["findings"][0])
 
 
 class PushProofTests(unittest.TestCase):

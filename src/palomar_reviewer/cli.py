@@ -681,6 +681,15 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     beside this document and carries the review's remarks too, so it has to
     carry a list that no severity can be read out of; `registered_comments`
     below is the half of this decision that lives there.
+
+    What removes by name cannot remove a name nobody has thought of, and the
+    review contract does grow names: `STEP_SCHEMA` above is closed, so a new
+    `confidence` or `raw_score` inside a pass is a deliberate change to it and
+    to the rubric that asks for it, made in two repositories, neither of which
+    is this function. That is why `served_review` checks the result against
+    `public-review.schema.json`, which is closed at every level, and why the
+    check is not optional. A field this function has not been taught to drop
+    fails there instead of being served.
     """
     archived = json.loads(json.dumps(review))
     archived.pop("scores", None)
@@ -692,6 +701,42 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(finding, dict):
                     finding.pop("severity", None)
     return archived
+
+
+def served_review(review: dict[str, Any], policy: Path) -> dict[str, Any]:
+    """The projection above, checked against the schema that describes it.
+
+    The check is required, not run when convenient. It used to happen only if
+    the schema file happened to be present in the policy checkout, so a commit
+    from before that file existed registered an unchecked document by the same
+    code path as a checked one and said nothing about the difference. A policy
+    commit this cannot judge is a reason to stop, because the thing being
+    judged is what a stranger will read.
+
+    It is also the half of the redaction that does not work by name.
+    `public_review` drops the fields it was taught to drop; the schema is
+    closed at every level, so a field it was not taught about fails here,
+    before the archived copy is written, rather than being registered and
+    served with nothing having gone wrong.
+
+    A policy commit from before that schema existed is refused rather than
+    excused. There is one such window, it closed on 7 August 2026, and the
+    remedy is the one `validate_current_review_contract` already imposes for a
+    rubric that old: rerun the review against current policy. Registering an
+    unchecked document instead would be trading the property this exists for
+    against the convenience of not rerunning something.
+    """
+    served = public_review(review)
+    schema = policy / "schemas" / "public-review.schema.json"
+    if not schema.is_file():
+        raise ReviewerError(
+            f"policy commit {review.get('policy_commit', 'unknown')} has no "
+            "schemas/public-review.schema.json, so what would be served cannot "
+            "be checked against what may be served; rerun the review against "
+            "current policy"
+        )
+    jsonschema.validate(served, load_json(schema), format_checker=jsonschema.FormatChecker())
+    return served
 
 
 def registered_comments(review: dict[str, Any]) -> list[str]:
@@ -4626,12 +4671,7 @@ def register(args: argparse.Namespace) -> int:
     #
     # The digest written beside it stays the digest of what the submitter read,
     # because that is what consent was given to.
-    served = public_review(review)
-    public_schema = work / "policy" / "schemas" / "public-review.schema.json"
-    if public_schema.is_file():
-        jsonschema.validate(
-            served, load_json(public_schema), format_checker=jsonschema.FormatChecker()
-        )
+    served = served_review(review, work / "policy")
     write_json(work / "review.json", served)
     (work / "review-sha256").write_text(review_digest(review) + "\n")
     state = load_json(work / "state.json")
