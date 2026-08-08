@@ -191,11 +191,12 @@ emitted, plus an explicit status and reason when usage is absent, malformed, or
 ambiguous. Usage accounting never discards an otherwise successful review.
 
 The `palomar_reviewer.usage` module is the accounting boundary. It normalizes
-engine evidence, derives the durable model identity and record, and computes an
-operator-facing current-price summary from values supplied by the CLI. It has
-no filesystem, subprocess, network, clock, or state-repository access. The CLI
-owns event collection and persistence and passes the measurement time
-explicitly, so accounting can be tested directly without review orchestration.
+engine evidence, builds the durable spend record, and computes an operator-facing
+current-price summary from values supplied by the CLI. It has no filesystem,
+subprocess, network, clock, or state-repository access. The CLI passes the
+measurement time explicitly and owns persistence of the assembled accounting;
+`palomar_reviewer.engine` derives the durable engine identity, collects the raw
+events, and hands them to that pure accounting boundary.
 
 Production uses `codex:gpt-5.6-sol`. At the current list prices, ordinary input
 is $5.00/M tokens, cached input is $0.50/M, cache-write input is 1.25 times the
@@ -431,6 +432,15 @@ record that names a different submission.
   prompt on stdin, and expects one JSON object on stdout. The program is not a
   tool-restricted model engine; its abilities are those of arbitrary code
   inside the outer namespace.
+
+`palomar_reviewer.engine` is the execution boundary for all three: it validates
+the selected configuration, constructs the exact provider command and
+Bubblewrap namespace, collects subprocess output and Codex events, and
+requires the complete stripped engine output to be one JSON object before
+validating its schema. Prose and Markdown wrappers are not accepted. The CLI
+owns rubric prompts and orchestration and checks every returned pass with the
+credential-output backstop before that pass can enter another prompt or leave
+the review workspace.
 
 An acceptance-capable literature pass must be able to verify important sources
 and search for obvious prior formalizations. Only the configured Claude
