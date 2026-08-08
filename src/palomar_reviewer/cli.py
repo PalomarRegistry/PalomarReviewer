@@ -4011,12 +4011,6 @@ PUSH_PROOF_METHODS = {
     "tag-and-gist": "separately-attested",
 }
 
-# Current private State still contains pre-cutoff records without this field,
-# including a review-ready record that may yet be registered. Keep this narrow
-# cutoff until those records are resolved or migrated; newer records must carry
-# the proof so absence cannot become permanently acceptable.
-PUSH_PROOF_REQUIRED_FROM = "2026-08-08T00:00:00Z"
-
 
 def verify_push_proof(state: dict[str, Any]) -> None:
     """Require a described proof, not merely a boolean somebody set.
@@ -4025,20 +4019,30 @@ def verify_push_proof(state: dict[str, Any]) -> None:
     that a code path ran, not what it observed. That was adequate while one
     path could set it. With more than one, the record has to say which, so that
     admitting a new method is a decision taken here rather than a side effect
-    of deploying a server.
+    of deploying a server. Creation time is not proof and survives a later
+    review rerun, so it deliberately creates no exception to this requirement.
+
+    The submission server records the GitHub repository and principal IDs. The
+    reviewer validates that evidence contract and binds the proof to the
+    reviewed commit; it does not independently resolve the repository ID from
+    GitHub.
     """
     proof = state.get("push_proof")
     if proof is None:
-        created = str(state.get("created_at") or "")
-        if created and created >= PUSH_PROOF_REQUIRED_FROM:
-            raise ReviewerError(
-                "the submission record carries no push_proof, and records this "
-                "recent are required to describe how write access was proved"
-            )
-        return
+        raise ReviewerError(
+            "the submission record carries no push_proof; every registration "
+            "must describe how write access was proved"
+        )
 
     if not isinstance(proof, dict):
         raise ReviewerError("push_proof is not an object")
+    schema_version = proof.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
+        raise ReviewerError("push_proof schema_version must be the integer 1")
     method = proof.get("method")
     if method not in PUSH_PROOF_METHODS:
         raise ReviewerError(
@@ -4050,14 +4054,28 @@ def verify_push_proof(state: dict[str, Any]) -> None:
             f"push_proof method {method!r} claims binding {proof.get('binding')!r}, "
             f"but that method establishes {PUSH_PROOF_METHODS[method]!r}"
         )
-    for field in ("verified_at", "repository_id", "commit"):
+    for field in ("verified_at", "commit"):
         if not proof.get(field):
             raise ReviewerError(f"push_proof is missing {field}")
+    repository_id = proof.get("repository_id")
+    if (
+        not isinstance(repository_id, int)
+        or isinstance(repository_id, bool)
+        or repository_id <= 0
+    ):
+        raise ReviewerError("push_proof repository_id must be a positive integer")
     if proof.get("commit") != state.get("commit"):
         raise ReviewerError("push_proof was made against a different commit")
     principal = proof.get("principal")
-    if not isinstance(principal, dict) or not principal.get("id"):
+    if not isinstance(principal, dict) or "id" not in principal:
         raise ReviewerError("push_proof does not identify who proved it")
+    principal_id = principal.get("id")
+    if (
+        not isinstance(principal_id, int)
+        or isinstance(principal_id, bool)
+        or principal_id <= 0
+    ):
+        raise ReviewerError("push_proof principal.id must be a positive integer")
 
 
 def authorize_registration(
@@ -4069,9 +4087,11 @@ def authorize_registration(
     anyone able to dispatch the workflow can produce a mechanical report
     carrying a real one. Existence of a state record is therefore not enough.
     What is checked is that the private record and the report describe the same
-    submission, that the submitter proved write access, that they have not
-    withdrawn, that they explicitly consented to registration, and that nothing
-    has been registered for this submission already.
+    submission, that the record carries the Server's supported write-access
+    proof contract, that the submitter has not withdrawn and explicitly
+    consented to registration, and that nothing has been registered for this
+    submission already. Reviewer validates and binds that recorded contract; it
+    does not independently resolve its repository ID against GitHub.
     """
     state = submission_state(submission_id)
     if state is None:
@@ -4716,11 +4736,16 @@ def register(args: argparse.Namespace) -> int:
     # unattended runner has no dry-run workspace to inherit, and even an
     # operator's workspace is a weaker thing to trust than what was delivered.
     review = delivered_review(args.submission)
-    # Before the workspace, the preservation tags, the render dispatch and the
-    # database change, all of which are things done in the open that cannot be
-    # taken back. A review delivered before this check existed still has to get
-    # past it to be registered.
+    # A delivered review predating this backstop may still contain the model
+    # engine credential. Checking it is cheap and local, so even a rejection
+    # must not become another route by which the credential is exposed.
     refuse_engine_credential(review, context="the review being registered")
+    # A non-acceptance cannot become registrable by doing more work. Refuse it
+    # before cloning policy or source, downloading artifacts, writing a local
+    # archive, or reaching any public side effect. This also makes a stale or
+    # manually edited consent flag cheap to reject on every unattended pass.
+    if review.get("decision") != "accept":
+        raise ReviewerError("only an accepted review can be registered")
     if not (work / "mechanical-report.json").is_file():
         work, _, _, _ = prepare_workspace(
             args.submission,
@@ -4812,8 +4837,6 @@ def register(args: argparse.Namespace) -> int:
         review_schema=committed_review_schema,
         rubric=committed_rubric,
     )
-    if review["decision"] != "accept":
-        raise ReviewerError("only an accepted review can be registered")
     # Before anything public happens. Rendering dispatches a public Actions run
     # named with the repository and commit, which would signal an acceptance
     # the submitter has not agreed to register, and cannot be taken back.
