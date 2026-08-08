@@ -3172,6 +3172,11 @@ class SubmissionListingTests(unittest.TestCase):
         records = {
             "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
             "bbbbbbbbbbbb": {"id": "bbbbbbbbbbbb", "status": "review-failed"},
+            # The submission server could not find the verification run it
+            # started. There is no report to review and there never will be, so
+            # leaving this in the queue would have it read on every pass for
+            # ever.
+            "eeeeeeeeeeee": {"id": "eeeeeeeeeeee", "status": "dispatch-lost"},
             "cccccccccccc": {"id": "cccccccccccc", "status": "registered",
                              "registered_entry": "PALOMAR-2026-08-01-000001-v1"},
             "dddddddddddd": {"id": "dddddddddddd", "status": "registered",
