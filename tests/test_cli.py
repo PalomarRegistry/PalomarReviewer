@@ -4614,8 +4614,11 @@ class QueueSweepTests(unittest.TestCase):
             "_blob_sha": "sha",
         }
         derived = {**fresh, "open": ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]}
+        # `state_json` answers the derived set here because the sweep reads it
+        # back to check the write landed, which is what makes a refused write
+        # fail rather than pass quietly.
         with (
-            mock.patch.object(cli, "state_json", return_value=fresh),
+            mock.patch.object(cli, "state_json", return_value=derived),
             mock.patch.object(cli, "rebuild_open_index", return_value=derived) as rebuilt,
         ):
             self.assertEqual(cli.rebuild_queue(SimpleNamespace()), 0)
@@ -4624,3 +4627,35 @@ class QueueSweepTests(unittest.TestCase):
     def test_the_window_is_long_enough_to_be_a_sweep(self):
         """Six hours against a two-hourly pass was several clones a day."""
         self.assertGreaterEqual(cli.OPEN_INDEX_REBUILD_SECONDS, 24 * 3600)
+
+
+class QueueSweepFailureTests(unittest.TestCase):
+    def test_a_sweep_that_could_not_record_the_queue_fails(self):
+        """A pass shrugs off a refused write, because the index is a cache and
+        the next pass tries again. For the sweep the write is the whole errand,
+        and a weekly check that quietly does nothing is worse than none."""
+        derived = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-08T00:00:00Z",
+            "rebuild_after": "2026-08-15T00:00:00Z",
+            "open": ["aaaaaaaaaaaa"],
+        }
+        with (
+            mock.patch.object(cli, "rebuild_open_index", return_value=derived),
+            mock.patch.object(cli, "state_json", return_value={"open": ["bbbbbbbbbbbb"]}),
+        ):
+            with self.assertRaisesRegex(cli.ReviewerError, "not recorded"):
+                cli.rebuild_queue(SimpleNamespace())
+
+    def test_a_sweep_that_recorded_the_queue_succeeds(self):
+        derived = {
+            "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
+            "rebuilt_at": "2026-08-08T00:00:00Z",
+            "rebuild_after": "2026-08-15T00:00:00Z",
+            "open": ["aaaaaaaaaaaa"],
+        }
+        with (
+            mock.patch.object(cli, "rebuild_open_index", return_value=derived),
+            mock.patch.object(cli, "state_json", return_value={**derived, "_blob_sha": "x"}),
+        ):
+            self.assertEqual(cli.rebuild_queue(SimpleNamespace()), 0)

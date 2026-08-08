@@ -2393,6 +2393,18 @@ def rebuild_queue(_: argparse.Namespace) -> int:
     long enough and six hours was several clones a day for nothing.
     """
     index = rebuild_open_index()
+    # A pass treats a refused write as nothing much, because the index is a
+    # cache of what the records already say and the next pass will try again.
+    # For the sweep the write is the whole errand: a sweep that derived the
+    # right set and failed to record it has done nothing, and saying so
+    # quietly is how a weekly check becomes a weekly no-op nobody notices.
+    recorded = state_json(OPEN_INDEX_PATH)
+    if not isinstance(recorded, dict) or recorded.get("open") != index["open"]:
+        raise ReviewerError(
+            "the queue was derived but not recorded, so nothing was swept. The "
+            "usual cause is a pass writing the index in between, which is why "
+            "this runs in its own concurrency group."
+        )
     print(f"the queue holds {len(index['open'])} open submission(s)")
     return 0
 
