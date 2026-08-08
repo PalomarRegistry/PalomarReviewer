@@ -109,9 +109,6 @@ MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
 MAX_RENDER_BYTES = 25 * 1024 * 1024
 MAX_EVIDENCE_FILE_BYTES = 16 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 24 * 1024 * 1024
-MECHANICAL_MARKER = "<!-- palomar-mechanical-report -->"
-REVIEW_MARKER = "<!-- palomar-editorial-review -->"
-CLAIM_MARKER = "<!-- palomar-review-claim -->"
 WEB_URL = "https://palomar-registry.org"
 SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
@@ -140,7 +137,6 @@ CODEX_REQUIRED_USAGE_KEYS = (
     "output_tokens",
     "reasoning_output_tokens",
 )
-MAX_CHALLENGE_PROMPT_BYTES = 8 * 1024 * 1024
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
     "classification",
@@ -154,24 +150,15 @@ STEP_SCORE_KEYS = (
     "proof_alignment",
 )
 RUBRIC_EVIDENCE_INPUTS = {
-    "README.md",
-    "Challenge.lean",
-    "Solution.lean",
     "all_previous_results",
     "challenge_source",
-    "comparator.json",
     "comparator_config",
-    "formalization.yaml",
     "formalization_metadata",
     "submission",
     "lakefile",
-    "lakefile.lean",
-    "lakefile.toml",
-    "lean-toolchain",
     "lean_toolchain",
     "mechanical_report",
     "project_readme",
-    "repository_readme",
     "solution_source",
 }
 STEP_SCHEMA = {
@@ -246,11 +233,6 @@ SYNTHESIS_SCHEMA = {
     },
 }
 JSON_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
-REVIEW_DETAILS_RE = re.compile(
-    r"<details><summary>Machine-readable editorial report</summary>\n\n"
-    r"```json[ \t]*\n(\{.*\})\n```[ \t]*\n</details>[ \t\n]*\Z",
-    re.DOTALL,
-)
 MECHANICAL_REPORT_SCHEMA = {
     "type": "object",
     "required": [
@@ -272,6 +254,9 @@ MECHANICAL_REPORT_SCHEMA = {
         "project_dependencies",
         "provenance",
         "license",
+        "formalization",
+        "lakefile",
+        "lean_toolchain_path",
     ],
     "properties": {
         "schema_version": {"const": 1},
@@ -376,6 +361,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "challenge": {
             "type": "object",
             "required": [
+                "path",
                 "sha256",
                 "lines",
                 "bytes",
@@ -410,7 +396,7 @@ MECHANICAL_REPORT_SCHEMA = {
         },
         "solution": {
             "type": "object",
-            "required": ["sha256"],
+            "required": ["path", "sha256"],
             "properties": {
                 "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
                 "path": {"type": "string", "minLength": 1},
@@ -420,7 +406,7 @@ MECHANICAL_REPORT_SCHEMA = {
         "lean_toolchain": {"type": "string", "pattern": r"^leanprover/lean4:"},
         "comparator": {
             "type": "object",
-            "required": ["theorem_names", "definition_names", "permitted_axioms"],
+            "required": ["path", "theorem_names", "definition_names", "permitted_axioms"],
             "properties": {
                 "theorem_names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                 "definition_names": {"type": "array", "items": {"type": "string"}},
@@ -484,6 +470,7 @@ MECHANICAL_REPORT_SCHEMA = {
         },
         "formalization": {
             "type": "object",
+            "required": ["path", "sha256"],
             "properties": {
                 "path": {"type": "string", "minLength": 1},
                 "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
@@ -495,6 +482,22 @@ MECHANICAL_REPORT_SCHEMA = {
 
 class ReviewerError(RuntimeError):
     pass
+
+
+def validate_mechanical_report_schema(report: dict[str, Any]) -> None:
+    """Reject a malformed current report before any path is dereferenced."""
+    try:
+        jsonschema.validate(
+            report,
+            MECHANICAL_REPORT_SCHEMA,
+            format_checker=jsonschema.FormatChecker(),
+        )
+    except jsonschema.ValidationError as error:
+        location = ".".join(str(part) for part in error.absolute_path)
+        where = f" at {location}" if location else ""
+        raise ReviewerError(
+            f"mechanical report violates the current artifact contract{where}: {error.message}"
+        ) from error
 
 
 def safe_repository_path(value: str, field: str) -> str:
@@ -539,27 +542,19 @@ def mechanical_source_path(source: Path, value: str, field: str) -> Path:
 
 
 def mechanical_relative_path(mechanical: dict[str, Any], name: str) -> str:
-    if False:
-        legacy = {
-            "challenge_source": "Challenge.lean",
-            "solution_source": "Solution.lean",
-            "comparator_config": "comparator.json",
-            "formalization_metadata": "formalization.yaml",
-            "lakefile": "lakefile.toml",
-            "lean_toolchain": "lean-toolchain",
-        }
-        return legacy[name]
     mapping = {
-        "challenge_source": mechanical["challenge"].get("path", "Challenge.lean"),
-        "solution_source": mechanical["solution"].get("path", "Solution.lean"),
-        "comparator_config": mechanical["comparator"].get("path", "comparator.json"),
-        "formalization_metadata": mechanical.get("formalization", {}).get(
-            "path", "formalization.yaml"
-        ),
-        "lakefile": mechanical.get("lakefile", {}).get("path", "lakefile.toml"),
-        "lean_toolchain": mechanical.get("lean_toolchain_path", "lean-toolchain"),
+        "challenge_source": ("challenge", "path"),
+        "solution_source": ("solution", "path"),
+        "comparator_config": ("comparator", "path"),
+        "formalization_metadata": ("formalization", "path"),
+        "lakefile": ("lakefile", "path"),
     }
-    return safe_repository_path(mapping[name], name)
+    value = (
+        mechanical["lean_toolchain_path"]
+        if name == "lean_toolchain"
+        else mechanical[mapping[name][0]][mapping[name][1]]
+    )
+    return safe_repository_path(value, name)
 
 
 def project_readme_relative(mechanical: dict[str, Any], source: Path) -> str:
@@ -922,19 +917,23 @@ def review_digest(report: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def validate_rubric(rubric: dict[str, Any]) -> int:
+def validate_rubric(rubric: dict[str, Any]) -> None:
     version = rubric.get("schema_version")
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2, 3, 4, 5, 6, 7}:
-        raise ReviewerError(f"unsupported rubric schema_version: {version!r}")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != CURRENT_RUBRIC_VERSION
+    ):
+        raise ReviewerError(
+            f"unsupported rubric schema_version: {version!r}; rerun against current policy "
+            f"(schema version {CURRENT_RUBRIC_VERSION})"
+        )
     steps = rubric.get("steps")
     if not isinstance(steps, list):
         raise ReviewerError("rubric steps must be a list")
     step_ids = [step.get("id") for step in steps]
     if len(step_ids) != len(set(step_ids)) or not step_ids or step_ids[-1] != "synthesis":
         raise ReviewerError("rubric steps must be unique and end with synthesis")
-    if version == 1:
-        return version
-
     minimum = rubric.get("minimum_accept_score")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
         raise ReviewerError("rubric minimum_accept_score must be an integer from 1 to 5")
@@ -952,31 +951,28 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
-    if version >= 6 and rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
-        raise ReviewerError("rubric v6 must declare exactly the supported pass verdicts")
-    if version >= 7:
-        if rubric.get("finding_comment_policy", "material") not in {"material", "all"}:
-            raise ReviewerError(
-                "rubric v7 finding_comment_policy must be 'material' or 'all'"
-            )
-        coverage_steps = {
-            step.get("id")
-            for step in steps
-            if step.get("requires_declaration_coverage") is True
-        }
-        required_coverage = {
-            "statement_alignment",
-            "definition_fidelity",
-            "literature_notability",
-            "proof_account",
-        }
-        if coverage_steps != required_coverage:
-            raise ReviewerError(
-                "rubric v7 must require declaration coverage for every substantive pass"
-            )
+    if rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
+        raise ReviewerError("the rubric must declare exactly the supported pass verdicts")
+    if rubric.get("finding_comment_policy", "material") not in {"material", "all"}:
+        raise ReviewerError(
+            "the rubric finding_comment_policy must be 'material' or 'all'"
+        )
+    coverage_steps = {
+        step.get("id")
+        for step in steps
+        if step.get("requires_declaration_coverage") is True
+    }
+    required_coverage = {
+        "statement_alignment",
+        "definition_fidelity",
+        "literature_notability",
+        "proof_account",
+    }
+    if coverage_steps != required_coverage:
+        raise ReviewerError(
+            "the rubric must require declaration coverage for every substantive pass"
+        )
     allowed_step_scores = set(STEP_SCORE_KEYS)
-    if version < 4:
-        allowed_step_scores.remove("classification")
     owned: list[str] = []
     owners: dict[str, dict[str, Any]] = {}
     for step in steps:
@@ -1003,49 +999,34 @@ def validate_rubric(rubric: dict[str, Any]) -> int:
         raise ReviewerError("rubric score ownership is duplicate or incomplete")
     if any(not owners[key].get("required") for key in SYNTHESIS_SCORE_KEYS):
         raise ReviewerError("every registry score must be owned by a required pass")
-    return version
 
 
 def validate_current_review_contract(
     rubric: dict[str, Any], review_schema: dict[str, Any]
-) -> int:
+) -> None:
     """Reject a policy checkout that cannot produce a current review."""
-    rubric_version = validate_rubric(rubric)
+    validate_rubric(rubric)
     properties = review_schema.get("properties", {})
     schema_version = properties.get("schema_version", {}).get("const")
     decisions = properties.get("decision", {}).get("enum")
     if (
-        rubric_version != CURRENT_RUBRIC_VERSION
-        or schema_version != REVIEW_SCHEMA_VERSION
+        schema_version != REVIEW_SCHEMA_VERSION
         or decisions != list(REVIEW_DECISIONS)
     ):
         raise ReviewerError(
             "policy commit predates the current review contract; rerun against current policy"
         )
-    return rubric_version
 
 
-def step_schema_for_rubric(step: dict[str, Any], rubric_version: int) -> dict[str, Any]:
+def step_schema_for_rubric(step: dict[str, Any]) -> dict[str, Any]:
     schema = copy.deepcopy(STEP_SCHEMA)
-    if rubric_version < 4:
-        schema["properties"]["scores"]["required"].remove("classification")
-        schema["properties"]["scores"]["properties"].pop("classification")
-    if rubric_version == 1:
-        schema["properties"]["summary"].pop("minLength", None)
-        findings = schema["properties"]["findings"]
-        findings.pop("minItems", None)
-        finding_properties = findings["items"]["properties"]
-        finding_properties["evidence"].pop("minLength", None)
-        finding_properties["message"].pop("minLength", None)
-        return schema
-
     owned = set(step["score_keys"])
     score_properties = schema["properties"]["scores"]["properties"]
     for key in schema["properties"]["scores"]["properties"]:
         score_properties[key] = (
             {"type": "integer", "minimum": 1, "maximum": 5} if key in owned else {"type": "null"}
         )
-    if rubric_version >= 7 and step.get("requires_declaration_coverage"):
+    if step.get("requires_declaration_coverage"):
         schema["properties"]["declarations_checked"]["minItems"] = 1
         schema["properties"]["findings"].pop("minItems", None)
     return schema
@@ -1083,8 +1064,6 @@ def utc_now() -> str:
     the database now refuses. One reading, and the date is the day of it.
     """
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 
 
 def _is_date(value: str) -> bool:
@@ -2030,52 +2009,34 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
     return download
 
 
-
-
-
-
-
-
 def download_mechanical_artifact(
     run_id: int,
-    submission_id: int,
+    submission_id: str,
     destination: Path,
 ) -> Path:
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
-    errors: list[str] = []
-    for name in (f"mechanical-report-{submission_id}", "mechanical-report"):
-        proc = run(
-            [
-                "gh",
-                "run",
-                "download",
-                str(run_id),
-                "--repo",
-                SUBMISSION_REPO,
-                "--name",
-                name,
-                "--dir",
-                str(destination),
-            ],
-            check=False,
-        )
-        report_path = destination / "mechanical-report.json"
-        if proc.returncode == 0 and report_path.is_file() and not report_path.is_symlink():
-            return report_path
-        errors.append((proc.stderr or proc.stdout).strip())
-        for path in destination.iterdir():
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-    detail = next((error for error in errors if error), "artifact is missing or expired")
+    proc = run(
+        [
+            "gh",
+            "run",
+            "download",
+            str(run_id),
+            "--repo",
+            SUBMISSION_REPO,
+            "--name",
+            f"mechanical-report-{submission_id}",
+            "--dir",
+            str(destination),
+        ],
+        check=False,
+    )
+    report_path = destination / "mechanical-report.json"
+    if proc.returncode == 0 and report_path.is_file() and not report_path.is_symlink():
+        return report_path
+    detail = (proc.stderr or proc.stdout).strip() or "artifact is missing or expired"
     raise ReviewerError(f"could not download trusted mechanical report artifact: {detail}")
-
-
-
-
 
 
 def validate_mechanical_artifact(
@@ -2089,11 +2050,7 @@ def validate_mechanical_artifact(
         raise ReviewerError(
             f"mechanical verification did not pass ({report.get('status')}): {problems}"
         )
-    jsonschema.validate(
-        report,
-        MECHANICAL_REPORT_SCHEMA,
-        format_checker=jsonschema.FormatChecker(),
-    )
+    validate_mechanical_report_schema(report)
     required_paths = (
         (report.get("challenge", {}), "path", "challenge.path"),
         (report.get("solution", {}), "path", "solution.path"),
@@ -2979,13 +2936,7 @@ def prepare_workspace(
     return work, state, mechanical, policy_commit
 
 
-def has_proof_account(source: Path, mechanical: dict[str, Any] | None = None) -> bool:
-    mechanical = mechanical or {
-        "source": {},
-        "challenge": {},
-        "solution": {},
-        "comparator": {},
-    }
+def has_proof_account(source: Path, mechanical: dict[str, Any]) -> bool:
     paths = {
         mechanical_relative_path(mechanical, "formalization_metadata"),
         mechanical_relative_path(mechanical, "challenge_source"),
@@ -3100,37 +3051,21 @@ def render_prompt(
             content = json.dumps(mechanical, indent=2)
         elif name == "all_previous_results":
             content = json.dumps(previous, indent=2)
-        elif name in {"README.md", "repository_readme", "project_readme"}:
+        elif name == "project_readme":
             evidence_path = project_readme_relative(mechanical, source)
             content = context_file(source, evidence_path)
         elif name in {
-            "formalization.yaml",
             "formalization_metadata",
-            "Challenge.lean",
             "challenge_source",
-            "Solution.lean",
             "solution_source",
-            "comparator.json",
             "comparator_config",
-            "lakefile.toml",
-            "lakefile.lean",
             "lakefile",
-            "lean-toolchain",
             "lean_toolchain",
         }:
-            semantic_name = {
-                "formalization.yaml": "formalization_metadata",
-                "Challenge.lean": "challenge_source",
-                "Solution.lean": "solution_source",
-                "comparator.json": "comparator_config",
-                "lakefile.toml": "lakefile",
-                "lakefile.lean": "lakefile",
-                "lean-toolchain": "lean_toolchain",
-            }.get(name, name)
-            evidence_path = mechanical_relative_path(mechanical, semantic_name)
+            evidence_path = mechanical_relative_path(mechanical, name)
             content = context_file(source, evidence_path)
         else:
-            continue
+            raise ReviewerError(f"rubric evidence input {name!r} has no renderer")
         envelope = {
             "name": name,
             "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -3584,8 +3519,6 @@ def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
     return f"{engine}:{model or 'default'}"
 
 
-
-
 def review_spend(model_id: str, passes: list[dict[str, Any]]) -> dict[str, Any]:
     """Durable turn-aggregate evidence, without a vendor dollar value."""
     return {
@@ -3714,7 +3647,7 @@ def validate_stored_review(
         else load_json(work / "policy" / "schemas" / "review.schema.json")
     )
     rubric_data = rubric if rubric is not None else load_json(work / "policy" / "rubric.json")
-    rubric_version = validate_current_review_contract(rubric_data, schema)
+    validate_current_review_contract(rubric_data, schema)
     jsonschema.validate(report, schema, format_checker=jsonschema.FormatChecker())
     expected_source = {
         "repository": mechanical["source"]["repository"],
@@ -3735,23 +3668,22 @@ def validate_stored_review(
         step_id = result.get("step")
         if step_id not in steps or step_id in seen:
             raise ReviewerError(f"stored review has an unknown or duplicate pass: {step_id!r}")
-        jsonschema.validate(result, step_schema_for_rubric(steps[step_id], rubric_version))
+        jsonschema.validate(result, step_schema_for_rubric(steps[step_id]))
         validate_declaration_coverage(result, steps[step_id], mechanical)
         seen.add(step_id)
-    if rubric_version >= 2:
-        synthesis = {
-            "decision": report["decision"],
-            "summary": report["summary"],
-            "scores": report["scores"],
-            "warnings": report["warnings"],
-            "requested_changes": report["requested_changes"],
-        }
-        validate_synthesis_policy(
-            synthesis,
-            passes=report["passes"],
-            rubric=rubric_data,
-            mechanical=mechanical,
-        )
+    synthesis = {
+        "decision": report["decision"],
+        "summary": report["summary"],
+        "scores": report["scores"],
+        "warnings": report["warnings"],
+        "requested_changes": report["requested_changes"],
+    }
+    validate_synthesis_policy(
+        synthesis,
+        passes=report["passes"],
+        rubric=rubric_data,
+        mechanical=mechanical,
+    )
 
 
 def pass_scores(passes: list[dict[str, Any]], rubric: dict[str, Any]) -> dict[str, int]:
@@ -3781,20 +3713,19 @@ def validate_synthesis_policy(
     if synthesis["scores"] != evidence_scores:
         raise ReviewerError("synthesis scores must reproduce the evidence-pass scores without inflating them")
 
-    if rubric.get("schema_version", 1) >= 7:
-        comment_policy = rubric.get("finding_comment_policy", "material")
-        if comment_policy not in {"material", "all"}:
-            raise ReviewerError(f"unsupported finding_comment_policy: {comment_policy!r}")
-        comments = [
-            finding["message"]
-            for result in passes
-            for finding in result["findings"]
-            if comment_policy == "all" or finding["severity"] in {"warning", "error"}
-        ]
-        if synthesis["warnings"] != comments:
-            raise ReviewerError(
-                "synthesis warnings must reproduce every required pass finding in pass order"
-            )
+    comment_policy = rubric.get("finding_comment_policy", "material")
+    if comment_policy not in {"material", "all"}:
+        raise ReviewerError(f"unsupported finding_comment_policy: {comment_policy!r}")
+    comments = [
+        finding["message"]
+        for result in passes
+        for finding in result["findings"]
+        if comment_policy == "all" or finding["severity"] in {"warning", "error"}
+    ]
+    if synthesis["warnings"] != comments:
+        raise ReviewerError(
+            "synthesis warnings must reproduce every required pass finding in pass order"
+        )
 
     minimum = rubric.get("minimum_accept_score")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
@@ -3899,7 +3830,7 @@ def run_review(args: argparse.Namespace) -> int:
     model_id = reviewer_model(args.engine, args.model, args.command)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
-    rubric_version = validate_current_review_contract(rubric, review_schema)
+    validate_current_review_contract(rubric, review_schema)
     passes: list[dict[str, Any]] = []
     spend: list[dict[str, Any]] = []
     synthesis: dict[str, Any] | None = None
@@ -3920,7 +3851,7 @@ def run_review(args: argparse.Namespace) -> int:
         result_schema = (
             SYNTHESIS_SCHEMA
             if step["id"] == "synthesis"
-            else step_schema_for_rubric(step, rubric_version)
+            else step_schema_for_rubric(step)
         )
         result, usage = engine_result(
             prompt,
@@ -3952,13 +3883,12 @@ def run_review(args: argparse.Namespace) -> int:
     accounting = review_spend(model_id, spend)
     write_json(work / "spend.json", accounting)
     print(spend_summary(accounting), file=sys.stderr)
-    if rubric_version >= 2:
-        validate_synthesis_policy(
-            synthesis,
-            passes=passes,
-            rubric=rubric,
-            mechanical=mechanical,
-        )
+    validate_synthesis_policy(
+        synthesis,
+        passes=passes,
+        rubric=rubric,
+        mechanical=mechanical,
+    )
     mechanical_url = (work / "mechanical-report-url").read_text().strip()
     final = normalize_final(
         synthesis,
@@ -3970,7 +3900,6 @@ def run_review(args: argparse.Namespace) -> int:
         passes=passes,
     )
     jsonschema.validate(final, review_schema, format_checker=jsonschema.FormatChecker())
-    (work / "review-url").unlink(missing_ok=True)
     (work / "review-sha256").unlink(missing_ok=True)
     write_json(work / "review.json", final)
     print(json.dumps(final, indent=2))
@@ -4082,8 +4011,10 @@ PUSH_PROOF_METHODS = {
     "tag-and-gist": "separately-attested",
 }
 
-# Records written before proofs were described. Anything created after this is
-# required to carry one, so absence never becomes permanently acceptable.
+# Current private State still contains pre-cutoff records without this field,
+# including a review-ready record that may yet be registered. Keep this narrow
+# cutoff until those records are resolved or migrated; newer records must carry
+# the proof so absence cannot become permanently acceptable.
 PUSH_PROOF_REQUIRED_FROM = "2026-08-08T00:00:00Z"
 
 
@@ -4381,8 +4312,7 @@ def registry_record(
         "definition_names": mechanical["comparator"]["definition_names"],
         "permitted_axioms": mechanical["comparator"]["permitted_axioms"],
     }
-    if True:
-        formalization_record["lakefile_path"] = mechanical_relative_path(mechanical, "lakefile")
+    formalization_record["lakefile_path"] = mechanical_relative_path(mechanical, "lakefile")
     record = {
         "schema_version": 2,
         "id": permanent_id,
@@ -4812,11 +4742,7 @@ def register(args: argparse.Namespace) -> int:
     mechanical = load_json(work / "mechanical-report.json")
     if state.get("id") != args.submission:
         raise ReviewerError("workspace state does not match the requested submission")
-    jsonschema.validate(
-        mechanical,
-        MECHANICAL_REPORT_SCHEMA,
-        format_checker=jsonschema.FormatChecker(),
-    )
+    validate_mechanical_report_schema(mechanical)
     mechanical_url_path = work / "mechanical-report-url"
     mechanical_digest_path = work / "mechanical-report-sha256"
     mechanical_bytes_digest_path = work / "mechanical-report-bytes-sha256"
@@ -4898,12 +4824,7 @@ def register(args: argparse.Namespace) -> int:
         mechanical_relative_path(mechanical, "formalization_metadata"),
         "formalization metadata",
     )
-    formalization_record = mechanical.get("formalization")
-    expected_formalization_sha256 = (
-        formalization_record.get("sha256") if isinstance(formalization_record, dict) else None
-    )
-    if expected_formalization_sha256 is None:
-        expected_formalization_sha256 = mechanical.get("formalization_sha256")
+    expected_formalization_sha256 = mechanical["formalization"]["sha256"]
     if not isinstance(expected_formalization_sha256, str) or not re.fullmatch(
         r"[0-9a-f]{64}", expected_formalization_sha256
     ):
