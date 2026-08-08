@@ -48,7 +48,6 @@ from palomar_reviewer.cli import (
     render_prompt,
     request_render,
     review_digest,
-    reviewer_model,
     step_schema_for_rubric,
     validate_declaration_coverage,
     validate_mechanical_artifact,
@@ -1268,9 +1267,6 @@ class ReviewerTests(unittest.TestCase):
             self.assertTrue(has_proof_account(root, mechanical))
             (root / "README.md").write_text("## Result\n\nAn induction theorem.\n")
             self.assertFalse(has_proof_account(root, mechanical))
-
-    def test_model_id(self):
-        self.assertEqual(reviewer_model("codex", "gpt-test", None), "codex:gpt-test")
 
     def test_claude_network_pass_uses_current_automatic_permission_mode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4668,163 +4664,23 @@ class ReviewTimingTests(unittest.TestCase):
         self.assertEqual(set(written) - {"schema_version", "seconds"}, set())
 
 
-class SpendAccountingTests(unittest.TestCase):
-    """Turn aggregates are retained faithfully and priced only when sufficient."""
-
-    def usage(
-        self,
-        *,
-        input_tokens,
-        cached=0,
-        cache_write=0,
-        output=0,
-        reasoning=0,
-        total=None,
-    ):
-        usage = {
-            "input_tokens": input_tokens,
-            "cached_input_tokens": cached,
-            "cache_write_input_tokens": cache_write,
-            "output_tokens": output,
-            "reasoning_output_tokens": reasoning,
-        }
-        if total is not None:
-            usage["total_tokens"] = total
-        return usage
-
-    def evidence(self, usage):
-        return {"usage_status": "recorded", "usage_reason": None, "turns": [usage]}
-
-    def entry(self, step, usage):
-        return {"step": step, **self.evidence(usage)}
-
-    def event(self, usage):
-        return json.dumps({"type": "turn.completed", "usage": usage})
-
-    def test_verified_turn_aggregate_shape_is_not_mistaken_for_one_request(self):
-        # One production Codex diagnostic made four requests, then emitted one
-        # completed-turn aggregate. The request inputs sum exactly to the turn.
-        request_inputs = [15_611, 15_699, 15_772, 15_843]
-        aggregate = self.usage(
-            input_tokens=62_925,
-            cached=52_224,
-            output=163,
-            total=63_088,
-        )
-        evidence = cli.codex_usage(self.event(aggregate))
-        self.assertEqual(evidence["usage_status"], "recorded")
-        self.assertEqual(evidence["turns"], [aggregate])
-        self.assertEqual(evidence["turns"][0]["total_tokens"], 63_088)
-        self.assertEqual(sum(request_inputs), aggregate["input_tokens"])
-        self.assertLess(max(request_inputs), aggregate["input_tokens"])
-
-    def test_base_categories_are_exact_at_272000_total_input(self):
-        usage = self.usage(
-            input_tokens=272_000,
-            cached=100_000,
-            cache_write=20_000,
-            output=10_000,
-            reasoning=4_000,
-        )
-        # $0.76 ordinary + $0.05 cached + $0.125 cache write + $0.30 output.
-        self.assertAlmostEqual(
-            cli.usage_cost(cli.GPT_5_6_SOL_MODEL, self.evidence(usage)),
-            1.235,
-        )
-
-    def test_turn_aggregate_above_272000_is_not_exactly_priceable(self):
-        evidence = self.evidence(self.usage(input_tokens=272_001, output=10))
-        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, evidence))
-        accounting = cli.review_spend(
-            cli.GPT_5_6_SOL_MODEL,
-            [{"step": "metadata", **evidence}],
-        )
-        self.assertIsNone(cli.review_cost(accounting))
-        self.assertIn("aggregate exceeds 272,000", cli.spend_summary(accounting))
-        self.assertIn("request boundaries", cli.spend_summary(accounting))
-
-    def test_review_aggregate_never_controls_the_request_tier(self):
-        accounting = cli.review_spend(
-            cli.GPT_5_6_SOL_MODEL,
-            [
-                self.entry("metadata", self.usage(input_tokens=200_000)),
-                self.entry("synthesis", self.usage(input_tokens=200_000)),
-            ],
-        )
-        self.assertAlmostEqual(cli.review_cost(accounting), 2.0)
-        one_turn = self.evidence(self.usage(input_tokens=400_000))
-        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, one_turn))
-
-    def test_missing_and_malformed_usage_is_retained_without_raising(self):
-        unavailable = cli.codex_usage("")
-        self.assertEqual(unavailable["usage_status"], "unavailable")
-        self.assertEqual(unavailable["turns"], [])
-
-        absent = cli.codex_usage('{"type":"turn.completed"}')
-        self.assertEqual(absent["usage_status"], "invalid")
-        self.assertEqual(absent["turns"], [None])
-
-        malformed = {"input_tokens": 10, "cached_input_tokens": 0}
-        evidence = cli.codex_usage(self.event(malformed))
-        self.assertEqual(evidence["usage_status"], "invalid")
-        self.assertEqual(evidence["turns"], [malformed])
-        self.assertIn("cache_write_input_tokens", evidence["usage_reason"])
-        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, evidence))
-
-    def test_contradictory_usage_is_retained_without_raising(self):
-        contradictory = self.usage(input_tokens=10, cached=8, cache_write=3)
-        evidence = cli.codex_usage(self.event(contradictory))
-        self.assertEqual(evidence["usage_status"], "invalid")
-        self.assertEqual(evidence["turns"], [contradictory])
-        self.assertIn("exceed total input", evidence["usage_reason"])
-
-    def test_multiple_completed_turns_are_preserved_and_unpriceable(self):
-        first = self.usage(input_tokens=10, output=2)
-        second = self.usage(input_tokens=20, output=3)
-        evidence = cli.codex_usage("\n".join([self.event(first), self.event(second)]))
-        self.assertEqual(evidence["usage_status"], "multiple")
-        self.assertEqual(evidence["turns"], [first, second])
-        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, evidence))
-
-    def test_non_codex_usage_is_unavailable_not_zero(self):
-        evidence = cli.unavailable_usage("claude")
-        self.assertEqual(evidence["usage_status"], "unavailable")
-        self.assertEqual(evidence["turns"], [])
-        accounting = cli.review_spend(
-            "claude:default",
-            [{"step": "metadata", **evidence}],
-        )
-        self.assertIsNone(cli.review_cost(accounting))
-        self.assertNotIn("0 in", cli.spend_summary(accounting))
-        self.assertIn("no current price", cli.spend_summary(accounting))
-
-    def test_durable_accounting_keeps_raw_passes_and_no_vendor_dollars(self):
-        usage = self.usage(
-            input_tokens=100,
-            cached=30,
-            cache_write=20,
-            output=10,
-            total=110,
-        )
-        passes = [self.entry("metadata", usage)]
-        accounting = cli.review_spend(cli.GPT_5_6_SOL_MODEL, passes)
-        self.assertEqual(accounting["schema_version"], 2)
-        self.assertEqual(accounting["passes"], passes)
-        self.assertEqual(accounting["passes"][0]["turns"], [usage])
-        self.assertEqual(accounting["passes"][0]["usage_status"], "recorded")
-        self.assertNotIn("usd", accounting)
-        self.assertNotIn("usd", accounting["passes"][0])
-
+class SpendPersistenceTests(unittest.TestCase):
     def test_the_spend_is_kept_with_the_private_record_and_accumulates(self):
+        from palomar_reviewer import usage as usage_accounting
+
         legacy = {
             "schema_version": 1,
-            "model": cli.GPT_5_6_SOL_MODEL,
+            "model": usage_accounting.GPT_5_6_SOL_MODEL,
             "measured_at": "2026-08-08T00:00:00Z",
             "passes": [],
             "usage": {},
             "usd": None,
         }
-        current = cli.review_spend(cli.GPT_5_6_SOL_MODEL, [])
+        current = usage_accounting.review_spend(
+            usage_accounting.GPT_5_6_SOL_MODEL,
+            [],
+            measured_at="2026-08-08T01:00:00Z",
+        )
         state = {
             "id": "a1b2c3d4e5f6",
             "status": "awaiting-review",
@@ -4840,6 +4696,82 @@ class SpendAccountingTests(unittest.TestCase):
             updated = cli.deliver_review(state, review, current)
         self.assertEqual(updated["spend"], [legacy, current])
         self.assertNotIn("usd", updated["spend"][1])
+
+
+class RunReviewAccountingTests(unittest.TestCase):
+    def test_a_completed_review_records_and_prints_the_measured_spend(self):
+        """Exercise the paid-run tail through the pure accounting call seam."""
+        measured_at = "2026-08-08T01:02:03Z"
+        turn = {
+            "input_tokens": 100,
+            "cached_input_tokens": 30,
+            "cache_write_input_tokens": 20,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 5,
+        }
+        usage = {"usage_status": "recorded", "usage_reason": None, "turns": [turn]}
+        rubric = {"steps": [{"id": "synthesis"}]}
+        final = {"schema_version": 2, "decision": "accept"}
+        args = SimpleNamespace(
+            submission="a1b2c3d4e5f6",
+            work_dir=None,
+            apply=False,
+            policy_ref=None,
+            engine="codex",
+            model="gpt-5.6-sol",
+            command=None,
+            reasoning_effort="high",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / args.submission
+            work.mkdir()
+            (work / "mechanical-report-url").write_text("https://example.test/report\n")
+            args.work_dir = directory
+            with (
+                mock.patch.object(cli, "queue", return_value=[]),
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    return_value=(
+                        work,
+                        {"id": args.submission},
+                        {"status": "pass"},
+                        "a" * 40,
+                    ),
+                ),
+                mock.patch.object(cli, "load_json", side_effect=[rubric, {}]),
+                mock.patch.object(cli, "validate_current_review_contract"),
+                mock.patch.object(cli, "render_prompt", return_value="review prompt"),
+                mock.patch.object(cli, "engine_result", return_value=({}, usage)),
+                mock.patch.object(cli, "validate_synthesis_policy") as validate_policy,
+                mock.patch.object(cli, "normalize_final", return_value=final),
+                mock.patch.object(cli.jsonschema, "validate"),
+                mock.patch.object(cli, "utc_now", return_value=measured_at) as clock,
+                mock.patch.object(
+                    cli.usage_accounting,
+                    "review_spend",
+                    wraps=cli.usage_accounting.review_spend,
+                ) as build_spend,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(cli.run_review(args), 0)
+
+            accounting = json.loads((work / "spend.json").read_text())
+            self.assertEqual(accounting["measured_at"], measured_at)
+            self.assertRegex(accounting["measured_at"], r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+            self.assertEqual(accounting["passes"], [{"step": "synthesis", **usage}])
+            self.assertIn("Spend:", stderr.getvalue())
+            self.assertIn("at current base list prices", stderr.getvalue())
+            self.assertEqual(json.loads((work / "review.json").read_text()), final)
+            build_spend.assert_called_once_with(
+                "codex:gpt-5.6-sol",
+                [{"step": "synthesis", **usage}],
+                measured_at=measured_at,
+            )
+            clock.assert_called_once_with()
+            validate_policy.assert_called_once()
 
 
 class TrustedRunSelectionTests(unittest.TestCase):
@@ -5255,9 +5187,15 @@ class VocabularyTests(unittest.TestCase):
         here. Two words for one idea is how a field gets written under one name
         and read under the other.
         """
-        source = Path(cli.__file__).read_text(encoding="utf-8")
-        stray = sorted(set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source)))
-        self.assertEqual(stray, [], f"cli.py still says {', '.join(stray)}")
+        package = Path(cli.__file__).parent
+        stray = []
+        for path in sorted(package.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for word in sorted(
+                set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source))
+            ):
+                stray.append(f"{path.relative_to(package)}:{word}")
+        self.assertEqual(stray, [], f"production package still says {', '.join(stray)}")
 
     def test_public_ci_fetches_only_the_current_record_schema(self):
         workflow = (
