@@ -2133,7 +2133,7 @@ def submission_state(submission_id: str) -> dict[str, Any] | None:
     return state_json(f"submissions/{submission_id}/state.json")
 
 
-def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) -> None:
+def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) -> str | None:
     # Writing here changes the live, private record of somebody's submission,
     # so it has to be asked for. Twice now a test has reached this by way of a
     # failure path nobody remembered to stub, and invented submissions in
@@ -2150,6 +2150,10 @@ def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) 
     The write is conditional on the sha that was read, not on whatever the sha
     is now: fetching the current sha and writing against it would authorize
     overwriting a concurrent change rather than detecting it.
+
+    The sha the file now stands at is returned, because a second write in the
+    same pass has to be conditional on what this one left behind rather than on
+    what it replaced.
     """
     body = json.dumps({k: v for k, v in value.items() if k != "_blob_sha"}, indent=2) + "\n"
     fields = [
@@ -2160,7 +2164,11 @@ def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) 
     ]
     if blob_sha:
         fields += ["-f", f"sha={blob_sha}"]
-    gh(["api", "--method", "PUT", f"repos/{STATE_REPO}/contents/{path}", *fields])
+    written = gh(
+        ["api", "--method", "PUT", f"repos/{STATE_REPO}/contents/{path}", *fields,
+         "--jq", ".content.sha"]
+    )
+    return written.strip() or None
 
 
 def advance_state(
@@ -2388,7 +2396,12 @@ def rebuild_open_index() -> dict[str, Any]:
         "open": ids,
     }
     print(f"rebuilt the open-submission index: {len(ids)} open")
-    _write_open_index(index, blob_sha=_state_blob_sha(OPEN_INDEX_PATH))
+    # The sha comes back with the index, because `open_submissions` prunes the
+    # queue and writes again in the same pass. Without it that second write was
+    # unconditional, the contents API refused it, and `_write_open_index`
+    # swallowed the refusal as a warning: the first submission the reviewer
+    # finished with after any rebuild was silently never dropped.
+    index["_blob_sha"] = _write_open_index(index, blob_sha=_state_blob_sha(OPEN_INDEX_PATH))
     return index
 
 
@@ -2400,7 +2413,7 @@ def _state_blob_sha(path: str) -> str | None:
     return raw.stdout.strip() or None
 
 
-def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> None:
+def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> str | None:
     """Record the index, treating every refusal as something to try again later.
 
     The index is a cache of what the records already say, so nothing is lost by
@@ -2408,11 +2421,15 @@ def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> None:
     refused write is usually the submission server having admitted something in
     between, which is exactly what the read sha is here to catch: an admission
     must not be erased by a pass that never saw it.
+
+    Returns the sha the index now stands at, for the next write in this pass:
+    the new one when the write landed, and the one it was asked for otherwise,
+    because a refused or skipped write leaves the file exactly as it was.
     """
     if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
-        return  # a read-only invocation, such as `list`, maintains nothing
+        return blob_sha  # a read-only invocation, such as `list`, maintains nothing
     try:
-        put_state(
+        return put_state(
             OPEN_INDEX_PATH,
             {key: value for key, value in index.items() if key != "_blob_sha"},
             f"Record {len(index['open'])} open submission(s)",
@@ -2420,6 +2437,7 @@ def _write_open_index(index: dict[str, Any], blob_sha: str | None) -> None:
         )
     except ReviewerError as error:
         print(f"::warning::could not record the open-submission index: {error}")
+        return blob_sha
 
 
 def rebuild_queue(_: argparse.Namespace) -> int:
