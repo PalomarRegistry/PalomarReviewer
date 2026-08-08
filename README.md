@@ -262,11 +262,9 @@ preservation receipt.
 
 The generated record is then validated against `schema-v2.json`, and the scores
 that decided it against `scores-v1.json`. The scores go beside the record, in
-`scores/<id>-vN.json`, and not inside it. There is one record schema again
-because of that: while the publisher stripped the scores on the way out, a
-published record's bytes were a function of publisher code rather than of the
-commit, so the contract the record was built against and the schema of the data
-served were two documents, and a record could satisfy one and fail the other.
+`scores/<id>-vN.json`, and not inside it. There is one current record schema:
+the record is published exactly as committed, so the contract used here is the
+same `schema-v2.json` served beside the data.
 The render bundle is checked by the reviewer's own render validation and then by
 the database's `tools/validate.py`. It archives the exact mechanical-report
 bytes, the normalized run and job provenance, and the review itself in one
@@ -274,6 +272,44 @@ content-addressed evidence bundle together with `source-archive.json`, so a
 single tree hash covers everything justifying the record; raw Actions logs are
 deliberately not retained. It pushes a branch to
 `PalomarRegistry/PalomarDatabase` and opens a PR.
+
+Database registration requires Git 2.34 or newer. Its checkout begins
+blob-filtered, depth one, and sparse: the filtered fetch itself registers
+`origin` as the promisor and `blob:none` filter, then checkout lazily fetches
+the in-sparse schemas, tools, entries, scores and index. Historical `renders/`
+and `evidence/` payload blobs are neither materialized nor downloaded. New
+payload files are normalized to mode `100644`, enumerated rather than added by
+directory, force-added by their explicit paths so an ignore rule cannot omit
+one, and compared with the staged Git tree before the commit is accepted.
+
+The proposed commit is validated with the real `tools/validate.py --since` the
+exact Database `main` commit it extends, so the validator hashes the new
+immutable bundles while still checking every entry's metadata and the complete
+index. Before invoking it, the reviewer asks that exact checked-out validator
+to derive its scope; a fallback stops with a sparse-checkout error instead of
+running an unscoped check over historical bundles that are intentionally
+absent.
+
+The checkout stays depth one through validation and for every dry run. Just
+before a real push, the reviewer removes the shallow boundary with another
+`blob:none` fetch. This is deliberately later and narrower than the old eager
+unshallow, but cannot yet be deleted: registration previously reached GitHub
+and was rejected because a no-workflow-scope credential pushing a shallow new
+branch was treated as introducing an existing workflow. A scratch push with an
+operator OAuth token proves the current shallow tree shape is accepted, but
+that token has `workflow` scope and is not the production GitHub App token, so
+it cannot disprove the permission-specific failure. The final fetch downloads
+commit/tree history, not historical payload contents.
+
+Registration therefore no longer grows with immutable payload bytes. It
+retains O(V) work in the number of accepted versions: registration scans every
+entry's metadata for identity allocation/update, the Database proves absolute
+entry/index agreement, and extending the index reads, copies, sorts and rewrites
+the full index. It also retains the filtered commit/tree history transfer at the
+final push boundary. Replacing the entry scans requires one separately validated
+identity projection, not another local cache; deleting the history transfer
+requires an experiment with the production App credential that proves GitHub no
+longer applies the old workflow-scope interpretation.
 
 The automatic finalizer merges only when GitHub reports the change `CLEAN` and
 the database's own `validate.yml` run for that exact head commit completed

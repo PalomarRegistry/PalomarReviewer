@@ -103,6 +103,13 @@ FINISHED_STATUSES = frozenset(
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
 DATABASE_VALIDATE_WORKFLOW = "validate.yml"
+MINIMUM_SPARSE_GIT = (2, 34, 0)
+# Registration needs all canonical metadata, schemas and tools, but not the
+# immutable payload behind historical records. A partial clone alone postpones
+# those blobs only until checkout; this sparse shape keeps them out of both the
+# worktree and the local object store. New bundles can still be created and
+# staged explicitly with ``git add --sparse``.
+DATABASE_SPARSE_PATTERNS = ("/*", "!/renders/", "!/evidence/")
 MAX_RENDER_FILES = 2_000
 MAX_RENDER_NODES = 4_000
 MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
@@ -2749,7 +2756,13 @@ def registry_git_environment(base: dict[str, str] | None = None) -> dict[str, st
     return environment
 
 
-def clone_at(repository_url: str, revision: str, destination: Path) -> str:
+def clone_at(
+    repository_url: str,
+    revision: str,
+    destination: Path,
+    *,
+    sparse_patterns: tuple[str, ...] = (),
+) -> str:
     if destination.exists():
         shutil.rmtree(destination)
     git_env = os.environ.copy()
@@ -2761,6 +2774,10 @@ def clone_at(repository_url: str, revision: str, destination: Path) -> str:
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
+    # GIT_ALLOW_PROTOCOL overrides protocol.<name>.allow. Inheriting a test or
+    # operator shell's `file` allowance here would turn the command-line pin
+    # below into theatre and let a repository URL escape to a local path.
+    git_env.pop("GIT_ALLOW_PROTOCOL", None)
     if repository_url.rstrip("/").removesuffix(".git") == f"https://github.com/{DATABASE_REPO}":
         git_env = registry_git_environment(git_env)
     git = [
@@ -2772,25 +2789,93 @@ def clone_at(repository_url: str, revision: str, destination: Path) -> str:
         "-c",
         "protocol.ext.allow=never",
     ]
+    if sparse_patterns:
+        version_output = run([*git, "version"], env=git_env).stdout.strip()
+        version_match = re.search(r"\b([0-9]+)\.([0-9]+)\.([0-9]+)\b", version_output)
+        if version_match is None or tuple(map(int, version_match.groups())) < MINIMUM_SPARSE_GIT:
+            raise ReviewerError(
+                "sparse database registration requires Git 2.34 or newer "
+                f"(found {version_output or 'an unreadable version'})"
+            )
+    # Start empty and fetch only the commit that was resolved before this call.
+    # `git clone --depth=1` follows the remote's branch tip and would introduce
+    # a resolve/clone race; an unbounded filtered clone still downloads the
+    # complete commit and tree history. This repository has exactly one
+    # shallow commit before a registration adds its child.
+    run([*git, "init", "--quiet", str(destination)], env=git_env)
+    local_git = [*git, "-C", str(destination)]
+    run([*local_git, "remote", "add", "origin", repository_url], env=git_env)
     run(
-        [*git, "clone", "--filter=blob:none", "--no-checkout", repository_url, str(destination)],
+        [*local_git, "fetch", "--filter=blob:none", "--depth=1", "origin", revision],
         env=git_env,
     )
-    local_git = [*git, "-C", str(destination)]
-    run([*local_git, "fetch", "--depth=1", "origin", revision], env=git_env)
+    # A successful filtered fetch registers the repository as a partial clone.
+    # Do not manufacture those settings: if Git or the server did not establish
+    # the contract, a later missing object is corruption rather than a lazy
+    # fetch and registration must stop here.
+    partial_clone = {
+        "repository format": run(
+            [*local_git, "config", "--get", "core.repositoryformatversion"],
+            env=git_env,
+            check=False,
+        ).stdout.strip(),
+        "promisor remote": run(
+            [*local_git, "config", "--get", "remote.origin.promisor"],
+            env=git_env,
+            check=False,
+        ).stdout.strip(),
+        "partial-clone filter": run(
+            [*local_git, "config", "--get", "remote.origin.partialclonefilter"],
+            env=git_env,
+            check=False,
+        ).stdout.strip(),
+    }
+    expected_partial_clone = {
+        "repository format": "1",
+        "promisor remote": "true",
+        "partial-clone filter": "blob:none",
+    }
+    if partial_clone != expected_partial_clone:
+        detail = ", ".join(f"{name}={value or 'unset'}" for name, value in partial_clone.items())
+        raise ReviewerError(
+            "Git did not establish the requested partial clone "
+            f"({detail}); Palomar registration requires Git 2.34 or newer"
+        )
+    if sparse_patterns:
+        run(
+            [*local_git, "sparse-checkout", "set", "--no-cone", *sparse_patterns],
+            env=git_env,
+        )
     run([*local_git, "checkout", "--detach", revision], env=git_env)
     resolved = run([*local_git, "rev-parse", "HEAD"], env=git_env).stdout.strip()
     run([*local_git, "remote", "set-url", "--push", "origin", "no_push"], env=git_env)
     return resolved
 
 
-def unshallow(checkout: Path) -> None:
-    """Give a shallow checkout enough history to be pushed from."""
+def complete_database_history_for_push(database: Path) -> None:
+    """Remove the shallow boundary immediately before a production push.
+
+    A real registration was rejected when GitHub treated a shallow branch as
+    introducing an existing workflow and the deliberately narrow credential
+    lacked workflow scope. The reviewer still validates and prepares dry runs
+    at depth one. Only a branch that is actually about to leave the machine
+    fetches the remaining commit/tree history, and ``blob:none`` keeps all
+    historical payload contents behind the promisor boundary.
+    """
     shallow = run(
-        ["git", "rev-parse", "--is-shallow-repository"], cwd=checkout
+        ["git", "rev-parse", "--is-shallow-repository"], cwd=database
     ).stdout.strip()
     if shallow == "true":
-        run(["git", "fetch", "--unshallow", "origin"], cwd=checkout)
+        parent = run(["git", "rev-parse", "HEAD^"], cwd=database).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", parent):
+            raise ReviewerError("database registration commit has no usable parent")
+        run(
+            ["git", "fetch", "--filter=blob:none", "--unshallow", "origin", parent],
+            cwd=database,
+            env=registry_git_environment(),
+        )
+    elif shallow != "false":
+        raise ReviewerError("could not determine whether the database checkout is shallow")
 
 
 def remote_branch_commit(branch: str) -> str | None:
@@ -2827,6 +2912,7 @@ def push_registration_branch(database: Path, branch: str) -> None:
     The replacement is leased against the commit that was actually observed, so
     a branch that changed underneath this process is not overwritten.
     """
+    complete_database_history_for_push(database)
     remote = ["git", "push", f"https://github.com/{DATABASE_REPO}.git"]
     git_env = registry_git_environment()
     existing = remote_branch_commit(branch)
@@ -4398,7 +4484,7 @@ def registry_record(
             "reasons": reasons,
         },
         # No issue, no URL, no submitter: keeping the submitter private is
-        # what the private intake exists for, and schema-v1 forbids those
+        # what the private intake exists for, and schema-v2 forbids those
         # fields structurally rather than trusting this code to omit them.
         "submission": {
             "submission_id": state["id"],
@@ -4450,6 +4536,189 @@ def registry_scores(
         "policy_commit": review["policy_commit"],
         "scores": {key: review["scores"][key] for key in SYNTHESIS_SCORE_KEYS},
     }
+
+
+def extend_registration_index(
+    database: Path,
+    *,
+    record: dict[str, Any],
+    filename: str,
+) -> dict[str, Any]:
+    """Append one summary to the already validated canonical index.
+
+    This deliberately does not rediscover summaries from every entry. The
+    Database validator does that absolute O(V) check after the registration is
+    committed, so accepting any stale or malformed prior summary here cannot
+    reach a push. This helper uses O(1) entry-file reads, but it still reads,
+    copies, sorts and rewrites the full O(V) index. Avoiding the redundant entry
+    pass does not make registration as a whole constant-time or invent a second
+    projection contract.
+    """
+    current = load_json(database / "index.json")
+    if (
+        not isinstance(current, dict)
+        or current.get("schema_version") != 2
+        or not isinstance(current.get("entries"), list)
+    ):
+        raise ReviewerError("PalomarDatabase main has an invalid index.json")
+    entries = list(current["entries"])
+    entries.append(
+        {
+            "id": record["id"],
+            "version": record["version"],
+            "title": record["title"],
+            "status": record["status"],
+            "path": f"entries/{filename}",
+        }
+    )
+    try:
+        entries.sort(key=lambda entry: entry["path"])
+    except (KeyError, TypeError) as error:
+        raise ReviewerError("PalomarDatabase main has an invalid index.json") from error
+    return {"schema_version": 2, "generated_at": utc_now(), "entries": entries}
+
+
+def _registration_bundle_files(database: Path, root: Path, label: str) -> list[str]:
+    """List and normalize every ordinary file in one newly built bundle."""
+    if root.is_symlink() or not root.is_dir():
+        raise ReviewerError(f"{label} must be an ordinary directory")
+    files: list[str] = []
+    for path in sorted(root.rglob("*")):
+        mode = path.lstat().st_mode
+        relative = path.relative_to(database).as_posix()
+        if stat.S_ISLNK(mode):
+            raise ReviewerError(f"{relative}: {label} contains a symbolic link")
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ReviewerError(f"{relative}: {label} contains a non-regular file")
+        # Git records only the executable bit, which has no meaning for served
+        # render/evidence bytes. Normalize it before staging and then verify the
+        # index mode below; an executable or otherwise odd source mode must not
+        # turn an ordinary registration into an unscoped validator fallback.
+        path.chmod(0o644)
+        files.append(relative)
+    if not files:
+        raise ReviewerError(f"{label} must contain at least one ordinary file")
+    return files
+
+
+def stage_registration_change(
+    database: Path,
+    *,
+    entry: Path,
+    scores: Path,
+    render_bundle: Path,
+    evidence_bundle: Path,
+) -> tuple[str, ...]:
+    """Stage exactly one registration, including ignored bundle files.
+
+    Passing bundle directories to ``git add`` can silently omit a nested file
+    selected by an ignore rule. Enumerating every file, forcing those explicit
+    paths, and comparing the resulting index to the expected path/mode set
+    makes the Git tree itself the authority before validation or push.
+    """
+    additions: list[str] = []
+    for path, label in ((entry, "database entry"), (scores, "database scores")):
+        relative = path.relative_to(database).as_posix()
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ReviewerError(f"{relative}: {label} must be an ordinary file")
+        path.chmod(0o644)
+        additions.append(relative)
+    additions.extend(_registration_bundle_files(database, render_bundle, "render bundle"))
+    additions.extend(_registration_bundle_files(database, evidence_bundle, "evidence bundle"))
+    additions = sorted(additions)
+    pathspecs = [*additions, "index.json"]
+    run(
+        [
+            "git",
+            "add",
+            "--force",
+            "--sparse",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        cwd=database,
+        input_text="\0".join(pathspecs) + "\0",
+    )
+
+    raw = run(
+        ["git", "diff", "--cached", "--raw", "-r", "-z", "--no-renames", "HEAD", "--"],
+        cwd=database,
+    ).stdout
+    fields = raw.split("\0")
+    staged: dict[str, tuple[str, str, str]] = {}
+    index = 0
+    while index < len(fields) and fields[index]:
+        meta = fields[index]
+        path = fields[index + 1] if index + 1 < len(fields) else ""
+        index += 2
+        parts = meta.lstrip(":").split()
+        if len(parts) != 5 or not path:
+            raise ReviewerError("Git reported an unreadable staged registration change")
+        old_mode, new_mode, _old, _new, status_letter = parts
+        staged[path] = (status_letter, old_mode, new_mode)
+
+    expected = {path: "A" for path in additions}
+    expected["index.json"] = "M"
+    if set(staged) != set(expected):
+        missing = sorted(set(expected) - set(staged))
+        extra = sorted(set(staged) - set(expected))
+        detail = []
+        if missing:
+            detail.append(f"missing {missing}")
+        if extra:
+            detail.append(f"unexpected {extra}")
+        raise ReviewerError("staged registration paths do not match the built record: " + "; ".join(detail))
+    for path, expected_status in expected.items():
+        status_letter, old_mode, new_mode = staged[path]
+        if status_letter != expected_status:
+            raise ReviewerError(
+                f"{path}: staged as {status_letter}, expected {expected_status} for one registration"
+            )
+        if new_mode != "100644" or (expected_status == "M" and old_mode != "100644"):
+            raise ReviewerError(
+                f"{path}: staged with mode {new_mode}; registration files must be 100644"
+            )
+    return tuple(additions)
+
+
+def validate_sparse_database(database: Path, base: str) -> subprocess.CompletedProcess[str]:
+    """Run Database validation only after its own code proves a delta scope.
+
+    The checkout intentionally omits historical render/evidence worktrees. A
+    normal Database invocation may safely fall back to full validation, but in
+    this checkout that fallback cannot inspect what is absent and would emit a
+    misleading wall of missing-bundle errors. Ask the exact checked-out
+    validator for its scope first, and fail explicitly if it cannot derive one.
+    """
+    preflight = run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,sys; "
+                "root=pathlib.Path(sys.argv[1]); "
+                "sys.path.insert(0,str(root/'tools')); "
+                "import validate; "
+                "raise SystemExit(0 if validate.scope_of(root,sys.argv[2]) is not None else 3)"
+            ),
+            str(database),
+            base,
+        ],
+        cwd=database,
+        check=False,
+    )
+    if preflight.returncode:
+        detail = (preflight.stderr or preflight.stdout).strip()[-2000:]
+        suffix = f": {detail}" if detail else ""
+        raise ReviewerError(
+            "PalomarDatabase could not derive a changed-record validation scope; refusing "
+            "unscoped validation because this sparse checkout omits historical "
+            f"renders/evidence{suffix}"
+        )
+    return run([sys.executable, "tools/validate.py", "--since", base], cwd=database)
 
 
 def registration_identity(
@@ -4862,12 +5131,14 @@ def register(args: argparse.Namespace) -> int:
         raise ReviewerError("review workspace source no longer matches the mechanical report")
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
-    clone_at(f"https://github.com/{DATABASE_REPO}", resolved, database)
-    # The branch built here is pushed, and a shallow history cannot be pushed
-    # honestly: with the parent commit absent, the new commit reads as though
-    # it introduced every file in the tree, workflows included, and GitHub
-    # refuses a token that may not touch workflows. Nothing here writes one.
-    unshallow(database)
+    checked_out = clone_at(
+        f"https://github.com/{DATABASE_REPO}",
+        resolved,
+        database,
+        sparse_patterns=DATABASE_SPARSE_PATTERNS,
+    )
+    if checked_out != resolved:
+        raise ReviewerError("PalomarDatabase checkout does not match resolved main")
     schema_path = database / "schema-v2.json"
     if not schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register schema-v2.json")
@@ -4961,21 +5232,16 @@ def register(args: argparse.Namespace) -> int:
         registry_scores(permanent_id=record["id"], version=version, review=review),
     )
 
-    entries = []
-    for path in sorted((database / "entries").glob("*.json")):
-        data = load_json(path)
-        entries.append(
-            {
-                "id": data["id"],
-                "version": data["version"],
-                "title": data["title"],
-                "status": data["status"],
-                "path": f"entries/{path.name}",
-            }
-        )
+    # The checkout's index was already validated on main. Extend that canonical
+    # projection instead of opening every entry a second time merely to rebuild
+    # bytes we already have. The absolute validator below still reads all O(V)
+    # accepted-version metadata and proves this exact index agrees with it;
+    # registration identity retains the same O(V) scan, and extending this
+    # projection reads, copies, sorts and rewrites the full index. Removing that
+    # residual work requires one separately validated identity projection.
     write_json(
         database / "index.json",
-        {"schema_version": 2, "generated_at": utc_now(), "entries": entries},
+        extend_registration_index(database, record=record, filename=filename),
     )
     schema = load_json(schema_path)
     jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
@@ -4984,21 +5250,20 @@ def register(args: argparse.Namespace) -> int:
         load_json(scores_schema_path),
         format_checker=jsonschema.FormatChecker(),
     )
-    run([sys.executable, "tools/validate.py"], cwd=database)
     branch = f"submission-{args.submission}-v{version}"
     run(["git", "checkout", "-b", branch], cwd=database)
-    run(
-        [
-            "git",
-            "add",
-            f"entries/{filename}",
-            f"scores/{filename}",
-            "index.json",
-            artifact_path.rstrip("/"),
-            evidence_path.rstrip("/"),
-        ],
-        cwd=database,
+    stage_registration_change(
+        database,
+        entry=destination,
+        scores=scores_destination,
+        render_bundle=artifact_destination,
+        evidence_bundle=evidence_destination,
     )
+    # Database validation scopes immutable payload hashing from the exact main
+    # commit this registration extends. It still checks every entry's metadata,
+    # identity/date agreement and the complete index. The change must be
+    # committed first: the Database validator deliberately refuses to infer an
+    # append-only scope from uncommitted record paths.
     run(
         [
             "git",
@@ -5012,6 +5277,7 @@ def register(args: argparse.Namespace) -> int:
         ],
         cwd=database,
     )
+    validate_sparse_database(database, checked_out)
     if args.dry_run:
         print(f"Prepared {destination}; dry run, branch was not pushed.")
         return 0
