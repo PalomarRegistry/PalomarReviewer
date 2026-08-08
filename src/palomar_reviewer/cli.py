@@ -24,6 +24,7 @@ from urllib.parse import quote
 import jsonschema
 import yaml
 
+from . import authorization as registration_authorization
 from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
 from . import usage as usage_accounting
@@ -565,16 +566,6 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
                 "the reviewed repository as having attempted a prompt injection, and read the "
                 "raw pass output by hand."
             )
-
-
-def review_digest(report: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        report,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def validate_rubric(rubric: dict[str, Any]) -> None:
@@ -2060,7 +2051,7 @@ def deliver_review(
         state,
         "review-ready",
         "The editorial review is ready for you",
-        review_sha256=review_digest(review),
+        review_sha256=registration_authorization.document_digest(review),
         review_schema_version=review["schema_version"],
         registration_consent=False,
         registration_consent_review_sha256=None,
@@ -2620,7 +2611,9 @@ def prepare_workspace(
     shutil.copyfile(download_root / "mechanical-report.json", work / "mechanical-report.json")
     write_json(work / "workflow-run.json", verification_run_provenance(run_data))
     (work / "mechanical-report-url").write_text(report_url + "\n")
-    (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
+    (work / "mechanical-report-sha256").write_text(
+        registration_authorization.document_digest(mechanical) + "\n"
+    )
     (work / "mechanical-report-bytes-sha256").write_text(sha256_file(work / "mechanical-report.json") + "\n")
     (work / "workflow-run-sha256").write_text(sha256_file(work / "workflow-run.json") + "\n")
     return work, state, mechanical, policy_commit
@@ -3006,7 +2999,9 @@ def run_review(args: argparse.Namespace) -> int:
         spend = load_json(spend_path) if spend_path.is_file() else None
         state = deliver_review(state, stored, spend)
         write_json(work / "state.json", state)
-        (work / "review-sha256").write_text(review_digest(stored) + "\n")
+        (work / "review-sha256").write_text(
+            registration_authorization.document_digest(stored) + "\n"
+        )
         print(f"Delivered the review privately for submission {args.submission}.")
         return 0
 
@@ -3194,166 +3189,6 @@ def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any
     if result != {key: submitted[key] for key in result}:
         raise ReviewerError("formalization.yaml classification disagrees with the mechanical report")
     return result
-
-
-# How a submitter may prove they can write to the repository they are
-# submitting. Adding a route to the submission server is not enough to admit a
-# new one: it has to be named here, which is the point. Each entry says what the
-# method actually establishes, because they do not all establish the same thing.
-PUSH_PROOF_METHODS = {
-    # The submitter authorised Palomar and GitHub answered `permissions.push`
-    # for that same authenticated account. One account, both facts.
-    "oauth": "same-account",
-    # A tag created at the submitted commit proves someone holds `contents:
-    # write`; a gist proves an account named itself. Nothing ties the two
-    # together, so two colluding accounts could separate the credential that
-    # can push from the identity on the record. Weaker than `oauth`, knowingly.
-    "tag-and-gist": "separately-attested",
-}
-
-
-def verify_push_proof(state: dict[str, Any]) -> None:
-    """Require a described proof, not merely a boolean somebody set.
-
-    `push_verified` is a hardcoded literal in the submission server: it records
-    that a code path ran, not what it observed. That was adequate while one
-    path could set it. With more than one, the record has to say which, so that
-    admitting a new method is a decision taken here rather than a side effect
-    of deploying a server. Creation time is not proof and survives a later
-    review rerun, so it deliberately creates no exception to this requirement.
-
-    The submission server records the GitHub repository and principal IDs. The
-    reviewer validates that evidence contract and binds the proof to the
-    reviewed commit; it does not independently resolve the repository ID from
-    GitHub.
-    """
-    proof = state.get("push_proof")
-    if proof is None:
-        raise ReviewerError(
-            "the submission record carries no push_proof; every registration "
-            "must describe how write access was proved"
-        )
-
-    if not isinstance(proof, dict):
-        raise ReviewerError("push_proof is not an object")
-    schema_version = proof.get("schema_version")
-    if (
-        not isinstance(schema_version, int)
-        or isinstance(schema_version, bool)
-        or schema_version != 1
-    ):
-        raise ReviewerError("push_proof schema_version must be the integer 1")
-    method = proof.get("method")
-    if method not in PUSH_PROOF_METHODS:
-        raise ReviewerError(
-            f"push_proof names an unrecognised method: {method!r}. A method must be "
-            "described in PUSH_PROOF_METHODS before a record relying on it registers."
-        )
-    if proof.get("binding") != PUSH_PROOF_METHODS[method]:
-        raise ReviewerError(
-            f"push_proof method {method!r} claims binding {proof.get('binding')!r}, "
-            f"but that method establishes {PUSH_PROOF_METHODS[method]!r}"
-        )
-    for field in ("verified_at", "commit"):
-        if not proof.get(field):
-            raise ReviewerError(f"push_proof is missing {field}")
-    repository_id = proof.get("repository_id")
-    if (
-        not isinstance(repository_id, int)
-        or isinstance(repository_id, bool)
-        or repository_id <= 0
-    ):
-        raise ReviewerError("push_proof repository_id must be a positive integer")
-    if proof.get("commit") != state.get("commit"):
-        raise ReviewerError("push_proof was made against a different commit")
-    principal = proof.get("principal")
-    if not isinstance(principal, dict) or "id" not in principal:
-        raise ReviewerError("push_proof does not identify who proved it")
-    principal_id = principal.get("id")
-    if (
-        not isinstance(principal_id, int)
-        or isinstance(principal_id, bool)
-        or principal_id <= 0
-    ):
-        raise ReviewerError("push_proof principal.id must be a positive integer")
-
-
-def authorize_registration(
-    submission_id: str, mechanical: dict[str, Any], review: dict[str, Any]
-) -> dict[str, Any]:
-    """Refuse to register anything the submission server did not authorize.
-
-    The submission id is public: it appears in the verification run's name, so
-    anyone able to dispatch the workflow can produce a mechanical report
-    carrying a real one. Existence of a state record is therefore not enough.
-    What is checked is that the private record and the report describe the same
-    submission, that the record carries the Server's supported write-access
-    proof contract, that the submitter has not withdrawn and explicitly
-    consented to registration, and that nothing has been registered for this
-    submission already. Reviewer validates and binds that recorded contract; it
-    does not independently resolve its repository ID against GitHub.
-    """
-    state = submission_state(submission_id)
-    if state is None:
-        raise ReviewerError(
-            f"submission {submission_id} has no record in {STATE_REPO}: "
-            "the submission server never created it"
-        )
-
-    submission = mechanical.get("submission", {})
-    if state.get("id") != submission_id:
-        raise ReviewerError("state record is filed under a different submission id")
-    if submission.get("submission_id") != submission_id:
-        raise ReviewerError("mechanical report and state disagree on the submission id")
-    if review.get("submission_id") != submission_id:
-        raise ReviewerError("review and state disagree on the submission id")
-
-    for field, reported, recorded in (
-        ("repository", mechanical["source"]["repository"], state.get("repository")),
-        ("commit", mechanical["source"]["commit"], state.get("commit")),
-    ):
-        if reported != recorded:
-            raise ReviewerError(
-                f"mechanical report and state disagree on {field}: "
-                f"{reported!r} against {recorded!r}"
-            )
-
-    if submission.get("authorization") != state.get("authorization"):
-        raise ReviewerError("mechanical report and state disagree on the authorization")
-    if (mechanical.get("existing_id") or None) != (state.get("existing_id") or None):
-        raise ReviewerError("mechanical report and state disagree on the update intent")
-    if state.get("push_verified") is not True:
-        raise ReviewerError("the submitter never proved write access to the repository")
-    verify_push_proof(state)
-    # A positive status, not merely "not withdrawn": a stale consent flag on a
-    # record that has gone back to any other state must not authorize anything.
-    if state.get("status") != "review-ready":
-        raise ReviewerError(
-            f"submission {submission_id} is {state.get('status')}, and only a submission "
-            "holding a delivered review may be registered"
-        )
-    if state.get("registered_entry"):
-        raise ReviewerError(
-            f"submission {submission_id} was already registered as {state['registered_entry']}"
-        )
-    if state.get("registration_consent") is not True:
-        raise ReviewerError(
-            "the submitter has not consented to registration; "
-            "nothing is registered until they choose to"
-        )
-    # Consent is to the exact review the submitter read. The digest recorded at
-    # delivery, the digest they consented to, and the review about to be
-    # archived must all be the same bytes.
-    delivered = state.get("review_sha256")
-    consented = state.get("registration_consent_review_sha256")
-    registering = review_digest(review)
-    if delivered != registering:
-        raise ReviewerError(
-            "the review being registered is not the review delivered to the submitter"
-        )
-    if consented != registering:
-        raise ReviewerError("the submitter consented to a different review")
-    return state
 
 
 def allocate_identifier(registered_on: str, taken: set[str]) -> str:
@@ -4004,7 +3839,7 @@ def registration_attempt_identity(
     the day its reserved identifier names, which is the disagreement the
     database refuses.
     """
-    review_sha256 = review_digest(review)
+    review_sha256 = registration_authorization.document_digest(review)
     source_repository = mechanical["source"]["repository"]
     source_commit = mechanical["source"]["commit"]
     existing_id = mechanical.get("existing_id") or None
@@ -4153,7 +3988,9 @@ def register(args: argparse.Namespace) -> int:
     # because that is what consent was given to.
     served = served_review(review, work / "policy")
     write_json(work / "review.json", served)
-    (work / "review-sha256").write_text(review_digest(review) + "\n")
+    (work / "review-sha256").write_text(
+        registration_authorization.document_digest(review) + "\n"
+    )
     state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")
     if state.get("id") != args.submission:
@@ -4178,7 +4015,9 @@ def register(args: argparse.Namespace) -> int:
     ):
         raise ReviewerError("registration requires an inspected review bound to the mechanical report")
     mechanical_url = mechanical_url_path.read_text().strip()
-    if mechanical_digest_path.read_text().strip() != review_digest(mechanical):
+    if mechanical_digest_path.read_text().strip() != registration_authorization.document_digest(
+        mechanical
+    ):
         raise ReviewerError("mechanical report no longer matches the reviewed artifact")
     if mechanical_bytes_digest_path.read_text().strip() != sha256_file(work / "mechanical-report.json"):
         raise ReviewerError("mechanical report bytes no longer match the downloaded artifact")
@@ -4231,7 +4070,13 @@ def register(args: argparse.Namespace) -> int:
     # Before anything public happens. Rendering dispatches a public Actions run
     # named with the repository and commit, which would signal an acceptance
     # the submitter has not agreed to register, and cannot be taken back.
-    state = authorize_registration(args.submission, mechanical, review)
+    state = registration_authorization.validate_registration(
+        args.submission,
+        mechanical,
+        review,
+        submission_state(args.submission),
+        state_repository=STATE_REPO,
+    )
     source = work / "source"
     formalization_path = mechanical_evidence.source_path(
         source,

@@ -19,6 +19,7 @@ from unittest import mock
 
 import jsonschema
 
+import palomar_reviewer.authorization as registration_authorization
 import palomar_reviewer.cli as cli
 import palomar_reviewer.engine as engine_execution
 import palomar_reviewer.mechanical as mechanical_evidence
@@ -43,7 +44,6 @@ from palomar_reviewer.cli import (
     render_bundle_manifest,
     render_prompt,
     request_render,
-    review_digest,
     step_schema_for_rubric,
     validate_declaration_coverage,
     validate_render_result,
@@ -784,7 +784,10 @@ class ReviewerTests(unittest.TestCase):
             self.assertEqual(
                 saved["registration_attempt"]["registered_at"], "2026-08-11T09:30:00Z"
             )
-            self.assertEqual(saved["registration_attempt"]["review_sha256"], review_digest(review))
+            self.assertEqual(
+                saved["registration_attempt"]["review_sha256"],
+                registration_authorization.document_digest(review),
+            )
             self.assertEqual(write.call_args.kwargs["blob_sha"], "state-blob")
 
             with (
@@ -819,7 +822,7 @@ class ReviewerTests(unittest.TestCase):
             "id": "PALOMAR-2026-08-08-000001",
             "version": 1,
             "accepted_at": "2026-08-08",
-            "review_sha256": review_digest(review),
+            "review_sha256": registration_authorization.document_digest(review),
             "source_repository": mechanical["source"]["repository"],
             "source_commit": mechanical["source"]["commit"],
             "existing_id": None,
@@ -858,7 +861,7 @@ class ReviewerTests(unittest.TestCase):
             "id": "PALOMAR-2026-08-08-000001",
             "version": 1,
             "accepted_at": "2026-08-08",
-            "review_sha256": review_digest(review),
+            "review_sha256": registration_authorization.document_digest(review),
             "source_repository": mechanical["source"]["repository"],
             "source_commit": mechanical["source"]["commit"],
             "existing_id": None,
@@ -2231,7 +2234,9 @@ class ReviewerTests(unittest.TestCase):
             commit_source(source, mechanical)
             review["source"]["commit"] = mechanical["source"]["commit"]
             (work / "mechanical-report.json").write_text(json.dumps(mechanical))
-            (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
+            (work / "mechanical-report-sha256").write_text(
+                registration_authorization.document_digest(mechanical) + "\n"
+            )
             bind_publication_evidence(work, mechanical)
             (work / "review.json").write_text(json.dumps(review))
             (work / "state.json").write_text(json.dumps({
@@ -2245,10 +2250,14 @@ class ReviewerTests(unittest.TestCase):
                 "status": "review-ready",
                 "run": {"id": 101},
                 "registration_consent": True,
-                "review_sha256": review_digest(review),
-                "registration_consent_review_sha256": review_digest(review),
+                "review_sha256": registration_authorization.document_digest(review),
+                "registration_consent_review_sha256": (
+                    registration_authorization.document_digest(review)
+                ),
             }))
-            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            (work / "review-sha256").write_text(
+                registration_authorization.document_digest(review) + "\n"
+            )
             (work / "mechanical-report-url").write_text(mechanical["workflow_url"] + "\n")
 
             render_result = root / "render-result"
@@ -2349,19 +2358,25 @@ class ReviewerTests(unittest.TestCase):
             (work / "mechanical-report-sha256").write_text("0" * 64 + "\n")
             with self.assertRaisesRegex(ReviewerError, "mechanical report no longer matches"):
                 register(args)
-            (work / "mechanical-report-sha256").write_text(review_digest(mechanical) + "\n")
+            (work / "mechanical-report-sha256").write_text(
+                registration_authorization.document_digest(mechanical) + "\n"
+            )
             classification_pass = next(item for item in review["passes"] if item["step"] == "classification")
             classification_pass["scores"]["classification"] = 2
             dirty_rubric = json.loads((work / "policy" / "rubric.json").read_text())
             dirty_rubric["minimum_accept_score"] = 1
             (work / "policy" / "rubric.json").write_text(json.dumps(dirty_rubric))
             (work / "review.json").write_text(json.dumps(review))
-            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            (work / "review-sha256").write_text(
+                registration_authorization.document_digest(review) + "\n"
+            )
             with self.assertRaisesRegex(ReviewerError, "scores below"):
                 register(args)
             classification_pass["scores"]["classification"] = 4
             (work / "review.json").write_text(json.dumps(review))
-            (work / "review-sha256").write_text(review_digest(review) + "\n")
+            (work / "review-sha256").write_text(
+                registration_authorization.document_digest(review) + "\n"
+            )
             formalization_path = source / "formalization.yaml"
             formalization_bytes = formalization_path.read_bytes()
             formalization_path.write_bytes(formalization_bytes + b"# changed\n")
@@ -2499,7 +2514,9 @@ class ReviewerTests(unittest.TestCase):
             ).hexdigest()
             commit_source(update_source, update_mechanical)
             (update_work / "mechanical-report.json").write_text(json.dumps(update_mechanical))
-            (update_work / "mechanical-report-sha256").write_text(review_digest(update_mechanical) + "\n")
+            (update_work / "mechanical-report-sha256").write_text(
+                registration_authorization.document_digest(update_mechanical) + "\n"
+            )
             bind_publication_evidence(update_work, update_mechanical)
             update_mechanical_url = update_mechanical["workflow_url"]
             # The update takes its Comparator configuration from the database's
@@ -2551,8 +2568,10 @@ class ReviewerTests(unittest.TestCase):
                 "status": "review-ready",
                 "run": {"id": 103},
                 "registration_consent": True,
-                "review_sha256": review_digest(update_review),
-                "registration_consent_review_sha256": review_digest(update_review),
+                "review_sha256": registration_authorization.document_digest(update_review),
+                "registration_consent_review_sha256": (
+                    registration_authorization.document_digest(update_review)
+                ),
             }))
             (update_work / "mechanical-report-url").write_text(update_mechanical_url + "\n")
             update_render = root / "update-render-result"
@@ -5066,7 +5085,9 @@ class DeliveredReviewChainTests(unittest.TestCase):
             updated = cli.deliver_review(state, review)
 
         self.assertEqual(updated["status"], "review-ready")
-        self.assertEqual(updated["review_sha256"], cli.review_digest(review))
+        self.assertEqual(
+            updated["review_sha256"], registration_authorization.document_digest(review)
+        )
         self.assertEqual(updated["review_schema_version"], 2)
         # A second review must not inherit consent given to the first.
         self.assertIs(updated["registration_consent"], False)
@@ -5090,19 +5111,28 @@ class DeliveredReviewChainTests(unittest.TestCase):
             "push_verified": True,
             "push_proof": push_proof_for("1" * 40),
             "registration_consent": True,
-            "review_sha256": cli.review_digest(review),
-            "registration_consent_review_sha256": cli.review_digest(review),
+            "review_sha256": registration_authorization.document_digest(review),
+            "registration_consent_review_sha256": (
+                registration_authorization.document_digest(review)
+            ),
         }
         mechanical = {
             "submission": {"submission_id": "a1b2c3d4e5f6",
                            "authorization": {"relationship": "maintainer"}},
             "source": {"repository": "example/project", "commit": "1" * 40},
         }
-        with mock.patch.object(cli, "submission_state", return_value=state):
-            cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+        registration_authorization.validate_registration(
+            "a1b2c3d4e5f6",
+            mechanical,
+            review,
+            state,
+            state_repository=cli.STATE_REPO,
+        )
         # The archived file is the one the record's digest is taken over.
         self.assertEqual(
-            cli.review_digest(json.loads((work / "review.json").read_text())),
+            registration_authorization.document_digest(
+                json.loads((work / "review.json").read_text())
+            ),
             state["review_sha256"],
         )
 
@@ -5114,7 +5144,7 @@ class RegistrationPreflightTests(unittest.TestCase):
         "download_mechanical_artifact",
         "served_review",
         "write_json",
-        "authorize_registration",
+        "submission_state",
         "request_render",
         "preserve_sources",
         "clone_at",
@@ -5161,6 +5191,9 @@ class RegistrationPreflightTests(unittest.TestCase):
                     **decision,
                 }
                 blocked = self.blocked(stack)
+                authorization = stack.enter_context(
+                    mock.patch.object(registration_authorization, "validate_registration")
+                )
                 credential = stack.enter_context(
                     mock.patch.object(cli, "refuse_engine_credential")
                 )
@@ -5177,6 +5210,7 @@ class RegistrationPreflightTests(unittest.TestCase):
                 )
                 for call in blocked.values():
                     call.assert_not_called()
+                authorization.assert_not_called()
                 self.assertFalse((root / args.submission).exists())
 
     def test_a_credential_in_a_rejected_review_is_refused_before_the_decision(self):
@@ -5195,6 +5229,9 @@ class RegistrationPreflightTests(unittest.TestCase):
                 "summary": f"Rejected. The credential was {key}.",
             }
             blocked = self.blocked(stack)
+            authorization = stack.enter_context(
+                mock.patch.object(registration_authorization, "validate_registration")
+            )
             delivered = stack.enter_context(
                 mock.patch.object(cli, "delivered_review", return_value=review)
             )
@@ -5205,15 +5242,16 @@ class RegistrationPreflightTests(unittest.TestCase):
             delivered.assert_called_once_with(args.submission)
             for call in blocked.values():
                 call.assert_not_called()
+            authorization.assert_not_called()
             self.assertFalse((root / args.submission).exists())
 
 
-class PublicationAuthorizationTests(unittest.TestCase):
-    """A forged verification run must never reach the registry.
+class RegistrationAuthorizationContractTests(unittest.TestCase):
+    """The pure contract binds public evidence to private authorization.
 
     The submission id is public: it appears in the verification run's name, so
     anyone able to dispatch the workflow can produce a report carrying a real
-    one. Existence of a state record is therefore not enough.
+    one. The contract must refuse evidence the private record did not authorize.
     """
 
     def parts(self, **state_overrides):
@@ -5236,27 +5274,33 @@ class PublicationAuthorizationTests(unittest.TestCase):
             "status": "review-ready",
             "run": {"id": 101},
             "registration_consent": True,
-            "review_sha256": cli.review_digest(review),
-            "registration_consent_review_sha256": cli.review_digest(review),
+            "review_sha256": registration_authorization.document_digest(review),
+            "registration_consent_review_sha256": (
+                registration_authorization.document_digest(review)
+            ),
             **state_overrides,
         }
         return mechanical, review, state
 
     def authorize(self, mechanical, review, state):
-        with mock.patch.object(cli, "submission_state", return_value=state):
-            return cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+        return registration_authorization.validate_registration(
+            "a1b2c3d4e5f6",
+            mechanical,
+            review,
+            state,
+            state_repository=cli.STATE_REPO,
+        )
 
-    def test_an_authorized_submission_publishes(self):
+    def test_the_current_contract_is_authorized(self):
         mechanical, review, state = self.parts()
         self.assertEqual(self.authorize(mechanical, review, state)["id"], "a1b2c3d4e5f6")
 
     def test_a_submission_the_server_never_made_is_refused(self):
         mechanical, review, _ = self.parts()
-        with mock.patch.object(cli, "submission_state", return_value=None):
-            with self.assertRaisesRegex(ReviewerError, "never created it"):
-                cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+        with self.assertRaisesRegex(ReviewerError, "never created it"):
+            self.authorize(mechanical, review, None)
 
-    def test_publication_without_consent_is_refused(self):
+    def test_a_record_without_consent_is_refused(self):
         """Nothing is registered until the submitter chooses to register it."""
         mechanical, review, state = self.parts(registration_consent=False)
         with self.assertRaisesRegex(ReviewerError, "not consented"):
@@ -5270,7 +5314,7 @@ class PublicationAuthorizationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ReviewerError, "only a submission holding"):
                     self.authorize(mechanical, review, state)
 
-    def test_consent_to_one_review_does_not_publish_another(self):
+    def test_consent_to_one_review_does_not_authorize_another(self):
         """Consent is to the review the submitter read, not to publishing at large."""
         mechanical, review, state = self.parts()
         revised = {**review, "summary": "A different review."}
@@ -5278,14 +5322,16 @@ class PublicationAuthorizationTests(unittest.TestCase):
             self.authorize(mechanical, revised, state)
 
         stale, _, state = self.parts()
-        state["review_sha256"] = cli.review_digest(review)
-        state["registration_consent_review_sha256"] = cli.review_digest(
+        state["review_sha256"] = registration_authorization.document_digest(review)
+        state["registration_consent_review_sha256"] = (
+            registration_authorization.document_digest(
             {**review, "summary": "An earlier review."}
+            )
         )
         with self.assertRaisesRegex(ReviewerError, "consented to a different review"):
             self.authorize(mechanical, review, state)
 
-    def test_a_second_publication_is_refused(self):
+    def test_a_second_registration_is_refused(self):
         mechanical, review, state = self.parts(registered_entry="PALOMAR-2026-08-05-123456-v1")
         with self.assertRaisesRegex(ReviewerError, "already registered"):
             self.authorize(mechanical, review, state)
@@ -5310,7 +5356,8 @@ class PublicationAuthorizationTests(unittest.TestCase):
     def test_a_record_whose_proof_nobody_described_is_refused(self):
         """The predicate must actually consult the proof.
 
-        Testing `verify_push_proof` alone leaves it possible to stop calling it,
+        Testing `authorization.validate_push_proof` alone leaves it possible to
+        stop calling it,
         which is the only thing standing between a new intake path and the
         registry.
         """
@@ -5322,15 +5369,13 @@ class PublicationAuthorizationTests(unittest.TestCase):
                 "commit": "1" * 40, "principal": {"login": "someone", "id": 1},
             },
         )
-        with mock.patch.object(cli, "submission_state", return_value=state):
-            with self.assertRaisesRegex(ReviewerError, "unrecognised method"):
-                cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+        with self.assertRaisesRegex(ReviewerError, "unrecognised method"):
+            self.authorize(mechanical, review, state)
 
     def test_a_record_with_no_proof_at_all_is_refused(self):
         mechanical, review, state = self.parts(push_proof=None)
-        with mock.patch.object(cli, "submission_state", return_value=state):
-            with self.assertRaisesRegex(ReviewerError, "no push_proof"):
-                cli.authorize_registration("a1b2c3d4e5f6", mechanical, review)
+        with self.assertRaisesRegex(ReviewerError, "no push_proof"):
+            self.authorize(mechanical, review, state)
 
     def test_a_report_claiming_a_different_authorization_is_refused(self):
         mechanical, review, state = self.parts()
@@ -6543,35 +6588,45 @@ class PushProofTests(unittest.TestCase):
         return value
 
     def test_a_described_proof_is_accepted(self):
-        cli.verify_push_proof(self.state())
-        cli.verify_push_proof(self.state(
-            push_proof=self.proof(method="oauth", binding="same-account")))
+        registration_authorization.validate_push_proof(self.state())
+        registration_authorization.validate_push_proof(
+            self.state(push_proof=self.proof(method="oauth", binding="same-account"))
+        )
 
     def test_a_method_nobody_described_is_refused(self):
         with self.assertRaisesRegex(ReviewerError, "unrecognised method"):
-            cli.verify_push_proof(self.state(push_proof=self.proof(method="trust-me")))
+            registration_authorization.validate_push_proof(
+                self.state(push_proof=self.proof(method="trust-me"))
+            )
 
     def test_a_method_cannot_overstate_what_it_establishes(self):
         # tag-and-gist proves someone can push and that an account named
         # itself, not that they are the same account. A record must not claim
         # otherwise, whatever wrote it.
         with self.assertRaisesRegex(ReviewerError, "establishes"):
-            cli.verify_push_proof(self.state(
-                push_proof=self.proof(method="tag-and-gist", binding="same-account")))
+            registration_authorization.validate_push_proof(
+                self.state(
+                    push_proof=self.proof(method="tag-and-gist", binding="same-account")
+                )
+            )
 
     def test_a_proof_of_another_commit_is_refused(self):
         with self.assertRaisesRegex(ReviewerError, "different commit"):
-            cli.verify_push_proof(self.state(push_proof=self.proof(commit="2" * 40)))
+            registration_authorization.validate_push_proof(
+                self.state(push_proof=self.proof(commit="2" * 40))
+            )
 
     def test_a_proof_that_names_nobody_is_refused(self):
         with self.assertRaisesRegex(ReviewerError, "does not identify"):
-            cli.verify_push_proof(self.state(push_proof=self.proof(principal={})))
+            registration_authorization.validate_push_proof(
+                self.state(push_proof=self.proof(principal={}))
+            )
 
     def test_schema_version_is_exactly_integer_one(self):
         for value in (None, True, 1.0, "1", 0, 2):
             with self.subTest(schema_version=value):
                 with self.assertRaisesRegex(ReviewerError, "integer 1"):
-                    cli.verify_push_proof(
+                    registration_authorization.validate_push_proof(
                         self.state(push_proof=self.proof(schema_version=value))
                     )
 
@@ -6580,12 +6635,12 @@ class PushProofTests(unittest.TestCase):
         for value in invalid:
             with self.subTest(repository_id=value):
                 with self.assertRaisesRegex(ReviewerError, "repository_id"):
-                    cli.verify_push_proof(
+                    registration_authorization.validate_push_proof(
                         self.state(push_proof=self.proof(repository_id=value))
                     )
             with self.subTest(principal_id=value):
                 with self.assertRaisesRegex(ReviewerError, "principal.id"):
-                    cli.verify_push_proof(
+                    registration_authorization.validate_push_proof(
                         self.state(
                             push_proof=self.proof(
                                 principal={"login": "someone", "id": value}
@@ -6597,7 +6652,9 @@ class PushProofTests(unittest.TestCase):
         for created_at in (None, "2026-08-07T00:00:00Z", "2026-08-09T00:00:00Z"):
             with self.subTest(created_at=created_at):
                 with self.assertRaisesRegex(ReviewerError, "every registration"):
-                    cli.verify_push_proof({"commit": "1" * 40, "created_at": created_at})
+                    registration_authorization.validate_push_proof(
+                        {"commit": "1" * 40, "created_at": created_at}
+                    )
 
 
 class OpenIndexFailureTests(unittest.TestCase):
