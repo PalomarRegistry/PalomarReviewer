@@ -6,6 +6,7 @@ import concurrent.futures
 import copy
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -719,6 +720,105 @@ def registered_comments(review: dict[str, Any]) -> list[str]:
             comments.append(warning)
             seen.add(warning)
     return comments
+
+
+# An OpenAI key is `sk-` and then a long run of URL-safe characters, and the
+# Anthropic OAuth token the Claude engine binds in from the host is `sk-ant-`
+# and the same shape after it. The lookbehind is what keeps this off English:
+# `risk-averse-choice-of-definitions` is prose and `task-directed-search` is
+# prose, and neither begins a word at the `sk`. A token that really does start
+# a word with `sk-` is not something a review of a Lean repository writes by
+# accident.
+_ENGINE_CREDENTIAL_SHAPE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}")
+
+
+def _strings_in(value: Any) -> list[str]:
+    """Every string anywhere in a JSON document, keys as well as values.
+
+    A finding's `message` is the field that reaches a record, but it is not the
+    only field the model fills in: `evidence` quotes the repository verbatim,
+    which is exactly where a quoted secret would sit, and the whole document
+    goes to the submitter whatever the record takes from it.
+    """
+    if isinstance(value, str):
+        return [value]
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found.extend(_strings_in(key))
+            found.extend(_strings_in(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_strings_in(item))
+    return found
+
+
+def _holds_configured_key(text: str, key: bytes) -> bool:
+    """Whether `text` contains the configured key, without timing on its bytes.
+
+    A window at a time, so no comparison stops early on the first byte that
+    differs. Encoded first because the review is model-authored and may hold
+    anything; a key is ASCII, so this only ever compares like with like.
+    """
+    haystack = text.encode("utf-8", "surrogatepass")
+    return any(
+        hmac.compare_digest(haystack[offset:offset + len(key)], key)
+        for offset in range(len(haystack) - len(key) + 1)
+    )
+
+
+def refuse_engine_credential(document: Any, *, context: str) -> None:
+    """Refuse a model-authored document that carries the engine's own credential.
+
+    The reviewer's API key has to be inside the namespace the passes run in,
+    because the engine reads it: it is bound in at
+    `/home/reviewer/.codex/auth.json` under a sandbox whose read-only setting
+    permits reads, in the same namespace as `/workspace`, which is the
+    submitter's repository and is attacker-authored text every pass is told to
+    go and read. Everything else the host holds is out of reach in there. This
+    one thing cannot be.
+
+    The other end of that is already built: finding messages become the
+    `warnings` a registered record carries, and the review document goes whole
+    to the submitter's status page. So both halves of a working prompt
+    injection exist, and this stands between them.
+
+    It refuses rather than redacts. A redacted review reads almost right and
+    arrives as though nothing had happened, and the one thing anybody needed to
+    learn from it, that a repository in the queue tried this, is precisely what
+    the redaction erases. Failing costs the review and tells somebody.
+
+    Read it as a backstop and not as containment. It catches the credential
+    written out plainly, which is what an injection that works at all produces
+    first, and it does not catch one that base64s the key, reverses it, spells
+    it across two findings or writes it in homoglyphs. No amount of pattern
+    work here would. What keeps the key in is the namespace around it; this
+    only makes sure that the easy way out is also a loud one.
+    """
+    key = os.environ.get("OPENAI_API_KEY", "").strip().encode("utf-8")
+    for text in _strings_in(document):
+        # Whitespace removed as well as raw, because a key with a newline
+        # through the middle of it is the first thing to try against a check
+        # like this one, and joining words up cannot invent a `sk-` at the
+        # start of one: it can only put another letter in front of it.
+        packed = "".join(text.split())
+        if (
+            _ENGINE_CREDENTIAL_SHAPE.search(text)
+            or _ENGINE_CREDENTIAL_SHAPE.search(packed)
+            or (key and (_holds_configured_key(text, key) or _holds_configured_key(packed, key)))
+        ):
+            # One message for both findings, and no quotation of what matched.
+            # This text is stored in the private record, shown on the status
+            # page and printed into a run log, so anything it repeated would be
+            # the leak it exists to prevent; and saying which of the two checks
+            # fired would answer, for whoever wrote the injection, the one
+            # question they cannot otherwise settle.
+            raise ReviewerError(
+                f"refusing to release {context}: it holds text matching the reviewer's engine "
+                "credential or the shape of an API key. The text is not repeated here. Treat "
+                "the reviewed repository as having attempted a prompt injection, and read the "
+                "raw pass output by hand."
+            )
 
 
 def review_digest(report: dict[str, Any]) -> str:
@@ -2329,6 +2429,7 @@ def deliver_review(
     review of the same submission could be registered under consent given to an
     earlier one.
     """
+    refuse_engine_credential(review, context="the review being delivered")
     existing = state_json(f"submissions/{state['id']}/review.json")
     put_state(
         f"submissions/{state['id']}/review.json",
@@ -3063,6 +3164,12 @@ def engine_credential_file(api_key: str) -> Path:
     enter, and never under the workspace or the engine's output directory: the
     model can read anything bound into its namespace, and an output directory is
     exactly where a prompt-injected model would try to copy a secret to.
+
+    None of which keeps the key from the model. It cannot: the engine has to
+    read this file, and the read-only sandbox the engine runs under is
+    read-only about writing. What is kept from the model is every other
+    credential the host holds, and what watches the way out is
+    `refuse_engine_credential`, over everything the model writes.
     """
     global _ENGINE_CREDENTIAL_DIR
     if _ENGINE_CREDENTIAL_DIR is None:
@@ -3644,6 +3751,11 @@ def run_review(args: argparse.Namespace) -> int:
             allow_network=step["id"] == "literature_notability",
             reasoning_effort=args.reasoning_effort,
         )
+        # Here rather than only at the end, so a pass that came back holding a
+        # credential fails as that pass, before its findings are quoted into
+        # the prompt for the next one and before a dry run prints the assembled
+        # review to a run log.
+        refuse_engine_credential(result, context=f"the {step['id']} review pass")
         spend.append({"step": step["id"], "usage": usage, "usd": usage_cost(model_id, usage)})
         if step["id"] == "synthesis":
             synthesis = result
@@ -4077,7 +4189,7 @@ def registry_record(
     }
     if True:
         formalization_record["lakefile_path"] = mechanical_relative_path(mechanical, "lakefile")
-    return {
+    record = {
         "schema_version": 2,
         "id": permanent_id,
         "accepted_at": accepted_at,
@@ -4140,6 +4252,14 @@ def registry_record(
             "authorization": copy.deepcopy(mechanical["submission"]["authorization"]),
         },
     }
+    # Whole, and after assembly. The review has been checked already and
+    # `warnings` comes out of it, but the title and the abstract come from the
+    # submitter's own `formalization.yaml` by a route no check on the review
+    # covers. What lands in `entries/` is permanent and readable by anyone, so
+    # a credential-shaped token in any part of it is worth stopping for,
+    # whoever put it there.
+    refuse_engine_credential(record, context="the record being registered")
+    return record
 
 
 def registry_scores(
@@ -4394,6 +4514,11 @@ def register(args: argparse.Namespace) -> int:
     # unattended runner has no dry-run workspace to inherit, and even an
     # operator's workspace is a weaker thing to trust than what was delivered.
     review = delivered_review(args.submission)
+    # Before the workspace, the preservation tags, the render dispatch and the
+    # database change, all of which are things done in the open that cannot be
+    # taken back. A review delivered before this check existed still has to get
+    # past it to be registered.
+    refuse_engine_credential(review, context="the review being registered")
     if not (work / "mechanical-report.json").is_file():
         work, _, _, _ = prepare_workspace(
             args.submission,
