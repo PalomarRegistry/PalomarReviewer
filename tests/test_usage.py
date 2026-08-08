@@ -56,9 +56,17 @@ class UsageAccountingTests(unittest.TestCase):
             "claude:default",
         )
         self.assertEqual(
-            usage_accounting.reviewer_model("command", None, "reviewer --json"),
-            "command:reviewer",
+            usage_accounting.reviewer_model(
+                "command",
+                None,
+                "'/opt/Palomar Reviewer/bin/reviewer' --json",
+            ),
+            "command:/opt/Palomar Reviewer/bin/reviewer",
         )
+
+    def test_malformed_command_identity_fails_like_command_execution(self):
+        with self.assertRaisesRegex(ValueError, "No closing quotation"):
+            usage_accounting.reviewer_model("command", None, "'unterminated")
 
     def test_verified_turn_aggregate_shape_is_not_mistaken_for_one_request(self):
         # One production Codex diagnostic made four requests, then emitted one

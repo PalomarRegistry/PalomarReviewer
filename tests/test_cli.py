@@ -4698,6 +4698,82 @@ class SpendPersistenceTests(unittest.TestCase):
         self.assertNotIn("usd", updated["spend"][1])
 
 
+class RunReviewAccountingTests(unittest.TestCase):
+    def test_a_completed_review_records_and_prints_the_measured_spend(self):
+        """Exercise the paid-run tail through the pure accounting call seam."""
+        measured_at = "2026-08-08T01:02:03Z"
+        turn = {
+            "input_tokens": 100,
+            "cached_input_tokens": 30,
+            "cache_write_input_tokens": 20,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 5,
+        }
+        usage = {"usage_status": "recorded", "usage_reason": None, "turns": [turn]}
+        rubric = {"steps": [{"id": "synthesis"}]}
+        final = {"schema_version": 2, "decision": "accept"}
+        args = SimpleNamespace(
+            submission="a1b2c3d4e5f6",
+            work_dir=None,
+            apply=False,
+            policy_ref=None,
+            engine="codex",
+            model="gpt-5.6-sol",
+            command=None,
+            reasoning_effort="high",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / args.submission
+            work.mkdir()
+            (work / "mechanical-report-url").write_text("https://example.test/report\n")
+            args.work_dir = directory
+            with (
+                mock.patch.object(cli, "queue", return_value=[]),
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    return_value=(
+                        work,
+                        {"id": args.submission},
+                        {"status": "pass"},
+                        "a" * 40,
+                    ),
+                ),
+                mock.patch.object(cli, "load_json", side_effect=[rubric, {}]),
+                mock.patch.object(cli, "validate_current_review_contract"),
+                mock.patch.object(cli, "render_prompt", return_value="review prompt"),
+                mock.patch.object(cli, "engine_result", return_value=({}, usage)),
+                mock.patch.object(cli, "validate_synthesis_policy") as validate_policy,
+                mock.patch.object(cli, "normalize_final", return_value=final),
+                mock.patch.object(cli.jsonschema, "validate"),
+                mock.patch.object(cli, "utc_now", return_value=measured_at) as clock,
+                mock.patch.object(
+                    cli.usage_accounting,
+                    "review_spend",
+                    wraps=cli.usage_accounting.review_spend,
+                ) as build_spend,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(cli.run_review(args), 0)
+
+            accounting = json.loads((work / "spend.json").read_text())
+            self.assertEqual(accounting["measured_at"], measured_at)
+            self.assertRegex(accounting["measured_at"], r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+            self.assertEqual(accounting["passes"], [{"step": "synthesis", **usage}])
+            self.assertIn("Spend:", stderr.getvalue())
+            self.assertIn("at current base list prices", stderr.getvalue())
+            self.assertEqual(json.loads((work / "review.json").read_text()), final)
+            build_spend.assert_called_once_with(
+                "codex:gpt-5.6-sol",
+                [{"step": "synthesis", **usage}],
+                measured_at=measured_at,
+            )
+            clock.assert_called_once_with()
+            validate_policy.assert_called_once()
+
+
 class TrustedRunSelectionTests(unittest.TestCase):
     """The run is the one the server recorded, not the one that says the right words.
 
@@ -5111,9 +5187,15 @@ class VocabularyTests(unittest.TestCase):
         here. Two words for one idea is how a field gets written under one name
         and read under the other.
         """
-        source = Path(cli.__file__).read_text(encoding="utf-8")
-        stray = sorted(set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source)))
-        self.assertEqual(stray, [], f"cli.py still says {', '.join(stray)}")
+        package = Path(cli.__file__).parent
+        stray = []
+        for path in sorted(package.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for word in sorted(
+                set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source))
+            ):
+                stray.append(f"{path.relative_to(package)}:{word}")
+        self.assertEqual(stray, [], f"production package still says {', '.join(stray)}")
 
     def test_public_ci_fetches_only_the_current_record_schema(self):
         workflow = (

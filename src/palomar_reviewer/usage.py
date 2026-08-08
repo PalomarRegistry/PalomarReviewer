@@ -9,6 +9,7 @@ CLI remains responsible for collecting the evidence and persisting the result.
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any
 
 # The one model production runs, at the provider's current USD prices per
@@ -32,7 +33,10 @@ CODEX_REQUIRED_USAGE_KEYS = (
 def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
     """Return the durable identity for the configured review engine."""
     if engine == "command":
-        parts = (command or "").split()
+        # Keep the identity's executable identical to the argv that the CLI
+        # executes, including a quoted path. Malformed shell syntax fails here
+        # just as it does at execution rather than recording another command.
+        parts = shlex.split(command or "")
         return f"command:{parts[0] if parts else 'unknown'}"
     return f"{engine}:{model or 'default'}"
 
@@ -146,7 +150,11 @@ def review_spend(
     *,
     measured_at: str,
 ) -> dict[str, Any]:
-    """Build durable turn-aggregate evidence without a vendor dollar value."""
+    """Build durable turn evidence stamped as canonical UTC seconds.
+
+    ``measured_at`` is supplied by orchestration in ``YYYY-MM-DDTHH:MM:SSZ``
+    form. This pure module deliberately does not read the clock itself.
+    """
     return {
         "schema_version": 2,
         "model": model_id,
