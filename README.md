@@ -43,6 +43,16 @@ subprocess, environment, clock, or state-repository access.
 Registration separately rechecks the stored report bytes, semantic digest, and
 workflow-run digest before using an inspected workspace.
 
+`palomar_reviewer.authorization` is the pure registration-authorization
+contract. It owns the accepted push-proof methods, binds the private State
+record to the report and review, requires the positive one-time consent state,
+and checks that the delivered, consented-to, and registering review have one
+canonical digest. The CLI applies this contract, on the State record it
+retrieved, only after the credential-output backstop, accepted-decision check,
+and stored report/run/policy bindings, and before source preservation, render,
+database, or other public work. The module performs no retrieval, filesystem
+access, subprocess, network, State write, or public action.
+
 ## Install
 
 ```bash
