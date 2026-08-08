@@ -123,8 +123,16 @@ checkout of every record, and deleting the file makes the next pass rebuild it
 at once. `palomar-review rebuild-queue` derives it on demand, which is what the
 weekly sweep runs: a rebuild is the one thing here that costs the size of the
 whole registry, so it belongs on a schedule rather than falling out of whichever
-pass crosses the window. A pass that cannot enumerate its work fails; it never reports having
-found nothing.
+pass crosses the window. A rebuild captures the live index's blob identity
+before cloning the records and writes only against that identity. An admission
+or pass that changes the queue between that capture and the conditional write
+therefore makes the rebuild refuse its stale snapshot instead of overwriting
+the live queue. The State repository runs the scheduled sweep in its own
+concurrency group, so the command also reads back the exact blob it wrote and
+fails loudly if another writer replaced or reserialized it. An ordinary pass
+may continue over the queue it derived after a refused cache write, because the
+concurrent live index remains intact for its next pass. A pass that cannot
+enumerate its work fails; it never reports having found nothing.
 
 The reviewer accepts only the current rubric contract (schema version 7). It
 rejects an internally inconsistent positive review: synthesis must reproduce
