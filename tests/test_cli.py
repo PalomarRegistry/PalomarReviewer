@@ -21,13 +21,12 @@ import jsonschema
 
 import palomar_reviewer.cli as cli
 import palomar_reviewer.engine as engine_execution
+import palomar_reviewer.mechanical as mechanical_evidence
 from palomar_reviewer.cli import (
-    MECHANICAL_REPORT_SCHEMA,
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
     SYNTHESIS_SCORE_KEYS,
-    ReviewerError,
     allocate_identifier,
     authors_from_metadata,
     finalize,
@@ -47,7 +46,6 @@ from palomar_reviewer.cli import (
     review_digest,
     step_schema_for_rubric,
     validate_declaration_coverage,
-    validate_mechanical_artifact,
     validate_render_result,
     validate_rubric,
     validate_stored_review,
@@ -58,6 +56,7 @@ from palomar_reviewer.cli import (
     verify_repository_license,
 )
 from palomar_reviewer.engine import SYSTEM_RESOLUTION_PATHS, execute, isolated_command
+from palomar_reviewer.errors import ReviewerError
 
 # Some of what this suite checks is not in this repository: the schemas
 # PalomarDatabase serves, a PalomarDatabase checkout to register into, a
@@ -972,7 +971,7 @@ class ReviewerTests(unittest.TestCase):
         run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
                     "event": "workflow_dispatch"}
         with self.assertRaisesRegex(ReviewerError, "challenge.path is outside the selected project"):
-            validate_mechanical_artifact(mechanical, state, run_data)
+            mechanical_evidence.validate_report_contract(mechanical, state, run_data)
 
     def test_the_lakefile_must_be_the_selected_project_lakefile(self):
         mechanical = self.nested_mechanical_fixture()
@@ -984,7 +983,7 @@ class ReviewerTests(unittest.TestCase):
         run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
                     "event": "workflow_dispatch"}
         with self.assertRaisesRegex(ReviewerError, "not the selected project's Lakefile"):
-            validate_mechanical_artifact(mechanical, state, run_data)
+            mechanical_evidence.validate_report_contract(mechanical, state, run_data)
 
     def nested_state(self, **paths):
         requested = {
@@ -1014,7 +1013,9 @@ class ReviewerTests(unittest.TestCase):
                 run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
                             "event": "workflow_dispatch"}
                 with self.assertRaisesRegex(ReviewerError, f"different {field}"):
-                    validate_mechanical_artifact(mechanical, self.nested_state(), run_data)
+                    mechanical_evidence.validate_report_contract(
+                        mechanical, self.nested_state(), run_data
+                    )
 
     def test_a_run_asked_for_other_files_is_not_this_submission(self):
         """What the run was asked for must be what the submitter asked for."""
@@ -1027,15 +1028,42 @@ class ReviewerTests(unittest.TestCase):
         run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
                     "event": "workflow_dispatch"}
         with self.assertRaisesRegex(ReviewerError, "asked for a different comparator_config_path"):
-            validate_mechanical_artifact(mechanical, self.nested_state(), run_data)
+            mechanical_evidence.validate_report_contract(
+                mechanical, self.nested_state(), run_data
+            )
 
     def test_the_paths_a_submission_did_ask_for_are_accepted(self):
         """A layout nowhere near the defaults still has to go through."""
         mechanical = self.nested_mechanical_fixture()
         run_data = {"url": mechanical["workflow_url"], "headSha": "9" * 40,
                     "event": "workflow_dispatch"}
-        with mock.patch.object(cli, "gh", return_value="identical\n"):
-            validate_mechanical_artifact(mechanical, self.nested_state(), run_data)
+        with mock.patch.object(cli, "gh", return_value="identical\n") as compare:
+            cli.validate_trusted_mechanical_artifact(
+                mechanical, self.nested_state(), run_data
+            )
+        compare.assert_called_once_with(
+            [
+                "api",
+                f"repos/{mechanical_evidence.SUBMISSION_REPO}/compare/{'9' * 40}...main",
+                "--jq",
+                ".status",
+            ]
+        )
+
+    def test_invalid_report_is_refused_before_the_workflow_ancestry_query(self):
+        mechanical = self.nested_mechanical_fixture()
+        mechanical["challenge"]["path"] = "outside/Challenge.lean"
+        run_data = {
+            "url": mechanical["workflow_url"],
+            "headSha": "9" * 40,
+            "event": "workflow_dispatch",
+        }
+        with mock.patch.object(cli, "gh") as compare:
+            with self.assertRaisesRegex(ReviewerError, "outside the selected project"):
+                cli.validate_trusted_mechanical_artifact(
+                    mechanical, self.nested_state(), run_data
+                )
+        compare.assert_not_called()
 
     def test_mechanical_schema_accepts_explicitly_unspecified_provenance(self):
         mechanical = self.mechanical_fixture()
@@ -1051,7 +1079,7 @@ class ReviewerTests(unittest.TestCase):
                 "responsible_maintainers": False,
             },
         }
-        jsonschema.validate(mechanical, MECHANICAL_REPORT_SCHEMA)
+        jsonschema.validate(mechanical, mechanical_evidence.MECHANICAL_REPORT_SCHEMA)
 
     def step_result(self, step, scores, verdict="pass"):
         all_scores = {key: None for key in STEP_SCORE_KEYS}
@@ -3364,7 +3392,7 @@ class MechanicalReportContractTests(unittest.TestCase):
     def validate(self, block):
         report = ReviewerTests.mechanical_fixture(ReviewerTests())
         report["submission"] = block
-        jsonschema.validate(report, cli.MECHANICAL_REPORT_SCHEMA,
+        jsonschema.validate(report, mechanical_evidence.MECHANICAL_REPORT_SCHEMA,
                             format_checker=jsonschema.FormatChecker())
 
     def test_the_block_the_workflow_emits_is_accepted(self):
@@ -3387,7 +3415,7 @@ class MechanicalReportContractTests(unittest.TestCase):
         report = ReviewerTests.mechanical_fixture(ReviewerTests())
         report["formalization_sha256"] = report.pop("formalization")["sha256"]
         with self.assertRaises(jsonschema.ValidationError):
-            jsonschema.validate(report, cli.MECHANICAL_REPORT_SCHEMA)
+            jsonschema.validate(report, mechanical_evidence.MECHANICAL_REPORT_SCHEMA)
 
     def test_every_reused_mechanical_path_is_structurally_required(self):
         for parts in (
@@ -3409,7 +3437,7 @@ class MechanicalReportContractTests(unittest.TestCase):
                     ReviewerError,
                     "mechanical report violates the current artifact contract",
                 ):
-                    cli.validate_mechanical_report_schema(report)
+                    mechanical_evidence.validate_report_schema(report)
 
     def test_registration_reuse_refuses_a_missing_path_before_dereferencing_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5399,7 +5427,57 @@ class FailedVerificationTests(unittest.TestCase):
         }
         state = {"id": "a1b2c3d4e5f6", "run": {"id": 1}}
         with self.assertRaisesRegex(ReviewerError, "did not pass.*project must be a mapping"):
-            cli.validate_mechanical_artifact(report, state, {"url": "x", "headSha": "9" * 40})
+            mechanical_evidence.validate_report_contract(
+                report, state, {"url": "x", "headSha": "9" * 40}
+            )
+
+    def test_a_failed_report_stops_workspace_preparation_before_any_clone(self):
+        report = {
+            "schema_version": 1,
+            "status": "error",
+            "stage": "intake",
+            "errors": ["project must be a mapping"],
+        }
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "status": "awaiting-review",
+            "repository": "example/project",
+            "commit": "1" * 40,
+            "run": {"id": 101},
+        }
+        run_data = {
+            "databaseId": 101,
+            "url": (
+                "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101"
+            ),
+            "headSha": "9" * 40,
+            "event": "workflow_dispatch",
+        }
+
+        def download(_run_id, _submission_id, destination):
+            destination.mkdir(parents=True)
+            path = destination / "mechanical-report.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            return path
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(cli, "submission_state", return_value=state),
+                mock.patch.object(
+                    cli, "trusted_verification_runs", return_value=[run_data]
+                ),
+                mock.patch.object(
+                    cli, "download_mechanical_artifact", side_effect=download
+                ),
+                mock.patch.object(cli, "clone_at") as clone,
+            ):
+                with self.assertRaisesRegex(
+                    ReviewerError, "did not pass.*project must be a mapping"
+                ):
+                    cli.prepare_workspace(
+                        state["id"], root=Path(directory), policy_ref="main"
+                    )
+            clone.assert_not_called()
 
 
 class EntryProvenanceTests(unittest.TestCase):

@@ -31,6 +31,18 @@ commit, requested paths and authorization, and to pinned
 Comparator/Lean-export/Landrun/NanoDa revisions on a workflow commit that is an
 ancestor of `main`.
 
+`palomar_reviewer.mechanical` is the current mechanical-evidence contract. It
+owns the report schema, safe repository-path resolution, and the data bindings
+among the report, private submission record, and recorded workflow run. The CLI
+remains the composition root: it selects and downloads the server-recorded
+artifact, applies that contract before cloning source, and only then asks
+GitHub whether the validated workflow commit is still on `main`'s lineage.
+The path helpers inspect filesystem metadata only inside a caller-supplied
+source checkout; the module reads no file contents and has no network,
+subprocess, environment, clock, or state-repository access.
+Registration separately rechecks the stored report bytes, semantic digest, and
+workflow-run digest before using an inspected workspace.
+
 ## Install
 
 ```bash
