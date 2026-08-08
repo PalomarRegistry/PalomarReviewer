@@ -124,12 +124,22 @@ CURRENT_RUBRIC_VERSION = 7
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_DECISIONS = ("accept", "revise", "reject")
 
-# What a review cost, in tokens, is reported by the engine and is never a
-# guess. Money is a guess unless somebody keeps this table current, so a model
-# absent from it records tokens and no price rather than an invented one.
-# USD per million tokens, as registered by the provider.
-MODEL_PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {}
-_PRICES_ENV = "PALOMAR_MODEL_PRICES"
+# The one model production runs, at the provider's current USD prices per
+# million tokens. These values are deliberately not copied into the durable
+# usage record: that record retains the engine evidence, not a vendor estimate.
+GPT_5_6_SOL_MODEL = "codex:gpt-5.6-sol"
+GPT_5_6_SOL_INPUT_USD_PER_MTOK = 5.00
+GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK = 0.50
+GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK = 1.25 * GPT_5_6_SOL_INPUT_USD_PER_MTOK
+GPT_5_6_SOL_OUTPUT_USD_PER_MTOK = 30.00
+GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS = 272_000
+CODEX_REQUIRED_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
 MAX_CHALLENGE_PROMPT_BYTES = 8 * 1024 * 1024
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
@@ -2518,9 +2528,11 @@ def deliver_review(
         f"Deliver review for {state['id']}",
         blob_sha=(existing or {}).get("_blob_sha"),
     )
-    # What the review cost is operational, not editorial: it is kept with the
-    # private record and never enters the registered one. Reviews are cumulative
-    # because a redelivered review is a review that was paid for twice.
+    # Raw operational usage, not editorial content: it is kept with the private
+    # record and never enters the registered one. Reviews are cumulative because
+    # a redelivered review consumed model tokens twice. When the evidence is
+    # sufficient, a current base-rate summary is derived during the run; it is
+    # never stored as history.
     previous = state.get("spend") or []
     return advance_state(
         state,
@@ -3176,50 +3188,75 @@ def _bind_if_present(command: list[str], source: Path, destination: str) -> None
         command.extend(["--ro-bind", str(source), destination])
 
 
-def model_prices() -> dict[str, dict[str, float]]:
-    """Prices from the environment, if the operator supplied any."""
-    raw = os.environ.get(_PRICES_ENV, "").strip()
-    if not raw:
-        return MODEL_PRICES_USD_PER_MTOK
-    try:
-        supplied = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ReviewerError(f"{_PRICES_ENV} is not valid JSON: {error}") from error
-    if not isinstance(supplied, dict):
-        raise ReviewerError(f"{_PRICES_ENV} must be an object keyed by model")
-    return {**MODEL_PRICES_USD_PER_MTOK, **supplied}
+def usage_problem(usage: Any) -> str | None:
+    """Why a raw turn aggregate cannot be split into the four billed categories."""
+    if not isinstance(usage, dict):
+        return "completed-turn usage is not an object"
+    for key in CODEX_REQUIRED_USAGE_KEYS:
+        value = usage.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"completed-turn usage has no valid {key}"
+    if usage["cached_input_tokens"] + usage["cache_write_input_tokens"] > usage["input_tokens"]:
+        return "cache-read and cache-write tokens exceed total input tokens"
+    if usage["reasoning_output_tokens"] > usage["output_tokens"]:
+        return "reasoning tokens exceed total output tokens"
+    if "total_tokens" in usage:
+        total = usage["total_tokens"]
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            return "completed-turn usage has no valid total_tokens"
+        if total != usage["input_tokens"] + usage["output_tokens"]:
+            return "total_tokens does not equal input_tokens plus output_tokens"
+    return None
 
 
-def usage_cost(model: str, usage: dict[str, Any]) -> float | None:
-    """The USD a pass cost, or None when the model's price is not known here."""
-    price = model_prices().get(model)
-    if not isinstance(price, dict):
-        return None
-    try:
-        uncached = max(0, int(usage["input_tokens"]) - int(usage.get("cached_input_tokens", 0)))
-        total = (
-            uncached * float(price["input"])
-            + int(usage.get("cached_input_tokens", 0)) * float(price.get("cached_input", price["input"]))
-            + int(usage["output_tokens"]) * float(price["output"])
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    return round(total / 1_000_000, 6)
-
-
-def codex_usage(events: str) -> dict[str, int]:
-    """Token usage from the JSONL codex writes with --json.
-
-    Every completed turn is added up: a pass that retried is a pass that cost
-    twice, and reporting only the last turn would understate what was spent.
-    """
-    totals = {
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "cache_write_input_tokens": 0,
-        "output_tokens": 0,
-        "reasoning_output_tokens": 0,
+def unavailable_usage(engine: str) -> dict[str, Any]:
+    """A durable statement that this engine exposed no token-usage contract."""
+    return {
+        "usage_status": "unavailable",
+        "usage_reason": f"{engine} did not report token usage through this runner",
+        "turns": [],
     }
+
+
+def priceable_turn_usage(evidence: dict[str, Any]) -> dict[str, int] | None:
+    """One valid turn aggregate known to contain no long-context request."""
+    if evidence.get("usage_status") != "recorded":
+        return None
+    turns = evidence.get("turns")
+    if not isinstance(turns, list) or len(turns) != 1:
+        return None
+    usage = turns[0]
+    if usage_problem(usage) is not None:
+        return None
+    if usage["input_tokens"] > GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS:
+        # A Codex turn may cover several model requests. Above the threshold,
+        # its aggregate does not reveal which requests received tiered pricing.
+        return None
+    return usage
+
+
+def usage_cost(model: str, evidence: dict[str, Any]) -> float | None:
+    """Exact current USD for one provably base-rate turn, otherwise None."""
+    if model != GPT_5_6_SOL_MODEL:
+        return None
+    usage = priceable_turn_usage(evidence)
+    if usage is None:
+        return None
+    cached = usage["cached_input_tokens"]
+    cache_write = usage["cache_write_input_tokens"]
+    ordinary = usage["input_tokens"] - cached - cache_write
+    total_per_million = (
+        ordinary * GPT_5_6_SOL_INPUT_USD_PER_MTOK
+        + cached * GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK
+        + cache_write * GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK
+        + usage["output_tokens"] * GPT_5_6_SOL_OUTPUT_USD_PER_MTOK
+    )
+    return total_per_million / 1_000_000
+
+
+def codex_usage(events: str) -> dict[str, Any]:
+    """Preserve completed-turn aggregates without mistaking them for requests."""
+    turns: list[Any] = []
     for line in events.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -3228,14 +3265,32 @@ def codex_usage(events: str) -> dict[str, int]:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        usage = event.get("usage")
-        if event.get("type") != "turn.completed" or not isinstance(usage, dict):
+        if not isinstance(event, dict):
             continue
-        for key in totals:
-            value = usage.get(key)
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                totals[key] += value
-    return totals
+        if event.get("type") != "turn.completed":
+            continue
+        # Keep the emitted object exactly, including total_tokens and future
+        # fields. None or another malformed value is evidence too, not a reason
+        # to discard the successfully produced review.
+        turns.append(event.get("usage"))
+    if not turns:
+        return {
+            "usage_status": "unavailable",
+            "usage_reason": "Codex emitted no completed-turn usage",
+            "turns": [],
+        }
+    if len(turns) > 1:
+        return {
+            "usage_status": "multiple",
+            "usage_reason": f"Codex emitted {len(turns)} completed-turn usage records",
+            "turns": turns,
+        }
+    problem = usage_problem(turns[0])
+    return {
+        "usage_status": "invalid" if problem else "recorded",
+        "usage_reason": problem,
+        "turns": turns,
+    }
 
 
 def engine_credential_file(api_key: str) -> Path:
@@ -3418,7 +3473,7 @@ def engine_result(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     if raw_path.is_symlink() or (raw_path.exists() and not raw_path.is_file()):
         raise ReviewerError("review raw-output path is not a regular file")
-    usage: dict[str, Any] = {}
+    usage = unavailable_usage(engine)
     engine_output = raw_path.parent / f".{raw_path.name}.engine-output"
     if engine_output.is_symlink() or (engine_output.exists() and not engine_output.is_dir()):
         raise ReviewerError("review engine-output path is not a real directory")
@@ -3436,8 +3491,8 @@ def engine_result(
             "read-only",
             "--ephemeral",
             "--ignore-user-config",
-            # Events on stdout, so what the pass cost is read from the engine
-            # rather than estimated.
+            # Events on stdout, so the available turn aggregate is retained
+            # from the engine rather than estimated.
             "--json",
             "--output-schema",
             f"/output/{schema_path.name}",
@@ -3527,37 +3582,78 @@ def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
 
 
 def review_spend(model_id: str, passes: list[dict[str, Any]]) -> dict[str, Any]:
-    """What this review cost: tokens always, money only if the price is known."""
-    totals: dict[str, int] = {}
-    for entry in passes:
-        for key, value in entry["usage"].items():
-            totals[key] = totals.get(key, 0) + value
-    priced = [entry["usd"] for entry in passes if entry["usd"] is not None]
+    """Durable turn-aggregate evidence, without a vendor dollar value."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": model_id,
         "measured_at": utc_now(),
         "passes": passes,
-        "usage": totals,
-        # None, not zero, when the price of any pass is unknown: a review that
-        # cost money must never be recorded as having cost nothing.
-        "usd": round(sum(priced), 6) if len(priced) == len(passes) and passes else None,
     }
 
 
+def review_usage_totals(accounting: dict[str, Any]) -> dict[str, int] | None:
+    """Aggregate only turns that are all provably on the linear base tier."""
+    totals = dict.fromkeys(CODEX_REQUIRED_USAGE_KEYS, 0)
+    for entry in accounting["passes"]:
+        usage = priceable_turn_usage(entry)
+        if usage is None:
+            return None
+        for key in CODEX_REQUIRED_USAGE_KEYS:
+            totals[key] += usage[key]
+    return totals
+
+
+def review_cost(accounting: dict[str, Any]) -> float | None:
+    """Current exact total only when every turn is provably on the base tier."""
+    costs = [usage_cost(accounting["model"], entry) for entry in accounting["passes"]]
+    if not costs or any(cost is None for cost in costs):
+        return None
+    return sum(cost for cost in costs if cost is not None)
+
+
+def review_pricing_problem(accounting: dict[str, Any]) -> str:
+    """Explain why the retained evidence cannot produce an exact current price."""
+    if accounting["model"] != GPT_5_6_SOL_MODEL:
+        return f"no current price is configured for {accounting['model']}"
+    if not accounting["passes"]:
+        return "no model passes were recorded"
+    for entry in accounting["passes"]:
+        if entry.get("usage_status") != "recorded":
+            return str(entry.get("usage_reason") or "turn usage was not recorded")
+        turns = entry.get("turns")
+        if not isinstance(turns, list) or len(turns) != 1:
+            return "the pass does not contain exactly one completed-turn usage record"
+        problem = usage_problem(turns[0])
+        if problem:
+            return problem
+        if turns[0]["input_tokens"] > GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS:
+            return (
+                "a completed-turn aggregate exceeds 272,000 input tokens, but Codex "
+                "does not expose its constituent request boundaries"
+            )
+    return "the retained usage cannot be priced exactly"
+
+
 def spend_summary(accounting: dict[str, Any]) -> str:
-    usage = accounting["usage"]
-    tokens = (
-        f"{usage.get('input_tokens', 0):,} in "
-        f"({usage.get('cached_input_tokens', 0):,} cached), "
-        f"{usage.get('output_tokens', 0):,} out"
-    )
-    if accounting["usd"] is None:
+    usage = review_usage_totals(accounting)
+    usd = review_cost(accounting)
+    if usage is None or usd is None:
         return (
-            f"Spend: {tokens}. No price is recorded for {accounting['model']}; "
-            f"set {_PRICES_ENV} to convert tokens to money."
+            "Usage evidence retained in spend.json; exact current USD is unavailable: "
+            f"{review_pricing_problem(accounting)}."
         )
-    return f"Spend: {tokens} — ${accounting['usd']:.2f}."
+    ordinary = (
+        usage["input_tokens"]
+        - usage["cached_input_tokens"]
+        - usage["cache_write_input_tokens"]
+    )
+    tokens = (
+        f"{usage['input_tokens']:,} in "
+        f"({ordinary:,} ordinary, {usage['cached_input_tokens']:,} cached, "
+        f"{usage['cache_write_input_tokens']:,} cache write), "
+        f"{usage['output_tokens']:,} out"
+    )
+    return f"Spend: {tokens} — ${usd:.2f} at current base list prices."
 
 
 def normalize_final(
@@ -3837,7 +3933,7 @@ def run_review(args: argparse.Namespace) -> int:
         # the prompt for the next one and before a dry run prints the assembled
         # review to a run log.
         refuse_engine_credential(result, context=f"the {step['id']} review pass")
-        spend.append({"step": step["id"], "usage": usage, "usd": usage_cost(model_id, usage)})
+        spend.append({"step": step["id"], **usage})
         if step["id"] == "synthesis":
             synthesis = result
         else:

@@ -1276,7 +1276,16 @@ class ReviewerTests(unittest.TestCase):
                         raw_path=output,
                         allow_network=True,
                     ),
-                    ({}, {}),
+                    (
+                        {},
+                        {
+                            "usage_status": "unavailable",
+                            "usage_reason": (
+                                "claude did not report token usage through this runner"
+                            ),
+                            "turns": [],
+                        },
+                    ),
                 )
 
             argv = runner.call_args.args[0]
@@ -4469,80 +4478,177 @@ class ReviewTimingTests(unittest.TestCase):
 
 
 class SpendAccountingTests(unittest.TestCase):
-    """What a review cost is read from the engine, never estimated."""
+    """Turn aggregates are retained faithfully and priced only when sufficient."""
 
-    EVENTS = "\n".join([
-        '{"type":"thread.started","thread_id":"t"}',
-        '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,'
-        '"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":5}}',
-        'not json at all',
-        '{"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":0,'
-        '"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":1}}',
-    ])
+    def usage(
+        self,
+        *,
+        input_tokens,
+        cached=0,
+        cache_write=0,
+        output=0,
+        reasoning=0,
+        total=None,
+    ):
+        usage = {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached,
+            "cache_write_input_tokens": cache_write,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoning,
+        }
+        if total is not None:
+            usage["total_tokens"] = total
+        return usage
 
-    def test_every_completed_turn_is_counted(self):
-        """A pass that retried cost twice; reporting the last turn understates it."""
-        self.assertEqual(
-            cli.codex_usage(self.EVENTS),
-            {"input_tokens": 150, "cached_input_tokens": 40, "cache_write_input_tokens": 0,
-             "output_tokens": 14, "reasoning_output_tokens": 6},
+    def evidence(self, usage):
+        return {"usage_status": "recorded", "usage_reason": None, "turns": [usage]}
+
+    def entry(self, step, usage):
+        return {"step": step, **self.evidence(usage)}
+
+    def event(self, usage):
+        return json.dumps({"type": "turn.completed", "usage": usage})
+
+    def test_verified_turn_aggregate_shape_is_not_mistaken_for_one_request(self):
+        # One production Codex diagnostic made four requests, then emitted one
+        # completed-turn aggregate. The request inputs sum exactly to the turn.
+        request_inputs = [15_611, 15_699, 15_772, 15_843]
+        aggregate = self.usage(
+            input_tokens=62_925,
+            cached=52_224,
+            output=163,
+            total=63_088,
+        )
+        evidence = cli.codex_usage(self.event(aggregate))
+        self.assertEqual(evidence["usage_status"], "recorded")
+        self.assertEqual(evidence["turns"], [aggregate])
+        self.assertEqual(evidence["turns"][0]["total_tokens"], 63_088)
+        self.assertEqual(sum(request_inputs), aggregate["input_tokens"])
+        self.assertLess(max(request_inputs), aggregate["input_tokens"])
+
+    def test_base_categories_are_exact_at_272000_total_input(self):
+        usage = self.usage(
+            input_tokens=272_000,
+            cached=100_000,
+            cache_write=20_000,
+            output=10_000,
+            reasoning=4_000,
+        )
+        # $0.76 ordinary + $0.05 cached + $0.125 cache write + $0.30 output.
+        self.assertAlmostEqual(
+            cli.usage_cost(cli.GPT_5_6_SOL_MODEL, self.evidence(usage)),
+            1.235,
         )
 
-    def test_only_completed_turns_count(self):
-        """An in-progress usage snapshot would be added to the completed one."""
-        events = "\n".join([
-            '{"type":"turn.progress","usage":{"input_tokens":999,"output_tokens":999}}',
-            '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,'
-            '"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}',
-        ])
-        self.assertEqual(cli.codex_usage(events)["input_tokens"], 10)
-        self.assertEqual(cli.codex_usage(events)["output_tokens"], 2)
-
-    def test_malformed_and_unrelated_events_are_ignored(self):
-        self.assertEqual(cli.codex_usage("")["input_tokens"], 0)
-        self.assertEqual(cli.codex_usage('{"type":"turn.completed"}')["input_tokens"], 0)
-        self.assertEqual(
-            cli.codex_usage('{"type":"turn.completed","usage":{"input_tokens":-5}}')["input_tokens"],
-            0,
+    def test_turn_aggregate_above_272000_is_not_exactly_priceable(self):
+        evidence = self.evidence(self.usage(input_tokens=272_001, output=10))
+        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, evidence))
+        accounting = cli.review_spend(
+            cli.GPT_5_6_SOL_MODEL,
+            [{"step": "metadata", **evidence}],
         )
+        self.assertIsNone(cli.review_cost(accounting))
+        self.assertIn("aggregate exceeds 272,000", cli.spend_summary(accounting))
+        self.assertIn("request boundaries", cli.spend_summary(accounting))
 
-    def test_an_unpriced_model_records_tokens_and_no_money(self):
-        usage = cli.codex_usage(self.EVENTS)
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("PALOMAR_MODEL_PRICES", None)
-            self.assertIsNone(cli.usage_cost("some-unpriced-model", usage))
-        accounting = cli.review_spend("some-unpriced-model", [
-            {"step": "metadata", "usage": usage, "usd": None},
-        ])
-        self.assertIsNone(accounting["usd"])
-        self.assertEqual(accounting["usage"]["input_tokens"], 150)
-        self.assertIn("No price is recorded", cli.spend_summary(accounting))
+    def test_review_aggregate_never_controls_the_request_tier(self):
+        accounting = cli.review_spend(
+            cli.GPT_5_6_SOL_MODEL,
+            [
+                self.entry("metadata", self.usage(input_tokens=200_000)),
+                self.entry("synthesis", self.usage(input_tokens=200_000)),
+            ],
+        )
+        self.assertAlmostEqual(cli.review_cost(accounting), 2.0)
+        one_turn = self.evidence(self.usage(input_tokens=400_000))
+        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, one_turn))
 
-    def test_a_priced_model_converts_tokens_to_money(self):
-        prices = json.dumps({"m": {"input": 1.0, "cached_input": 0.1, "output": 10.0}})
-        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000}
-        with mock.patch.dict(os.environ, {"PALOMAR_MODEL_PRICES": prices}):
-            # 500k uncached at $1/M, 500k cached at $0.10/M, 100k out at $10/M.
-            self.assertAlmostEqual(cli.usage_cost("m", usage), 0.5 + 0.05 + 1.0, places=6)
+    def test_missing_and_malformed_usage_is_retained_without_raising(self):
+        unavailable = cli.codex_usage("")
+        self.assertEqual(unavailable["usage_status"], "unavailable")
+        self.assertEqual(unavailable["turns"], [])
 
-    def test_a_partly_priced_review_reports_no_total(self):
-        """A review that cost money must never be recorded as costing nothing."""
-        accounting = cli.review_spend("m", [
-            {"step": "metadata", "usage": {"input_tokens": 1}, "usd": 0.25},
-            {"step": "synthesis", "usage": {"input_tokens": 1}, "usd": None},
-        ])
-        self.assertIsNone(accounting["usd"])
+        absent = cli.codex_usage('{"type":"turn.completed"}')
+        self.assertEqual(absent["usage_status"], "invalid")
+        self.assertEqual(absent["turns"], [None])
+
+        malformed = {"input_tokens": 10, "cached_input_tokens": 0}
+        evidence = cli.codex_usage(self.event(malformed))
+        self.assertEqual(evidence["usage_status"], "invalid")
+        self.assertEqual(evidence["turns"], [malformed])
+        self.assertIn("cache_write_input_tokens", evidence["usage_reason"])
+        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, evidence))
+
+    def test_contradictory_usage_is_retained_without_raising(self):
+        contradictory = self.usage(input_tokens=10, cached=8, cache_write=3)
+        evidence = cli.codex_usage(self.event(contradictory))
+        self.assertEqual(evidence["usage_status"], "invalid")
+        self.assertEqual(evidence["turns"], [contradictory])
+        self.assertIn("exceed total input", evidence["usage_reason"])
+
+    def test_multiple_completed_turns_are_preserved_and_unpriceable(self):
+        first = self.usage(input_tokens=10, output=2)
+        second = self.usage(input_tokens=20, output=3)
+        evidence = cli.codex_usage("\n".join([self.event(first), self.event(second)]))
+        self.assertEqual(evidence["usage_status"], "multiple")
+        self.assertEqual(evidence["turns"], [first, second])
+        self.assertIsNone(cli.usage_cost(cli.GPT_5_6_SOL_MODEL, evidence))
+
+    def test_non_codex_usage_is_unavailable_not_zero(self):
+        evidence = cli.unavailable_usage("claude")
+        self.assertEqual(evidence["usage_status"], "unavailable")
+        self.assertEqual(evidence["turns"], [])
+        accounting = cli.review_spend(
+            "claude:default",
+            [{"step": "metadata", **evidence}],
+        )
+        self.assertIsNone(cli.review_cost(accounting))
+        self.assertNotIn("0 in", cli.spend_summary(accounting))
+        self.assertIn("no current price", cli.spend_summary(accounting))
+
+    def test_durable_accounting_keeps_raw_passes_and_no_vendor_dollars(self):
+        usage = self.usage(
+            input_tokens=100,
+            cached=30,
+            cache_write=20,
+            output=10,
+            total=110,
+        )
+        passes = [self.entry("metadata", usage)]
+        accounting = cli.review_spend(cli.GPT_5_6_SOL_MODEL, passes)
+        self.assertEqual(accounting["schema_version"], 2)
+        self.assertEqual(accounting["passes"], passes)
+        self.assertEqual(accounting["passes"][0]["turns"], [usage])
+        self.assertEqual(accounting["passes"][0]["usage_status"], "recorded")
+        self.assertNotIn("usd", accounting)
+        self.assertNotIn("usd", accounting["passes"][0])
 
     def test_the_spend_is_kept_with_the_private_record_and_accumulates(self):
-        state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
-                 "spend": [{"usd": 0.5}]}
+        legacy = {
+            "schema_version": 1,
+            "model": cli.GPT_5_6_SOL_MODEL,
+            "measured_at": "2026-08-08T00:00:00Z",
+            "passes": [],
+            "usage": {},
+            "usd": None,
+        }
+        current = cli.review_spend(cli.GPT_5_6_SOL_MODEL, [])
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "status": "awaiting-review",
+            "events": [],
+            # The pre-launch stored attempts have this v1/null-USD shape.
+            "spend": [legacy],
+        }
         review = {"schema_version": 2, "submission_id": "a1b2c3d4e5f6", "decision": "accept"}
         with (
             mock.patch.object(cli, "put_state"),
             mock.patch.object(cli, "state_json", return_value=None),
         ):
-            updated = cli.deliver_review(state, review, {"usd": 1.25})
-        self.assertEqual([entry["usd"] for entry in updated["spend"]], [0.5, 1.25])
+            updated = cli.deliver_review(state, review, current)
+        self.assertEqual(updated["spend"], [legacy, current])
+        self.assertNotIn("usd", updated["spend"][1])
 
 
 class TrustedRunSelectionTests(unittest.TestCase):
@@ -5699,4 +5805,3 @@ class StarRaceTests(unittest.TestCase):
         ):
             self.assertEqual(cli.star_registered_sources(SimpleNamespace(dry_run=False)), 1)
         put_state.assert_not_called()
-

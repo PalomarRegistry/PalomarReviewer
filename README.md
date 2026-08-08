@@ -126,7 +126,8 @@ cannot override a failed pass, and every completed evidence score
 must meet the policy's acceptance minimum. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
 substantive judgments is not separately confirmed. The complete packet is
-retained so a reader can check that afterwards.
+available for the guaranteed 24-hour post-delivery audit window so a reader can
+inspect those judgments during that window.
 
 Rubric version 7 additionally rejects a substantive pass unless its
 `declarations_checked` manifest exactly matches every theorem and definition in
@@ -163,6 +164,48 @@ particular review, not to registering at large.
 This separation is a security boundary. Model output and repository prose are
 untrusted evidence, and the only thing that can be delivered is a stored report
 that still matches the trusted inputs it was produced from.
+
+## Review usage accounting
+
+Each rubric pass records the engine's `turn.completed` usage evidence under
+`spend.json` and, when the review is delivered, in the private submission
+record. A Codex completed turn is an aggregate across the model requests made
+while the agent handles that pass; it is not request-level usage. The record
+therefore keeps each raw turn-usage object, including `total_tokens` when
+emitted, plus an explicit status and reason when usage is absent, malformed, or
+ambiguous. Usage accounting never discards an otherwise successful review.
+
+Production uses `codex:gpt-5.6-sol`. At the current list prices, ordinary input
+is $5.00/M tokens, cached input is $0.50/M, cache-write input is 1.25 times the
+ordinary input rate, and output is $30.00/M. A request with more than 272,000
+input tokens is charged at 2 times input and 1.5 times output, and that threshold
+applies to each model request—not to the completed-turn aggregate. See the
+[official GPT-5.6 Sol model page](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+
+When a valid turn aggregate has at most 272,000 total input tokens, every
+constituent request is necessarily below the long-context threshold. The
+ordinary, cached, cache-write, and output categories are then linear, so the
+runner can display an exact current base-rate total. When a turn aggregate is
+larger, it does not apply the long-context multiplier to the aggregate: some,
+all, or none of its constituent requests may have crossed the threshold. It
+reports that exact USD is unavailable until Codex exposes request-level usage.
+
+For a valid aggregate, `input_tokens` is total input and cached and cache-write
+input are subsets, so both are subtracted once to derive ordinary input.
+Reasoning tokens are already included in output and are not charged again.
+OpenAI's
+[current model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+says to track both `cached_tokens` and `cache_write_tokens`, although the public
+Responses usage reference still documents only the cached-token detail. The
+reviewer preserves the Codex usage object rather than inventing a stronger
+cache-read/cache-write distinction.
+
+Existing pre-launch usage records are schema v1 and carry only a null `usd`
+placeholder. The reviewer can still read them when they are present in the
+cumulative private history. New records use schema v2 and contain the raw
+per-turn aggregates and evidence status, with no top-level aggregate or
+vendor-dollar field. Current dollar figures are only an operator-facing run
+summary when the evidence is sufficient.
 
 ## Registration
 
@@ -345,7 +388,9 @@ registered.
 
 ## Audit trail
 
-Each review directory retains:
+Palomar guarantees retention of the private review and its audit material for
+24 hours after the review is delivered. During that window, each review
+directory contains:
 
 ```text
 state.json                     # the private submission record under review
@@ -359,16 +404,18 @@ policy/                        # detached policy commit
 prompts/                       # fully rendered prompts
 raw/                           # exact engine final messages
 passes/                        # normalized per-pass JSON
+spend.json                     # raw turn-aggregate usage evidence; no historical USD value
 review.json                    # schema-validated final report
 review-sha256                  # digest of the review delivered to the submitter
 render-result/                 # validated immutable Challenge render and provenance
 ```
 
 Raw session histories remain controlled by the chosen engine. Palomar records
-the final messages, model identifier, policy commit, source commit, and the
-review itself. Reviews are private, not confidential: they are readable by
-Palomar operators, by GitHub, and by the model provider, and are retained
-indefinitely so that any decision can be audited.
+the final messages, turn-aggregate usage evidence, model identifier, policy
+commit, source commit, and the review itself. Reviews are private, not confidential:
+they are readable by Palomar operators, by GitHub, and by the model provider,
+and may remain available operationally after the guaranteed 24-hour window.
+Palomar makes no retention or availability promise after that window.
 
 Submission metadata, Lean source, comments and identifiers, README text, the
 submitter's notes, and prior model results may contain prompt-injection
@@ -376,4 +423,4 @@ attempts. The reviewer puts them in hashed JSON evidence envelopes, repeats the
 binding instruction after all evidence, runs engines without write or shell
 tools, and validates strict output schemas. These controls reduce accidental
 instruction following. The retained packet above lets a reader audit any
-decision after the fact.
+decision during the guaranteed window.
