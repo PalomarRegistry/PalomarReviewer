@@ -90,7 +90,16 @@ OPEN_INDEX_REBUILD_SECONDS = 7 * 24 * 3600
 # Statuses the reviewer will never act on again. A registered submission is
 # absent because it is not finished at that point: the accepted source is
 # starred afterwards, as a separate step that may fail and be retried.
-FINISHED_STATUSES = frozenset({"verification-failed", "review-failed", "withdrawn"})
+#
+# `dispatch-lost` is here because the submission server could not find the
+# verification run it started and gave the slot back. There is no mechanical
+# report to review and there never will be for that submission, so a pass would
+# read the record, do nothing, and leave the id in `index/open.json` to be read
+# again on every pass for ever. A status the reviewer does not recognise is not
+# inert: it is a queue entry that never drains.
+FINISHED_STATUSES = frozenset(
+    {"verification-failed", "review-failed", "withdrawn", "dispatch-lost"}
+)
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
 DATABASE_VALIDATE_WORKFLOW = "validate.yml"
