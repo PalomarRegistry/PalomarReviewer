@@ -25,6 +25,8 @@ from urllib.parse import quote
 import jsonschema
 import yaml
 
+from . import usage as usage_accounting
+
 # The public verification repository is also recorded in registered verification
 # provenance, where the current database schema pins this canonical name.
 SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
@@ -128,22 +130,6 @@ CURRENT_RUBRIC_VERSION = 7
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_DECISIONS = ("accept", "revise", "reject")
 
-# The one model production runs, at the provider's current USD prices per
-# million tokens. These values are deliberately not copied into the durable
-# usage record: that record retains the engine evidence, not a vendor estimate.
-GPT_5_6_SOL_MODEL = "codex:gpt-5.6-sol"
-GPT_5_6_SOL_INPUT_USD_PER_MTOK = 5.00
-GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK = 0.50
-GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK = 1.25 * GPT_5_6_SOL_INPUT_USD_PER_MTOK
-GPT_5_6_SOL_OUTPUT_USD_PER_MTOK = 30.00
-GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS = 272_000
-CODEX_REQUIRED_USAGE_KEYS = (
-    "input_tokens",
-    "cached_input_tokens",
-    "cache_write_input_tokens",
-    "output_tokens",
-    "reasoning_output_tokens",
-)
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
     "classification",
@@ -3212,111 +3198,6 @@ def _bind_if_present(command: list[str], source: Path, destination: str) -> None
         command.extend(["--ro-bind", str(source), destination])
 
 
-def usage_problem(usage: Any) -> str | None:
-    """Why a raw turn aggregate cannot be split into the four billed categories."""
-    if not isinstance(usage, dict):
-        return "completed-turn usage is not an object"
-    for key in CODEX_REQUIRED_USAGE_KEYS:
-        value = usage.get(key)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            return f"completed-turn usage has no valid {key}"
-    if usage["cached_input_tokens"] + usage["cache_write_input_tokens"] > usage["input_tokens"]:
-        return "cache-read and cache-write tokens exceed total input tokens"
-    if usage["reasoning_output_tokens"] > usage["output_tokens"]:
-        return "reasoning tokens exceed total output tokens"
-    if "total_tokens" in usage:
-        total = usage["total_tokens"]
-        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-            return "completed-turn usage has no valid total_tokens"
-        if total != usage["input_tokens"] + usage["output_tokens"]:
-            return "total_tokens does not equal input_tokens plus output_tokens"
-    return None
-
-
-def unavailable_usage(engine: str) -> dict[str, Any]:
-    """A durable statement that this engine exposed no token-usage contract."""
-    return {
-        "usage_status": "unavailable",
-        "usage_reason": f"{engine} did not report token usage through this runner",
-        "turns": [],
-    }
-
-
-def priceable_turn_usage(evidence: dict[str, Any]) -> dict[str, int] | None:
-    """One valid turn aggregate known to contain no long-context request."""
-    if evidence.get("usage_status") != "recorded":
-        return None
-    turns = evidence.get("turns")
-    if not isinstance(turns, list) or len(turns) != 1:
-        return None
-    usage = turns[0]
-    if usage_problem(usage) is not None:
-        return None
-    if usage["input_tokens"] > GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS:
-        # A Codex turn may cover several model requests. Above the threshold,
-        # its aggregate does not reveal which requests received tiered pricing.
-        return None
-    return usage
-
-
-def usage_cost(model: str, evidence: dict[str, Any]) -> float | None:
-    """Exact current USD for one provably base-rate turn, otherwise None."""
-    if model != GPT_5_6_SOL_MODEL:
-        return None
-    usage = priceable_turn_usage(evidence)
-    if usage is None:
-        return None
-    cached = usage["cached_input_tokens"]
-    cache_write = usage["cache_write_input_tokens"]
-    ordinary = usage["input_tokens"] - cached - cache_write
-    total_per_million = (
-        ordinary * GPT_5_6_SOL_INPUT_USD_PER_MTOK
-        + cached * GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK
-        + cache_write * GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK
-        + usage["output_tokens"] * GPT_5_6_SOL_OUTPUT_USD_PER_MTOK
-    )
-    return total_per_million / 1_000_000
-
-
-def codex_usage(events: str) -> dict[str, Any]:
-    """Preserve completed-turn aggregates without mistaking them for requests."""
-    turns: list[Any] = []
-    for line in events.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") != "turn.completed":
-            continue
-        # Keep the emitted object exactly, including total_tokens and future
-        # fields. None or another malformed value is evidence too, not a reason
-        # to discard the successfully produced review.
-        turns.append(event.get("usage"))
-    if not turns:
-        return {
-            "usage_status": "unavailable",
-            "usage_reason": "Codex emitted no completed-turn usage",
-            "turns": [],
-        }
-    if len(turns) > 1:
-        return {
-            "usage_status": "multiple",
-            "usage_reason": f"Codex emitted {len(turns)} completed-turn usage records",
-            "turns": turns,
-        }
-    problem = usage_problem(turns[0])
-    return {
-        "usage_status": "invalid" if problem else "recorded",
-        "usage_reason": problem,
-        "turns": turns,
-    }
-
-
 def engine_credential_file(api_key: str) -> Path:
     """A private, 0600 credential file for the engine to read inside its namespace.
 
@@ -3499,7 +3380,7 @@ def engine_result(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     if raw_path.is_symlink() or (raw_path.exists() and not raw_path.is_file()):
         raise ReviewerError("review raw-output path is not a regular file")
-    usage = unavailable_usage(engine)
+    usage = usage_accounting.unavailable_usage(engine)
     engine_output = raw_path.parent / f".{raw_path.name}.engine-output"
     if engine_output.is_symlink() or (engine_output.exists() and not engine_output.is_dir()):
         raise ReviewerError("review engine-output path is not a real directory")
@@ -3543,7 +3424,7 @@ def engine_result(
             timeout=7200,
         ).stdout
         (raw_path.parent / f"{raw_path.stem}.events.jsonl").write_text(events, encoding="utf-8")
-        usage = codex_usage(events)
+        usage = usage_accounting.codex_usage(events)
         if output_path.is_symlink() or not output_path.is_file():
             raise ReviewerError("Codex did not create a regular final-message file")
         text = output_path.read_text(encoding="utf-8")
@@ -3596,88 +3477,6 @@ def engine_result(
     result = parse_engine_json(text)
     jsonschema.validate(result, schema)
     return result, usage
-
-
-def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
-    if engine == "command":
-        parts = (command or "").split()
-        return f"command:{parts[0] if parts else 'unknown'}"
-    return f"{engine}:{model or 'default'}"
-
-
-def review_spend(model_id: str, passes: list[dict[str, Any]]) -> dict[str, Any]:
-    """Durable turn-aggregate evidence, without a vendor dollar value."""
-    return {
-        "schema_version": 2,
-        "model": model_id,
-        "measured_at": utc_now(),
-        "passes": passes,
-    }
-
-
-def review_usage_totals(accounting: dict[str, Any]) -> dict[str, int] | None:
-    """Aggregate only turns that are all provably on the linear base tier."""
-    totals = dict.fromkeys(CODEX_REQUIRED_USAGE_KEYS, 0)
-    for entry in accounting["passes"]:
-        usage = priceable_turn_usage(entry)
-        if usage is None:
-            return None
-        for key in CODEX_REQUIRED_USAGE_KEYS:
-            totals[key] += usage[key]
-    return totals
-
-
-def review_cost(accounting: dict[str, Any]) -> float | None:
-    """Current exact total only when every turn is provably on the base tier."""
-    costs = [usage_cost(accounting["model"], entry) for entry in accounting["passes"]]
-    if not costs or any(cost is None for cost in costs):
-        return None
-    return sum(cost for cost in costs if cost is not None)
-
-
-def review_pricing_problem(accounting: dict[str, Any]) -> str:
-    """Explain why the retained evidence cannot produce an exact current price."""
-    if accounting["model"] != GPT_5_6_SOL_MODEL:
-        return f"no current price is configured for {accounting['model']}"
-    if not accounting["passes"]:
-        return "no model passes were recorded"
-    for entry in accounting["passes"]:
-        if entry.get("usage_status") != "recorded":
-            return str(entry.get("usage_reason") or "turn usage was not recorded")
-        turns = entry.get("turns")
-        if not isinstance(turns, list) or len(turns) != 1:
-            return "the pass does not contain exactly one completed-turn usage record"
-        problem = usage_problem(turns[0])
-        if problem:
-            return problem
-        if turns[0]["input_tokens"] > GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS:
-            return (
-                "a completed-turn aggregate exceeds 272,000 input tokens, but Codex "
-                "does not expose its constituent request boundaries"
-            )
-    return "the retained usage cannot be priced exactly"
-
-
-def spend_summary(accounting: dict[str, Any]) -> str:
-    usage = review_usage_totals(accounting)
-    usd = review_cost(accounting)
-    if usage is None or usd is None:
-        return (
-            "Usage evidence retained in spend.json; exact current USD is unavailable: "
-            f"{review_pricing_problem(accounting)}."
-        )
-    ordinary = (
-        usage["input_tokens"]
-        - usage["cached_input_tokens"]
-        - usage["cache_write_input_tokens"]
-    )
-    tokens = (
-        f"{usage['input_tokens']:,} in "
-        f"({ordinary:,} ordinary, {usage['cached_input_tokens']:,} cached, "
-        f"{usage['cache_write_input_tokens']:,} cache write), "
-        f"{usage['output_tokens']:,} out"
-    )
-    return f"Spend: {tokens} — ${usd:.2f} at current base list prices."
 
 
 def normalize_final(
@@ -3913,7 +3712,7 @@ def run_review(args: argparse.Namespace) -> int:
         root=root,
         policy_ref=args.policy_ref,
     )
-    model_id = reviewer_model(args.engine, args.model, args.command)
+    model_id = usage_accounting.reviewer_model(args.engine, args.model, args.command)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
     validate_current_review_contract(rubric, review_schema)
@@ -3966,9 +3765,13 @@ def run_review(args: argparse.Namespace) -> int:
             write_json(work / "passes" / f"{step['id']}.json", result)
     if synthesis is None:
         raise ReviewerError("rubric did not produce a synthesis result")
-    accounting = review_spend(model_id, spend)
+    accounting = usage_accounting.review_spend(
+        model_id,
+        spend,
+        measured_at=utc_now(),
+    )
     write_json(work / "spend.json", accounting)
-    print(spend_summary(accounting), file=sys.stderr)
+    print(usage_accounting.spend_summary(accounting), file=sys.stderr)
     validate_synthesis_policy(
         synthesis,
         passes=passes,

@@ -176,6 +176,13 @@ therefore keeps each raw turn-usage object, including `total_tokens` when
 emitted, plus an explicit status and reason when usage is absent, malformed, or
 ambiguous. Usage accounting never discards an otherwise successful review.
 
+The `palomar_reviewer.usage` module is the accounting boundary. It normalizes
+engine evidence, derives the durable model identity and record, and computes an
+operator-facing current-price summary from values supplied by the CLI. It has
+no filesystem, subprocess, network, clock, or state-repository access. The CLI
+owns event collection and persistence and passes the measurement time
+explicitly, so accounting can be tested directly without review orchestration.
+
 Production uses `codex:gpt-5.6-sol`. At the current list prices, ordinary input
 is $5.00/M tokens, cached input is $0.50/M, cache-write input is 1.25 times the
 ordinary input rate, and output is $30.00/M. A request with more than 272,000
