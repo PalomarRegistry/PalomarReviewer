@@ -882,6 +882,32 @@ def utc_now() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def utc_today() -> str:
+    """Today's date in UTC, which is the date a registration starting now gets.
+
+    UTC and not the operator's zone, because the identifier this date goes into
+    is permanent and an unattended runner, an operator in Sydney and an
+    operator in Boston must all be able to hand out the next serial for the
+    same date without one of them stepping on another's.
+    """
+    return dt.datetime.now(dt.UTC).date().isoformat()
+
+
+def _is_date(value: str) -> bool:
+    """Whether a `YYYY-MM-DD` string names a day that exists.
+
+    The identifier grammar admits `2026-13-45`, and a reserved date used to be
+    checked by comparing it against a date this pass had parsed for itself.
+    Nothing parses it any more, so without this a hand-edited state file could
+    carry a day that does not exist into a permanent identifier.
+    """
+    try:
+        dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def utc_after(seconds: float) -> str:
     moment = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)
     return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -3885,7 +3911,7 @@ def authorize_registration(
     return state
 
 
-def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
+def allocate_identifier(registered_on: str, taken: set[str]) -> str:
     """The next serial for this date, so one date's identifiers sort in the
     order they were registered.
 
@@ -3893,28 +3919,41 @@ def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
     became records. That is no longer worth paying for, and what it cost was
     this: with a random serial, the order two identifiers were registered in
     cannot be read from the identifiers, so every surface that wants
-    registration order has to carry an ordinal beside the identifier -- and an
+    registration order has to carry an ordinal beside the identifier, and an
     ordinal and an identifier that disagree is a failure nothing downstream can
     detect or repair.
 
-    The date is not today. It is the date of `review.reviewed_at`, which is why
-    it is the same date the record carries as `accepted_at`, and registration
-    happens only once the submitter has read that review and consented to it.
-    They may take days over that, or never do it. So a result accepted on
-    Monday and consented to on Friday is registered under Monday's date, behind
-    identifiers already registered under Wednesday: ordering identifiers as
-    strings is acceptance order, and registration order only within one date.
+    The date is the date the result enters the registry, which is the date the
+    submitter's consent is acted on. It is deliberately not the date of
+    `review.reviewed_at`.
 
-    Two things follow for the browse layout, whose pages are keyed on this
-    date. An append can land on a day that is already past, so it is not true
-    that appends only ever touch today; and that append still rewrites exactly
-    one page, which is the bound the layout actually rests on, so the cost
-    argument is unaffected. Serials cannot collide across the gap either,
-    because `taken` is every identifier the database already holds, of every
-    date, and only this date's serials decide the next one; a date with none
-    starts at 1.
+    A date on a Palomar identifier is a priority claim, so it has to be a date
+    the submitter cannot choose. Nothing is registered until they have read
+    their review and consented, and they may take as long as they like over
+    that. Taking the date from the review put the choice in their hands: a
+    submitter who wanted an earlier position had only to hold their consent,
+    and would then be registered under the older date, ahead of every result
+    that entered the registry while they were holding it. Waiting has to cost a
+    later position rather than buy an earlier one, and the only date that makes
+    it cost one is the date registration actually happens.
+
+    Fixed at first registration, and never recomputed after it. A later version
+    reuses its v1's identifier and therefore its v1's date, because the
+    identifier belongs to the result and not to the version, and
+    `registration_identity` resolves an update to the prior version's date for
+    exactly that reason. A retry does not recompute it either: the identity is
+    reserved in private state before the first public side effect, so a
+    registration that failed at 23:59 and is retried at 00:01 finishes under
+    the date it reserved.
+
+    Serials cannot collide with another date's, because `taken` is every
+    identifier the database already holds, of every date, and only this date's
+    serials decide the next one; a date with none starts at 1. Ordering
+    identifiers as strings is registration order, up to a reservation carried
+    across midnight by a retry, which commits one older identifier late and
+    moves nothing else.
     """
-    prefix = f"PALOMAR-{accepted_at}-"
+    prefix = f"PALOMAR-{registered_on}-"
     serials = [
         int(serial)
         for identifier in taken
@@ -3925,7 +3964,7 @@ def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
     serial = max(serials, default=0) + 1
     if serial > 999_999:
         raise ReviewerError(
-            f"could not allocate a free permanent identifier: {accepted_at} has used "
+            f"could not allocate a free permanent identifier: {registered_on} has used "
             "all 999,999 serials"
         )
     return f"{prefix}{serial:06d}"
@@ -4147,6 +4186,15 @@ def registration_identity(
     A reserved identity was committed to private submission state before an
     earlier attempt made public side effects. It must be reused exactly: a
     retry must complete those archive refs, not allocate a second public ID.
+    That is why nothing here recomputes a reserved date. A registration that
+    began at 23:59 and is retried at 00:01 would otherwise resolve to a
+    different date, which is a different identifier, which is a second
+    permanent ID for one result and archive refs pointing at neither.
+
+    The date a first registration gets is today's, because that is when the
+    result enters the registry; an update gets the date its v1 got, because the
+    identifier and its date belong to the result rather than to any one version
+    of it. See `allocate_identifier` for why today's and not the review's.
     """
     if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
@@ -4225,21 +4273,24 @@ def registration_identity(
         raise ReviewerError(
             f"this submission already has a permanent ID; register an update to: {identifiers}"
         )
+    # The review's date decides nothing here any more, but it is still checked
+    # here, before the first public side effect, because the record carries it
+    # and a record with an unreadable review date cannot be written at all.
     try:
-        # The review's date, not this pass's. Consent comes after the submitter
-        # has read the review, so this can be days behind today, and the
-        # identifier and `accepted_at` both say when the result was accepted
-        # rather than when it was registered. See `allocate_identifier`.
-        accepted_at = dt.date.fromisoformat(str(reviewed_at)[:10]).isoformat()
+        dt.date.fromisoformat(str(reviewed_at)[:10])
     except ValueError as error:
         raise ReviewerError("accepted review has no valid review date") from error
     if reserved is not None:
         identifier, reserved_at, version = reserved
         match = PALOMAR_ID_RE.fullmatch(identifier)
+        # Checked for internal consistency and not against today. Comparing a
+        # reserved date with today's would refuse exactly the retry the
+        # reservation exists to make possible, because a registration long
+        # enough to fail is long enough to cross midnight.
         if (
             match is None
-            or match.group("date") != accepted_at
-            or reserved_at != accepted_at
+            or match.group("date") != reserved_at
+            or not _is_date(reserved_at)
             or version != 1
         ):
             raise ReviewerError("saved registration attempt has an invalid permanent identity")
@@ -4248,7 +4299,8 @@ def registration_identity(
                 f"saved registration attempt {identifier} is already used by another submission"
             )
         return reserved
-    return allocate_identifier(accepted_at, set(by_id)), accepted_at, 1
+    registered_on = utc_today()
+    return allocate_identifier(registered_on, set(by_id)), registered_on, 1
 
 
 def registration_attempt_identity(

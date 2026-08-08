@@ -222,17 +222,32 @@ finishes the same archive refs instead of allocating an orphaned second ID.
 Rerun `register`, or pass a previously downloaded trusted result with
 `--render-result PATH`.
 
-Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`, where the serial follows
-the largest one that date has already used, starting at 1 for a date with none.
+Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`. The date is the day the
+result entered the registry, which is the day the submitter's consent was acted
+on, and the serial follows the largest one that date has already used, starting
+at 1 for a date with none.
+
+The date is deliberately not the date of the review. A Palomar date is a
+priority claim, and nothing is registered until the submitter has read their
+review and consented, which they may take as long as they like over. A date
+taken from the review would therefore be a date the submitter could choose:
+holding consent back would have bought an earlier position, ahead of every
+result that entered the registry meanwhile. Waiting has to cost a later
+position instead. The record carries the review's own timestamp separately, as
+`review.reviewed_at`.
+
 The serial was drawn at random until 2026-08-07, to hide how many reservations
 never became records. What that cost was the ordering: with a random serial, the
 order two identifiers were registered in cannot be read from the identifiers, so
 anything wanting registration order has to carry an ordinal beside the
 identifier, and an ordinal that disagrees with its identifier is a failure
-nothing downstream can detect or repair. Serials rise within a date and dates
-never go backwards, because a new version of an existing result reuses its first
-version's identifier rather than allocating one, so ordering identifiers as
-strings is registration order across the whole registry.
+nothing downstream can detect or repair. Serials rise within a date, and a new
+version of an existing result reuses its first version's identifier and with it
+that version's date rather than allocating either, so ordering identifiers as
+strings is registration order across the whole registry. The one thing that can
+put an older identifier in late is the reservation above: a run that failed
+before midnight and is retried after it finishes under the date it reserved,
+which is one identifier committed late and no other identifier moved.
 
 Once the PR is merged, verify the immutable record and close out the private
 submission:

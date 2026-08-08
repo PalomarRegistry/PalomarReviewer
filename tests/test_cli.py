@@ -561,10 +561,11 @@ class ReviewerTests(unittest.TestCase):
             database = Path(directory)
             (database / "entries").mkdir()
             with (
+                mock.patch.object(cli, "utc_today", return_value="2026-08-11"),
                 mock.patch.object(
                     cli,
                     "allocate_identifier",
-                    return_value="PALOMAR-2026-08-01-123456",
+                    return_value="PALOMAR-2026-08-11-123456",
                 ) as allocate,
                 mock.patch.object(cli, "put_state") as write,
             ):
@@ -576,7 +577,7 @@ class ReviewerTests(unittest.TestCase):
                     dry_run=False,
                 )
 
-            self.assertEqual(identity, ("PALOMAR-2026-08-01-123456", "2026-08-01", 1))
+            self.assertEqual(identity, ("PALOMAR-2026-08-11-123456", "2026-08-11", 1))
             allocate.assert_called_once()
             saved = write.call_args.args[1]
             self.assertEqual(saved["registration_attempt"]["id"], identity[0])
@@ -584,6 +585,7 @@ class ReviewerTests(unittest.TestCase):
             self.assertEqual(write.call_args.kwargs["blob_sha"], "state-blob")
 
             with (
+                mock.patch.object(cli, "utc_today", return_value="2026-08-11"),
                 mock.patch.object(cli, "allocate_identifier") as allocate_again,
                 mock.patch.object(cli, "put_state") as write_again,
             ):
@@ -596,6 +598,50 @@ class ReviewerTests(unittest.TestCase):
                 )
             self.assertEqual(retried, identity)
             allocate_again.assert_not_called()
+            write_again.assert_not_called()
+
+    def test_a_registration_retried_after_midnight_keeps_the_date_it_reserved(self):
+        """The reservation is what makes a retry finish the attempt it started.
+
+        Registration pushes archive refs and opens a database pull request
+        under one identifier, and a run long enough to fail part way is long
+        enough to cross midnight. Taking today's date again on the retry would
+        hand out a second permanent identifier for one result, under a date the
+        first attempt's archive refs and render paths know nothing about.
+        """
+        mechanical = self.mechanical_fixture()
+        review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}
+        state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob"}
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            (database / "entries").mkdir()
+            with (
+                mock.patch.object(cli, "utc_today", return_value="2026-08-11"),
+                mock.patch.object(cli, "put_state") as write,
+            ):
+                reserved = registration_attempt_identity(
+                    database,
+                    state=state,
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
+                )
+            self.assertEqual(reserved, ("PALOMAR-2026-08-11-000001", "2026-08-11", 1))
+            attempt = write.call_args.args[1]["registration_attempt"]
+
+            with (
+                mock.patch.object(cli, "utc_today", return_value="2026-08-12") as tomorrow,
+                mock.patch.object(cli, "put_state") as write_again,
+            ):
+                retried = registration_attempt_identity(
+                    database,
+                    state={**state, "registration_attempt": attempt},
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
+                )
+            self.assertEqual(retried, reserved)
+            tomorrow.assert_not_called()
             write_again.assert_not_called()
 
     def test_registration_attempt_cannot_be_reused_for_changed_evidence(self):
@@ -2585,56 +2631,82 @@ class PublicationIdentityTests(unittest.TestCase):
             "submission": {"submission_id": submission},
         }
 
-    def resolve(self, database, *, submission="a1b2c3d4e5f6", existing_id=None):
-        return registration_identity(
-            database,
-            submission_id=submission,
-            existing_id=existing_id,
-            reviewed_at="2026-08-01T12:00:00Z",
-            mechanical={
-                "source": {"repository": "example/project"},
-                "comparator": {"path": "comparator.json"},
-            },
-        )
+    def registered_on(self, identifier, submission="c3d4e5f6a1b2"):
+        """A record whose date agrees with its identifier, as every record's does."""
+        record = self.prior(identifier=identifier, submission=submission)
+        record["accepted_at"] = identifier[len("PALOMAR-") :][:10]
+        return record
 
-    def test_a_new_submission_gets_the_first_free_serial_for_its_date(self):
-        identifier, accepted_at, version = self.resolve(self.database())
-        self.assertEqual(identifier, "PALOMAR-2026-08-01-000001")
-        self.assertEqual((accepted_at, version), ("2026-08-01", 1))
+    def resolve(
+        self,
+        database,
+        *,
+        submission="a1b2c3d4e5f6",
+        existing_id=None,
+        today="2026-08-11",
+        reviewed_at="2026-08-01T12:00:00Z",
+    ):
+        """Resolve an identity for a review of the first, acted on ten days later.
 
-    def test_a_new_submission_follows_the_last_one_registered_that_date(self):
-        database = self.database(self.prior(identifier="PALOMAR-2026-08-01-000042"))
-        identifier, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
-        self.assertEqual(identifier, "PALOMAR-2026-08-01-000043")
-
-    def test_an_identifier_carries_the_acceptance_date_and_not_the_day_it_was_registered(self):
-        """Registration waits on the submitter, so the two dates differ.
-
-        Nothing is registered until the submitter has read their review and
-        consented, which may be days after the review decided. The identifier
-        and `accepted_at` both take the review's date, so a result accepted on
-        the first and consented to later is registered under the first, behind
-        identifiers already in the database under the fifth. String order over
-        identifiers is therefore acceptance order, and registration order only
-        within one date.
-
-        What this costs the browse layout is one sealed day's page rewritten,
-        which is the same one-page bound an append to today pays. What it costs
-        is the claim that an append only ever touches today.
+        The two dates are apart in every test here on purpose. While they were
+        the same date, nothing distinguished the date of the review from the
+        date registration happened, and either could have been the one the
+        identifier carried without a test noticing.
         """
-        registered_on_the_fifth = self.prior(identifier="PALOMAR-2026-08-05-000001")
-        registered_on_the_fifth["accepted_at"] = "2026-08-05"
-        database = self.database(registered_on_the_fifth)
+        with mock.patch.object(cli, "utc_today", return_value=today):
+            return registration_identity(
+                database,
+                submission_id=submission,
+                existing_id=existing_id,
+                reviewed_at=reviewed_at,
+                mechanical={
+                    "source": {"repository": "example/project"},
+                    "comparator": {"path": "comparator.json"},
+                },
+            )
+
+    def test_a_new_submission_gets_the_first_free_serial_for_the_day_it_is_registered(self):
+        identifier, accepted_at, version = self.resolve(self.database())
+        self.assertEqual(identifier, "PALOMAR-2026-08-11-000001")
+        self.assertEqual((accepted_at, version), ("2026-08-11", 1))
+
+    def test_a_new_submission_follows_the_last_one_registered_that_day(self):
+        earlier_today = self.prior(identifier="PALOMAR-2026-08-11-000042")
+        earlier_today["accepted_at"] = "2026-08-11"
+        database = self.database(earlier_today)
+        identifier, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
+        self.assertEqual(identifier, "PALOMAR-2026-08-11-000043")
+
+    def test_holding_consent_back_does_not_buy_an_earlier_identifier(self):
+        """The date is when the result entered the registry, not when it was reviewed.
+
+        A Palomar date is a priority claim. Nothing is registered until the
+        submitter has read their review and consented, and they may take as
+        long as they like over it, so a date taken from the review would be a
+        date the submitter chose: hold the consent, and be registered under the
+        older date ahead of everything that entered the registry meanwhile.
+
+        Here a review dated the first is consented to on the eleventh, and a
+        result that entered the registry on the fifth is already in the
+        database. The waiting submitter must land behind it, not in front.
+        """
+        database = self.database(self.registered_on("PALOMAR-2026-08-05-000001"))
         identifier, accepted_at, _ = self.resolve(database, submission="b2c3d4e5f6a1")
-        self.assertEqual((identifier, accepted_at), ("PALOMAR-2026-08-01-000001", "2026-08-01"))
-        self.assertLess(identifier, "PALOMAR-2026-08-05-000001")
+        self.assertEqual((identifier, accepted_at), ("PALOMAR-2026-08-11-000001", "2026-08-11"))
+        self.assertGreater(identifier, "PALOMAR-2026-08-05-000001")
 
     def test_a_second_publication_of_one_submission_needs_an_update(self):
         database = self.database(self.prior())
         with self.assertRaisesRegex(ReviewerError, "already has a permanent ID"):
             self.resolve(database)
 
-    def test_an_update_takes_the_next_version_and_the_original_date(self):
+    def test_an_update_keeps_the_date_its_first_version_was_registered_under(self):
+        """The identifier belongs to the result, so its date does too.
+
+        A v2 registered today under today's date would be a second identifier
+        for one result, and the browse page a result sits on is read from its
+        identifier, so it would also move the whole result to another day.
+        """
         database = self.database(self.prior())
         identifier, accepted_at, version = self.resolve(
             database, submission="b2c3d4e5f6a1", existing_id="PALOMAR-2026-08-01-000012"
