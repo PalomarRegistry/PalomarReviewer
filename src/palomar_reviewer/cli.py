@@ -3853,7 +3853,8 @@ def authorize_registration(
 
 
 def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
-    """The next serial for this date, so identifiers sort in registration order.
+    """The next serial for this date, so one date's identifiers sort in the
+    order they were registered.
 
     The serial used to be drawn at random, to hide how many reservations never
     became records. That is no longer worth paying for, and what it cost was
@@ -3863,14 +3864,22 @@ def allocate_identifier(accepted_at: str, taken: set[str]) -> str:
     ordinal and an identifier that disagree is a failure nothing downstream can
     detect or repair.
 
-    Serials run from 1 within a date and dates never go backwards, because a
-    new result takes today's date and a new version of an existing result
-    reuses its first version's identifier rather than allocating one. So
-    ordering identifiers as strings is registration order across the whole
-    registry, with nothing recorded separately to fall out of step.
+    The date is not today. It is the date of `review.reviewed_at`, which is why
+    it is the same date the record carries as `accepted_at`, and registration
+    happens only once the submitter has read that review and consented to it.
+    They may take days over that, or never do it. So a result accepted on
+    Monday and consented to on Friday is registered under Monday's date, behind
+    identifiers already registered under Wednesday: ordering identifiers as
+    strings is acceptance order, and registration order only within one date.
 
-    `taken` is every identifier the database already holds, of every date. Only
-    this date's serials decide the next one; a date with none starts at 1.
+    Two things follow for the browse layout, whose pages are keyed on this
+    date. An append can land on a day that is already past, so it is not true
+    that appends only ever touch today; and that append still rewrites exactly
+    one page, which is the bound the layout actually rests on, so the cost
+    argument is unaffected. Serials cannot collide across the gap either,
+    because `taken` is every identifier the database already holds, of every
+    date, and only this date's serials decide the next one; a date with none
+    starts at 1.
     """
     prefix = f"PALOMAR-{accepted_at}-"
     serials = [
@@ -4184,6 +4193,10 @@ def registration_identity(
             f"this submission already has a permanent ID; register an update to: {identifiers}"
         )
     try:
+        # The review's date, not this pass's. Consent comes after the submitter
+        # has read the review, so this can be days behind today, and the
+        # identifier and `accepted_at` both say when the result was accepted
+        # rather than when it was registered. See `allocate_identifier`.
         accepted_at = dt.date.fromisoformat(str(reviewed_at)[:10]).isoformat()
     except ValueError as error:
         raise ReviewerError("accepted review has no valid review date") from error

@@ -2607,6 +2607,28 @@ class PublicationIdentityTests(unittest.TestCase):
         identifier, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
         self.assertEqual(identifier, "PALOMAR-2026-08-01-000043")
 
+    def test_an_identifier_carries_the_acceptance_date_and_not_the_day_it_was_registered(self):
+        """Registration waits on the submitter, so the two dates differ.
+
+        Nothing is registered until the submitter has read their review and
+        consented, which may be days after the review decided. The identifier
+        and `accepted_at` both take the review's date, so a result accepted on
+        the first and consented to later is registered under the first, behind
+        identifiers already in the database under the fifth. String order over
+        identifiers is therefore acceptance order, and registration order only
+        within one date.
+
+        What this costs the browse layout is one sealed day's page rewritten,
+        which is the same one-page bound an append to today pays. What it costs
+        is the claim that an append only ever touches today.
+        """
+        registered_on_the_fifth = self.prior(identifier="PALOMAR-2026-08-05-000001")
+        registered_on_the_fifth["accepted_at"] = "2026-08-05"
+        database = self.database(registered_on_the_fifth)
+        identifier, accepted_at, _ = self.resolve(database, submission="b2c3d4e5f6a1")
+        self.assertEqual((identifier, accepted_at), ("PALOMAR-2026-08-01-000001", "2026-08-01"))
+        self.assertLess(identifier, "PALOMAR-2026-08-05-000001")
+
     def test_a_second_publication_of_one_submission_needs_an_update(self):
         database = self.database(self.prior())
         with self.assertRaisesRegex(ReviewerError, "already has a permanent ID"):
