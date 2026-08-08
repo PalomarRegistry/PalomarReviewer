@@ -2868,6 +2868,51 @@ class SubmissionListingTests(unittest.TestCase):
                 # Written against the sha the damaged file had, not blind.
                 self.assertEqual(keywords["blob_sha"], "sha-on-disk")
 
+    def test_the_first_drop_after_a_rebuild_names_the_sha_the_rebuild_left(self):
+        """A rebuild writes the index and the pass over it writes again.
+
+        The second write has to be conditional on what the first one left
+        behind. It named nothing, because the rebuilt index carried no sha at
+        all: the contents API refuses an unconditional write to a file that
+        exists, `_write_open_index` prints the refusal as a warning and carries
+        on, and so the first submission the reviewer finished with after any
+        rebuild was never dropped from the queue.
+        """
+        cloned = {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
+            "bbbbbbbbbbbb": {"id": "bbbbbbbbbbbb", "status": "awaiting-review"},
+        }
+        # The rebuild reads a clone; the pass then reads the live records, and
+        # one of them has been withdrawn since the clone was taken. That is the
+        # drop this pass is meant to make.
+        live = {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "status": "awaiting-review"},
+            "bbbbbbbbbbbb": {"id": "bbbbbbbbbbbb", "status": "withdrawn"},
+        }
+        writes = []
+
+        def fake_put(path, value, message, blob_sha=None):
+            writes.append((value["open"], blob_sha))
+            return f"sha-after-write-{len(writes)}"
+
+        # No index on disk, so the pass rebuilds and then prunes, which is the
+        # two writes in one pass this is about.
+        with self.state_repository(cloned, index=None):
+            with (
+                mock.patch.object(cli, "put_state", side_effect=fake_put),
+                mock.patch.object(cli, "submission_state", side_effect=lambda name: live[name]),
+            ):
+                open_now = cli.open_submissions()
+
+        self.assertEqual([record["id"] for record in open_now], list(live))
+        self.assertEqual(
+            writes,
+            [
+                (["aaaaaaaaaaaa", "bbbbbbbbbbbb"], "sha-on-disk"),
+                (["aaaaaaaaaaaa"], "sha-after-write-1"),
+            ],
+        )
+
     def test_a_record_that_cannot_be_read_is_not_a_finished_one(self):
         """A rebuild that dropped what it could not parse would quietly retire
         the one submission most likely to need somebody to look at it."""
@@ -4236,6 +4281,21 @@ class StateWriteGuardTests(unittest.TestCase):
         ):
             cli.put_state("submissions/a1b2c3d4e5f6/state.json", {"id": "x"}, "yes")
         self.assertTrue(api.called)
+
+    def test_a_write_answers_with_the_sha_it_left_behind(self):
+        """The next write in the same pass is conditional on this one.
+
+        Not on the sha this write replaced, which is what the file no longer
+        stands at, and not on nothing, which the contents API refuses for a
+        file that exists.
+        """
+        with (
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+            mock.patch.object(cli, "gh", return_value="sha-after-write\n") as api,
+        ):
+            written = cli.put_state("submissions/a1b2c3d4e5f6/state.json", {"id": "x"}, "yes")
+        self.assertEqual(written, "sha-after-write")
+        self.assertIn(".content.sha", api.call_args.args[0])
 
 
 class VocabularyTests(unittest.TestCase):
