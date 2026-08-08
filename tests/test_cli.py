@@ -1,3 +1,4 @@
+import atexit
 import contextlib
 import datetime as dt
 import hashlib
@@ -60,7 +61,184 @@ from palomar_reviewer.cli import (
 )
 
 
+# Some of what this suite checks is not in this repository: the schemas
+# PalomarDatabase serves, a PalomarDatabase checkout to register into, a
+# PalomarPolicy checkout to review against, and Bubblewrap. Each was reached
+# for with a bare `os.environ.get` or `shutil.which`, and an absent one then
+# removed coverage without saying so.
+#
+# That is not hypothetical. Two tests validated a built record against the
+# served schema inside `if schema_checkout:` and simply did not validate when
+# it was unset, so they passed while checking nothing and did not even appear
+# in the skipped count: a full run reported 214 passes with the schema
+# contract unchecked. And the one end-to-end registration test needed
+# PALOMAR_DATABASE_CHECKOUT, which no workflow anywhere set, so it skipped
+# every run and was red for days before anybody looked.
+#
+# So an unavailable capability now has to be somebody's decision.
+#
+#   - Available: the tests run.
+#   - Absent, interactively: the tests skip or narrow, and the suite prints at
+#     the end exactly what it did not check. A run that says "227 tests, OK"
+#     may not also quietly mean "and the schema contract went unchecked".
+#   - Absent, under CI: the run fails, unless the workflow named the capability
+#     in PALOMAR_TESTS_WITHOUT. Nobody reads the tail of a CI log, so a summary
+#     there is worth nothing; and a variable renamed or an apt install that
+#     stopped working must break the build rather than silently take the
+#     coverage it was carrying with it.
+#
+# PALOMAR_TESTS_WITHOUT is how PalomarReviewer's own public CI declares that it
+# cannot reach the private database, which is a deliberate boundary rather than
+# an oversight. Writing it down is what makes the difference legible.
+#
+# What this does not cover: a test that asserts nothing, a fixture that has
+# drifted away from what it stands for, and a `self.skipTest` written inline
+# for a host property rather than for a capability. It closes exactly one hole,
+# which is coverage that disappears because configuration did.
+TEST_CAPABILITIES = {
+    # name: (variables naming it, executable that is it, what having it buys)
+    "schema": (
+        ("PALOMAR_SCHEMA_CHECKOUT", "PALOMAR_DATABASE_CHECKOUT"),
+        None,
+        "validating a built record against the schema the database serves",
+    ),
+    "database": (
+        ("PALOMAR_DATABASE_CHECKOUT",),
+        None,
+        "registering into a real PalomarDatabase checkout end to end",
+    ),
+    "policy": (
+        ("PALOMAR_POLICY_CHECKOUT",),
+        None,
+        "checking a review against the live PalomarPolicy rubric",
+    ),
+    "sandbox": (
+        (),
+        "bwrap",
+        "running an engine inside a real Bubblewrap namespace",
+    ),
+}
+
+_DECLARED_ABSENT = {
+    name.strip()
+    for name in os.environ.get("PALOMAR_TESTS_WITHOUT", "").split(",")
+    if name.strip()
+}
+_UNKNOWN_DECLARED = _DECLARED_ABSENT - set(TEST_CAPABILITIES)
+if _UNKNOWN_DECLARED:
+    # Refused at import, because a misspelt opt-out is an opt-out that does not
+    # apply, and the run it was meant to permit would then fail for a reason
+    # that says nothing about the spelling.
+    raise SystemExit(
+        "PALOMAR_TESTS_WITHOUT names capabilities that do not exist: "
+        + ", ".join(sorted(_UNKNOWN_DECLARED))
+        + "; known capabilities are "
+        + ", ".join(sorted(TEST_CAPABILITIES))
+    )
+
+_UNEXERCISED: dict[str, str] = {}
+
+
+def running_under_ci() -> bool:
+    """Whether the suite is running unattended.
+
+    GitHub Actions sets CI for every job, and so does every other hosted runner
+    worth naming. The distinction this draws is not "GitHub": it is whether
+    there is a person present who will read what the run printed.
+    """
+    return bool(os.environ.get("CI"))
+
+
+def capability_source(capability: str) -> Path | None:
+    variables, executable, _what = TEST_CAPABILITIES[capability]
+    for variable in variables:
+        value = os.environ.get(variable)
+        if value:
+            return Path(value).resolve()
+    if executable:
+        found = shutil.which(executable)
+        if found:
+            return Path(found)
+    return None
+
+
+def capability_wanted(capability: str) -> str:
+    variables, executable, _what = TEST_CAPABILITIES[capability]
+    named = list(variables)
+    if executable:
+        named.append(f"{executable} on PATH")
+    return " or ".join(named)
+
+
+def note_unexercised(name: str, what: str) -> None:
+    """Record something this run did not check, for the summary at the end.
+
+    For a fact about the host rather than a capability a workflow could
+    declare, so it is reported and never fails a build.
+    """
+    _UNEXERCISED[name] = what
+
+
+@atexit.register
+def say_what_this_run_did_not_check() -> None:
+    if not _UNEXERCISED:
+        return
+    lines = [
+        "",
+        "=" * 72,
+        "This run did NOT check the following. The tests above passed without",
+        "them, so their result is narrower than it looks.",
+        "",
+    ]
+    for name in sorted(_UNEXERCISED):
+        lines.append(f"  {name}: {_UNEXERCISED[name]}")
+    lines.append("")
+    lines.append("=" * 72)
+    print("\n".join(lines), file=sys.stderr)
+
+
 class ReviewerTests(unittest.TestCase):
+    def available(self, capability):
+        """Where `capability` is, or `None` once this run has said so.
+
+        `None` is for a capability that only widens a test worth running
+        anyway, so the caller carries on with narrower assertions. The run
+        announces the narrowing at the end, and fails outright under CI unless
+        the workflow declared the absence.
+        """
+        source = capability_source(capability)
+        if source is not None:
+            return source
+        _variables, _executable, what = TEST_CAPABILITIES[capability]
+        wanted = capability_wanted(capability)
+        if running_under_ci() and capability not in _DECLARED_ABSENT:
+            self.fail(
+                f"{wanted} is absent, so this job is not {what}. Provide it, or add "
+                f"{capability!r} to PALOMAR_TESTS_WITHOUT in the workflow to say "
+                "out loud that this job cannot."
+            )
+        _UNEXERCISED[capability] = f"{what} (needs {wanted})"
+        return None
+
+    def require(self, *capabilities):
+        """Every capability, or a skip this run will announce.
+
+        For a test that is nothing without them. All of them are resolved
+        before any decision to skip, so the summary names everything that was
+        missing rather than only the first thing looked for.
+        """
+        sources = [self.available(capability) for capability in capabilities]
+        missing = [
+            capability
+            for capability, source in zip(capabilities, sources, strict=True)
+            if source is None
+        ]
+        if missing:
+            self.skipTest(
+                "needs " + " and ".join(capability_wanted(name) for name in missing)
+            )
+        return sources
+
     def issue_body(self, commit="1" * 40):
         return f"### Repository URL\n\nhttps://github.com/example/project\n\n### Commit SHA\n\n{commit}\n"
 
@@ -797,6 +975,29 @@ class ReviewerTests(unittest.TestCase):
             "declarations_checked": ["Example.result"],
         }
 
+    def synthesis_warnings_for(self, passes, policy_checkout):
+        """The `warnings` list the live rubric will accept for these passes.
+
+        A fixture that hard-codes this list is a fixture that goes stale the
+        next time PalomarPolicy changes `finding_comment_policy`, and that is
+        exactly what happened: the integration test carried `[]`, PalomarPolicy
+        moved to rubric schema_version 7 with `all`, and the test began failing
+        with "synthesis warnings must reproduce every required pass finding in
+        pass order". Deriving it here means a policy change moves this fixture
+        with it, and a policy change the reviewer genuinely cannot satisfy
+        still fails, in `validate_synthesis_policy`, where it belongs.
+        """
+        rubric = json.loads((Path(policy_checkout) / "rubric.json").read_text())
+        if rubric.get("schema_version", 1) < 7:
+            return []
+        policy = rubric.get("finding_comment_policy", "material")
+        return [
+            finding["message"]
+            for result in passes
+            for finding in result["findings"]
+            if policy == "all" or finding["severity"] in {"warning", "error"}
+        ]
+
     def review_policy_fixture(self):
         scores = {
             "statement_alignment": 4,
@@ -1002,8 +1203,12 @@ class ReviewerTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--permission-mode") + 1], "auto")
             self.assertEqual(argv[argv.index("--tools") + 1], "WebSearch,WebFetch")
 
-    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is required")
     def test_engine_namespace_hides_operator_filesystem(self):
+        # Not `skipUnless(shutil.which("bwrap"))`. A CI job that means to run
+        # the sandbox and finds no bwrap -- because the apt install moved, say
+        # -- would then drop the only test that proves the operator's
+        # filesystem is out of the model's reach, and say nothing about it.
+        self.require("sandbox")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source"
@@ -1032,8 +1237,8 @@ class ReviewerTests(unittest.TestCase):
         # non-NixOS runner, where /etc/ssl/certs already holds the real bundle.
         self.assertIn(Path("/etc/static/ssl/certs"), SYSTEM_RESOLUTION_PATHS)
 
-    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is required")
     def test_engine_namespace_reads_the_system_trust_bundle(self):
+        self.require("sandbox")
         bundles = [
             path
             for path in (
@@ -1043,6 +1248,11 @@ class ReviewerTests(unittest.TestCase):
             if path.is_file()
         ]
         if not bundles:
+            note_unexercised(
+                "trust bundle",
+                "reading the host's CA bundle from inside the namespace"
+                " (this host has none to read)",
+            )
             self.skipTest("this host has no system trust bundle")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1318,11 +1528,9 @@ class ReviewerTests(unittest.TestCase):
         self.assertRegex(record["id"], r"^PALOMAR-2026-08-01-[0-9]{6}$")
         self.assertEqual(record["accepted_at"], "2026-08-01")
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
-        schema_checkout = os.environ.get("PALOMAR_SCHEMA_CHECKOUT") or os.environ.get(
-            "PALOMAR_DATABASE_CHECKOUT"
-        )
+        schema_checkout = self.available("schema")
         if schema_checkout:
-            schema = json.loads((Path(schema_checkout) / "schema-v2.json").read_text())
+            schema = json.loads((schema_checkout / "schema-v2.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -1537,11 +1745,11 @@ class ReviewerTests(unittest.TestCase):
         # review and is not one of them.
         self.assertEqual(set(scores["scores"]), set(SYNTHESIS_SCORE_KEYS))
 
-        database = os.environ.get("PALOMAR_DATABASE_CHECKOUT")
+        database = self.available("database")
         if database:
             jsonschema.validate(
                 scores,
-                json.loads((Path(database) / "scores-v1.json").read_text()),
+                json.loads((database / "scores-v1.json").read_text()),
                 format_checker=jsonschema.FormatChecker(),
             )
 
@@ -1564,11 +1772,9 @@ class ReviewerTests(unittest.TestCase):
         written = json.dumps(record)
         for invented in ("lab_notebook", "funding", "mood", "cost_aud", "a walk"):
             self.assertNotIn(invented, written, f"{invented} reached the record")
-        schema_checkout = os.environ.get("PALOMAR_SCHEMA_CHECKOUT") or os.environ.get(
-            "PALOMAR_DATABASE_CHECKOUT"
-        )
+        schema_checkout = self.available("schema")
         if schema_checkout:
-            schema = json.loads((Path(schema_checkout) / "schema-v2.json").read_text())
+            schema = json.loads((schema_checkout / "schema-v2.json").read_text())
             jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
 
     def test_repository_license_is_bound_to_metadata_and_file_bytes(self):
@@ -1678,13 +1884,15 @@ class ReviewerTests(unittest.TestCase):
         )
         self.assertIn("Challenge imports Tau Ceti", record["trust"]["reasons"])
 
-    @unittest.skipUnless(
-        os.environ.get("PALOMAR_DATABASE_CHECKOUT") and os.environ.get("PALOMAR_POLICY_CHECKOUT"),
-        "set PALOMAR_DATABASE_CHECKOUT and PALOMAR_POLICY_CHECKOUT for publication tests",
-    )
-    def test_publish_and_finalize_against_live_database_validator(self):
-        database_source = Path(os.environ["PALOMAR_DATABASE_CHECKOUT"]).resolve()
-        policy_source = Path(os.environ["PALOMAR_POLICY_CHECKOUT"]).resolve()
+    def test_a_registration_reaches_the_live_database_and_is_finalized(self):
+        """The whole registration path, against the real database and rubric.
+
+        Nothing else exercises it. It runs on a schedule and on the relevant
+        pull requests in PalomarDatabase, which is the repository that has the
+        private half of the contract without needing a credential for anything
+        else; see `.github/workflows/reviewer-contract.yml` there.
+        """
+        database_source, policy_source = self.require("database", "policy")
         # The registry starts empty, so the canonical record comes from the
         # database's own test fixture rather than from what is published.
         sample_record_path = database_source / "tests" / "fixtures" / "entry.json"
@@ -1696,6 +1904,12 @@ class ReviewerTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
+        # What the real database already holds. The registration under test is
+        # whatever appears beside this, which is the only way to name it that
+        # survives both the serial allocator and the passage of a day.
+        entries_before_registration = {
+            path.name for path in (database_source / "entries").glob("*.json")
+        }
 
         def commit_source(path, mechanical):
             formalization_sha256 = hashlib.sha256((path / "formalization.yaml").read_bytes()).hexdigest()
@@ -1803,6 +2017,19 @@ class ReviewerTests(unittest.TestCase):
                     "revision": qualified_revision,
                 }
             )
+            passes = [
+                self.step_result("classification", {"classification": 4}),
+                self.step_result("metadata", {"clarity": 4, "provenance": 4}),
+                self.step_result("statement_alignment", {"statement_alignment": 4}),
+                self.step_result(
+                    "definition_fidelity",
+                    {"definition_fidelity": 4, "auditability": 4},
+                ),
+                self.step_result(
+                    "literature_notability",
+                    {"notability": 4, "literature": 4},
+                ),
+            ]
             review = {
                 "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
@@ -1823,21 +2050,20 @@ class ReviewerTests(unittest.TestCase):
                     "literature": 4,
                     "clarity": 4,
                 },
-                "warnings": [],
+                # Derived from the passes rather than written out, because this
+                # is the one list the live rubric decides the contents of.
+                # Under `finding_comment_policy: all` the synthesis has to
+                # reproduce every finding in pass order; under `material` it
+                # reproduces the warning-and-error subset, which for these
+                # fixtures is empty. This was the literal `[]`, which was
+                # correct against `material` and became wrong the moment
+                # PalomarPolicy moved to rubric schema_version 7 with `all`.
+                # The test then failed with "synthesis warnings must reproduce
+                # every required pass finding in pass order", and nothing in
+                # CI ran it.
+                "warnings": self.synthesis_warnings_for(passes, work / "policy"),
                 "requested_changes": [],
-                "passes": [
-                    self.step_result("classification", {"classification": 4}),
-                    self.step_result("metadata", {"clarity": 4, "provenance": 4}),
-                    self.step_result("statement_alignment", {"statement_alignment": 4}),
-                    self.step_result(
-                        "definition_fidelity",
-                        {"definition_fidelity": 4, "auditability": 4},
-                    ),
-                    self.step_result(
-                        "literature_notability",
-                        {"notability": 4, "literature": 4},
-                    ),
-                ],
+                "passes": passes,
             }
             (source / "formalization.yaml").write_text(
                 "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
@@ -1978,19 +2204,28 @@ class ReviewerTests(unittest.TestCase):
                 self.assertEqual(register(args), 0)
 
             database = work / "database"
-            # The permanent identifier follows whatever that date has already
-            # used, so the entry is found rather than named. It is found among
-            # whatever the real database already holds, too: this test clones
-            # it, and it stopped being empty the day the first record was
-            # registered.
+            # The entry is found rather than named, twice over. The serial
+            # follows whatever the real database already holds for that day,
+            # and this test clones the real database; and since a result is
+            # dated by when it entered the registry rather than by when it was
+            # reviewed, the day is today. This used to select on the literal
+            # prefix `PALOMAR-2026-08-01-`, which stopped matching anything the
+            # day after the fixture was written and failed with "the
+            # registration under test was not written". Whatever is here and
+            # was not in the clone is the registration under test.
             entries = sorted(
                 path for path in (database / "entries").glob("*.json")
-                if path.name.startswith("PALOMAR-2026-08-01-")
+                if path.name not in entries_before_registration
             )
             self.assertEqual(len(entries), 1, "the registration under test was not written")
             entry_path = entries[0]
             record = json.loads(entry_path.read_text())
-            self.assertRegex(record["id"], r"\APALOMAR-2026-08-01-[0-9]{6}\Z")
+            self.assertRegex(record["id"], r"\APALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}\Z")
+            # The identifier's date, the result date and the registration
+            # instant are one fact written three times, and the database
+            # refuses a version 1 where they disagree.
+            self.assertEqual(record["id"][len("PALOMAR-"):][:10], record["accepted_at"])
+            self.assertEqual(record["accepted_at"], record["registered_at"][:10])
             self.assertEqual(record["schema_version"], 2)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
@@ -2079,6 +2314,23 @@ class ReviewerTests(unittest.TestCase):
             (update_work / "mechanical-report-sha256").write_text(review_digest(update_mechanical) + "\n")
             bind_publication_evidence(update_work, update_mechanical)
             update_mechanical_url = update_mechanical["workflow_url"]
+            # The update takes its Comparator configuration from the database's
+            # own fixture, so it selects a different theorem from the one the
+            # v1 fixture selects. A pass that claims coverage has to name what
+            # this Comparator selects, in configuration order, or the reviewer
+            # refuses the review with "declaration coverage must exactly match
+            # every Comparator-selected theorem and definition". Reusing the v1
+            # passes verbatim carried the v1 theorem name and did exactly that.
+            update_passes = [
+                {
+                    **result,
+                    "declarations_checked": [
+                        *update_mechanical["comparator"]["theorem_names"],
+                        *update_mechanical["comparator"]["definition_names"],
+                    ],
+                }
+                for result in passes
+            ]
             update_review = {
                 **review,
                 "submission_id": "b2c3d4e5f6a1",
@@ -2087,6 +2339,10 @@ class ReviewerTests(unittest.TestCase):
                     "commit": update_mechanical["source"]["commit"],
                 },
                 "mechanical_report": update_mechanical_url,
+                "passes": update_passes,
+                "warnings": self.synthesis_warnings_for(
+                    update_passes, update_work / "policy"
+                ),
             }
             (update_work / "review.json").write_text(json.dumps(update_review))
             review_stub.stop()
