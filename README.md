@@ -60,6 +60,37 @@ codex login
 claude auth
 ```
 
+## Running the tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+Some of what the suite checks is not in this repository, and it will tell you
+at the end of the run exactly what it therefore did not check:
+
+| capability | provide | what it buys |
+| --- | --- | --- |
+| `schema` | `PALOMAR_SCHEMA_CHECKOUT`, or `PALOMAR_DATABASE_CHECKOUT` | validating a built record against the schema the database serves |
+| `database` | `PALOMAR_DATABASE_CHECKOUT` | registering into a real PalomarDatabase checkout end to end |
+| `policy` | `PALOMAR_POLICY_CHECKOUT` | checking a review against the live PalomarPolicy rubric |
+| `sandbox` | `bwrap` on `PATH` | running an engine inside a real Bubblewrap namespace |
+
+Interactively an absent capability skips or narrows the tests that need it, and
+is named in a summary the run prints when it finishes. Under CI it fails the
+run instead, unless the workflow named it in `PALOMAR_TESTS_WITHOUT`. That
+exists because the alternative had already cost us: two tests validated a
+record against the served schema only if `PALOMAR_SCHEMA_CHECKOUT` happened to
+be set and passed silently when it was not, and the one end-to-end
+registration test needed `PALOMAR_DATABASE_CHECKOUT`, which no workflow set, so
+it skipped every run and was red for days before anybody looked.
+
+This repository's own CI declares `PALOMAR_TESTS_WITHOUT: database`, because
+PalomarDatabase is private and public CI is deliberately given no credential
+for it. The end-to-end registration test runs instead in PalomarDatabase, in
+`.github/workflows/reviewer-contract.yml`, daily and on any pull request there
+that touches a schema, the validator or the record fixtures.
+
 ## Running a review by hand
 
 These are the steps the pipeline performs. Run them yourself to reproduce a
