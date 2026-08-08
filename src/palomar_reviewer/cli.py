@@ -1096,6 +1096,20 @@ def registered_source_repository(state: dict[str, Any]) -> str:
     return repository
 
 
+def is_stale_write(error: Exception) -> bool:
+    """Whether a write was refused because the record had already moved on.
+
+    A conditional write answers 409 when the blob is no longer the one that was
+    read. That is the guard working, not a fault: something else wrote first,
+    and this pass was about to overwrite it with a stale copy. The distinction
+    matters because everything else that can fail here — a revoked token, a
+    repository that no longer exists — will still be failing on the next pass,
+    and only this one resolves itself.
+    """
+    detail = str(error)
+    return "HTTP 409" in detail or "does not match" in detail
+
+
 def star_registered_sources(args: argparse.Namespace) -> int:
     """Star every accepted registered source not already recorded as starred.
 
@@ -1128,12 +1142,31 @@ def star_registered_sources(args: argparse.Namespace) -> int:
                 "repository": repository,
                 "starred_at": starred_at,
             }
-            put_state(
-                f"submissions/{state['id']}/state.json",
-                updated,
-                f"Record source star for {state['id']}",
-                blob_sha=state.get("_blob_sha"),
-            )
+            try:
+                put_state(
+                    f"submissions/{state['id']}/state.json",
+                    updated,
+                    f"Record source star for {state['id']}",
+                    blob_sha=state.get("_blob_sha"),
+                )
+            except Exception as error:
+                # Only the conditional write has a retriable conflict. The
+                # record moved between this pass reading it and writing it,
+                # which is what happens when a registration lands moments
+                # earlier: GitHub's contents API served this pass the blob from
+                # before that write. The guard did its job by refusing a stale
+                # copy, the star itself is already applied and idempotent, and
+                # the next pass reads the record as it now stands. Failing the
+                # run for that marks red a workflow that recovered on its own
+                # two minutes later, and one that cries wolf about
+                # registrations is worse than one that says nothing.
+                if not is_stale_write(error):
+                    raise
+                print(
+                    f"{state['id']}: the record moved while starring {repository}; "
+                    "the next pass will record it",
+                )
+                continue
             print(f"Starred and verified {repository} as {ARCHIVE_USER}.")
         except Exception as error:
             failures += 1

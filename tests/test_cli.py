@@ -4821,3 +4821,66 @@ class QueueSweepFailureTests(unittest.TestCase):
             mock.patch.object(cli, "state_json", return_value={**derived, "_blob_sha": "x"}),
         ):
             self.assertEqual(cli.rebuild_queue(SimpleNamespace()), 0)
+
+
+class StarRaceTests(unittest.TestCase):
+    """A star that lost a race is retried, not reported as a failure.
+
+    The first record registered through the agent path marked its whole run
+    red. Nothing had gone wrong: registration wrote the record, GitHub's
+    contents API served the star step the blob from before that write, and the
+    conditional write correctly refused a stale copy. The next pass recorded
+    the star two minutes later.
+
+    A workflow that goes red when it has recovered on its own teaches people to
+    ignore it going red, and this is the workflow that registers records.
+    """
+
+    def one_pending(self):
+        return {
+            "id": "a1b2c3d4e5f6",
+            "registered_entry": "PALOMAR-2026-08-01-000001",
+            "registration_attempt": {"source_repository": "example/project"},
+            "_blob_sha": "the-sha-this-pass-read",
+        }
+
+    def run_with(self, error):
+        state = self.one_pending()
+        with (
+            mock.patch.object(cli, "open_index", return_value={"open": [state["id"]]}),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "validate_archive_token"),
+            mock.patch.object(cli, "ensure_repository_star"),
+            mock.patch.object(cli, "put_state", side_effect=error),
+            mock.patch.object(cli, "utc_now", return_value="2026-08-01T13:01:00Z"),
+        ):
+            return cli.star_registered_sources(SimpleNamespace(dry_run=False))
+
+    def test_a_record_that_moved_underneath_is_not_a_failure(self):
+        stale = ReviewerError(
+            "gh api --method failed (1): gh: submissions/a1b2c3d4e5f6/state.json "
+            "does not match 48d22f29c0afd7cdb573a08df31fc77ace734c15 (HTTP 409)"
+        )
+        self.assertEqual(self.run_with(stale), 0)
+
+    def test_anything_that_will_not_fix_itself_still_fails(self):
+        # A revoked token or a vanished repository is failing on the next pass
+        # too, and a run that stays green through it says nothing useful.
+        self.assertEqual(self.run_with(ReviewerError("HTTP 401: Bad credentials")), 1)
+        self.assertEqual(self.run_with(ReviewerError("HTTP 404: Not Found")), 1)
+
+    def test_only_the_write_has_a_retriable_conflict(self):
+        # A 409 from starring is not the same event and must not be swallowed
+        # just because it shares a status code: nothing was applied, and the
+        # next pass has no more reason to succeed than this one did.
+        state = self.one_pending()
+        with (
+            mock.patch.object(cli, "open_index", return_value={"open": [state["id"]]}),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "validate_archive_token"),
+            mock.patch.object(cli, "ensure_repository_star",
+                              side_effect=ReviewerError("HTTP 409: starring refused")),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            self.assertEqual(cli.star_registered_sources(SimpleNamespace(dry_run=False)), 1)
+        put_state.assert_not_called()
