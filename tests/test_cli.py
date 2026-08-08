@@ -5700,3 +5700,278 @@ class StarRaceTests(unittest.TestCase):
             self.assertEqual(cli.star_registered_sources(SimpleNamespace(dry_run=False)), 1)
         put_state.assert_not_called()
 
+
+
+class EndorserIndexTests(unittest.TestCase):
+    """Who the submission server may count as already trusted.
+
+    The file is derived from the records, so the two things that matter are
+    that it says what the records say, and that the half of it nothing here
+    derives, the hand-written `allowed` list, survives every path that
+    touches the file. Losing that list is not a bookkeeping error: with the
+    endorsement rule on it is what stops the registry refusing everybody.
+    """
+
+    def record(self, login="trusted", identifier=77, **fields):
+        return {
+            "id": "aaaaaaaaaaaa",
+            "status": "registered",
+            "submitter": login,
+            "push_proof": {"principal": {"login": login, "id": identifier}},
+            **fields,
+        }
+
+    @contextlib.contextmanager
+    def endorsers(self, stored, stored_sha="sha-on-disk"):
+        written = []
+        with (
+            mock.patch.object(cli, "state_json", return_value=stored),
+            mock.patch.object(cli, "_state_blob_sha", return_value=stored_sha),
+            mock.patch.object(cli, "put_state",
+                              side_effect=lambda *args, **kw: written.append((args, kw))),
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+        ):
+            yield written
+
+    def test_a_registration_adds_the_submitter_and_the_entry_they_registered(self):
+        with self.endorsers(None, stored_sha=None) as written:
+            cli.record_endorser(self.record(), "PALOMAR-2026-08-07-000001-v1")
+        (path, value, _), keywords = written[0]
+        self.assertEqual(path, cli.ENDORSERS_PATH)
+        self.assertEqual(
+            value["registered"],
+            [{"login": "trusted", "id": 77, "entries": ["PALOMAR-2026-08-07-000001-v1"]}],
+        )
+        self.assertEqual(value["allowed"], [])
+
+    def test_a_second_registration_is_another_entry_and_not_another_person(self):
+        stored = {
+            "schema_version": 1,
+            "allowed": [{"login": "early-reader"}],
+            "registered": [
+                {"login": "trusted", "id": 77, "entries": ["PALOMAR-2026-08-07-000001-v1"]}
+            ],
+            "_blob_sha": "sha-on-disk",
+        }
+        with self.endorsers(stored) as written:
+            cli.record_endorser(self.record(), "PALOMAR-2026-08-08-000002-v1")
+        (_, value, _), keywords = written[0]
+        self.assertEqual(len(value["registered"]), 1)
+        self.assertEqual(
+            value["registered"][0]["entries"],
+            ["PALOMAR-2026-08-07-000001-v1", "PALOMAR-2026-08-08-000002-v1"],
+        )
+        # The hand-written half is carried through untouched, and the write is
+        # conditional on the sha it was read at.
+        self.assertEqual(value["allowed"], [{"login": "early-reader"}])
+        self.assertEqual(keywords["blob_sha"], "sha-on-disk")
+
+    def test_an_endorser_who_has_been_renamed_keeps_one_row(self):
+        """The id is what identifies them. Two rows would be one person twice,
+        and the abandoned login is a name somebody else may now hold."""
+        stored = {
+            "schema_version": 1,
+            "allowed": [],
+            "registered": [
+                {"login": "old-name", "id": 77, "entries": ["PALOMAR-2026-08-07-000001-v1"]}
+            ],
+            "_blob_sha": "sha-on-disk",
+        }
+        with self.endorsers(stored) as written:
+            cli.record_endorser(
+                self.record(login="new-name"), "PALOMAR-2026-08-08-000002-v1"
+            )
+        (_, value, _), _ = written[0]
+        self.assertEqual(len(value["registered"]), 1)
+        self.assertEqual(value["registered"][0]["login"], "new-name")
+
+    def test_a_file_that_cannot_be_read_is_left_alone(self):
+        """Absent and unreadable are not the same. Writing a fresh file over an
+        unreadable one drops the `allowed` list, which nothing can rebuild."""
+        with self.endorsers(None, stored_sha="sha-on-disk") as written:
+            cli.record_endorser(self.record(), "PALOMAR-2026-08-07-000001-v1")
+        self.assertEqual(written, [])
+
+    def test_a_refused_write_does_not_fail_the_registration(self):
+        """The registration is already true and already recorded. This file is
+        derived, and the sweep will catch it."""
+        with (
+            mock.patch.object(cli, "state_json", return_value=None),
+            mock.patch.object(cli, "_state_blob_sha", return_value=None),
+            mock.patch.object(cli, "put_state", side_effect=ReviewerError("HTTP 409")),
+        ):
+            cli.record_endorser(self.record(), "PALOMAR-2026-08-07-000001-v1")
+
+    def test_a_record_naming_nobody_adds_nobody(self):
+        with self.endorsers(None, stored_sha=None) as written:
+            cli.record_endorser({"id": "aaaaaaaaaaaa", "status": "registered"}, "x-v1")
+        self.assertEqual(written, [])
+
+    @contextlib.contextmanager
+    def rebuild(self, records, takedowns, stored=None):
+        written = []
+
+        def fake_run(command, **kwargs):
+            if "clone" in command:
+                destination = Path(command[-1])
+                for name, record in records.items():
+                    directory = destination / "submissions" / name
+                    directory.mkdir(parents=True)
+                    if record is not None:
+                        (directory / "state.json").write_text(json.dumps(record))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(cli, "run", side_effect=fake_run),
+            mock.patch.object(cli, "registry_git_environment", return_value={}),
+            mock.patch.object(cli, "gh", return_value=json.dumps(takedowns)),
+            mock.patch.object(cli, "state_json", return_value=stored),
+            mock.patch.object(cli, "_state_blob_sha", return_value="sha-on-disk"),
+            mock.patch.object(cli, "put_state",
+                              side_effect=lambda *args, **kw: written.append((args, kw))),
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+        ):
+            yield written
+
+    def test_a_rebuild_counts_registered_results_and_nothing_else(self):
+        records = {
+            "aaaaaaaaaaaa": self.record(
+                login="trusted", identifier=77,
+                registered_entry="PALOMAR-2026-08-07-000001-v1",
+            ),
+            # Reviewed, consented to, and never registered.
+            "bbbbbbbbbbbb": self.record(
+                login="hopeful", identifier=78, status="review-ready",
+            ),
+            # Registered by the same person on a second result.
+            "cccccccccccc": self.record(
+                login="trusted", identifier=77,
+                registered_entry="PALOMAR-2026-08-08-000002-v1",
+            ),
+        }
+        with self.rebuild(records, {"schema_version": 1, "takedowns": []}) as written:
+            self.assertEqual(cli.rebuild_endorsers(SimpleNamespace(dry_run=False)), 0)
+        (_, value, _), _ = written[0]
+        self.assertEqual(
+            value["registered"],
+            [{
+                "login": "trusted", "id": 77,
+                "entries": ["PALOMAR-2026-08-07-000001-v1", "PALOMAR-2026-08-08-000002-v1"],
+            }],
+        )
+
+    def test_a_taken_down_result_stops_counting(self):
+        """The registry's only retraction lives in the database repository and
+        nothing propagates it back here: the record still reads `registered`.
+        This sweep is the only thing that ever notices."""
+        records = {
+            "aaaaaaaaaaaa": self.record(
+                login="trusted", identifier=77,
+                registered_entry="PALOMAR-2026-08-07-000001-v1",
+            ),
+            "bbbbbbbbbbbb": self.record(
+                login="still-here", identifier=78,
+                registered_entry="PALOMAR-2026-08-08-000002-v1",
+            ),
+        }
+        taken_down = {
+            "schema_version": 1,
+            "takedowns": [{
+                "id": "PALOMAR-2026-08-07-000001", "version": 1,
+                "taken_down_at": "2026-08-08T00:00:00Z", "reason": "because",
+            }],
+        }
+        with self.rebuild(records, taken_down) as written:
+            cli.rebuild_endorsers(SimpleNamespace(dry_run=False))
+        (_, value, _), _ = written[0]
+        self.assertEqual([row["login"] for row in value["registered"]], ["still-here"])
+
+    def test_a_rebuild_keeps_the_hand_written_list_exactly(self):
+        stored = {
+            "schema_version": 1,
+            "allowed": [{"login": "early-reader", "note": "asked to look before launch"}],
+            "registered": [{"login": "gone", "id": 1, "entries": ["PALOMAR-2026-01-01-000001-v1"]}],
+            "_blob_sha": "sha-on-disk",
+        }
+        with self.rebuild({}, {"schema_version": 1, "takedowns": []}, stored=stored) as written:
+            cli.rebuild_endorsers(SimpleNamespace(dry_run=False))
+        (_, value, _), keywords = written[0]
+        self.assertEqual(value["allowed"], stored["allowed"])
+        # Derived from nothing, so it says nothing: the row that was there is
+        # not backed by any record.
+        self.assertEqual(value["registered"], [])
+        self.assertEqual(keywords["blob_sha"], "sha-on-disk")
+
+    def test_a_rebuild_that_cannot_read_the_takedowns_writes_nothing(self):
+        """Treating an unreadable manifest as an empty one would silently give
+        back the endorsing power of everybody whose result was withdrawn."""
+        for answer in ("not json at all", json.dumps({"schema_version": 99, "takedowns": []})):
+            with self.subTest(answer[:20]):
+                with (
+                    mock.patch.object(cli, "gh", return_value=answer),
+                    mock.patch.object(cli, "put_state") as put_state,
+                ):
+                    with self.assertRaises((ReviewerError, ValueError)):
+                        cli.rebuild_endorsers(SimpleNamespace(dry_run=False))
+                put_state.assert_not_called()
+
+    def test_a_dry_run_writes_nothing(self):
+        with self.rebuild({}, {"schema_version": 1, "takedowns": []}) as written:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.rebuild_endorsers(SimpleNamespace(dry_run=True))
+        self.assertEqual(written, [])
+
+
+class FinalizeEndorserTests(unittest.TestCase):
+    """A registration is what makes somebody an endorser, so `finalize` is the
+    one place that can say so, and it has to say it after the fact rather than
+    on the strength of a merged pull request it has not yet checked."""
+
+    ENTRY = {
+        "id": "PALOMAR-2026-08-07-000001",
+        "version": 1,
+        "status": "accepted",
+        "submission": {"submission_id": "aaaaaaaaaaaa"},
+    }
+    PR = {
+        "state": "MERGED",
+        "mergeCommit": {"oid": "f" * 40},
+        "files": [{"path": "entries/PALOMAR-2026-08-07-000001-v1.json"}],
+        "url": "https://github.com/x/y/pull/1",
+    }
+
+    @contextlib.contextmanager
+    def finalizing(self, pr=None):
+        answers = [json.dumps(pr if pr is not None else self.PR), json.dumps(self.ENTRY)]
+        state = {"id": "aaaaaaaaaaaa", "status": "review-ready"}
+        with (
+            mock.patch.object(cli, "gh", side_effect=answers),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "advance_state",
+                              side_effect=lambda record, status, note, **fields:
+                              {**record, "status": status, **fields}),
+            mock.patch.object(cli, "record_endorser") as recorded,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            yield recorded
+
+    def test_finalizing_a_registration_records_the_endorser(self):
+        with self.finalizing() as recorded:
+            cli.finalize(SimpleNamespace(submission="aaaaaaaaaaaa", pr=1, dry_run=False))
+        record, entry = recorded.call_args.args
+        self.assertEqual(entry, "PALOMAR-2026-08-07-000001-v1")
+        # The record as it stands after the transition, so what is recorded is
+        # a submitter who is registered rather than one who is about to be.
+        self.assertEqual(record["status"], "registered")
+        self.assertEqual(record["registered_entry"], entry)
+
+    def test_a_dry_run_makes_nobody_an_endorser(self):
+        with self.finalizing() as recorded:
+            cli.finalize(SimpleNamespace(submission="aaaaaaaaaaaa", pr=1, dry_run=True))
+        recorded.assert_not_called()
+
+    def test_an_unmerged_registration_makes_nobody_an_endorser(self):
+        with self.finalizing(pr={**self.PR, "state": "OPEN"}) as recorded:
+            with self.assertRaises(ReviewerError):
+                cli.finalize(SimpleNamespace(submission="aaaaaaaaaaaa", pr=1, dry_run=False))
+        recorded.assert_not_called()

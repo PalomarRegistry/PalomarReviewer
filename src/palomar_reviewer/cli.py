@@ -87,6 +87,23 @@ OPEN_INDEX_SCHEMA_VERSION = 1
 # own schedule rather than falling out of whichever pass happens to cross the
 # window.
 OPEN_INDEX_REBUILD_SECONDS = 7 * 24 * 3600
+# Who the submission server counts as already trusted, for the rule that a
+# repository may only be submitted if somebody like that has been near it:
+# starred it, forked it, raised an issue or a pull request, commented, or
+# committed. `PalomarServer/src/endorsement.js` reads this file and nothing
+# else, and only when that deployment is configured to ask.
+#
+# Two lists, because they answer different questions. `registered` is derived
+# from the records and is this end's business to keep right. `allowed` is
+# maintained by hand and is never written here: it is how somebody counts
+# before they have registered anything, which is the only way the rule can be
+# switched on at all. With `registered` empty it refuses everybody, including
+# the people whose submissions would have filled it in.
+ENDORSERS_PATH = "index/endorsers.json"
+ENDORSERS_SCHEMA_VERSION = 1
+REGISTERED_ENTRY_RE = re.compile(
+    r"(?P<id>PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})-v(?P<version>[0-9]+)\Z"
+)
 # Statuses the reviewer will never act on again. A registered submission is
 # absent because it is not finished at that point: the accepted source is
 # starred afterwards, as a separate step that may fail and be retried.
@@ -2713,6 +2730,214 @@ def rebuild_queue(_: argparse.Namespace) -> int:
     return 0
 
 
+def endorser_of(record: dict[str, Any]) -> dict[str, Any] | None:
+    """The account a registered submission makes an endorser, if it names one.
+
+    The proof's principal rather than `submitter`. They are the same login
+    today, and the principal is the half that was actually attested and the
+    half that carries a numeric id. The id is what survives a rename, and a
+    login released and taken by somebody else is a different person with the
+    same name, which for this file would mean a stranger's star answering the
+    question on somebody else's behalf.
+    """
+    principal = (record.get("push_proof") or {}).get("principal") or {}
+    login = principal.get("login") or record.get("submitter")
+    identifier = principal.get("id")
+    row: dict[str, Any] = {}
+    if isinstance(login, str) and login:
+        row["login"] = login
+    if isinstance(identifier, int):
+        row["id"] = identifier
+    return row or None
+
+
+def _endorser_key(row: dict[str, Any]) -> tuple[str, Any]:
+    """Two rows are the same person if the ids match, or the logins do."""
+    if isinstance(row.get("id"), int):
+        return ("id", row["id"])
+    return ("login", str(row.get("login", "")).lower())
+
+
+def _merge_endorser(
+    rows: list[dict[str, Any]], addition: dict[str, Any], entry: str
+) -> list[dict[str, Any]]:
+    """This person's row, with one more registered entry against it."""
+    merged = [dict(row) for row in rows if isinstance(row, dict)]
+    key = _endorser_key(addition)
+    for row in merged:
+        if _endorser_key(row) != key:
+            continue
+        # A rename is recorded rather than duplicated: the id matched, so this
+        # is the same account under a name it has since changed.
+        row.update({k: v for k, v in addition.items() if v is not None})
+        entries = [item for item in row.get("entries", []) if isinstance(item, str)]
+        row["entries"] = sorted({*entries, entry})
+        return merged
+    merged.append({**addition, "entries": [entry]})
+    # Sorted by login so a diff of this file reads as a list of people rather
+    # than as an append log.
+    return sorted(merged, key=lambda row: str(row.get("login", "")).lower())
+
+
+def record_endorser(record: dict[str, Any], entry: str) -> None:
+    """Note that this submitter has registered a result, so their star counts.
+
+    Never fatal. The registration is already true and already recorded; this
+    file is derived from the records, so the worst a failure here costs is that
+    one person's engagement does not count until `rebuild-endorsers` next runs.
+    Failing `finalize` over it would turn a bookkeeping problem into a
+    half-finished registration, which is the more expensive thing to be wrong.
+    """
+    addition = endorser_of(record)
+    if addition is None:
+        print("warning: the registered record names no submitter; endorsers unchanged")
+        return
+    current = state_json(ENDORSERS_PATH)
+    if current is None:
+        # Absent or unreadable, and the two are not the same. Writing a fresh
+        # file over one that is merely unreadable would drop the hand-written
+        # `allowed` list, which is the half nothing here can reconstruct.
+        blob_sha = _state_blob_sha(ENDORSERS_PATH)
+        if blob_sha:
+            print(f"warning: {ENDORSERS_PATH} could not be read; endorsers unchanged")
+            return
+        current = {"schema_version": ENDORSERS_SCHEMA_VERSION, "allowed": [], "registered": []}
+    registered = current.get("registered")
+    updated = {
+        **{k: v for k, v in current.items() if k != "_blob_sha"},
+        "schema_version": ENDORSERS_SCHEMA_VERSION,
+        "allowed": current.get("allowed") if isinstance(current.get("allowed"), list) else [],
+        "registered": _merge_endorser(
+            registered if isinstance(registered, list) else [], addition, entry
+        ),
+    }
+    try:
+        put_state(
+            ENDORSERS_PATH,
+            updated,
+            f"Record {addition.get('login') or addition.get('id')} as an endorser ({entry})",
+            blob_sha=current.get("_blob_sha"),
+        )
+    except ReviewerError as error:
+        print(f"warning: the endorser index was not updated: {error}")
+        return
+    print(f"Recorded {addition.get('login') or addition.get('id')} in {ENDORSERS_PATH}.")
+
+
+def taken_down_entries() -> set[tuple[str, int]]:
+    """Every `(id, version)` the database no longer serves.
+
+    Read rather than assumed. A takedown is the registry's only retraction, it
+    lives in the database repository, and nothing propagates it back to the
+    private record, and a taken-down result still reads as `registered` here. So a
+    rebuild that could not read this manifest would quietly restore the
+    endorsing power of everybody whose result was withdrawn, which is exactly
+    the thing a takedown is for. It raises instead.
+    """
+    raw = gh(
+        [
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw+json",
+            f"repos/{DATABASE_REPO}/contents/takedowns.json",
+        ]
+    )
+    value = json.loads(raw)
+    rows = value.get("takedowns")
+    if value.get("schema_version") != 1 or not isinstance(rows, list):
+        raise ReviewerError("takedowns.json is not a manifest this understands")
+    return {
+        (row["id"], int(row["version"]))
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+    }
+
+
+def rebuild_endorsers(args: argparse.Namespace) -> int:
+    """Derive the endorser set from every record and every takedown.
+
+    The sweep to `record_endorser`'s per-event write, for the same reasons
+    `rebuild-queue` is the sweep to a pass dropping one id. It catches what an
+    incrementally maintained file cannot: a registration whose write of this
+    file failed, and, the one that actually matters, a result taken down
+    since. Nothing tells this end that a takedown happened, so until this runs
+    the person behind a withdrawn result is still letting repositories in.
+
+    `allowed` is copied through untouched. It is the hand-written half and
+    nothing here is entitled to an opinion about it.
+    """
+    taken_down = taken_down_entries()
+    rows: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="palomar-state-") as work:
+        checkout = Path(work) / "state"
+        run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "clone",
+                "--depth=1",
+                "--quiet",
+                f"https://github.com/{STATE_REPO}.git",
+                str(checkout),
+            ],
+            env=registry_git_environment(),
+        )
+        for directory in sorted((checkout / "submissions").glob("*")):
+            if not SUBMISSION_ID_RE.fullmatch(directory.name):
+                continue
+            try:
+                record = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # Unlike the queue rebuild, an unreadable record is skipped
+                # rather than kept. The queue errs towards holding an id it
+                # cannot read, because dropping one loses a submission; this
+                # errs towards leaving somebody out, because inventing an
+                # endorser from a record nobody could parse is the failure that
+                # would not be noticed.
+                print(f"warning: {directory.name} could not be read; not counted")
+                continue
+            if record.get("status") != "registered":
+                continue
+            match = REGISTERED_ENTRY_RE.fullmatch(str(record.get("registered_entry", "")))
+            if not match:
+                print(f"warning: {directory.name} is registered but names no entry; not counted")
+                continue
+            if (match["id"], int(match["version"])) in taken_down:
+                continue
+            person = endorser_of(record)
+            if person is None:
+                continue
+            rows = _merge_endorser(rows, person, match[0])
+
+    current = state_json(ENDORSERS_PATH)
+    allowed = (current or {}).get("allowed")
+    index = {
+        "schema_version": ENDORSERS_SCHEMA_VERSION,
+        "rebuilt_at": utc_now(),
+        "allowed": allowed if isinstance(allowed, list) else [],
+        "registered": rows,
+    }
+    print(
+        f"{len(rows)} endorser(s) from registered results, "
+        f"{len(index['allowed'])} allowed by hand, "
+        f"{len(taken_down)} taken-down version(s) excluded"
+    )
+    if args.dry_run:
+        print(json.dumps(index, indent=2))
+        return 0
+    if current is not None and current.get("registered") == rows and current.get("allowed") == index["allowed"]:
+        print("the endorser index already says this; nothing written")
+        return 0
+    put_state(
+        ENDORSERS_PATH,
+        index,
+        "Rebuild the endorser index",
+        blob_sha=(current or {}).get("_blob_sha") or _state_blob_sha(ENDORSERS_PATH),
+    )
+    return 0
+
+
 def open_submissions() -> list[dict[str, Any]]:
     """Every submission record the reviewer may still have work for.
 
@@ -5078,7 +5303,7 @@ def finalize(args: argparse.Namespace) -> int:
     state = submission_state(args.submission)
     if state is None:
         raise ReviewerError(f"submission {args.submission} has no record in {STATE_REPO}")
-    advance_state(
+    registered = advance_state(
         state,
         "registered",
         f"Registered as {record['id']} version {record['version']}",
@@ -5086,6 +5311,9 @@ def finalize(args: argparse.Namespace) -> int:
         registered_url=website_url,
     )
     print("Recorded the registration against the private submission record.")
+    # After the registration and never before it: the whole claim this file
+    # makes about somebody is that they have registered a result.
+    record_endorser(registered, f"{record['id']}-v{record['version']}")
     return 0
 
 
@@ -5683,6 +5911,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="derive the open-submission index from every record and record it",
     )
     rebuild_parser.set_defaults(func=rebuild_queue)
+    endorsers_parser = commands.add_parser(
+        "rebuild-endorsers",
+        help="derive the endorser index from every registered result, less takedowns",
+    )
+    endorsers_parser.add_argument("--dry-run", action="store_true")
+    endorsers_parser.set_defaults(func=rebuild_endorsers)
     return parser
 
 
