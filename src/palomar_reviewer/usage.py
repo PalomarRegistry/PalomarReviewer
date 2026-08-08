@@ -1,15 +1,13 @@
 """Normalize and price review-engine usage evidence.
 
-This module owns the durable spend-document boundary. It receives engine event
-text, model identity inputs, pass evidence, and an explicit measurement time;
-it performs no filesystem, subprocess, network, or state-repository work. The
-CLI remains responsible for collecting the evidence and persisting the result.
+This module owns the durable spend-document boundary. It receives model
+identity, engine event text, pass evidence, and an explicit measurement time;
+it performs no filesystem, subprocess, network, clock, or state-repository work.
 """
 
 from __future__ import annotations
 
 import json
-import shlex
 from typing import Any
 
 # The one model production runs, at the provider's current USD prices per
@@ -28,17 +26,6 @@ CODEX_REQUIRED_USAGE_KEYS = (
     "output_tokens",
     "reasoning_output_tokens",
 )
-
-
-def reviewer_model(engine: str, model: str | None, command: str | None) -> str:
-    """Return the durable identity for the configured review engine."""
-    if engine == "command":
-        # Keep the identity's executable identical to the argv that the CLI
-        # executes, including a quoted path. Malformed shell syntax fails here
-        # just as it does at execution rather than recording another command.
-        parts = shlex.split(command or "")
-        return f"command:{parts[0] if parts else 'unknown'}"
-    return f"{engine}:{model or 'default'}"
 
 
 def usage_problem(usage: Any) -> str | None:
