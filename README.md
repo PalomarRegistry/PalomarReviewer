@@ -40,7 +40,10 @@ palomar-review doctor
 
 `gh` must be authenticated as an account with access to the private
 `PalomarSubmissionState` and private `PalomarDatabase` repositories. `doctor`
-checks both API visibility and an authenticated Git read of the database.
+checks API visibility and an authenticated Git read of the database, and the
+archive token's identity. It does not check `PalomarSubmissionState`, so a
+credential that can read the database and not the state repository passes it and
+fails on the first pass instead.
 Registration passes the short-lived `gh auth token` to Git through an
 environment-only HTTP header, never a command-line argument; the same identity
 must be able to push registration branches and open pull requests. Anything
@@ -140,7 +143,8 @@ palomar-review register --submission a1b2c3d4e5f6
 ```
 
 `register` authorises first, before anything public happens. It requires the
-private record to hold a delivered review, to show proved write access, to name
+private record to hold a delivered review, to say how push access was proved and
+not merely that it was, to name
 no previous registration, to carry the submitter's consent, and for the digest
 delivered, the digest consented to, and the review about to be archived to be
 the same bytes. Only then does it dispatch the pinned Challenge renderer, which
@@ -165,18 +169,33 @@ transferred since verification, the reviewer uses GitHub's returned canonical
 name for archive operations while retaining the submitted location in the
 preservation receipt.
 
-The generated record and render bundle are then validated against the database
-schema. It archives the exact mechanical-report
+The generated record is then validated against `schema-v2.json`, and the scores
+that decided it against `scores-v1.json`. The scores go beside the record, in
+`scores/<id>-vN.json`, and not inside it. There is one record schema again
+because of that: while the publisher stripped the scores on the way out, a
+published record's bytes were a function of publisher code rather than of the
+commit, so the contract the record was built against and the schema of the data
+served were two documents, and a record could satisfy one and fail the other.
+The render bundle is checked by the reviewer's own render validation and then by
+the database's `tools/validate.py`. It archives the exact mechanical-report
 bytes, the normalized run and job provenance, and the review itself in one
 content-addressed evidence bundle together with `source-archive.json`, so a
 single tree hash covers everything justifying the record; raw Actions logs are
 deliberately not retained. It pushes a branch to
 `PalomarRegistry/PalomarDatabase` and opens a PR.
 
-The automatic finalizer reads GitHub's aggregate mergeability state and merges
-only when it is `CLEAN`; pending or failed database checks remain `UNSTABLE`.
-This avoids granting the reviewer separate access to individual check-run
-details while preserving the all-green publication gate.
+The automatic finalizer merges only when GitHub reports the change `CLEAN` and
+the database's own `validate.yml` run for that exact head commit completed
+successfully. `CLEAN` alone is not enough and was believed for a while: the
+database has no enforced branch protection, so there are no required checks for
+GitHub to withhold `CLEAN` over, and it says `CLEAN` in the seconds after the
+change is opened, before Actions has started anything. Merging on it alone
+registers a record whose validation had not run. The outcome is read from the
+Actions API rather than from the pull request's check rollup, because reading
+that rollup needs a permission fine-grained tokens do not offer under any name;
+the reviewer credential therefore needs `Actions: read` on `PalomarDatabase`. A
+validation the credential cannot see is never a reason to merge, and the merge
+itself is pinned with `--match-head-commit`.
 
 `PalomarArchive` and its `PalomarArchivist` machine account are operator-created
 GitHub resources; the workflow does not sign up an account. Add the account as
