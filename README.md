@@ -126,7 +126,8 @@ cannot override a failed pass, and every completed evidence score
 must meet the policy's acceptance minimum. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
 substantive judgments is not separately confirmed. The complete packet is
-retained so a reader can check that afterwards.
+available for the guaranteed 24-hour post-delivery audit window so a reader can
+inspect those judgments during that window.
 
 Rubric version 7 additionally rejects a substantive pass unless its
 `declarations_checked` manifest exactly matches every theorem and definition in
@@ -166,7 +167,7 @@ that still matches the trusted inputs it was produced from.
 
 ## Review usage accounting
 
-Each rubric pass retains the engine's `turn.completed` usage evidence under
+Each rubric pass records the engine's `turn.completed` usage evidence under
 `spend.json` and, when the review is delivered, in the private submission
 record. A Codex completed turn is an aggregate across the model requests made
 while the agent handles that pass; it is not request-level usage. The record
@@ -200,10 +201,11 @@ reviewer preserves the Codex usage object rather than inventing a stronger
 cache-read/cache-write distinction.
 
 Existing pre-launch usage records are schema v1 and carry only a null `usd`
-placeholder. They remain readable in the cumulative private history. New
-records use schema v2, retain the raw per-turn aggregates and evidence status,
-and contain no top-level aggregate or vendor-dollar field. Current dollar
-figures are only an operator-facing run summary when the evidence is sufficient.
+placeholder. The reviewer can still read them when they are present in the
+cumulative private history. New records use schema v2 and contain the raw
+per-turn aggregates and evidence status, with no top-level aggregate or
+vendor-dollar field. Current dollar figures are only an operator-facing run
+summary when the evidence is sufficient.
 
 ## Registration
 
@@ -386,7 +388,9 @@ registered.
 
 ## Audit trail
 
-Each review directory retains:
+Palomar guarantees retention of the private review and its audit material for
+24 hours after the review is delivered. During that window, each review
+directory contains:
 
 ```text
 state.json                     # the private submission record under review
@@ -410,7 +414,8 @@ Raw session histories remain controlled by the chosen engine. Palomar records
 the final messages, turn-aggregate usage evidence, model identifier, policy
 commit, source commit, and the review itself. Reviews are private, not confidential:
 they are readable by Palomar operators, by GitHub, and by the model provider,
-and are retained indefinitely so that any decision can be audited.
+and may remain available operationally after the guaranteed 24-hour window.
+Palomar makes no retention or availability promise after that window.
 
 Submission metadata, Lean source, comments and identifiers, README text, the
 submitter's notes, and prior model results may contain prompt-injection
@@ -418,4 +423,4 @@ attempts. The reviewer puts them in hashed JSON evidence envelopes, repeats the
 binding instruction after all evidence, runs engines without write or shell
 tools, and validates strict output schemas. These controls reduce accidental
 instruction following. The retained packet above lets a reader audit any
-decision after the fact.
+decision during the guaranteed window.
