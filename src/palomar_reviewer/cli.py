@@ -869,11 +869,13 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
     well would spread it rather than report it.
 
     Read it as a backstop and not as containment. It catches the credential
-    written out plainly, which is what an injection that works at all produces
-    first, and it does not catch one that base64s the key, reverses it, spells
-    it across two findings or writes it in homoglyphs. No amount of pattern
-    work here would. What keeps the key in is the namespace around it; this
-    only makes sure that the easy way out is also a loud one.
+    written out plainly, and it does not catch one that base64s the key,
+    reverses it, spells it across two findings, writes it in homoglyphs or uses
+    another channel. No amount of pattern work here would. The namespace hides
+    other host credentials and makes the workspace read-only, but it shares
+    the network and deliberately exposes this credential to the engine. The
+    planned broker boundary, which does not exist yet, must keep the provider
+    credential outside the namespace.
     """
     key = os.environ.get("OPENAI_API_KEY", "").strip().encode("utf-8")
     for text in _strings_in(document):
@@ -3303,9 +3305,11 @@ def engine_credential_file(api_key: str) -> Path:
 
     None of which keeps the key from the model. It cannot: the engine has to
     read this file, and the read-only sandbox the engine runs under is
-    read-only about writing. What is kept from the model is every other
-    credential the host holds, and what watches the way out is
-    `refuse_engine_credential`, over everything the model writes.
+    read-only about writing. Every other host credential remains outside the
+    namespace. `refuse_engine_credential` checks what the model writes for a
+    plainly copied key, but it cannot stop an encoding or another channel. The
+    planned broker boundary will remove the provider key from this namespace;
+    it is not implemented here.
     """
     global _ENGINE_CREDENTIAL_DIR
     if _ENGINE_CREDENTIAL_DIR is None:
@@ -4217,14 +4221,14 @@ def allocate_identifier(registered_on: str, taken: set[str]) -> str:
     `review.reviewed_at`.
 
     A date on a Palomar identifier is a priority claim, so it has to be a date
-    the submitter cannot choose. Nothing is registered until they have read
-    their review and consented, and they may take as long as they like over
-    that. Taking the date from the review put the choice in their hands: a
-    submitter who wanted an earlier position had only to hold their consent,
-    and would then be registered under the older date, ahead of every result
-    that entered the registry while they were holding it. Waiting has to cost a
-    later position rather than buy an earlier one, and the only date that makes
-    it cost one is the date registration actually happens.
+    the submitter cannot choose. Nothing is registered until they consent.
+    Palomar guarantees an accepted offer for 24 hours after delivery; after
+    that it may expire the offer and require reverification, though an offer
+    may remain usable longer without a promise. Whenever registration happens,
+    taking the date from the review would let waiting buy an earlier position
+    ahead of results registered meanwhile. Waiting instead costs a later
+    position, because the identifier uses the date registration actually
+    happens.
 
     Fixed at first registration, and never recomputed after it. A later version
     reuses its v1's identifier and therefore its v1's date, because the

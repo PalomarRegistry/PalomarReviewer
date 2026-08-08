@@ -1630,11 +1630,11 @@ class ReviewerTests(unittest.TestCase):
         """Every ordering surface in the database reads `registered_at`.
 
         The review's verdict is a different moment and can be days earlier:
-        nothing is registered until the submitter has read their review and
-        consented, and they may take as long as they like over that. A record
-        dated by the review orders behind everything reviewed since, so a
-        submitter who waited can be registered and yet absent from the page of
-        what is new.
+        nothing is registered until the submitter consents. The accepted offer
+        is guaranteed for 24 hours and may remain usable longer without a
+        promise. Whenever registration happens, a record dated by the review
+        would let waiting buy an earlier position. A submitter who waited can
+        be registered and yet absent from the page of what is new.
         """
         record = self.example_record()
 
