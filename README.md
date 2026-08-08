@@ -234,7 +234,19 @@ taken from the review would therefore be a date the submitter could choose:
 holding consent back would have bought an earlier position, ahead of every
 result that entered the registry meanwhile. Waiting has to cost a later
 position instead. The record carries the review's own timestamp separately, as
-`review.reviewed_at`.
+`review.reviewed_at`, which nothing orders by.
+
+The record carries the moment of registration too, as `registered_at`, and the
+date in the identifier is the day of it. Both come from one reading of the
+clock, so a registration that starts a second before midnight cannot end up
+with an instant on one day and an identifier on another. Every ordering surface
+in the database reads `registered_at`: the landing page, the feeds and the
+subject pages. It is per version, because a v2 is a new registration and is
+news, where the result's date would file it among the results registered in the
+year of its v1. `accepted_at` stays the result's date and is inherited by every
+later version, because it is what the identifier carries and what the browse
+page is read from, and the database refuses a version 1 whose two dates
+disagree.
 
 The serial was drawn at random until 2026-08-07, to hide how many reservations
 never became records. What that cost was the ordering: with a random serial, the

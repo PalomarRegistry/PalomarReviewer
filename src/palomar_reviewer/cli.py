@@ -106,6 +106,9 @@ CLAIM_MARKER = "<!-- palomar-review-claim -->"
 WEB_URL = "https://palomar-registry.org"
 SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})")
+# The shape the database's schema gives an instant, which is what `utc_now`
+# emits and what a record's `registered_at` has to be.
+TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 MAX_CONTEXT_BYTES = 300_000
 _ENGINE_CREDENTIAL_DIR: Path | None = None
 CURRENT_RUBRIC_VERSION = 7
@@ -1000,18 +1003,21 @@ def validate_declaration_coverage(
 
 
 def utc_now() -> str:
+    """The one reading of the clock a registration takes.
+
+    UTC and not the operator's zone, because the identifier the day of this
+    goes into is permanent, and an unattended runner, an operator in Sydney and
+    an operator in Boston must all hand out the next serial for the same date
+    without stepping on one another.
+
+    There was a `utc_today` beside this, and a registration called both. Two
+    readings a moment apart can straddle midnight, which is a record whose
+    `registered_at` and `accepted_at` name different days -- the disagreement
+    the database now refuses. One reading, and the date is the day of it.
+    """
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def utc_today() -> str:
-    """Today's date in UTC, which is the date a registration starting now gets.
-
-    UTC and not the operator's zone, because the identifier this date goes into
-    is permanent and an unattended runner, an operator in Sydney and an
-    operator in Boston must all be able to hand out the next serial for the
-    same date without one of them stepping on another's.
-    """
-    return dt.datetime.now(dt.UTC).date().isoformat()
 
 
 def _is_date(value: str) -> bool:
@@ -4141,6 +4147,7 @@ def registry_record(
     review: dict[str, Any],
     metadata: dict[str, Any],
     accepted_at: str,
+    registered_at: str,
     version: int,
     challenge_render: dict[str, Any],
     verification_evidence: dict[str, Any],
@@ -4148,6 +4155,17 @@ def registry_record(
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", accepted_at):
         raise ReviewerError("review has no valid acceptance date")
+    # The database refuses a version 1 whose `accepted_at` is not the day it
+    # was registered, and it is right to: the identifier carries the one and
+    # every ordering surface reads the other. Checked here as well, because
+    # this is where both are written and a record that fails there has already
+    # cost an archive tag and a render run.
+    if not TIMESTAMP_RE.fullmatch(registered_at):
+        raise ReviewerError("registration has no valid registration instant")
+    if version == 1 and registered_at[:10] != accepted_at:
+        raise ReviewerError(
+            f"version 1 is dated {accepted_at} but was registered on {registered_at[:10]}"
+        )
     title = registry_title(metadata, state.get("title") or state["repository"])
     abstract = (
         metadata_value(
@@ -4214,6 +4232,15 @@ def registry_record(
         "schema_version": 2,
         "id": permanent_id,
         "accepted_at": accepted_at,
+        # The moment this version's registration happened, which is the moment
+        # the submitter's consent was acted on. Every ordering surface reads it
+        # and nothing else: `recent.json`, the feeds and the subject pages. It
+        # is per version because a v2 is a new registration and is news, where
+        # `accepted_at` would file it among the results registered in the year
+        # of its v1. It is not `review.reviewed_at`, which is when the verdict
+        # was reached and can be days earlier, because nothing is registered
+        # until the submitter has read their review and consented.
+        "registered_at": registered_at,
         "version": version,
         "status": "accepted",
         "title": str(title),
@@ -4326,23 +4353,31 @@ def registration_identity(
     submission_id: str,
     existing_id: object,
     reviewed_at: object,
+    registered_at: str,
     mechanical: dict[str, Any],
-    reserved: tuple[str, str, int] | None = None,
-) -> tuple[str, str, int]:
+    reserved: tuple[str, str, str, int] | None = None,
+) -> tuple[str, str, str, int]:
     """Resolve one submission to one permanent ID and its next append-only version.
+
+    The answer is the identifier, the result's date, the instant this version
+    was registered and the version number.
 
     A reserved identity was committed to private submission state before an
     earlier attempt made public side effects. It must be reused exactly: a
     retry must complete those archive refs, not allocate a second public ID.
-    That is why nothing here recomputes a reserved date. A registration that
-    began at 23:59 and is retried at 00:01 would otherwise resolve to a
-    different date, which is a different identifier, which is a second
-    permanent ID for one result and archive refs pointing at neither.
+    That is why nothing here recomputes a reserved date, and why `registered_at`
+    is handed in rather than read from the clock here -- the caller passes the
+    reserved instant back when there is one. A registration that began at 23:59
+    and is retried at 00:01 would otherwise resolve to a different date, which
+    is a different identifier, which is a second permanent ID for one result and
+    archive refs pointing at neither.
 
-    The date a first registration gets is today's, because that is when the
-    result enters the registry; an update gets the date its v1 got, because the
-    identifier and its date belong to the result rather than to any one version
-    of it. See `allocate_identifier` for why today's and not the review's.
+    The date a first registration gets is the day of `registered_at`, because
+    that is when the result enters the registry; an update gets the date its v1
+    got, because the identifier and its date belong to the result rather than to
+    any one version of it. See `allocate_identifier` for why that day and not
+    the review's. Both come from one reading of the clock, so the date the
+    identifier carries and the instant the record carries cannot disagree.
     """
     if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
         raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
@@ -4411,7 +4446,7 @@ def registration_identity(
                 f"update to {identifier} uses Comparator configuration {submitted_config}, "
                 f"not {current[5]}"
             )
-        resolved = (identifier, current[2], current[0] + 1)
+        resolved = (identifier, current[2], registered_at, current[0] + 1)
         if reserved is not None and reserved != resolved:
             raise ReviewerError("saved registration attempt disagrees with the requested update")
         return resolved
@@ -4429,16 +4464,21 @@ def registration_identity(
     except ValueError as error:
         raise ReviewerError("accepted review has no valid review date") from error
     if reserved is not None:
-        identifier, reserved_at, version = reserved
+        identifier, reserved_at, reserved_instant, version = reserved
         match = PALOMAR_ID_RE.fullmatch(identifier)
         # Checked for internal consistency and not against today. Comparing a
         # reserved date with today's would refuse exactly the retry the
         # reservation exists to make possible, because a registration long
-        # enough to fail is long enough to cross midnight.
+        # enough to fail is long enough to cross midnight. The instant has to
+        # agree with the date for the same reason the record's two dates do:
+        # the database refuses a v1 whose `accepted_at` is not the day it was
+        # registered, and a reservation is where the two are settled.
         if (
             match is None
             or match.group("date") != reserved_at
             or not _is_date(reserved_at)
+            or not TIMESTAMP_RE.fullmatch(str(reserved_instant))
+            or str(reserved_instant)[:10] != reserved_at
             or version != 1
         ):
             raise ReviewerError("saved registration attempt has an invalid permanent identity")
@@ -4447,8 +4487,8 @@ def registration_identity(
                 f"saved registration attempt {identifier} is already used by another submission"
             )
         return reserved
-    registered_on = utc_today()
-    return allocate_identifier(registered_on, set(by_id)), registered_on, 1
+    registered_on = registered_at[:10]
+    return allocate_identifier(registered_on, set(by_id)), registered_on, registered_at, 1
 
 
 def registration_attempt_identity(
@@ -4458,14 +4498,22 @@ def registration_attempt_identity(
     mechanical: dict[str, Any],
     review: dict[str, Any],
     dry_run: bool,
-) -> tuple[str, str, int]:
-    """Reserve one retry-stable identity before archive side effects begin."""
+) -> tuple[str, str, str, int]:
+    """Reserve one retry-stable identity before archive side effects begin.
+
+    The instant is part of the identity and is reserved with it. It is the
+    moment the submitter's consent was acted on, which is this moment: consent
+    is checked immediately before this runs, and nothing public has happened
+    yet. Recomputing it on a retry would move the day a v1 was registered off
+    the day its reserved identifier names, which is the disagreement the
+    database refuses.
+    """
     review_sha256 = review_digest(review)
     source_repository = mechanical["source"]["repository"]
     source_commit = mechanical["source"]["commit"]
     existing_id = mechanical.get("existing_id") or None
     attempt = state.get("registration_attempt")
-    reserved: tuple[str, str, int] | None = None
+    reserved: tuple[str, str, str, int] | None = None
 
     if attempt is not None:
         if not isinstance(attempt, dict) or attempt.get("schema_version") != 1:
@@ -4480,34 +4528,42 @@ def registration_attempt_identity(
             raise ReviewerError("saved registration attempt belongs to different accepted evidence")
         identifier = attempt.get("id")
         accepted_at = attempt.get("accepted_at")
+        registered_at = attempt.get("registered_at")
         version = attempt.get("version")
         if (
             not isinstance(identifier, str)
             or not isinstance(accepted_at, str)
+            or not isinstance(registered_at, str)
             or not isinstance(version, int)
             or isinstance(version, bool)
         ):
             raise ReviewerError("saved registration attempt has an invalid permanent identity")
-        reserved = (identifier, accepted_at, version)
+        reserved = (identifier, accepted_at, registered_at, version)
 
     resolved = registration_identity(
         database,
         submission_id=state["id"],
         existing_id=existing_id,
         reviewed_at=review.get("reviewed_at"),
+        # The reserved instant, or this one. Reading the clock again on a retry
+        # would date the record by when the retry happened rather than by when
+        # the consent was acted on, and for a first registration would move it
+        # off the day its reserved identifier names.
+        registered_at=reserved[2] if reserved is not None else utc_now(),
         mechanical=mechanical,
         reserved=reserved,
     )
     if attempt is not None or dry_run:
         return resolved
 
-    identifier, accepted_at, version = resolved
+    identifier, accepted_at, registered_at, version = resolved
     updated = dict(state)
     updated["registration_attempt"] = {
         "schema_version": 1,
         "id": identifier,
         "version": version,
         "accepted_at": accepted_at,
+        "registered_at": registered_at,
         "review_sha256": review_sha256,
         "source_repository": source_repository,
         "source_commit": source_commit,
@@ -4692,7 +4748,7 @@ def register(args: argparse.Namespace) -> int:
     if not scores_schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
 
-    permanent_id, accepted_at, version = registration_attempt_identity(
+    permanent_id, accepted_at, registered_at, version = registration_attempt_identity(
         database,
         state=state,
         mechanical=mechanical,
@@ -4749,6 +4805,7 @@ def register(args: argparse.Namespace) -> int:
         review=review,
         metadata=metadata,
         accepted_at=accepted_at,
+        registered_at=registered_at,
         version=version,
         challenge_render=challenge_render,
         verification_evidence=verification_evidence,
