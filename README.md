@@ -64,7 +64,11 @@ claude auth
 
 ```bash
 python -m unittest discover -s tests
+uv run --locked --only-group dev ruff check .
 ```
+
+The lint command uses the exact Ruff release and artifact hashes recorded in
+`uv.lock`; CI runs the same locked command.
 
 Some of what the suite checks is not in this repository, and it will tell you
 at the end of the run exactly what it therefore did not check:

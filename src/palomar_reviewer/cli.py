@@ -1962,7 +1962,9 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
             break
         time.sleep(5)
     if run_data is None:
-        raise ReviewerError("render workflow dispatch was not visible after five minutes; retry the registration")
+        raise ReviewerError(
+            "render workflow dispatch was not visible after five minutes; retry the registration"
+        )
     run_id = str(run_data["databaseId"])
     watched = run(
         ["gh", "run", "watch", run_id, "--repo", SUBMISSION_REPO, "--exit-status"],
@@ -5437,10 +5439,10 @@ def _stale_review(record: dict[str, Any], limit_seconds: int = 7200) -> bool:
     if not isinstance(started, str):
         return True
     try:
-        began = dt.datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        began = dt.datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
     except ValueError:
         return True
-    return (dt.datetime.now(dt.timezone.utc) - began).total_seconds() > limit_seconds
+    return (dt.datetime.now(dt.UTC) - began).total_seconds() > limit_seconds
 
 
 def _cooling_review(record: dict[str, Any]) -> bool:
@@ -5768,7 +5770,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="reasoning effort for engines that expose it (codex)",
     )
     run_parser.add_argument("--command")
-    run_parser.add_argument("--apply", action="store_true", help="deliver the inspected review privately to the submitter")
+    run_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="deliver the inspected review privately to the submitter",
+    )
     run_parser.set_defaults(func=run_review)
     register_parser = commands.add_parser("register", help="prepare a database PR from an accepted report")
     register_parser.add_argument("--submission", type=str, required=True)

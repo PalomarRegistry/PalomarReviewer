@@ -61,7 +61,6 @@ from palomar_reviewer.cli import (
     verify_repository_license,
 )
 
-
 # Some of what this suite checks is not in this repository: the schemas
 # PalomarDatabase serves, a PalomarDatabase checkout to register into, a
 # PalomarPolicy checkout to review against, and Bubblewrap. Each was reached
@@ -3823,7 +3822,7 @@ class AutomaticLoopTests(unittest.TestCase):
         )
 
     def test_a_review_already_running_is_not_started_again(self):
-        recent = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recent = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.assertEqual(
             self.split(self.row("aaaaaaaaaaaa", status="reviewing", review_started_at=recent)),
             [[], [], []],
@@ -3851,7 +3850,7 @@ class AutomaticLoopTests(unittest.TestCase):
         """Every pass reset the clock, so a failing review retried for ever:
         a review's worth of tokens each time, and a submitter told it was
         still running."""
-        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).strftime(
+        old = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=3)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         row = self.row("aaaaaaaaaaaa", status="reviewing", review_started_at=old,
@@ -3903,7 +3902,7 @@ class AutomaticLoopTests(unittest.TestCase):
 
     def test_a_review_whose_runner_died_is_picked_up_again(self):
         """Otherwise a submission stays marked as running for ever."""
-        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).strftime(
+        old = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=3)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         for started in (old, None, "not a timestamp"):
@@ -3943,7 +3942,11 @@ class AutomaticLoopTests(unittest.TestCase):
             listing, state,
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
-            mock.patch.object(cli, "run_review", side_effect=lambda a: seen.append((a.submission, a.apply)) or 0),
+            mock.patch.object(
+                cli,
+                "run_review",
+                side_effect=lambda a: seen.append((a.submission, a.apply)) or 0,
+            ),
         ):
             cli.auto(self.opts(max_reviews=2))
         # Two submissions, each dry-run then applied.
@@ -3984,8 +3987,10 @@ class AutomaticLoopTests(unittest.TestCase):
                     listing, state,
                     mock.patch.object(
                         cli, "gh",
-                        side_effect=lambda a, **k: calls.append(a) or json.dumps(
-                            {"state": "OPEN", "mergeStateStatus": merge_state}),
+                        side_effect=lambda a, calls=calls, merge_state=merge_state, **k: (
+                            calls.append(a)
+                            or json.dumps({"state": "OPEN", "mergeStateStatus": merge_state})
+                        ),
                     ),
                     mock.patch.object(cli, "finalize") as finalized,
                 ):
@@ -5868,7 +5873,13 @@ class RenderFailureTests(unittest.TestCase):
 
             def download(command):
                 target = Path(command[command.index("--dir") + 1])
-                self.report(target, ["verify_filesystem_confinement() got an unexpected keyword argument 'readable_paths'"])
+                self.report(
+                    target,
+                    [
+                        "verify_filesystem_confinement() got an unexpected keyword argument "
+                        "'readable_paths'"
+                    ],
+                )
                 return ""
 
             with mock.patch.object(cli, "gh", side_effect=download):
