@@ -262,11 +262,9 @@ preservation receipt.
 
 The generated record is then validated against `schema-v2.json`, and the scores
 that decided it against `scores-v1.json`. The scores go beside the record, in
-`scores/<id>-vN.json`, and not inside it. There is one record schema again
-because of that: while the publisher stripped the scores on the way out, a
-published record's bytes were a function of publisher code rather than of the
-commit, so the contract the record was built against and the schema of the data
-served were two documents, and a record could satisfy one and fail the other.
+`scores/<id>-vN.json`, and not inside it. There is one current record schema:
+the record is published exactly as committed, so the contract used here is the
+same `schema-v2.json` served beside the data.
 The render bundle is checked by the reviewer's own render validation and then by
 the database's `tools/validate.py`. It archives the exact mechanical-report
 bytes, the normalized run and job provenance, and the review itself in one
@@ -304,12 +302,14 @@ it cannot disprove the permission-specific failure. The final fetch downloads
 commit/tree history, not historical payload contents.
 
 Registration therefore no longer grows with immutable payload bytes. It
-retains an O(A) active-entry scan for identity allocation/update and the
-Database's absolute entry/index agreement, plus the filtered commit/tree
-history transfer at the final push boundary. Replacing the entry scans requires
-one separately validated identity projection, not another local cache; deleting
-the history transfer requires an experiment with the production App credential
-that proves GitHub no longer applies the old workflow-scope interpretation.
+retains O(V) work in the number of accepted versions: registration scans every
+entry's metadata for identity allocation/update, the Database proves absolute
+entry/index agreement, and extending the index reads, copies, sorts and rewrites
+the full index. It also retains the filtered commit/tree history transfer at the
+final push boundary. Replacing the entry scans requires one separately validated
+identity projection, not another local cache; deleting the history transfer
+requires an experiment with the production App credential that proves GitHub no
+longer applies the old workflow-scope interpretation.
 
 The automatic finalizer merges only when GitHub reports the change `CLEAN` and
 the database's own `validate.yml` run for that exact head commit completed

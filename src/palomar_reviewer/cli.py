@@ -4484,7 +4484,7 @@ def registry_record(
             "reasons": reasons,
         },
         # No issue, no URL, no submitter: keeping the submitter private is
-        # what the private intake exists for, and schema-v1 forbids those
+        # what the private intake exists for, and schema-v2 forbids those
         # fields structurally rather than trusting this code to omit them.
         "submission": {
             "submission_id": state["id"],
@@ -4547,10 +4547,12 @@ def extend_registration_index(
     """Append one summary to the already validated canonical index.
 
     This deliberately does not rediscover summaries from every entry. The
-    Database validator does that absolute O(A) check after the registration is
+    Database validator does that absolute O(V) check after the registration is
     committed, so accepting any stale or malformed prior summary here cannot
-    reach a push. Keeping this operation O(1) in entry reads avoids a redundant
-    pass without inventing a second projection contract.
+    reach a push. This helper uses O(1) entry-file reads, but it still reads,
+    copies, sorts and rewrites the full O(V) index. Avoiding the redundant entry
+    pass does not make registration as a whole constant-time or invent a second
+    projection contract.
     """
     current = load_json(database / "index.json")
     if (
@@ -5232,10 +5234,11 @@ def register(args: argparse.Namespace) -> int:
 
     # The checkout's index was already validated on main. Extend that canonical
     # projection instead of opening every entry a second time merely to rebuild
-    # bytes we already have. The absolute validator below still reads all entry
-    # metadata and proves this exact index agrees with it; registration identity
-    # likewise intentionally retains its O(A) scan until there is one separately
-    # validated identity projection to replace it.
+    # bytes we already have. The absolute validator below still reads all O(V)
+    # accepted-version metadata and proves this exact index agrees with it;
+    # registration identity retains the same O(V) scan, and extending this
+    # projection reads, copies, sorts and rewrites the full index. Removing that
+    # residual work requires one separately validated identity projection.
     write_json(
         database / "index.json",
         extend_registration_index(database, record=record, filename=filename),

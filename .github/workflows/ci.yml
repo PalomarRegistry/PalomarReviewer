@@ -27,11 +27,8 @@ jobs:
       # "Maintainers run it locally" was the previous answer and it was not
       # true: nothing ran it, and it was red.
       #
-      # One schema. It was briefly two, while a record was rewritten on the way
-      # into the release and the served document had to describe the result;
-      # now a record is published exactly as it was committed, so the contract
-      # this builds against and the schema served beside the data are the same
-      # file. `scores-v1.json` is not fetched because it is not published: the
+      # A registered record has one current public contract: schema-v2.json.
+      # `scores-v1.json` is not fetched because it is not published: the
       # database validates `scores/` itself, at registration.
       # The custom domain, not the workers.dev name. That second hostname is
       # being turned off: it was a whole second front door onto the production
@@ -42,9 +39,6 @@ jobs:
           PUBLIC_DATA_ORIGIN: https://data.palomar-registry.org
         run: |
           mkdir palomar-schemas
-          curl --fail --silent --show-error --retry 3 \
-            "$PUBLIC_DATA_ORIGIN/schema-v1.json" \
-            --output palomar-schemas/schema-v1.json
           curl --fail --silent --show-error --retry 3 \
             "$PUBLIC_DATA_ORIGIN/schema-v2.json" \
             --output palomar-schemas/schema-v2.json

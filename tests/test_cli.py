@@ -5259,6 +5259,14 @@ class VocabularyTests(unittest.TestCase):
         stray = sorted(set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source)))
         self.assertEqual(stray, [], f"cli.py still says {', '.join(stray)}")
 
+    def test_public_ci_fetches_only_the_current_record_schema(self):
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("$PUBLIC_DATA_ORIGIN/schema-v2.json", workflow)
+        self.assertIn("--output palomar-schemas/schema-v2.json", workflow)
+        self.assertNotIn("schema-v1.json", workflow)
+
 
 class FailedVerificationTests(unittest.TestCase):
     def test_a_failed_report_is_refused_in_words(self):
@@ -5282,7 +5290,7 @@ class EntryProvenanceTests(unittest.TestCase):
 
     Registration failed on its first real use because the report's provenance
     was copied into the record wholesale, and the report has a `declared`
-    block that schema-v1 does not allow. Nothing caught it: the record is
+    block that schema-v2 does not allow. Nothing caught it: the record is
     validated against a schema cloned from PalomarDatabase at registration
     time, and registration had never run.
     """
@@ -5306,7 +5314,7 @@ class EntryProvenanceTests(unittest.TestCase):
     def test_the_bookkeeping_the_report_needs_is_not_registered(self):
         result = cli.entry_provenance(self.provenance())
         self.assertNotIn("declared", result)
-        # schema-v1 admits exactly these, and `additionalProperties` is false,
+        # schema-v2 admits exactly these, and `additionalProperties` is false,
         # so anything else would be refused at the last step of a submission.
         self.assertLessEqual(
             set(result),
