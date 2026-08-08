@@ -1630,11 +1630,11 @@ class ReviewerTests(unittest.TestCase):
         """Every ordering surface in the database reads `registered_at`.
 
         The review's verdict is a different moment and can be days earlier:
-        nothing is registered until the submitter has read their review and
-        consented, and they may take as long as they like over that. A record
-        dated by the review orders behind everything reviewed since, so a
-        submitter who waited can be registered and yet absent from the page of
-        what is new.
+        nothing is registered until the submitter consents. The accepted offer
+        normally remains usable for 24 hours, subject to immediate
+        reverification after a review-contract or security change, and may
+        remain usable longer without a promise. Whenever registration happens,
+        a record dated by the review would let waiting buy an earlier position.
         """
         record = self.example_record()
 
@@ -3134,10 +3134,10 @@ class PublicationIdentityTests(unittest.TestCase):
         """The date is when the result entered the registry, not when it was reviewed.
 
         A Palomar date is a priority claim. Nothing is registered until the
-        submitter has read their review and consented, and they may take as
-        long as they like over it, so a date taken from the review would be a
-        date the submitter chose: hold the consent, and be registered under the
-        older date ahead of everything that entered the registry meanwhile.
+        submitter consents. The normal offer window is 24 hours, subject to
+        immediate reverification after a review-contract or security change,
+        and it may remain usable longer without a promise. A date taken from
+        the review would still let waiting buy an earlier position.
 
         Here a review dated the first is consented to on the eleventh, and a
         result that entered the registry on the fifth is already in the

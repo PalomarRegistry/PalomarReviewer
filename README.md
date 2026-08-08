@@ -125,9 +125,9 @@ positive review: synthesis must reproduce the evidence-pass scores exactly, acce
 cannot override a failed pass, and every completed evidence score
 must meet the policy's acceptance minimum. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
-substantive judgments is not separately confirmed. The complete packet is
-available for the guaranteed 24-hour post-delivery audit window so a reader can
-inspect those judgments during that window.
+substantive judgments is not separately confirmed. The private State workflow
+uploads the complete packet as operator evidence with a requested 90-day
+artifact lifetime; that operational setting is not an author-access promise.
 
 Rubric version 7 additionally rejects a substantive pass unless its
 `declarations_checked` manifest exactly matches every theorem and definition in
@@ -225,6 +225,13 @@ the same bytes. Only then does it dispatch the pinned Challenge renderer, which
 is a public Actions run naming the repository and commit and would otherwise
 signal an acceptance the submitter never agreed to register.
 
+An acceptance normally remains an offer to register for 24 hours after the
+review is delivered. A review-contract or security change may require immediate
+reverification instead; this exception avoids retaining obsolete validators as
+compatibility code. After 24 hours Palomar may expire the offer and require
+reverification before making a new one. The offer may remain usable longer,
+but there is no promise that it will.
+
 It then checks that the render matches the accepted source, Challenge hash,
 workflow run and renderer commit, revalidates every stored evidence pass and the
 score-to-decision policy, binds registered metadata to the mechanically recorded
@@ -302,13 +309,14 @@ on, and the serial follows the largest one that date has already used, starting
 at 1 for a date with none.
 
 The date is deliberately not the date of the review. A Palomar date is a
-priority claim, and nothing is registered until the submitter has read their
-review and consented, which they may take as long as they like over. A date
-taken from the review would therefore be a date the submitter could choose:
-holding consent back would have bought an earlier position, ahead of every
-result that entered the registry meanwhile. Waiting has to cost a later
-position instead. The record carries the review's own timestamp separately, as
-`review.reviewed_at`, which nothing orders by.
+priority claim, and nothing is registered until the submitter consents. The
+normal offer window is 24 hours, subject to immediate reverification after a
+review-contract or security change, and an offer may remain usable longer
+without a promise. Whenever registration happens, a date taken from the review
+would let waiting buy an earlier position ahead of results registered meanwhile.
+Waiting therefore costs a later position instead. The record carries the
+review's own timestamp separately, as `review.reviewed_at`, which nothing orders
+by.
 
 The record carries the moment of registration too, as `registered_at`, and the
 date in the identifier is the day of it. Both come from one reading of the
@@ -347,18 +355,22 @@ record that names a different submission.
 
 ## Engines
 
-- `--engine codex`: runs `codex exec` ephemerally with a read-only sandbox and a
-  JSON output schema.
-- `--engine claude`: runs `claude -p` in safe mode, with filesystem/shell tools
-  disabled and only web search/fetch available for the literature pass.
-- `--engine command --command 'program ...'`: sends the prompt on stdin and
-  expects one JSON object on stdout.
+- `--engine codex`: runs `codex exec` ephemerally with its normal inspection
+  and shell tools, a read-only Codex sandbox, and a JSON output schema.
+- `--engine claude`: runs `claude --print` in safe mode. Its explicit tool
+  allowlist is empty for ordinary passes and contains only `WebSearch` and
+  `WebFetch` for the literature pass; it has no filesystem or shell tool there.
+- `--engine command --command 'program ...'`: runs the named program, sends the
+  prompt on stdin, and expects one JSON object on stdout. The program is not a
+  tool-restricted model engine; its abilities are those of arbitrary code
+  inside the outer namespace.
 
 An acceptance-capable literature pass must be able to verify important sources
-and search for obvious prior formalizations. The configured Claude engine has
-explicit web tools; Codex may use the read-only tools available to its ephemeral
-session. A custom command without equivalent research access should not award a
-literature score above the policy's verification ceiling.
+and search for obvious prior formalizations. Only the configured Claude
+literature pass currently has explicit web research tools. This runner never
+enables Codex web search and ignores user configuration that could enable it.
+Codex, and any custom command without equivalent research access, therefore
+must not award a literature score above the policy's verification ceiling.
 
 Every engine is additionally launched inside a fail-closed Bubblewrap namespace.
 The namespace exposes the submission at `/workspace`, a dedicated output
@@ -366,9 +378,22 @@ directory, an empty scratch home, and only the selected engine's model
 authentication file. It does not expose the runner's GitHub CLI configuration,
 registration credentials, unrelated home files, or other workspaces. The engine
 transport can reach its model API in every pass. Claude web tools are disabled,
-and Codex search is not enabled, outside the literature/notability pass;
-general host-level egress filtering would require a separate API-aware proxy.
+outside the literature/notability pass; this runner never enables Codex web
+search and ignores Codex user configuration. General host-level egress
+filtering would require a separate API-aware proxy.
 `palomar-review doctor` refuses an installation without `bwrap`.
+
+This containment is not a credential broker. For Codex and Claude, the selected
+engine's own authentication file is deliberately bound into its namespace;
+Codex can read files and run shell commands there. The namespace keeps other
+operator credentials out and prevents repository writes, but its shared
+network and engine-process-visible authentication material leave a residual
+prompt-injection and exfiltration risk. The output credential check catches a
+key copied out in plain text; it is a backstop, not proof against encoding or
+another channel.
+The planned broker boundary will keep provider credentials outside the engine
+namespace and expose only a narrow authenticated model transport. That broker
+does not exist yet.
 
 The reviewer is told the repository, commit, authorization, update intent and
 the submitter's notes. It is deliberately not told who submitted: a review
@@ -388,9 +413,7 @@ registered.
 
 ## Audit trail
 
-Palomar guarantees retention of the private review and its audit material for
-24 hours after the review is delivered. During that window, each review
-directory contains:
+During a review, its private work directory contains:
 
 ```text
 state.json                     # the private submission record under review
@@ -412,15 +435,20 @@ render-result/                 # validated immutable Challenge render and proven
 
 Raw session histories remain controlled by the chosen engine. Palomar records
 the final messages, turn-aggregate usage evidence, model identifier, policy
-commit, source commit, and the review itself. Reviews are private, not confidential:
-they are readable by Palomar operators, by GitHub, and by the model provider,
-and may remain available operationally after the guaranteed 24-hour window.
-Palomar makes no retention or availability promise after that window.
+commit, source commit, and the review itself. The private State workflow uploads
+the complete packet as an Actions artifact with a requested 90-day operational
+lifetime. That packet is operator evidence, not an author-access service or the
+24-hour registration-offer promise. Reviews are private, not confidential: they
+are readable by Palomar operators, by GitHub, and by the model provider.
 
 Submission metadata, Lean source, comments and identifiers, README text, the
 submitter's notes, and prior model results may contain prompt-injection
 attempts. The reviewer puts them in hashed JSON evidence envelopes, repeats the
-binding instruction after all evidence, runs engines without write or shell
-tools, and validates strict output schemas. These controls reduce accidental
-instruction following. The retained packet above lets a reader audit any
-decision during the guaranteed window.
+binding instruction after all evidence, exposes the submission read-only,
+restricts Claude's tool list, runs Codex with a read-only sandbox, isolates host
+files with Bubblewrap, and validates strict output schemas. Codex still has
+shell tools, a custom command is arbitrary code inside the namespace, and the
+selected engine credential remains exposed as described above. These controls
+reduce accidental instruction following; they do not create the planned
+credential-broker boundary. While the private packet remains available, it lets
+an operator audit the decision.
