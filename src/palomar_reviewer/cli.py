@@ -27,6 +27,7 @@ import yaml
 from . import authorization as registration_authorization
 from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
+from . import registration as registration_authority
 from . import usage as usage_accounting
 from .errors import ReviewerError
 
@@ -106,12 +107,19 @@ DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
 DATABASE_VALIDATE_WORKFLOW = "validate.yml"
 MINIMUM_SPARSE_GIT = (2, 34, 0)
-# Registration needs all canonical metadata, schemas and tools, but not the
-# immutable payload behind historical records. A partial clone alone postpones
-# those blobs only until checkout; this sparse shape keeps them out of both the
-# worktree and the local object store. New bundles can still be created and
-# staged explicitly with ``git add --sparse``.
-DATABASE_SPARSE_PATTERNS = ("/*", "!/renders/", "!/evidence/")
+# Registration needs schemas and tools, but no historical record payload or
+# registration projection. A partial clone alone postpones those blobs only
+# until checkout; this sparse shape keeps them out of the worktree and local
+# object store. The authority reader fetches only the exact projection blobs
+# needed by this event, and new paths are staged with ``git add --sparse``.
+DATABASE_SPARSE_PATTERNS = (
+    "/*",
+    "!/entries/",
+    "!/scores/",
+    "!/renders/",
+    "!/evidence/",
+    "!/registrations/",
+)
 MAX_RENDER_FILES = 2_000
 MAX_RENDER_NODES = 4_000
 MAX_RENDER_FILE_BYTES = 8 * 1024 * 1024
@@ -726,10 +734,10 @@ def _is_date(value: str) -> bool:
     carry a day that does not exist into a permanent identifier.
     """
     try:
-        dt.date.fromisoformat(value)
+        parsed = dt.date.fromisoformat(value)
     except ValueError:
         return False
-    return True
+    return parsed.isoformat() == value
 
 
 def utc_after(seconds: float) -> str:
@@ -3191,65 +3199,6 @@ def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any
     return result
 
 
-def allocate_identifier(registered_on: str, taken: set[str]) -> str:
-    """The next serial for this date, so one date's identifiers sort in the
-    order they were registered.
-
-    The serial used to be drawn at random, to hide how many reservations never
-    became records. That is no longer worth paying for, and what it cost was
-    this: with a random serial, the order two identifiers were registered in
-    cannot be read from the identifiers, so every surface that wants
-    registration order has to carry an ordinal beside the identifier, and an
-    ordinal and an identifier that disagree is a failure nothing downstream can
-    detect or repair.
-
-    The date is the date the result enters the registry, which is the date the
-    submitter's consent is acted on. It is deliberately not the date of
-    `review.reviewed_at`.
-
-    A date on a Palomar identifier is a priority claim, so it has to be a date
-    the submitter cannot choose. Nothing is registered until they consent.
-    The normal offer window is 24 hours after delivery, but a review-contract
-    or security change may require immediate reverification rather than retain
-    an obsolete validator. After the window Palomar may expire the offer,
-    though it may remain usable longer without a promise. Whenever registration
-    happens, taking the date from the review would let waiting buy an earlier
-    position ahead of results registered meanwhile. Waiting instead costs a
-    later position, because the identifier uses the registration date.
-
-    Fixed at first registration, and never recomputed after it. A later version
-    reuses its v1's identifier and therefore its v1's date, because the
-    identifier belongs to the result and not to the version, and
-    `registration_identity` resolves an update to the prior version's date for
-    exactly that reason. A retry does not recompute it either: the identity is
-    reserved in private state before the first public side effect, so a
-    registration that failed at 23:59 and is retried at 00:01 finishes under
-    the date it reserved.
-
-    Serials cannot collide with another date's, because `taken` is every
-    identifier the database already holds, of every date, and only this date's
-    serials decide the next one; a date with none starts at 1. Ordering
-    identifiers as strings is registration order, up to a reservation carried
-    across midnight by a retry, which commits one older identifier late and
-    moves nothing else.
-    """
-    prefix = f"PALOMAR-{registered_on}-"
-    serials = [
-        int(serial)
-        for identifier in taken
-        if identifier.startswith(prefix)
-        and (serial := identifier[len(prefix) :]).isdigit()
-        and len(serial) == 6
-    ]
-    serial = max(serials, default=0) + 1
-    if serial > 999_999:
-        raise ReviewerError(
-            f"could not allocate a free permanent identifier: {registered_on} has used "
-            "all 999,999 serials"
-        )
-    return f"{prefix}{serial:06d}"
-
-
 def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
     """The provenance a record carries, from the one the report carries.
 
@@ -3495,46 +3444,6 @@ def registry_scores(
     }
 
 
-def extend_registration_index(
-    database: Path,
-    *,
-    record: dict[str, Any],
-    filename: str,
-) -> dict[str, Any]:
-    """Append one summary to the already validated canonical index.
-
-    This deliberately does not rediscover summaries from every entry. The
-    Database validator does that absolute O(V) check after the registration is
-    committed, so accepting any stale or malformed prior summary here cannot
-    reach a push. This helper uses O(1) entry-file reads, but it still reads,
-    copies, sorts and rewrites the full O(V) index. Avoiding the redundant entry
-    pass does not make registration as a whole constant-time or invent a second
-    projection contract.
-    """
-    current = load_json(database / "index.json")
-    if (
-        not isinstance(current, dict)
-        or current.get("schema_version") != 2
-        or not isinstance(current.get("entries"), list)
-    ):
-        raise ReviewerError("PalomarDatabase main has an invalid index.json")
-    entries = list(current["entries"])
-    entries.append(
-        {
-            "id": record["id"],
-            "version": record["version"],
-            "title": record["title"],
-            "status": record["status"],
-            "path": f"entries/{filename}",
-        }
-    )
-    try:
-        entries.sort(key=lambda entry: entry["path"])
-    except (KeyError, TypeError) as error:
-        raise ReviewerError("PalomarDatabase main has an invalid index.json") from error
-    return {"schema_version": 2, "generated_at": utc_now(), "entries": entries}
-
-
 def _registration_bundle_files(database: Path, root: Path, label: str) -> list[str]:
     """List and normalize every ordinary file in one newly built bundle."""
     if root.is_symlink() or not root.is_dir():
@@ -3560,6 +3469,70 @@ def _registration_bundle_files(database: Path, root: Path, label: str) -> list[s
     return files
 
 
+def _registration_projection_statuses(
+    projections: tuple[registration_authority.ProjectionChange, ...],
+) -> dict[str, str]:
+    """Validate one exact projection transition without touching the filesystem."""
+    statuses: dict[str, str] = {}
+    for change in projections:
+        if change.status not in {"A", "M"} or change.path in statuses:
+            raise ReviewerError("registration projection transition is malformed")
+        statuses[change.path] = change.status
+    result_changes = [
+        change
+        for change in projections
+        if change.path.startswith(f"{registration_authority.RESULTS_DIRECTORY}/")
+        and change.path.endswith(".json")
+        and registration_authority.PALOMAR_ID_RE.fullmatch(
+            change.path.removeprefix(f"{registration_authority.RESULTS_DIRECTORY}/").removesuffix(
+                ".json"
+            )
+        )
+    ]
+    submission_changes = [
+        change
+        for change in projections
+        if change.path.startswith(f"{registration_authority.SUBMISSIONS_DIRECTORY}/")
+        and change.path.endswith(".json")
+        and registration_authority.SUBMISSION_ID_RE.fullmatch(
+            change.path.removeprefix(
+                f"{registration_authority.SUBMISSIONS_DIRECTORY}/"
+            ).removesuffix(".json")
+        )
+    ]
+    day_changes = [
+        change
+        for change in projections
+        if change.path.startswith(f"{registration_authority.DAYS_DIRECTORY}/")
+        and change.path.endswith(".json")
+        and _is_date(
+            change.path.removeprefix(f"{registration_authority.DAYS_DIRECTORY}/").removesuffix(
+                ".json"
+            )
+        )
+    ]
+    result_relative = result_changes[0].path if len(result_changes) == 1 else ""
+    result_identifier = result_relative.removeprefix(
+        f"{registration_authority.RESULTS_DIRECTORY}/"
+    ).removesuffix(".json")
+    result_match = registration_authority.PALOMAR_ID_RE.fullmatch(result_identifier)
+    day_matches_result = not day_changes or (
+        result_match is not None
+        and day_changes[0].path == registration_authority.day_path(result_match.group("date"))
+    )
+    if (
+        len(result_changes) != 1
+        or len(submission_changes) != 1
+        or len(result_changes) + len(submission_changes) + len(day_changes) != len(projections)
+        or not day_matches_result
+        or submission_changes[0].status != "A"
+        or (result_changes[0].status == "A" and len(day_changes) != 1)
+        or (result_changes[0].status == "M" and day_changes)
+    ):
+        raise ReviewerError("registration projection transition is not one exact record append")
+    return statuses
+
+
 def stage_registration_change(
     database: Path,
     *,
@@ -3567,6 +3540,7 @@ def stage_registration_change(
     scores: Path,
     render_bundle: Path,
     evidence_bundle: Path,
+    projections: tuple[registration_authority.ProjectionChange, ...],
 ) -> tuple[str, ...]:
     """Stage exactly one registration, including ignored bundle files.
 
@@ -3575,6 +3549,7 @@ def stage_registration_change(
     paths, and comparing the resulting index to the expected path/mode set
     makes the Git tree itself the authority before validation or push.
     """
+    projection_statuses = _registration_projection_statuses(projections)
     additions: list[str] = []
     for path, label in ((entry, "database entry"), (scores, "database scores")):
         relative = path.relative_to(database).as_posix()
@@ -3586,7 +3561,18 @@ def stage_registration_change(
     additions.extend(_registration_bundle_files(database, render_bundle, "render bundle"))
     additions.extend(_registration_bundle_files(database, evidence_bundle, "evidence bundle"))
     additions = sorted(additions)
-    pathspecs = [*additions, "index.json"]
+    for change in projections:
+        path = database / change.path
+        try:
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise ReviewerError(
+                f"{change.path}: registration projection cannot be inspected"
+            ) from error
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ReviewerError(f"{change.path}: registration projection must be an ordinary file")
+        path.chmod(0o644)
+    pathspecs = [*additions, *sorted(projection_statuses)]
     run(
         [
             "git",
@@ -3618,7 +3604,7 @@ def stage_registration_change(
         staged[path] = (status_letter, old_mode, new_mode)
 
     expected = {path: "A" for path in additions}
-    expected["index.json"] = "M"
+    expected.update(projection_statuses)
     if set(staged) != set(expected):
         missing = sorted(set(expected) - set(staged))
         extra = sorted(set(staged) - set(expected))
@@ -3638,10 +3624,15 @@ def stage_registration_change(
             raise ReviewerError(
                 f"{path}: staged with mode {new_mode}; registration files must be 100644"
             )
-    return tuple(additions)
+    return tuple(pathspecs)
 
 
-def validate_sparse_database(database: Path, base: str) -> subprocess.CompletedProcess[str]:
+def validate_sparse_database(
+    database: Path,
+    base: str,
+    *,
+    git_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run Database validation only after its own code proves a delta scope.
 
     The checkout intentionally omits historical render/evidence worktrees. A
@@ -3666,6 +3657,7 @@ def validate_sparse_database(database: Path, base: str) -> subprocess.CompletedP
         ],
         cwd=database,
         check=False,
+        env=git_env,
     )
     if preflight.returncode:
         detail = (preflight.stderr or preflight.stdout).strip()[-2000:]
@@ -3673,153 +3665,13 @@ def validate_sparse_database(database: Path, base: str) -> subprocess.CompletedP
         raise ReviewerError(
             "PalomarDatabase could not derive a changed-record validation scope; refusing "
             "unscoped validation because this sparse checkout omits historical "
-            f"renders/evidence{suffix}"
+            f"entries/scores/renders/evidence/registration projections{suffix}"
         )
-    return run([sys.executable, "tools/validate.py", "--since", base], cwd=database)
-
-
-def registration_identity(
-    database: Path,
-    *,
-    submission_id: str,
-    existing_id: object,
-    reviewed_at: object,
-    registered_at: str,
-    mechanical: dict[str, Any],
-    reserved: tuple[str, str, str, int] | None = None,
-) -> tuple[str, str, str, int]:
-    """Resolve one submission to one permanent ID and its next append-only version.
-
-    The answer is the identifier, the result's date, the instant this version
-    was registered and the version number.
-
-    A reserved identity was committed to private submission state before an
-    earlier attempt made public side effects. It must be reused exactly: a
-    retry must complete those archive refs, not allocate a second public ID.
-    That is why nothing here recomputes a reserved date, and why `registered_at`
-    is handed in rather than read from the clock here -- the caller passes the
-    reserved instant back when there is one. A registration that began at 23:59
-    and is retried at 00:01 would otherwise resolve to a different date, which
-    is a different identifier, which is a second permanent ID for one result and
-    archive refs pointing at neither.
-
-    The date a first registration gets is the day of `registered_at`, because
-    that is when the result enters the registry; an update gets the date its v1
-    got, because the identifier and its date belong to the result rather than to
-    any one version of it. See `allocate_identifier` for why that day and not
-    the review's. Both come from one reading of the clock, so the date the
-    identifier carries and the instant the record carries cannot disagree.
-    """
-    if existing_id and not PALOMAR_ID_RE.fullmatch(str(existing_id)):
-        raise ReviewerError(f"requested existing ID is invalid: {existing_id}")
-
-    by_submission: set[str] = set()
-    by_id: dict[str, list[tuple[int, str, str, str, str, str]]] = {}
-    for path in (database / "entries").glob("*.json"):
-        prior = load_json(path)
-        identifier = str(prior.get("id", ""))
-        version = prior.get("version")
-        accepted_at = prior.get("accepted_at")
-        prior_source = prior.get("source", {})
-        repository = prior_source.get("repository")
-        project_path = prior_source.get("project_path") or ""
-        comparator_config_path = prior.get("formalization", {}).get(
-            "comparator_config_path"
-        )
-        prior_submission = prior.get("submission", {}).get("submission_id")
-        if not PALOMAR_ID_RE.fullmatch(identifier) or not isinstance(version, int):
-            raise ReviewerError(f"database entry has invalid registration identity: {path.name}")
-        if not isinstance(prior_submission, str):
-            raise ReviewerError(f"database entry names no submission: {path.name}")
-        if (
-            not isinstance(accepted_at, str)
-            or not isinstance(repository, str)
-            or not isinstance(comparator_config_path, str)
-        ):
-            raise ReviewerError(f"database entry has incomplete registration identity: {path.name}")
-        by_id.setdefault(identifier, []).append(
-            (
-                version,
-                prior_submission,
-                accepted_at,
-                repository,
-                project_path,
-                comparator_config_path,
-            )
-        )
-        if prior_submission == submission_id:
-            by_submission.add(identifier)
-
-    if existing_id:
-        identifier = str(existing_id)
-        records = by_id.get(identifier, [])
-        if not records:
-            raise ReviewerError(f"requested existing ID is not in the database: {identifier}")
-        if by_submission - {identifier}:
-            raise ReviewerError("this submission is already associated with another permanent ID")
-        current = max(records, key=lambda record: record[0])
-        submitted_repository = mechanical["source"]["repository"]
-        if current[3].casefold() != submitted_repository.casefold():
-            raise ReviewerError(
-                f"update to {identifier} comes from {submitted_repository}, not {current[3]}"
-            )
-        # A repository can hold many formalizations. Without this, a submission
-        # for one project in a monorepo could take over another's identifier.
-        submitted_project = mechanical["source"].get("project_path") or ""
-        if current[4] != submitted_project:
-            raise ReviewerError(
-                f"update to {identifier} comes from project {submitted_project or 'the repository root'}, "
-                f"not {current[4] or 'the repository root'}"
-            )
-        submitted_config = mechanical["comparator"]["path"]
-        if current[5] != submitted_config:
-            raise ReviewerError(
-                f"update to {identifier} uses Comparator configuration {submitted_config}, "
-                f"not {current[5]}"
-            )
-        resolved = (identifier, current[2], registered_at, current[0] + 1)
-        if reserved is not None and reserved != resolved:
-            raise ReviewerError("saved registration attempt disagrees with the requested update")
-        return resolved
-
-    if by_submission:
-        identifiers = ", ".join(sorted(by_submission))
-        raise ReviewerError(
-            f"this submission already has a permanent ID; register an update to: {identifiers}"
-        )
-    # The review's date decides nothing here any more, but it is still checked
-    # here, before the first public side effect, because the record carries it
-    # and a record with an unreadable review date cannot be written at all.
-    try:
-        dt.date.fromisoformat(str(reviewed_at)[:10])
-    except ValueError as error:
-        raise ReviewerError("accepted review has no valid review date") from error
-    if reserved is not None:
-        identifier, reserved_at, reserved_instant, version = reserved
-        match = PALOMAR_ID_RE.fullmatch(identifier)
-        # Checked for internal consistency and not against today. Comparing a
-        # reserved date with today's would refuse exactly the retry the
-        # reservation exists to make possible, because a registration long
-        # enough to fail is long enough to cross midnight. The instant has to
-        # agree with the date for the same reason the record's two dates do:
-        # the database refuses a v1 whose `accepted_at` is not the day it was
-        # registered, and a reservation is where the two are settled.
-        if (
-            match is None
-            or match.group("date") != reserved_at
-            or not _is_date(reserved_at)
-            or not TIMESTAMP_RE.fullmatch(str(reserved_instant))
-            or str(reserved_instant)[:10] != reserved_at
-            or version != 1
-        ):
-            raise ReviewerError("saved registration attempt has an invalid permanent identity")
-        if identifier in by_id:
-            raise ReviewerError(
-                f"saved registration attempt {identifier} is already used by another submission"
-            )
-        return reserved
-    registered_on = registered_at[:10]
-    return allocate_identifier(registered_on, set(by_id)), registered_on, registered_at, 1
+    return run(
+        [sys.executable, "tools/validate.py", "--since", base],
+        cwd=database,
+        env=git_env,
+    )
 
 
 def registration_attempt_identity(
@@ -3829,6 +3681,7 @@ def registration_attempt_identity(
     mechanical: dict[str, Any],
     review: dict[str, Any],
     dry_run: bool,
+    git_env: dict[str, str] | None = None,
 ) -> tuple[str, str, str, int]:
     """Reserve one retry-stable identity before archive side effects begin.
 
@@ -3862,49 +3715,17 @@ def registration_attempt_identity(
         registered_at = attempt.get("registered_at")
         version = attempt.get("version")
 
-        # An attempt from before the instant was part of the identity. That
-        # version reserved an identifier and a date and no more, and this one
-        # cannot finish the job from that: the instant is half of what was being
-        # reserved. Discarding it and reserving again is safe for exactly the
-        # reason the reservation exists to be checked -- the identifier is only
-        # ever spent by a registration that merged, so an identifier the
-        # database has never heard of was never spent, and re-reserving takes
-        # nothing from anybody.
-        #
-        # Not tolerated when the database does know the identifier. That is a
-        # registration that got further than this one did, and quietly
-        # allocating around it would be inventing a second answer to a question
-        # already answered publicly.
-        if registered_at is None and isinstance(identifier, str):
-            known = {
-                str(load_json(path).get("id", ""))
-                for path in (database / "entries").glob("*.json")
-            }
-            if identifier in known:
-                raise ReviewerError(
-                    f"saved registration attempt {identifier} predates the registration "
-                    "instant and is already in the database; it needs a person"
-                )
-            print(
-                f"discarding a registration attempt for {identifier} that predates the "
-                "registration instant; reserving again",
-            )
-            attempt = None
-            reserved = None
-            identifier = accepted_at = version = None
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(accepted_at, str)
+            or not isinstance(registered_at, str)
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+        ):
+            raise ReviewerError("saved registration attempt has an invalid permanent identity")
+        reserved = (identifier, accepted_at, registered_at, version)
 
-        if attempt is not None:
-            if (
-                not isinstance(identifier, str)
-                or not isinstance(accepted_at, str)
-                or not isinstance(registered_at, str)
-                or not isinstance(version, int)
-                or isinstance(version, bool)
-            ):
-                raise ReviewerError("saved registration attempt has an invalid permanent identity")
-            reserved = (identifier, accepted_at, registered_at, version)
-
-    resolved = registration_identity(
+    resolved = registration_authority.registration_identity(
         database,
         submission_id=state["id"],
         existing_id=existing_id,
@@ -3916,6 +3737,7 @@ def registration_attempt_identity(
         registered_at=reserved[2] if reserved is not None else utc_now(),
         mechanical=mechanical,
         reserved=reserved,
+        git_env=git_env,
     )
     if attempt is not None or dry_run:
         return resolved
@@ -4106,6 +3928,10 @@ def register(args: argparse.Namespace) -> int:
     )
     if checked_out != resolved:
         raise ReviewerError("PalomarDatabase checkout does not match resolved main")
+    # The sparse projection reader can lazily fetch promised authority blobs
+    # after clone_at returns. Keep the private credential ephemeral and retain
+    # the same no-global-config/no-replace hardening used for the clone.
+    database_git_env = registry_git_environment(git_env)
     schema_path = database / "schema-v2.json"
     if not schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register schema-v2.json")
@@ -4119,6 +3945,7 @@ def register(args: argparse.Namespace) -> int:
         mechanical=mechanical,
         review=review,
         dry_run=args.dry_run,
+        git_env=database_git_env,
     )
     preservation = preserve_sources(
         work,
@@ -4177,46 +4004,34 @@ def register(args: argparse.Namespace) -> int:
         preservation=preservation,
     )
     filename = f"{record['id']}-v{version}.json"
+    scores_document = registry_scores(
+        permanent_id=record["id"], version=version, review=review
+    )
+    projections = registration_authority.projection_changes(
+        database,
+        record=record,
+        entry_relative=f"entries/{filename}",
+        git_env=database_git_env,
+    )
+    _registration_projection_statuses(projections)
+    schema = load_json(schema_path)
+    jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
+    jsonschema.validate(
+        scores_document,
+        load_json(scores_schema_path),
+        format_checker=jsonschema.FormatChecker(),
+    )
     destination = database / "entries" / filename
-    if destination.exists():
-        raise ReviewerError(f"database entry already exists: {filename}")
     artifact_destination = database / artifact_path
-    if artifact_destination.exists():
-        raise ReviewerError(f"database render artifact already exists: {artifact_path}")
     artifact_destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(render_bundle, artifact_destination)
     evidence_destination = database / evidence_path
-    if evidence_destination.exists():
-        raise ReviewerError(f"database verification evidence already exists: {evidence_path}")
     evidence_destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(evidence_bundle, evidence_destination)
     write_json(destination, record)
     scores_destination = database / "scores" / filename
-    if scores_destination.exists():
-        raise ReviewerError(f"database scores already exist: {filename}")
-    write_json(
-        scores_destination,
-        registry_scores(permanent_id=record["id"], version=version, review=review),
-    )
-
-    # The checkout's index was already validated on main. Extend that canonical
-    # projection instead of opening every entry a second time merely to rebuild
-    # bytes we already have. The absolute validator below still reads all O(V)
-    # accepted-version metadata and proves this exact index agrees with it;
-    # registration identity retains the same O(V) scan, and extending this
-    # projection reads, copies, sorts and rewrites the full index. Removing that
-    # residual work requires one separately validated identity projection.
-    write_json(
-        database / "index.json",
-        extend_registration_index(database, record=record, filename=filename),
-    )
-    schema = load_json(schema_path)
-    jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
-    jsonschema.validate(
-        load_json(scores_destination),
-        load_json(scores_schema_path),
-        format_checker=jsonschema.FormatChecker(),
-    )
+    write_json(scores_destination, scores_document)
+    registration_authority.materialize_changes(database, projections)
     branch = f"submission-{args.submission}-v{version}"
     run(["git", "checkout", "-b", branch], cwd=database)
     stage_registration_change(
@@ -4225,12 +4040,12 @@ def register(args: argparse.Namespace) -> int:
         scores=scores_destination,
         render_bundle=artifact_destination,
         evidence_bundle=evidence_destination,
+        projections=projections,
     )
-    # Database validation scopes immutable payload hashing from the exact main
-    # commit this registration extends. It still checks every entry's metadata,
-    # identity/date agreement and the complete index. The change must be
-    # committed first: the Database validator deliberately refuses to infer an
-    # append-only scope from uncommitted record paths.
+    # Database validation scopes immutable payload hashing and the exact local
+    # projection transition from the main commit this registration extends.
+    # The change must be committed first: the Database validator deliberately
+    # refuses to infer an append-only scope from uncommitted record paths.
     run(
         [
             "git",
@@ -4244,7 +4059,7 @@ def register(args: argparse.Namespace) -> int:
         ],
         cwd=database,
     )
-    validate_sparse_database(database, checked_out)
+    validate_sparse_database(database, checked_out, git_env=database_git_env)
     if args.dry_run:
         print(f"Prepared {destination}; dry run, branch was not pushed.")
         return 0

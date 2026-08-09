@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,12 +24,12 @@ import palomar_reviewer.authorization as registration_authorization
 import palomar_reviewer.cli as cli
 import palomar_reviewer.engine as engine_execution
 import palomar_reviewer.mechanical as mechanical_evidence
+import palomar_reviewer.registration as registration_authority
 from palomar_reviewer.cli import (
     STEP_SCHEMA,
     STEP_SCORE_KEYS,
     SYNTHESIS_SCHEMA,
     SYNTHESIS_SCORE_KEYS,
-    allocate_identifier,
     authors_from_metadata,
     finalize,
     has_proof_account,
@@ -37,7 +38,6 @@ from palomar_reviewer.cli import (
     register,
     registration_attempt_identity,
     registration_entry_path,
-    registration_identity,
     registry_record,
     registry_scores,
     registry_title,
@@ -57,6 +57,7 @@ from palomar_reviewer.cli import (
 )
 from palomar_reviewer.engine import SYSTEM_RESOLUTION_PATHS, execute, isolated_command
 from palomar_reviewer.errors import ReviewerError
+from palomar_reviewer.registration import allocate_identifier, registration_identity
 
 # Some of what this suite checks is not in this repository: the schemas
 # PalomarDatabase serves, a PalomarDatabase checkout to register into, a
@@ -754,14 +755,25 @@ class ReviewerTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory)
-            (database / "entries").mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(database)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-C",
+                    str(database),
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "fixture",
+                ],
+                check=True,
+            )
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
-                mock.patch.object(
-                    cli,
-                    "allocate_identifier",
-                    return_value="PALOMAR-2026-08-11-123456",
-                ) as allocate,
                 mock.patch.object(cli, "put_state") as write,
             ):
                 identity = registration_attempt_identity(
@@ -774,9 +786,8 @@ class ReviewerTests(unittest.TestCase):
 
             self.assertEqual(
                 identity,
-                ("PALOMAR-2026-08-11-123456", "2026-08-11", "2026-08-11T09:30:00Z", 1),
+                ("PALOMAR-2026-08-11-000001", "2026-08-11", "2026-08-11T09:30:00Z", 1),
             )
-            allocate.assert_called_once()
             saved = write.call_args.args[1]
             self.assertEqual(saved["registration_attempt"]["id"], identity[0])
             # The instant is reserved with the identity, because it is what a
@@ -792,7 +803,9 @@ class ReviewerTests(unittest.TestCase):
 
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:31:00Z"),
-                mock.patch.object(cli, "allocate_identifier") as allocate_again,
+                mock.patch.object(
+                    registration_authority, "allocate_identifier"
+                ) as allocate_again,
                 mock.patch.object(cli, "put_state") as write_again,
             ):
                 retried = registration_attempt_identity(
@@ -806,15 +819,7 @@ class ReviewerTests(unittest.TestCase):
             allocate_again.assert_not_called()
             write_again.assert_not_called()
 
-    def test_an_attempt_reserved_before_the_instant_existed_is_reserved_again(self):
-        """That version reserved an identifier and a date and no more, and this
-        one cannot finish from that: the instant is half of what was reserved.
-
-        Refusing left every retry failing on a reservation nothing could
-        complete, with a hand edit of private state the only way out. The
-        identifier is only ever spent by a registration that merged, so one the
-        database has never heard of was never spent.
-        """
+    def test_an_attempt_from_the_retired_pre_instant_shape_is_rejected(self):
         mechanical = self.mechanical_fixture()
         review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}
         stale = {
@@ -830,61 +835,19 @@ class ReviewerTests(unittest.TestCase):
         state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob", "registration_attempt": stale}
 
         with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory)
-            (database / "entries").mkdir()
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
-                mock.patch.object(
-                    cli, "allocate_identifier", return_value="PALOMAR-2026-08-11-123456",
-                ) as allocate,
                 mock.patch.object(cli, "put_state") as write,
-            ):
-                identity = registration_attempt_identity(
-                    database, state=state, mechanical=mechanical, review=review, dry_run=False,
-                )
-
-            allocate.assert_called_once()
-            self.assertEqual(
-                identity,
-                ("PALOMAR-2026-08-11-123456", "2026-08-11", "2026-08-11T09:30:00Z", 1),
-            )
-            saved = write.call_args.args[1]["registration_attempt"]
-            self.assertEqual(saved["registered_at"], "2026-08-11T09:30:00Z")
-
-    def test_an_attempt_without_an_instant_whose_identifier_is_public_needs_a_person(self):
-        """A registration that got further than this one did. Allocating around
-        it would invent a second answer to a question already answered."""
-        mechanical = self.mechanical_fixture()
-        review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}
-        stale = {
-            "schema_version": 1,
-            "id": "PALOMAR-2026-08-08-000001",
-            "version": 1,
-            "accepted_at": "2026-08-08",
-            "review_sha256": registration_authorization.document_digest(review),
-            "source_repository": mechanical["source"]["repository"],
-            "source_commit": mechanical["source"]["commit"],
-            "existing_id": None,
-        }
-        state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob", "registration_attempt": stale}
-
-        with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory)
-            (database / "entries").mkdir()
-            (database / "entries" / "PALOMAR-2026-08-08-000001-v1.json").write_text(
-                json.dumps({"id": "PALOMAR-2026-08-08-000001"}), encoding="utf-8",
-            )
-            with (
-                mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
-                mock.patch.object(cli, "allocate_identifier") as allocate,
-                mock.patch.object(cli, "put_state"),
-                self.assertRaises(ReviewerError) as raised,
+                self.assertRaisesRegex(ReviewerError, "invalid permanent identity"),
             ):
                 registration_attempt_identity(
-                    database, state=state, mechanical=mechanical, review=review, dry_run=False,
+                    Path(directory),
+                    state=state,
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
                 )
-            self.assertIn("needs a person", str(raised.exception))
-            allocate.assert_not_called()
+            write.assert_not_called()
 
     def test_a_registration_retried_after_midnight_keeps_the_date_it_reserved(self):
         """The reservation is what makes a retry finish the attempt it started.
@@ -900,7 +863,23 @@ class ReviewerTests(unittest.TestCase):
         state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob"}
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory)
-            (database / "entries").mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(database)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-C",
+                    str(database),
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "fixture",
+                ],
+                check=True,
+            )
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T23:59:00Z"),
                 mock.patch.object(cli, "put_state") as write,
@@ -2327,8 +2306,17 @@ class ReviewerTests(unittest.TestCase):
                         ["git", "-C", str(destination), "checkout", "--quiet", branch],
                         check=True,
                     )
-                shutil.copy(database_source / "schema-v2.json", destination / "schema-v2.json")
-                shutil.copy(database_source / "tools" / "validate.py", destination / "tools" / "validate.py")
+                subprocess.run(
+                    ["git", "-C", str(destination), "sparse-checkout", "init", "--no-cone"],
+                    check=True,
+                )
+                (destination / ".git" / "info" / "sparse-checkout").write_text(
+                    "\n".join(cli.DATABASE_SPARSE_PATTERNS) + "\n"
+                )
+                subprocess.run(
+                    ["git", "-C", str(destination), "read-tree", "-mu", "HEAD"],
+                    check=True,
+                )
                 return subprocess.run(
                     ["git", "-C", str(destination), "rev-parse", "HEAD"],
                     check=True,
@@ -2384,16 +2372,75 @@ class ReviewerTests(unittest.TestCase):
                 register(args)
             formalization_path.write_bytes(formalization_bytes)
             validation_commands = []
+            validation_environments = []
             real_run = cli.run
 
             def record_validation(command, *run_args, **run_kwargs):
                 if len(command) >= 2 and command[1] == "tools/validate.py":
                     validation_commands.append(command)
+                    validation_environments.append(run_kwargs.get("env"))
                 return real_run(command, *run_args, **run_kwargs)
+
+            authority_environment = {**os.environ, "PALOMAR_TEST_AUTH": "threaded"}
+            real_identity_reader = registration_authority.registration_identity
+            with (
+                mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
+                mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+                mock.patch(
+                    "palomar_reviewer.cli.registry_git_environment",
+                    return_value=authority_environment,
+                ),
+                mock.patch.object(
+                    registration_authority,
+                    "registration_identity",
+                    wraps=real_identity_reader,
+                ) as identity_reader,
+                mock.patch.object(
+                    registration_authority,
+                    "projection_changes",
+                    side_effect=ReviewerError("poisoned registration authority"),
+                ) as projection_reader,
+                mock.patch.object(cli, "stage_registration_change") as staged,
+                mock.patch.object(cli, "push_registration_branch") as pushed,
+                mock.patch.object(cli, "open_registration_pr") as opened,
+                mock.patch.object(cli, "gh") as public_gh,
+                self.assertRaisesRegex(ReviewerError, "poisoned registration authority"),
+            ):
+                register(args)
+            failed_database = work / "database"
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(failed_database), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                database_head,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(failed_database), "diff", "--cached", "--name-only"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
+            staged.assert_not_called()
+            pushed.assert_not_called()
+            opened.assert_not_called()
+            public_gh.assert_not_called()
+            self.assertIs(identity_reader.call_args.kwargs["git_env"], authority_environment)
+            self.assertIs(projection_reader.call_args.kwargs["git_env"], authority_environment)
+            shutil.rmtree(failed_database)
 
             with (
                 mock.patch("palomar_reviewer.cli.resolve_remote_commit", return_value=database_head),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+                mock.patch(
+                    "palomar_reviewer.cli.registry_git_environment",
+                    return_value=authority_environment,
+                ),
                 mock.patch("palomar_reviewer.cli.run", side_effect=record_validation),
             ):
                 self.assertEqual(register(args), 0)
@@ -2401,6 +2448,7 @@ class ReviewerTests(unittest.TestCase):
                 validation_commands,
                 [[sys.executable, "tools/validate.py", "--since", database_head]],
             )
+            self.assertEqual(validation_environments, [authority_environment])
             self.assertEqual(
                 database_clone_options[-1],
                 {"sparse_patterns": cli.DATABASE_SPARSE_PATTERNS},
@@ -2443,7 +2491,19 @@ class ReviewerTests(unittest.TestCase):
                 "Challenge imports Tau Ceti",
                 "\n".join(record["trust"]["reasons"]),
             )
-            self.assertEqual(json.loads((database / "index.json").read_text())["schema_version"], 2)
+            result_projection = json.loads(
+                (database / registration_authority.result_path(record["id"])).read_text()
+            )
+            self.assertEqual(result_projection["versions"][-1]["path"], f"entries/{entry_path.name}")
+            binding_path = registration_authority.submission_path("a1b2c3d4e5f6")
+            self.assertEqual(json.loads((database / binding_path).read_text())["id"], record["id"])
+            match = registration_authority.PALOMAR_ID_RE.fullmatch(record["id"])
+            assert match is not None
+            day_path = registration_authority.day_path(match.group("date"))
+            self.assertEqual(
+                json.loads((database / day_path).read_text())["last_serial"],
+                int(match.group("serial")),
+            )
             self.assertTrue((database / record["challenge_render"]["artifact_path"]).is_dir())
             self.assertTrue((database / record["verification"]["evidence_path"]).is_dir())
 
@@ -2451,7 +2511,12 @@ class ReviewerTests(unittest.TestCase):
                 "state": "MERGED",
                 "mergedAt": "2026-08-01T13:00:00Z",
                 "mergeCommit": {"oid": "e" * 40},
-                "files": [{"path": f"entries/{entry_path.name}"}, {"path": "index.json"}],
+                "files": [
+                    {"path": f"entries/{entry_path.name}"},
+                    {"path": registration_authority.result_path(record["id"])},
+                    {"path": binding_path},
+                    {"path": day_path},
+                ],
                 "url": "https://github.com/PalomarRegistry/PalomarDatabase/pull/99",
             }
 
@@ -2604,6 +2669,10 @@ class ReviewerTests(unittest.TestCase):
                     return_value=updated_database_head,
                 ),
                 mock.patch("palomar_reviewer.cli.clone_at", side_effect=clone_database),
+                mock.patch(
+                    "palomar_reviewer.cli.registry_git_environment",
+                    side_effect=lambda environment=None: dict(environment or os.environ),
+                ),
             ):
                 self.assertEqual(register(update_args), 0)
 
@@ -2638,7 +2707,15 @@ class ReviewerTests(unittest.TestCase):
             self.assertEqual(update_record["accepted_at"], record["accepted_at"])
             update_pr = {
                 **pr,
-                "files": [{"path": f"entries/{update_entry.name}"}, {"path": "index.json"}],
+                "files": [
+                    {"path": f"entries/{update_entry.name}"},
+                    {"path": registration_authority.result_path(record["id"])},
+                    {
+                        "path": registration_authority.submission_path(
+                            "b2c3d4e5f6a1"
+                        )
+                    },
+                ],
             }
 
             def finalize_update_gh(arguments, **_kwargs):
@@ -2658,7 +2735,10 @@ class ReviewerTests(unittest.TestCase):
         pr = {
             "files": [
                 {"path": "entries/PALOMAR-2026-08-01-000012-v2.json"},
-                {"path": "index.json"},
+                {
+                    "path": "registrations/results/"
+                    "PALOMAR-2026-08-01-000012.json"
+                },
             ]
         }
         self.assertEqual(
@@ -3143,25 +3223,16 @@ if __name__ == "__main__":
 class IdentifierAllocationTests(unittest.TestCase):
     """Identifiers sort in registration order, with no ordinal to disagree."""
 
-    def test_an_allocated_identifier_avoids_the_ones_already_registered(self):
-        taken = {f"PALOMAR-2026-08-05-{n:06d}" for n in range(1, 400)}
-        for _ in range(50):
-            allocated = allocate_identifier("2026-08-05", taken)
-            self.assertNotIn(allocated, taken)
-            self.assertRegex(allocated, r"^PALOMAR-2026-08-05-[0-9]{6}$")
+    def test_an_allocated_identifier_follows_the_day_counter(self):
+        self.assertEqual(
+            allocate_identifier("2026-08-05", 399),
+            "PALOMAR-2026-08-05-000400",
+        )
 
     def test_a_date_with_nothing_registered_on_it_starts_at_one(self):
         self.assertEqual(
-            allocate_identifier("2026-08-05", {"PALOMAR-2026-08-04-000009"}),
+            allocate_identifier("2026-08-05", 0),
             "PALOMAR-2026-08-05-000001",
-        )
-
-    def test_the_next_serial_follows_the_largest_already_taken_on_that_date(self):
-        """Largest and not count, so a serial is never handed out twice after a
-        record is withdrawn from the served release or a reservation lapses."""
-        taken = {"PALOMAR-2026-08-07-735171", "PALOMAR-2026-08-07-000004"}
-        self.assertEqual(
-            allocate_identifier("2026-08-07", taken), "PALOMAR-2026-08-07-735172"
         )
 
     def test_sorting_identifiers_as_strings_is_registration_order(self):
@@ -3171,25 +3242,18 @@ class IdentifierAllocationTests(unittest.TestCase):
         ordinal has to be recorded and none can fall out of step with the
         identifier it belongs to.
         """
-        taken: set[str] = set()
+        counters: dict[str, int] = {}
         registered = []
         for date in ("2026-08-05", "2026-08-05", "2026-08-06", "2026-08-08"):
-            allocated = allocate_identifier(date, taken)
-            taken.add(allocated)
+            allocated = allocate_identifier(date, counters.get(date, 0))
+            counters[date] = int(allocated.rsplit("-", 1)[-1])
             registered.append(allocated)
         self.assertEqual(sorted(registered), registered)
-
-    def test_another_date_does_not_move_this_one_along(self):
-        taken = {f"PALOMAR-2026-08-06-{n:06d}" for n in range(1, 900)}
-        self.assertEqual(
-            allocate_identifier("2026-08-05", taken | {"PALOMAR-2026-08-05-000002"}),
-            "PALOMAR-2026-08-05-000003",
-        )
 
     def test_a_date_that_has_used_every_serial_is_refused_rather_than_wrapped(self):
         """Wrapping would hand out an identifier that is already someone's."""
         with self.assertRaisesRegex(ReviewerError, "could not allocate"):
-            allocate_identifier("2026-08-05", {"PALOMAR-2026-08-05-999999"})
+            allocate_identifier("2026-08-05", 999_999)
 
 
 class PublicationIdentityTests(unittest.TestCase):
@@ -3197,11 +3261,85 @@ class PublicationIdentityTests(unittest.TestCase):
 
     def database(self, *entries) -> Path:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        (root / "entries").mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+        by_result = {}
+        days = {}
         for record in entries:
-            (root / "entries" / f"{record['id']}-v{record['version']}.json").write_text(
-                json.dumps(record)
+            identifier = record["id"]
+            version = record["version"]
+            row = {
+                "version": version,
+                "submission_id": record["submission"]["submission_id"],
+                "registered_at": f"{record['accepted_at']}T12:00:00Z",
+                "title": "Prior result",
+                "status": "accepted",
+                "path": f"entries/{identifier}-v{version}.json",
+                "abstract": "Prior abstract",
+                "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            }
+            result = by_result.setdefault(
+                identifier,
+                {
+                    "schema_version": 1,
+                    "id": identifier,
+                    "accepted_at": record["accepted_at"],
+                    "identity": {
+                        "source_repository": record["source"]["repository"],
+                        "project_path": record["source"].get("project_path"),
+                        "comparator_config_path": record["formalization"][
+                            "comparator_config_path"
+                        ],
+                    },
+                    "versions": [],
+                },
             )
+            result["versions"].append(row)
+            submission_id = record["submission"]["submission_id"]
+            binding = {
+                "schema_version": 1,
+                "submission_id": submission_id,
+                "id": identifier,
+                "version": version,
+                "entry_path": row["path"],
+            }
+            path = root / registration_authority.submission_path(submission_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(binding) + "\n")
+            if version == 1:
+                match = registration_authority.PALOMAR_ID_RE.fullmatch(identifier)
+                assert match is not None
+                day = match.group("date")
+                days[day] = max(days.get(day, 0), int(match.group("serial")))
+        for identifier, document in by_result.items():
+            document["versions"].sort(key=lambda row: row["version"])
+            path = root / registration_authority.result_path(identifier)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(document) + "\n")
+        for day, last_serial in days.items():
+            path = root / registration_authority.day_path(day)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"schema_version": 1, "date": day, "last_serial": last_serial})
+                + "\n"
+            )
+        marker = root / ".fixture"
+        marker.write_text("segmented registration fixture\n")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-C",
+                str(root),
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            check=True,
+        )
         return root
 
     def prior(self, identifier="PALOMAR-2026-08-01-000012", submission="a1b2c3d4e5f6", version=1):
@@ -3322,7 +3460,11 @@ class PublicationIdentityTests(unittest.TestCase):
                 reviewed_at="2026-08-01T12:00:00Z",
                 registered_at="2026-08-11T09:00:00Z",
                 mechanical={
-                    "source": {"repository": "example/project", "project_path": "projects/second"}
+                    "source": {
+                        "repository": "example/project",
+                        "project_path": "projects/second",
+                    },
+                    "comparator": {"path": "comparator.json"},
                 },
             )
 
@@ -5620,13 +5762,57 @@ class DatabaseCheckoutTests(unittest.TestCase):
         (source / "entries").mkdir()
         (source / "scores").mkdir()
         payload_blobs = set()
-        entries = []
         for number in range(payload_count):
             identifier = f"PALOMAR-2026-08-08-{number + 1:06d}"
             filename = f"{identifier}-v1.json"
             (source / "entries" / filename).write_text(json.dumps({"id": identifier}) + "\n")
             (source / "scores" / filename).write_text("{}\n")
-            entries.append({"path": f"entries/{filename}"})
+            submission_id = f"{number + 1:012d}"
+            result = source / registration_authority.result_path(identifier)
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "id": identifier,
+                        "accepted_at": "2026-08-08",
+                        "identity": {
+                            "source_repository": "example/project",
+                            "project_path": None,
+                            "comparator_config_path": "comparator.json",
+                        },
+                        "versions": [
+                            {
+                                "version": 1,
+                                "submission_id": submission_id,
+                                "registered_at": "2026-08-08T12:00:00Z",
+                                "title": f"Result {number + 1}",
+                                "status": "accepted",
+                                "path": f"entries/{filename}",
+                                "abstract": "Fixture",
+                                "classification": {"arxiv": [], "msc2020": []},
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+            submission = source / registration_authority.submission_path(
+                submission_id
+            )
+            submission.parent.mkdir(parents=True, exist_ok=True)
+            submission.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "submission_id": submission_id,
+                        "id": identifier,
+                        "version": 1,
+                        "entry_path": f"entries/{filename}",
+                    }
+                )
+                + "\n"
+            )
             for directory_name in ("renders", "evidence"):
                 payload = source / directory_name / identifier / "hash" / "payload"
                 payload.parent.mkdir(parents=True)
@@ -5640,10 +5826,30 @@ class DatabaseCheckoutTests(unittest.TestCase):
                         text=True,
                     ).stdout.strip()
                 )
-        (source / "index.json").write_text(
-            json.dumps({"schema_version": 2, "generated_at": "2026-08-08T00:00:00Z",
-                        "entries": entries}) + "\n"
+        day = source / registration_authority.day_path("2026-08-08")
+        day.parent.mkdir(parents=True, exist_ok=True)
+        day.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "date": "2026-08-08",
+                    "last_serial": payload_count,
+                }
+            )
+            + "\n"
         )
+        for directory_name in ("entries", "scores", "registrations"):
+            for path in (source / directory_name).rglob("*"):
+                if path.is_file():
+                    payload_blobs.add(
+                        subprocess.run(
+                            ["git", "hash-object", str(path)],
+                            cwd=source,
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip()
+                    )
         subprocess.run([*git, "-C", str(source), "add", "-A"], check=True)
         subprocess.run([*git, "-C", str(source), "commit", "-qm", "database"], check=True)
         subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
@@ -5716,6 +5922,8 @@ class DatabaseCheckoutTests(unittest.TestCase):
                 self.sparse_clone(remote, revision, checkout)
                 self.assertFalse((checkout / "renders").exists())
                 self.assertFalse((checkout / "evidence").exists())
+                self.assertFalse((checkout / "scores").exists())
+                self.assertFalse((checkout / "registrations").exists())
                 self.assertEqual(
                     subprocess.run(
                         ["git", "rev-list", "--count", "--all"],
@@ -5757,7 +5965,7 @@ class DatabaseCheckoutTests(unittest.TestCase):
                     ).stdout.strip(),
                     "blob:none",
                 )
-                self.assertEqual(len(list((checkout / "entries").glob("*.json"))), payload_count)
+                self.assertFalse((checkout / "entries").exists())
                 missing = {
                     line[1:]
                     for line in subprocess.run(
@@ -5770,6 +5978,82 @@ class DatabaseCheckoutTests(unittest.TestCase):
                     if line.startswith("?")
                 }
                 self.assertLessEqual(payload_blobs, missing)
+
+    def test_one_exact_authority_read_fetches_only_its_promised_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, remote, revision, payload_blobs = self.repository(directory, 12)
+            checkout = Path(directory) / "checkout"
+            identifier = "PALOMAR-2026-08-08-000007"
+            relative = registration_authority.result_path(identifier)
+            wanted_blob = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", f"HEAD:{relative}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            with self.serve(remote) as url, mock.patch.dict(
+                os.environ, {"GIT_ALLOW_PROTOCOL": "file"}
+            ):
+                cli.clone_at(
+                    url,
+                    revision,
+                    checkout,
+                    sparse_patterns=cli.DATABASE_SPARSE_PATTERNS,
+                )
+                before = {
+                    line[1:]
+                    for line in subprocess.run(
+                        ["git", "rev-list", "--objects", "--missing=print", "HEAD"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    if line.startswith("?")
+                }
+                self.assertLessEqual(payload_blobs, before)
+                authority_env = os.environ.copy()
+                authority_env.update(
+                    {
+                        "GIT_ALLOW_PROTOCOL": "git",
+                        "GIT_CONFIG_GLOBAL": "/dev/null",
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_NO_REPLACE_OBJECTS": "1",
+                        "GIT_TERMINAL_PROMPT": "0",
+                    }
+                )
+                loaded = registration_authority.load_result(
+                    checkout, identifier, git_env=authority_env
+                )
+                self.assertEqual(loaded["id"], identifier)
+                self.assertFalse((checkout / relative).exists())
+                after = {
+                    line[1:]
+                    for line in subprocess.run(
+                        ["git", "rev-list", "--objects", "--missing=print", "HEAD"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    if line.startswith("?")
+                }
+            self.assertIn(wanted_blob, before)
+            self.assertNotIn(wanted_blob, after)
+            self.assertLessEqual(payload_blobs - {wanted_blob}, after)
+
+    def test_sparse_validator_receives_the_exact_git_environment(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        git_env = {"PATH": os.environ["PATH"], "PALOMAR_TEST_AUTH": "threaded"}
+        with mock.patch.object(cli, "run", side_effect=[completed, completed]) as runner:
+            self.assertIs(
+                cli.validate_sparse_database(
+                    Path("/tmp/database"), "a" * 40, git_env=git_env
+                ),
+                completed,
+            )
+        self.assertEqual(runner.call_count, 2)
+        self.assertTrue(all(call.kwargs["env"] is git_env for call in runner.call_args_list))
 
     def test_a_sparse_shallow_child_pushes_only_the_new_record_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5792,6 +6076,15 @@ class DatabaseCheckoutTests(unittest.TestCase):
                 path.write_text("{}\n")
             subprocess.run(
                 ["git", "-C", str(checkout), "add", "--sparse", *new_paths], check=True,
+            )
+            self.assertIn(
+                "scores/new.json",
+                subprocess.run(
+                    ["git", "-C", str(checkout), "diff", "--cached", "--name-only"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines(),
             )
             subprocess.run(
                 ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
@@ -5942,18 +6235,6 @@ class DatabaseCheckoutTests(unittest.TestCase):
             # their current real blobs must remain behind the promisor.
             self.assertTrue(payload_blobs & missing)
 
-            index_path = checkout / "index.json"
-            index = json.loads(index_path.read_text())
-            index["generated_at"] = "2026-08-08T01:00:00Z"
-            index_path.write_text(json.dumps(index, indent=2) + "\n")
-            subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "validation"],
-                           check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(checkout), "add", "index.json"], check=True)
-            subprocess.run(
-                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
-                 "-C", str(checkout), "commit", "-qm", "change current index timestamp"],
-                check=True,
-            )
             validated = cli.validate_sparse_database(checkout, revision)
             self.assertIn("checking all entry metadata and 0 changed record bundle(s)",
                           validated.stdout)
@@ -5969,7 +6250,8 @@ class DatabaseCheckoutTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 ReviewerError,
-                "refusing unscoped validation.*omits historical renders/evidence",
+                "refusing unscoped validation.*omits historical "
+                "entries/scores/renders/evidence/registration projections",
             ):
                 cli.validate_sparse_database(checkout, revision)
 
@@ -5980,14 +6262,23 @@ class RegistrationStagingTests(unittest.TestCase):
         database.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(database)], check=True)
         (database / ".gitignore").write_text("*~\n")
-        (database / "index.json").write_text("{\"old\": true}\n")
-        subprocess.run(["git", "-C", str(database), "add", ".gitignore", "index.json"],
-                       check=True)
+        subprocess.run(["git", "-C", str(database), "add", ".gitignore"], check=True)
         subprocess.run(
             ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
              "-C", str(database), "commit", "-qm", "base"],
             check=True,
         )
+        subprocess.run(
+            ["git", "-C", str(database), "sparse-checkout", "init", "--no-cone"],
+            check=True,
+        )
+        (database / ".git" / "info" / "sparse-checkout").write_text(
+            "/*\n!/registrations/\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(database), "read-tree", "-mu", "HEAD"], check=True
+        )
+        self.assertFalse((database / "registrations").exists())
         return database
 
     def built_paths(self, database):
@@ -5998,13 +6289,24 @@ class RegistrationStagingTests(unittest.TestCase):
         for path in (entry, scores, render / "index.html", evidence / "report.json"):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("{}\n")
-        (database / "index.json").write_text("{\"new\": true}\n")
-        return entry, scores, render, evidence
+        projection_paths = (
+            "registrations/days/2026-08-09.json",
+            "registrations/results/PALOMAR-2026-08-09-000001.json",
+            "registrations/submissions/a1b2c3d4e5f6.json",
+        )
+        for projection_path in projection_paths:
+            (database / projection_path).parent.mkdir(parents=True, exist_ok=True)
+            (database / projection_path).write_text("{}\n")
+        projections = tuple(
+            registration_authority.ProjectionChange(path, {}, "A")
+            for path in projection_paths
+        )
+        return entry, scores, render, evidence, projections
 
     def test_ignored_bundle_files_are_explicitly_staged_at_mode_100644(self):
         with tempfile.TemporaryDirectory() as directory:
             database = self.repository(directory)
-            entry, scores, render, evidence = self.built_paths(database)
+            entry, scores, render, evidence, projections = self.built_paths(database)
             # This is repository-local and invisible to the worktree diff. A
             # directory-level `git add renders/...` may omit the file; the
             # production helper must force the exact enumerated path instead.
@@ -6016,6 +6318,7 @@ class RegistrationStagingTests(unittest.TestCase):
                 scores=scores,
                 render_bundle=render,
                 evidence_bundle=evidence,
+                projections=projections,
             )
             self.assertIn("renders/new/hash/index.html", additions)
             staged = subprocess.run(
@@ -6027,7 +6330,9 @@ class RegistrationStagingTests(unittest.TestCase):
                 [
                     "entries/new.json",
                     "evidence/new/hash/report.json",
-                    "index.json",
+                    "registrations/days/2026-08-09.json",
+                    "registrations/results/PALOMAR-2026-08-09-000001.json",
+                    "registrations/submissions/a1b2c3d4e5f6.json",
                     "renders/new/hash/index.html",
                     "scores/new.json",
                 ],
@@ -6042,9 +6347,9 @@ class RegistrationStagingTests(unittest.TestCase):
     def test_a_bundle_symlink_is_rejected_before_staging(self):
         with tempfile.TemporaryDirectory() as directory:
             database = self.repository(directory)
-            entry, scores, render, evidence = self.built_paths(database)
+            entry, scores, render, evidence, projections = self.built_paths(database)
             (evidence / "report.json").unlink()
-            (evidence / "report.json").symlink_to(database / "index.json")
+            (evidence / "report.json").symlink_to(database / ".gitignore")
             with self.assertRaisesRegex(ReviewerError, "evidence bundle contains a symbolic link"):
                 cli.stage_registration_change(
                     database,
@@ -6052,38 +6357,273 @@ class RegistrationStagingTests(unittest.TestCase):
                     scores=scores,
                     render_bundle=render,
                     evidence_bundle=evidence,
+                    projections=projections,
                 )
 
-
-class RegistrationIndexTests(unittest.TestCase):
-    def test_extending_the_index_reads_no_entry_files_as_it_grows(self):
-        for entry_count in (1, 1_000):
-            with self.subTest(entry_count=entry_count), tempfile.TemporaryDirectory() as directory:
-                database = Path(directory)
-                entries = [
-                    {"id": f"old-{number}", "version": 1, "title": "old", "status": "accepted",
-                     "path": f"entries/old-{number:06d}.json"}
-                    for number in range(entry_count)
-                ]
-                (database / "index.json").write_text(
-                    json.dumps({"schema_version": 2, "generated_at": "old", "entries": entries})
+    def test_a_malformed_projection_path_is_rejected_before_chmod(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = self.repository(directory)
+            entry, scores, render, evidence, projections = self.built_paths(database)
+            outside = Path(directory) / "outside.json"
+            outside.write_text("{}\n")
+            outside.chmod(0o600)
+            poisoned = (
+                registration_authority.ProjectionChange(str(outside.resolve()), {}, "A"),
+                *projections[1:],
+            )
+            with self.assertRaisesRegex(ReviewerError, "not one exact record append"):
+                cli.stage_registration_change(
+                    database,
+                    entry=entry,
+                    scores=scores,
+                    render_bundle=render,
+                    evidence_bundle=evidence,
+                    projections=poisoned,
                 )
-                reads = []
-                real_load_json = cli.load_json
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o600)
 
-                def counted(path, reads=reads, real_load_json=real_load_json):
-                    reads.append(Path(path))
-                    return real_load_json(path)
+    def test_a_version_stages_only_result_and_new_submission_projections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = self.repository(directory)
+            result_path = "registrations/results/PALOMAR-2026-08-09-000001.json"
+            (database / result_path).parent.mkdir(parents=True)
+            (database / result_path).write_text('{"old":true}\n')
+            subprocess.run(
+                ["git", "-C", str(database), "add", "--sparse", result_path], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-C",
+                    str(database),
+                    "commit",
+                    "-qm",
+                    "result projection",
+                ],
+                check=True,
+            )
+            entry, scores, render, evidence, first_projections = self.built_paths(database)
+            day_path = "registrations/days/2026-08-09.json"
+            (database / day_path).unlink()
+            (database / result_path).write_text('{"new":true}\n')
+            projections = tuple(
+                registration_authority.ProjectionChange(
+                    change.path,
+                    change.document,
+                    "M" if change.path == result_path else change.status,
+                )
+                for change in first_projections
+                if change.path != day_path
+            )
 
-                record = {"id": "new", "version": 1, "title": "new", "status": "accepted"}
-                with mock.patch.object(cli, "load_json", side_effect=counted), \
-                     mock.patch.object(cli, "utc_now", return_value="2026-08-08T01:00:00Z"):
-                    result = cli.extend_registration_index(
-                        database, record=record, filename="new-v1.json"
+            cli.stage_registration_change(
+                database,
+                entry=entry,
+                scores=scores,
+                render_bundle=render,
+                evidence_bundle=evidence,
+                projections=projections,
+            )
+            staged = subprocess.run(
+                ["git", "-C", str(database), "diff", "--cached", "--name-only"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertIn(result_path, staged)
+            self.assertIn("registrations/submissions/a1b2c3d4e5f6.json", staged)
+            self.assertNotIn(day_path, staged)
+
+    def test_a_first_registration_stages_an_existing_day_as_one_exact_modification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = self.repository(directory)
+            day_path = "registrations/days/2026-08-09.json"
+            (database / day_path).parent.mkdir(parents=True)
+            (database / day_path).write_text('{"last_serial":1}\n')
+            subprocess.run(
+                ["git", "-C", str(database), "add", "--sparse", day_path], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-C",
+                    str(database),
+                    "commit",
+                    "-qm",
+                    "day projection",
+                ],
+                check=True,
+            )
+            entry, scores, render, evidence, first_projections = self.built_paths(database)
+            projections = tuple(
+                registration_authority.ProjectionChange(
+                    change.path,
+                    change.document,
+                    "M" if change.path == day_path else change.status,
+                )
+                for change in first_projections
+            )
+            cli.stage_registration_change(
+                database,
+                entry=entry,
+                scores=scores,
+                render_bundle=render,
+                evidence_bundle=evidence,
+                projections=projections,
+            )
+            staged = subprocess.run(
+                ["git", "-C", str(database), "diff", "--cached", "--raw", "--", day_path],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertRegex(staged, r"\A:100644 100644 [0-9a-f]+ [0-9a-f]+ M\t")
+
+
+class RegistrationProjectionCostTests(unittest.TestCase):
+    """Ordinary identity work never enumerates unrelated registrations."""
+
+    def repository(self, directory, unrelated, *, with_result=False):
+        database = Path(directory)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(database)], check=True)
+        results = database / registration_authority.RESULTS_DIRECTORY
+        results.mkdir(parents=True)
+        for number in range(1, unrelated + 1):
+            (results / f"PALOMAR-2025-01-01-{number:06d}.json").write_text("{}\n")
+        if with_result:
+            identifier = "PALOMAR-2026-08-01-000012"
+            (results / f"{identifier}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "id": identifier,
+                        "accepted_at": "2026-08-01",
+                        "identity": {
+                            "source_repository": "example/project",
+                            "project_path": None,
+                            "comparator_config_path": "comparator.json",
+                        },
+                        "versions": [
+                            {
+                                "version": 1,
+                                "submission_id": "a1b2c3d4e5f6",
+                                "registered_at": "2026-08-01T12:00:00Z",
+                                "title": "Prior",
+                                "status": "accepted",
+                                "path": f"entries/{identifier}-v1.json",
+                                "abstract": "Prior abstract",
+                                "classification": {
+                                    "arxiv": ["math.CO"],
+                                    "msc2020": ["05C10"],
+                                },
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+        subprocess.run(["git", "-C", str(database), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-C",
+                str(database),
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(database), "sparse-checkout", "init", "--no-cone"],
+            check=True,
+        )
+        (database / ".git" / "info" / "sparse-checkout").write_text(
+            "/*\n!/registrations/\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(database), "read-tree", "-mu", "HEAD"], check=True
+        )
+        self.assertFalse((database / "registrations").exists())
+        return database
+
+    def resolve(self, database, *, existing_id=None):
+        return registration_authority.registration_identity(
+            database,
+            submission_id="b2c3d4e5f6a1",
+            existing_id=existing_id,
+            reviewed_at="2026-08-09T11:00:00Z",
+            registered_at="2026-08-09T12:00:00Z",
+            mechanical={
+                "source": {"repository": "example/project"},
+                "comparator": {"path": "comparator.json"},
+            },
+        )
+
+    def test_first_registration_reads_only_submission_day_and_allocated_result(self):
+        costs = {}
+        for unrelated in (1, 200):
+            with self.subTest(unrelated=unrelated), tempfile.TemporaryDirectory() as directory:
+                database = self.repository(directory, unrelated)
+                opened = []
+                real_load = registration_authority._load_projection
+
+                def counted(root, relative, *, opened=opened, real_load=real_load, **options):
+                    opened.append(relative)
+                    return real_load(root, relative, **options)
+
+                with mock.patch.object(
+                    registration_authority, "_load_projection", side_effect=counted
+                ):
+                    identity = self.resolve(database)
+                self.assertEqual(identity[0], "PALOMAR-2026-08-09-000001")
+                costs[unrelated] = opened
+        expected = [
+            "registrations/submissions/b2c3d4e5f6a1.json",
+            "registrations/days/2026-08-09.json",
+            "registrations/results/PALOMAR-2026-08-09-000001.json",
+        ]
+        self.assertEqual(costs[1], costs[200])
+        self.assertEqual(costs[1], expected)
+
+    def test_version_registration_reads_only_submission_and_one_bounded_result(self):
+        costs = {}
+        for unrelated in (1, 200):
+            with self.subTest(unrelated=unrelated), tempfile.TemporaryDirectory() as directory:
+                database = self.repository(directory, unrelated, with_result=True)
+                opened = []
+                real_load = registration_authority._load_projection
+
+                def counted(root, relative, *, opened=opened, real_load=real_load, **options):
+                    opened.append(relative)
+                    return real_load(root, relative, **options)
+
+                with mock.patch.object(
+                    registration_authority, "_load_projection", side_effect=counted
+                ):
+                    identity = self.resolve(
+                        database, existing_id="PALOMAR-2026-08-01-000012"
                     )
-                self.assertEqual(reads, [database / "index.json"])
-                self.assertEqual(len(result["entries"]), entry_count + 1)
-                self.assertEqual(result["entries"], sorted(result["entries"], key=lambda item: item["path"]))
+                self.assertEqual(identity[-1], 2)
+                costs[unrelated] = opened
+        expected = [
+            "registrations/submissions/b2c3d4e5f6a1.json",
+            "registrations/results/PALOMAR-2026-08-01-000012.json",
+        ]
+        self.assertEqual(costs[1], costs[200])
+        self.assertEqual(costs[1], expected)
 
 
 class RegistrationRetryTests(unittest.TestCase):

@@ -320,19 +320,23 @@ deliberately not retained. It pushes a branch to
 Database registration requires Git 2.34 or newer. Its checkout begins
 blob-filtered, depth one, and sparse: the filtered fetch itself registers
 `origin` as the promisor and `blob:none` filter, then checkout lazily fetches
-the in-sparse schemas, tools, entries, scores and index. Historical `renders/`
-and `evidence/` payload blobs are neither materialized nor downloaded. New
-payload files are normalized to mode `100644`, enumerated rather than added by
-directory, force-added by their explicit paths so an ignore rule cannot omit
-one, and compared with the staged Git tree before the commit is accepted.
+only the in-sparse schemas and tools. Historical `entries/`, `scores/`,
+`renders/`, `evidence/`, and segmented registration projections are not
+materialized. Registration reads the checked-out Git tree and fetches only the
+exact submission/result/day authority blobs needed for the event; unrelated
+authority and payload blobs remain promised. New files are normalized to mode
+`100644`, enumerated rather than
+added by directory, force-added by their explicit paths so an ignore rule
+cannot omit one, and compared with the staged Git tree before the commit is
+accepted.
 
 The proposed commit is validated with the real `tools/validate.py --since` the
 exact Database `main` commit it extends, so the validator hashes the new
-immutable bundles while still checking every entry's metadata and the complete
-index. Before invoking it, the reviewer asks that exact checked-out validator
-to derive its scope; a fallback stops with a sparse-checkout error instead of
-running an unscoped check over historical bundles that are intentionally
-absent.
+immutable entry and bundles and proves the exact result, submission, and day
+projection transitions. Before invoking it, the reviewer asks that exact
+checked-out validator to derive its scope; a fallback stops with a
+sparse-checkout error instead of running an unscoped check over historical
+records and bundles that are intentionally absent.
 
 The checkout stays depth one through validation and for every dry run. Just
 before a real push, the reviewer removes the shallow boundary with another
@@ -345,15 +349,21 @@ that token has `workflow` scope and is not the production GitHub App token, so
 it cannot disprove the permission-specific failure. The final fetch downloads
 commit/tree history, not historical payload contents.
 
-Registration therefore no longer grows with immutable payload bytes. It
-retains O(V) work in the number of accepted versions: registration scans every
-entry's metadata for identity allocation/update, the Database proves absolute
-entry/index agreement, and extending the index reads, copies, sorts and rewrites
-the full index. It also retains the filtered commit/tree history transfer at the
-final push boundary. Replacing the entry scans requires one separately validated
-identity projection, not another local cache; deleting the history transfer
-requires an experiment with the production App credential that proves GitHub no
-longer applies the old workflow-scope interpretation.
+Registration identity reads only the immutable binding for this submission and
+either this result's projection or this date's constant-size serial counter.
+A source repository is stored there by its case-folded GitHub owner/name
+comparison key; project and Comparator paths remain exact.
+A first version reads submission/day/result state and writes those three paths;
+an update reads submission/result state and writes those two. The only growing
+ordinary term is the touched result's ordered version list, which is capped at
+500. No registry-sized JSON document is read, written, or staged, and the
+explicit authority/path operation count is independent of total results.
+Git's initial tree/index construction and later status/diff work still scale
+with repository path count, even though historical blobs remain promised.
+Registration also retains the filtered commit/tree history transfer at the
+final push boundary; deleting that transfer requires an
+experiment with the production App credential that proves GitHub no longer
+applies the old workflow-scope interpretation.
 
 The automatic finalizer merges only when GitHub reports the change `CLEAN` and
 the database's own `validate.yml` run for that exact head commit completed
@@ -390,13 +400,17 @@ A renderer or infrastructure failure does not undo acceptance. Before making
 any public archive changes, `register` reserves the permanent ID and version in
 the private submission state. A retry reuses that identity and verifies or
 finishes the same archive refs instead of allocating an orphaned second ID.
+If another same-day registration merges first, the contiguous day counter
+invalidates the saved serial and the attempt needs operator coordination; it
+is never silently reallocated under a second identity.
 Rerun `register`, or pass a previously downloaded trusted result with
 `--render-result PATH`.
 
 Permanent identifiers are `PALOMAR-YYYY-MM-DD-NNNNNN`. The date is the day the
 result entered the registry, which is the day the submitter's consent was acted
-on, and the serial follows the largest one that date has already used, starting
-at 1 for a date with none.
+on. `registrations/days/<date>.json` owns that day's last serial, so the next
+identifier is exactly that counter plus one, starting at 1 for a date with no
+counter.
 
 The date is deliberately not the date of the review. A Palomar date is a
 priority claim, and nothing is registered until the submitter consents. The
@@ -420,18 +434,13 @@ later version, because it is what the identifier carries and what the browse
 page is read from, and the database refuses a version 1 whose two dates
 disagree.
 
-The serial was drawn at random until 2026-08-07, to hide how many reservations
-never became records. What that cost was the ordering: with a random serial, the
-order two identifiers were registered in cannot be read from the identifiers, so
-anything wanting registration order has to carry an ordinal beside the
-identifier, and an ordinal that disagrees with its identifier is a failure
-nothing downstream can detect or repair. Serials rise within a date, and a new
-version of an existing result reuses its first version's identifier and with it
-that version's date rather than allocating either, so ordering identifiers as
-strings is registration order across the whole registry. The one thing that can
-put an older identifier in late is the reservation above: a run that failed
-before midnight and is retried after it finishes under the date it reserved,
-which is one identifier committed late and no other identifier moved.
+Serials rise within a date, and a new version of an existing result reuses its
+first version's identifier and with it that version's date rather than
+allocating either, so ordering identifiers as strings is registration order
+across the whole registry. The one thing that can put an older identifier in
+late is the reservation above: a run that failed before midnight and is retried
+after it finishes under the date it reserved, which is one identifier committed
+late and no other identifier moved.
 
 Once the PR is merged, verify the immutable record and close out the private
 submission:
