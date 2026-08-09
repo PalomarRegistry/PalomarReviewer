@@ -18,6 +18,9 @@ dependencies = [
 dev = [
   "ruff==0.16.2",
 ]
+artifact = [
+  "hatchling==1.31.0",
+]
 
 [project.scripts]
 palomar-review = "palomar_reviewer.cli:main"

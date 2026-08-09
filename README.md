@@ -55,10 +55,45 @@ access, subprocess, network, State write, or public action.
 
 ## Install
 
+For development or a source checkout:
+
 ```bash
 uv tool install git+https://github.com/PalomarRegistry/PalomarReviewer.git
 palomar-review doctor
 ```
+
+Production will not use that source-install command after the dependent State
+activation lands. `runtime/` holds the
+promoted Reviewer wheel, its complete hash-locked runtime requirements, and a
+`SHA256SUMS` manifest. Those workflows will independently pin both the Git
+commit containing the files and the digest of `SHA256SUMS`, then use Python
+3.11.10. Until that activation lands, this artifact is reviewed and
+reproducible but not yet consumed by State. The activated workflows install the
+third-party runtime wheels under
+`--require-hashes --no-deps --only-binary :all:` before installing the verified
+local Reviewer wheel with `--no-deps --no-index`. There is no package-version
+or source-build choice at runtime: the only acceptable local Reviewer wheel and
+downloaded dependency wheels are the bytes reviewed in the manifest and
+`uv.lock`.
+
+Regenerate a proposed promotion with exact uv 0.12.1 on x86-64 Linux:
+
+```bash
+python3 tools/runtime_artifact.py --write
+python3 tools/runtime_artifact.py --check
+```
+
+The build uses Python 3.11.10, a hash-locked Hatchling build graph, and a fixed
+ZIP epoch; CI reproduces the wheel byte-for-byte and performs a cold install.
+The current `runtime/` tree is about 110 KiB. Any commit that changes the
+packaged Reviewer source, `README.md`, `LICENSE`, or project packaging metadata
+must regenerate its roughly 95 KiB wheel and tiny manifest; a dependency change
+also replaces the roughly 15 KiB requirements file. The install still depends
+on PyPI availability, but the index cannot substitute a
+different distribution without a SHA-256 collision. The pinned checkout,
+GitHub runner image and exact setup actions/uv binary remain bootstrap trust;
+the separately pinned Codex package and Ubuntu packages are outside this Python
+artifact.
 
 `gh` must be authenticated as an account with access to the private
 `PalomarSubmissionState` and private `PalomarDatabase` repositories. `doctor`
