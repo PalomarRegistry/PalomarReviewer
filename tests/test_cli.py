@@ -5223,41 +5223,50 @@ class TrustedRunSelectionTests(unittest.TestCase):
         self.assertEqual(run_data["updatedAt"], "2026-08-01T00:10:00Z")
         self.assertEqual(run_data["workflowPath"], ".github/workflows/submission.yml")
         self.assertEqual(run_data["headBranch"], "main")
-        self.assertEqual(run_data["workflowName"], run_data["displayTitle"])
+        self.assertEqual(run_data["runName"], run_data["displayTitle"])
         self.assertEqual(
             run_data["url"],
             "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
         )
 
     def test_the_only_lookup_is_the_recorded_run_itself(self):
-        """No listing, no window, nothing keyed on the public title."""
+        """The whole argv, so no listing, window, page or title search can creep back."""
         with self.answers(self.document()) as ran:
             cli.trusted_verification_run(self.state())
-        argv = list(ran.call_args.args[0])
-        self.assertEqual(argv[:2], ["gh", "api"])
-        self.assertIn(self.ENDPOINT, argv)
-        for forbidden in ("list", "--limit", "--paginate", "--page", "--search"):
-            self.assertNotIn(forbidden, argv)
-        self.assertFalse([part for part in argv if "Verify submission" in part])
+        ran.assert_called_once_with(["gh", "api", self.ENDPOINT], check=False)
 
     def test_a_long_history_of_newer_runs_cannot_hide_the_recorded_run(self):
-        """The submission that used to fall out of the two hundredth place."""
+        """The submission that used to fall out of the two hundredth place.
+
+        The history here is load-bearing: it is what a listing would return,
+        and the recorded run is not in it. Going back to a window fails.
+        """
+        newer = [self.document(run_id=101 + index) for index in range(1, 301)]
+        self.assertEqual(len(newer), 300)
 
         def fake_run(command, **_kwargs):
             argv = list(command)
             if "list" in argv:
-                raise AssertionError("the recorded run must not be searched for")
+                return subprocess.CompletedProcess(argv, 0, json.dumps(newer), "")
             self.assertIn(self.ENDPOINT, argv)
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.document()), "")
 
-        newer = [self.document(run_id=101 + index) for index in range(1, 301)]
-        self.assertEqual(len(newer), 300)
-        with mock.patch.object(cli, "run", side_effect=fake_run):
+        with mock.patch.object(cli, "run", side_effect=fake_run) as ran:
             run_data = cli.trusted_verification_run(self.state())
         self.assertEqual(run_data["databaseId"], 101)
+        ran.assert_called_once_with(["gh", "api", self.ENDPOINT], check=False)
 
     def test_a_document_for_another_run_is_refused(self):
         self.refused(id=999)
+        self.refused(id="101")
+        self.refused(id=ABSENT)
+
+    def test_a_boolean_id_cannot_answer_for_run_one(self):
+        """`True == 1` in Python, so equality alone would have accepted this."""
+        state = {"id": self.SUBMISSION, "run": {"id": 1}}
+        with self.answers(self.document(run_id=1, id=True)):
+            with self.assertRaisesRegex(ReviewerError, "has id True, not 1"):
+                cli.trusted_verification_run(state)
 
     def test_another_workflow_file_is_refused(self):
         """The path is why the REST run object is read and not `gh run view`."""
@@ -5451,20 +5460,31 @@ class TrustedRunConsumptionTests(unittest.TestCase):
                     cli.mechanical_report(self.state(), Path(directory) / "download")
 
     def test_an_unreadable_run_stops_before_the_artifact_and_the_clone(self):
-        failed = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
-        with tempfile.TemporaryDirectory() as directory:
-            with (
-                mock.patch.object(cli, "submission_state", return_value=self.state()),
-                mock.patch.object(cli, "run", return_value=failed),
-                mock.patch.object(cli, "download_mechanical_artifact") as download,
-                mock.patch.object(cli, "clone_at") as clone,
-            ):
-                with self.assertRaisesRegex(ReviewerError, "could not be read"):
-                    cli.prepare_workspace(
-                        self.SUBMISSION, root=Path(directory), policy_ref="main"
-                    )
-            download.assert_not_called()
-            clone.assert_not_called()
+        for detail in (
+            "gh: Not Found (HTTP 404)",
+            "gh: Must have admin rights (HTTP 403)",
+            "gh: Server Error (HTTP 500)",
+            "",
+        ):
+            with self.subTest(detail=detail):
+                failed = subprocess.CompletedProcess(["gh"], 1, "", detail)
+                with tempfile.TemporaryDirectory() as directory:
+                    with (
+                        mock.patch.object(
+                            cli, "submission_state", return_value=self.state()
+                        ),
+                        mock.patch.object(cli, "run", return_value=failed),
+                        mock.patch.object(cli, "download_mechanical_artifact") as download,
+                        mock.patch.object(cli, "clone_at") as clone,
+                        mock.patch.object(cli, "write_json") as written,
+                    ):
+                        with self.assertRaisesRegex(ReviewerError, "could not be read"):
+                            cli.prepare_workspace(
+                                self.SUBMISSION, root=Path(directory), policy_ref="main"
+                            )
+                    download.assert_not_called()
+                    clone.assert_not_called()
+                    written.assert_not_called()
 
 
 class DeliveredReviewChainTests(unittest.TestCase):

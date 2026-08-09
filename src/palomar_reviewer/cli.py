@@ -1744,8 +1744,12 @@ def normalized_verification_run(
     # and not the workflow's own `name:`. Both fields therefore read "Verify
     # submission <id>" here, and the workflow's identity comes from the path.
     title = f"Verify submission {submission_id}"
+    # Not folded into the exact comparisons below, which are equality: `True`
+    # equals 1, so a document saying `"id": true` would answer for run 1.
+    returned = document.get("id")
+    if not isinstance(returned, int) or isinstance(returned, bool) or returned != recorded:
+        raise ReviewerError(f"{refusal} has id {returned!r}, not {recorded!r}")
     expected = {
-        "id": recorded,
         "path": f".github/workflows/{VERIFY_WORKFLOW}",
         "name": title,
         "display_title": title,
@@ -1776,7 +1780,9 @@ def normalized_verification_run(
     return {
         "databaseId": recorded,
         "displayTitle": document["display_title"],
-        "workflowName": document["name"],
+        # The run's name, not the workflow's: see above. Named for what it is,
+        # so that a later reader does not take it for the workflow's identity.
+        "runName": document["name"],
         "workflowPath": document["path"],
         "headBranch": document["head_branch"],
         "event": document["event"],
