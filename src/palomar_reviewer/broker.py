@@ -22,18 +22,22 @@ The contract, exactly:
   header, compared in constant time. The broker replaces it with the real
   upstream authorization before forwarding; the capability never leaves the
   runner and the upstream key never enters the namespace.
-* The request body must be one JSON object naming the configured model, and
-  the configured reasoning effort when one is configured. `stream` must be
-  true, which is what pinned Codex sends and what the ceilings below assume.
+* The request body must be one JSON object of the shape pinned Codex sends: the
+  configured model, the configured reasoning effort exactly, `stream` true, and
+  no stored, background, continued, priority or provider-hosted-tool request,
+  because those are the ones whose cost or reach nothing here could bound.
 * Request headers are forwarded from a fixed allowlist of what pinned Codex
-  sends. Anything else a process in the namespace invents is dropped rather
-  than handed to the provider.
-* Responses are streamed through in bounded chunks. The broker reads the SSE
-  `response.completed` usage as it passes and holds nothing else about it.
+  sends, and response headers from what it reads. Anything else a process in
+  the namespace invents is dropped rather than handed to the provider, and
+  nothing about the provider account is repeated back into the namespace.
+* Responses are streamed through in bounded chunks. The broker reads the usage
+  from the SSE terminal event as it passes and holds nothing else about it. A
+  request that ends without one is charged a standing estimate.
 * Ceilings are per pass, because one broker serves one engine pass: requests,
-  cumulative tokens, estimated spend, request bytes, response bytes and
-  concurrency. Reaching one refuses further requests rather than failing the
-  pass silently, and the refusal is recorded in the usage summary.
+  cumulative tokens, estimated spend, request bytes, response bytes,
+  concurrency and open connections. Reaching one refuses further requests
+  rather than failing the pass silently, and the refusal is recorded in the
+  usage summary.
 * Nothing here logs, returns, or records either credential.
 
 What this does not do: it is not general network isolation. The namespace still
@@ -124,6 +128,8 @@ CLIENT_SOCKET_SECONDS = 300.0
 # still holds the first billable request open.
 UPSTREAM_READ_SECONDS = 600.0
 STREAM_CHUNK_BYTES = 64 * 1024
+# How much of a refused request's body is read before the connection closes.
+DRAIN_LIMIT_BYTES = 64 * 1024
 # An SSE event that never ends its line must not grow the usage reader's
 # holdover buffer without bound.
 MAX_STREAM_LINE_BYTES = 1024 * 1024
@@ -545,8 +551,13 @@ class _Handler(BaseHTTPRequestHandler):
         return secrets.compare_digest(offered[0].strip(), expected)
 
     def _drain(self, length: int) -> None:
-        """Read a refused body so the connection can be closed cleanly."""
-        remaining = min(length, self.policy.max_request_bytes)
+        """Read a little of a refused body, so the refusal reaches the client.
+
+        A little, and not all of it: an unauthenticated client that announces
+        a large body is not owed the time it would take to read one, and the
+        connection is closed after this either way.
+        """
+        remaining = min(length, DRAIN_LIMIT_BYTES)
         while remaining > 0:
             chunk = self.rfile.read(min(STREAM_CHUNK_BYTES, remaining))
             if not chunk:
