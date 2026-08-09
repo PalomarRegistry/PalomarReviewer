@@ -57,6 +57,27 @@ jobs:
       - name: Lint
         working-directory: reviewer
         run: uv run --isolated --python 3.11.10 --locked --only-group dev ruff check .
+      - name: Reproduce the promoted runtime artifact
+        working-directory: reviewer
+        run: python3 tools/runtime_artifact.py --check
+      - name: Cold-install the promoted runtime artifact
+        working-directory: reviewer
+        run: |
+          set -euo pipefail
+          runtime_env="$RUNNER_TEMP/palomar-reviewer-runtime"
+          uv venv --no-project --python 3.11.10 --no-managed-python "$runtime_env"
+          (cd runtime && sha256sum --check SHA256SUMS)
+          (cd runtime && uv pip install --python "$runtime_env/bin/python" \
+            --require-hashes --no-deps --only-binary :all: \
+            --no-cache --no-config -r requirements.txt)
+          uv pip install --python "$runtime_env/bin/python" --no-deps --no-index \
+            --no-cache --no-config runtime/palomar_reviewer-0.1.0-py3-none-any.whl
+          uv pip check --python "$runtime_env/bin/python"
+          "$runtime_env/bin/palomar-review" --help >/dev/null
+          "$runtime_env/bin/palomar-review" auto --help >/dev/null
+          "$runtime_env/bin/palomar-review" rebuild-queue --help >/dev/null
+          "$runtime_env/bin/palomar-review" doctor --help >/dev/null
+          "$runtime_env/bin/palomar-review" star-registered --help >/dev/null
       - name: Install
         working-directory: reviewer
         run: |
