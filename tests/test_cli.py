@@ -6054,6 +6054,24 @@ class DatabaseCheckoutTests(unittest.TestCase):
             )
         self.assertEqual(runner.call_count, 2)
         self.assertTrue(all(call.kwargs["env"] is git_env for call in runner.call_args_list))
+        preflight = runner.call_args_list[0].args[0]
+        self.assertEqual(preflight[:2], [sys.executable, "-c"])
+        self.assertIn("import validation_scope", preflight[2])
+        self.assertIn("validation_scope.scope_of", preflight[2])
+        self.assertNotIn("import validate", preflight[2])
+        self.assertEqual(preflight[3:], ["/tmp/database", "a" * 40])
+
+    def test_a_scope_preflight_execution_failure_is_not_misreported_as_full_fallback(self):
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="broken import")
+        with (
+            mock.patch.object(cli, "run", return_value=failed) as runner,
+            self.assertRaisesRegex(
+                ReviewerError,
+                "validation-scope preflight failed to run: broken import",
+            ),
+        ):
+            cli.validate_sparse_database(Path("/tmp/database"), "a" * 40)
+        runner.assert_called_once()
 
     def test_a_sparse_shallow_child_pushes_only_the_new_record_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6217,10 +6235,11 @@ class DatabaseCheckoutTests(unittest.TestCase):
             self.sparse_clone(remote, revision, checkout)
             self.assertFalse((checkout / "renders").exists())
             self.assertFalse((checkout / "evidence").exists())
-            self.assertEqual(
-                (checkout / "tools" / "validate.py").read_bytes(),
-                (database_source / "tools" / "validate.py").read_bytes(),
-            )
+            for module in ("validate.py", "validation_scope.py"):
+                self.assertEqual(
+                    (checkout / "tools" / module).read_bytes(),
+                    (database_source / "tools" / module).read_bytes(),
+                )
             missing = {
                 line[1:]
                 for line in subprocess.run(
