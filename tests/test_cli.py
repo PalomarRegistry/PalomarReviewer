@@ -5164,10 +5164,15 @@ class TrustedRunSelectionTests(unittest.TestCase):
     ENDPOINT = "repos/PalomarRegistry/PalomarSubmission/actions/runs/101"
 
     def document(self, run_id=101, **overrides):
-        """What the Actions run API returns for a run worth reviewing."""
+        """What the Actions run API returns for a run worth reviewing.
+
+        Copied from a real one. `name` is the run name rather than the
+        workflow's own `name:` because submission.yml sets `run-name`, so it
+        reads "Verify submission <id>" and not "Verify submission".
+        """
         document = {
             "id": run_id,
-            "name": "Verify submission",
+            "name": f"Verify submission {self.SUBMISSION}",
             "path": ".github/workflows/submission.yml",
             "display_title": f"Verify submission {self.SUBMISSION}",
             "head_branch": "main",
@@ -5216,6 +5221,9 @@ class TrustedRunSelectionTests(unittest.TestCase):
         self.assertEqual(run_data["conclusion"], "success")
         self.assertEqual(run_data["createdAt"], "2026-08-01T00:00:00Z")
         self.assertEqual(run_data["updatedAt"], "2026-08-01T00:10:00Z")
+        self.assertEqual(run_data["workflowPath"], ".github/workflows/submission.yml")
+        self.assertEqual(run_data["headBranch"], "main")
+        self.assertEqual(run_data["workflowName"], run_data["displayTitle"])
         self.assertEqual(
             run_data["url"],
             "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
@@ -5255,9 +5263,15 @@ class TrustedRunSelectionTests(unittest.TestCase):
         """The path is why the REST run object is read and not `gh run view`."""
         self.refused(path=".github/workflows/render-challenge.yml")
 
-    def test_another_workflow_name_is_refused(self):
-        """Independently of the path: a renamed file and a renamed workflow differ."""
-        self.refused(name="Verify submission (staging)")
+    def test_another_run_name_is_refused(self):
+        """Independently of the path, and independently of the display title."""
+        for name in (
+            "Verify submission",
+            f"Verify submission {self.SUBMISSION} (staging)",
+            "Verify submission ffffffffffff",
+        ):
+            with self.subTest(name=name):
+                self.refused(name=name)
 
     def test_a_title_that_merely_contains_the_submission_id_is_refused(self):
         for title in (

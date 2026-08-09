@@ -1733,17 +1733,22 @@ def normalized_verification_run(
 
     The listing this replaced supplied these properties by filtering, so they
     are asserted here instead, one document at a time. The REST run object also
-    carries the workflow `path`, which a listing does not: the display name is
-    whatever the workflow file happens to say, while the path is which file ran.
+    carries the workflow `path`, which a listing does not, and the path is what
+    says which workflow file ran. Every name here is something a dispatcher can
+    choose; only the path is not.
     """
     refusal = f"run {recorded}, which the server recorded for {submission_id},"
     if not isinstance(document, dict):
         raise ReviewerError(f"{refusal} did not come back as a single run document")
+    # `submission.yml` declares `run-name`, so a run's `name` is that run name
+    # and not the workflow's own `name:`. Both fields therefore read "Verify
+    # submission <id>" here, and the workflow's identity comes from the path.
+    title = f"Verify submission {submission_id}"
     expected = {
         "id": recorded,
         "path": f".github/workflows/{VERIFY_WORKFLOW}",
-        "name": "Verify submission",
-        "display_title": f"Verify submission {submission_id}",
+        "name": title,
+        "display_title": title,
         "head_branch": "main",
         "event": "workflow_dispatch",
         "status": "completed",
