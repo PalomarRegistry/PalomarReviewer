@@ -1726,14 +1726,90 @@ def validate_trusted_mechanical_artifact(
         raise ReviewerError("verification workflow commit is not an ancestor of main")
 
 
-def trusted_verification_runs(state: dict[str, Any]) -> list[dict[str, Any]]:
+def normalized_verification_run(
+    document: Any, recorded: int, submission_id: str
+) -> dict[str, Any]:
+    """Check every trust property of a run document and put it in run_data shape.
+
+    The listing this replaced supplied these properties by filtering, so they
+    are asserted here instead, one document at a time. The REST run object also
+    carries the workflow `path`, which a listing does not, and the path is what
+    says which workflow file ran. Every name here is something a dispatcher can
+    choose; only the path is not.
+    """
+    refusal = f"run {recorded}, which the server recorded for {submission_id},"
+    if not isinstance(document, dict):
+        raise ReviewerError(f"{refusal} did not come back as a single run document")
+    # `submission.yml` declares `run-name`, so a run's `name` is that run name
+    # and not the workflow's own `name:`. Both fields therefore read "Verify
+    # submission <id>" here, and the workflow's identity comes from the path.
+    title = f"Verify submission {submission_id}"
+    # Not folded into the exact comparisons below, which are equality: `True`
+    # equals 1, so a document saying `"id": true` would answer for run 1.
+    returned = document.get("id")
+    if not isinstance(returned, int) or isinstance(returned, bool) or returned != recorded:
+        raise ReviewerError(f"{refusal} has id {returned!r}, not {recorded!r}")
+    expected = {
+        "path": f".github/workflows/{VERIFY_WORKFLOW}",
+        "name": title,
+        "display_title": title,
+        "head_branch": "main",
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    for field, wanted in expected.items():
+        if document.get(field) != wanted:
+            raise ReviewerError(
+                f"{refusal} has {field} {document.get(field)!r}, not {wanted!r}"
+            )
+    head_sha = document.get("head_sha")
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise ReviewerError(f"{refusal} has no full workflow commit")
+    attempt = document.get("run_attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ReviewerError(f"{refusal} has no run attempt number")
+    for field in ("created_at", "updated_at"):
+        if not isinstance(document.get(field), str) or not document[field]:
+            raise ReviewerError(f"{refusal} has no {field} timestamp")
+    # Derived rather than trusted: everything downstream binds the report and
+    # the record to this string, so it has to be the run that was asked for.
+    url = f"https://github.com/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{recorded}"
+    if document.get("html_url") != url:
+        raise ReviewerError(f"{refusal} does not carry its own run URL")
+    return {
+        "databaseId": recorded,
+        "displayTitle": document["display_title"],
+        # The run's name, not the workflow's: see above. Named for what it is,
+        # so that a later reader does not take it for the workflow's identity.
+        "runName": document["name"],
+        "workflowPath": document["path"],
+        "headBranch": document["head_branch"],
+        "event": document["event"],
+        "status": document["status"],
+        "conclusion": document["conclusion"],
+        "headSha": head_sha,
+        "attempt": attempt,
+        "url": url,
+        "createdAt": document["created_at"],
+        "updatedAt": document["updated_at"],
+    }
+
+
+def trusted_verification_run(state: dict[str, Any]) -> dict[str, Any]:
     """The one run the submission server recorded for this submission.
 
     The submission id is public: it is in the run name, so anyone who can
     dispatch the workflow can produce a run carrying it. The name is therefore
     not the trust boundary. The server records the run it dispatched, and that
-    recorded id is what is accepted here; the name is checked exactly as well,
+    recorded id is what is fetched here; the name is checked exactly as well,
     so a run that matches the id but not the submission is still refused.
+
+    Fetched by id, not found in a listing. A window over the newest runs has a
+    size, and a valid submission that waits while more verifications than that
+    are dispatched would fall out of the window and become unreviewable through
+    nothing it did. The server already knows which run it started, so searching
+    for it again bought no trust and could only lose the run.
     """
     submission_id = state["id"]
     recorded = (state.get("run") or {}).get("id")
@@ -1741,52 +1817,46 @@ def trusted_verification_runs(state: dict[str, Any]) -> list[dict[str, Any]]:
         raise ReviewerError(
             f"the submission server recorded no verification run for {submission_id}"
         )
-    runs = json.loads(
-        gh([
-            "run", "list", "--repo", mechanical_evidence.SUBMISSION_REPO,
-            "--workflow", VERIFY_WORKFLOW,
-            "--event", "workflow_dispatch", "--limit", "200", "--json",
-            "databaseId,displayTitle,status,conclusion,url,headSha,headBranch,event,"
-            "createdAt,updatedAt,attempt,workflowName",
-        ])
+    proc = run(
+        [
+            "gh",
+            "api",
+            f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{recorded}",
+        ],
+        check=False,
     )
-    if not isinstance(runs, list):
-        raise ReviewerError("GitHub returned a malformed verification-run list")
-    eligible = [
-        item for item in runs
-        if isinstance(item, dict)
-        and item.get("databaseId") == recorded
-        and item.get("headBranch") == "main"
-        and item.get("status") == "completed"
-        and item.get("conclusion") == "success"
-        and str(item.get("displayTitle", "")) == f"Verify submission {submission_id}"
-    ]
-    if not eligible:
+    if proc.returncode:
+        detail = (proc.stderr or proc.stdout).strip()[-2000:] or "no detail reported"
         raise ReviewerError(
-            f"run {recorded}, which the server recorded for {submission_id}, is not a "
-            "completed successful run of the verification workflow on main"
+            f"run {recorded}, which the server recorded for {submission_id}, could not be "
+            f"read from {mechanical_evidence.SUBMISSION_REPO}: {detail}"
         )
-    return eligible
+    try:
+        document = json.loads(proc.stdout)
+    except json.JSONDecodeError as error:
+        raise ReviewerError(
+            f"GitHub returned a malformed document for run {recorded}, which the server "
+            f"recorded for {submission_id}: {error}"
+        ) from error
+    return normalized_verification_run(document, recorded, submission_id)
 
 
 def mechanical_report(
     state: dict[str, Any], download_root: Path
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     submission_id = state["id"]
-    runs = trusted_verification_runs(state)
-    for run_data in runs:
-        report_path = download_mechanical_artifact(
-            run_data["databaseId"], submission_id, download_root
-        )
-        try:
-            report = load_json(report_path)
-        except (OSError, json.JSONDecodeError) as error:
-            raise ReviewerError(f"trusted mechanical report artifact is invalid: {error}") from error
-        if not isinstance(report, dict):
-            raise ReviewerError("trusted mechanical report artifact must be a JSON object")
-        validate_trusted_mechanical_artifact(report, state, run_data)
-        return report, str(run_data["url"]), run_data
-    raise ReviewerError("no trusted mechanical report artifact belongs to this submission")
+    run_data = trusted_verification_run(state)
+    report_path = download_mechanical_artifact(
+        run_data["databaseId"], submission_id, download_root
+    )
+    try:
+        report = load_json(report_path)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReviewerError(f"trusted mechanical report artifact is invalid: {error}") from error
+    if not isinstance(report, dict):
+        raise ReviewerError("trusted mechanical report artifact must be a JSON object")
+    validate_trusted_mechanical_artifact(report, state, run_data)
+    return report, str(run_data["url"]), run_data
 
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
