@@ -531,40 +531,50 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _forward(self, body: bytes) -> bool:
         secure, host, port = upstream_origin(self.policy.upstream_origin)
-        connection: http.client.HTTPConnection
+        connection: http.client.HTTPConnection | None = None
+        # One `finally` around the whole exchange, including the paths that
+        # fail before there is a response: a provider that stops answering
+        # must not leave this holding an open socket to it until a garbage
+        # collection nobody scheduled.
         try:
-            if secure:
-                connection = http.client.HTTPSConnection(
-                    host, port, timeout=self.policy.connect_seconds, context=ssl.create_default_context()
-                )
-            else:
-                connection = http.client.HTTPConnection(host, port, timeout=self.policy.connect_seconds)
-            connection.connect()
-            connection.sock.settimeout(self.policy.read_seconds)
-            connection.putrequest("POST", RESPONSES_PATH, skip_host=True, skip_accept_encoding=True)
-            connection.putheader("host", host if port in (80, 443) else f"{host}:{port}")
-            for name, value in self._upstream_headers():
-                connection.putheader(name, value)
-            connection.putheader("content-length", str(len(body)))
-            connection.endheaders(body)
-            response = connection.getresponse()
-        except TimeoutError:
-            self._refuse(504, "the model provider did not respond in time", "upstream timeout")
-            return False
-        except (OSError, http.client.HTTPException, ssl.SSLError) as error:
-            # The exception text is scrubbed and kept general: it can quote
-            # request material, and the client is untrusted.
-            self._note(f"upstream transport failure: {type(error).__name__}")
-            self._refuse(502, "the model provider could not be reached", "upstream transport failure")
-            return False
-        try:
+            try:
+                if secure:
+                    connection = http.client.HTTPSConnection(
+                        host,
+                        port,
+                        timeout=self.policy.connect_seconds,
+                        context=ssl.create_default_context(),
+                    )
+                else:
+                    connection = http.client.HTTPConnection(
+                        host, port, timeout=self.policy.connect_seconds
+                    )
+                connection.connect()
+                connection.sock.settimeout(self.policy.read_seconds)
+                connection.putrequest("POST", RESPONSES_PATH, skip_host=True, skip_accept_encoding=True)
+                connection.putheader("host", host if port in (80, 443) else f"{host}:{port}")
+                for name, value in self._upstream_headers():
+                    connection.putheader(name, value)
+                connection.putheader("content-length", str(len(body)))
+                connection.endheaders(body)
+                response = connection.getresponse()
+            except TimeoutError:
+                self._refuse(504, "the model provider did not respond in time", "upstream timeout")
+                return False
+            except (OSError, http.client.HTTPException, ssl.SSLError) as error:
+                # The exception text is scrubbed and kept general: it can quote
+                # request material, and the client is untrusted.
+                self._note(f"upstream transport failure: {type(error).__name__}")
+                self._refuse(502, "the model provider could not be reached", "upstream transport failure")
+                return False
             if 300 <= response.status < 400:
                 self._refuse(502, "the model provider redirected", "upstream redirect")
                 return False
             return self._stream(response)
         finally:
-            with contextlib.suppress(OSError, http.client.HTTPException):
-                connection.close()
+            if connection is not None:
+                with contextlib.suppress(OSError, http.client.HTTPException):
+                    connection.close()
 
     def _stream(self, response: http.client.HTTPResponse) -> bool:
         """Copy the upstream answer through in bounded chunks.
@@ -779,7 +789,13 @@ class BrokerProcess:
         except OSError as error:
             self.close()
             raise BrokerError(f"could not configure the model broker: {error}") from error
-        started = self._next_line(BROKER_START_SECONDS)
+        try:
+            started = self._next_line(BROKER_START_SECONDS)
+        except BrokerError:
+            # A broker that never answered is still a child of this process,
+            # and reaping it is this method's job whether it worked or not.
+            self.close()
+            raise
         port = started.get("port") if isinstance(started, dict) else None
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
             self.close()

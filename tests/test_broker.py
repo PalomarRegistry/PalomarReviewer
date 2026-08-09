@@ -695,6 +695,51 @@ class PinnedClientTests(unittest.TestCase):
                 self.assertIn(pinned, (root / relative).read_text(encoding="utf-8"))
 
 
+class EnginePassTests(unittest.TestCase):
+    def test_an_engine_timeout_still_takes_the_broker_with_it(self):
+        """The pass may end any way at all; the capability ends with it."""
+        with FakeUpstream() as upstream, tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            seen: dict[str, str] = {}
+
+            def timed_out(command, **kwargs):
+                configured = next(
+                    argument for argument in command if "base_url=" in argument
+                )
+                seen["base"] = configured.split('base_url="', 1)[1].removesuffix('/v1"')
+                raise engine.EngineError("codex exec timed out after 7200 seconds")
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        broker.UPSTREAM_KEY_ENV: UPSTREAM_CANARY,
+                        broker.UPSTREAM_ORIGIN_ENV: upstream.origin,
+                    },
+                ),
+                mock.patch.object(
+                    engine, "isolated_command", side_effect=lambda _engine, argv, **_kwargs: argv
+                ),
+                mock.patch.object(engine, "_run", side_effect=timed_out),
+            ):
+                with self.assertRaisesRegex(engine.EngineError, "timed out"):
+                    engine.execute(
+                        "prompt",
+                        engine="codex",
+                        command=None,
+                        model=MODEL,
+                        cwd=source,
+                        schema={"type": "object"},
+                        raw_path=root / "raw" / "result.txt",
+                    )
+
+        self.assertTrue(seen["base"].startswith("http://127.0.0.1:"))
+        with self.assertRaises(OSError):
+            request(seen["base"], capability="anything", timeout=5)
+
+
 class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
     """The real Bubblewrap namespace, searched for a credential it must not hold."""
 
