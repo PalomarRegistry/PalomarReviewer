@@ -818,7 +818,8 @@ def build_server(
         server.socket.close()
         server.socket = listen_socket
         server.server_address = listen_socket.getsockname()
-        server.server_port = server.server_address[1]
+        # `server_bind` would have set these, and it is not being run.
+        server.server_name, server.server_port = server.server_address
     server.daemon_threads = True
     return server, ledger
 
