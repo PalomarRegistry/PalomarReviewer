@@ -3639,7 +3639,8 @@ def validate_sparse_database(
     normal Database invocation may safely fall back to full validation, but in
     this checkout that fallback cannot inspect what is absent and would emit a
     misleading wall of missing-bundle errors. Ask the exact checked-out
-    validator for its scope first, and fail explicitly if it cannot derive one.
+    ``tools/validation_scope.py`` owner first, and fail explicitly if it cannot
+    derive one.
     """
     preflight = run(
         [
@@ -3649,8 +3650,8 @@ def validate_sparse_database(
                 "import pathlib,sys; "
                 "root=pathlib.Path(sys.argv[1]); "
                 "sys.path.insert(0,str(root/'tools')); "
-                "import validate; "
-                "raise SystemExit(0 if validate.scope_of(root,sys.argv[2]) is not None else 3)"
+                "import validation_scope; "
+                "raise SystemExit(0 if validation_scope.scope_of(root,sys.argv[2]) is not None else 3)"
             ),
             str(database),
             base,
@@ -3659,13 +3660,17 @@ def validate_sparse_database(
         check=False,
         env=git_env,
     )
-    if preflight.returncode:
-        detail = (preflight.stderr or preflight.stdout).strip()[-2000:]
-        suffix = f": {detail}" if detail else ""
+    detail = (preflight.stderr or preflight.stdout).strip()[-2000:]
+    suffix = f": {detail}" if detail else ""
+    if preflight.returncode == 3:
         raise ReviewerError(
             "PalomarDatabase could not derive a changed-record validation scope; refusing "
             "unscoped validation because this sparse checkout omits historical "
             f"entries/scores/renders/evidence/registration projections{suffix}"
+        )
+    if preflight.returncode:
+        raise ReviewerError(
+            f"PalomarDatabase validation-scope preflight failed to run{suffix}"
         )
     return run(
         [sys.executable, "tools/validate.py", "--since", base],

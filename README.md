@@ -368,10 +368,10 @@ accepted.
 The proposed commit is validated with the real `tools/validate.py --since` the
 exact Database `main` commit it extends, so the validator hashes the new
 immutable entry and bundles and proves the exact result, submission, and day
-projection transitions. Before invoking it, the reviewer asks that exact
-checked-out validator to derive its scope; a fallback stops with a
-sparse-checkout error instead of running an unscoped check over historical
-records and bundles that are intentionally absent.
+projection transitions. Before invoking it, the reviewer asks the exact
+checked-out `tools/validation_scope.py` owner to derive its scope; a fallback
+stops with a sparse-checkout error instead of running an unscoped check over
+historical records and bundles that are intentionally absent.
 
 The checkout stays depth one through validation and for every dry run. Just
 before a real push, the reviewer removes the shallow boundary with another
