@@ -185,6 +185,28 @@ def identity(engine: str, model: str | None, command: str | None) -> str:
     return f"{engine}:{model or 'default'}"
 
 
+def sandbox_process_environment() -> dict[str, str]:
+    """The environment Bubblewrap itself is started with, holding nothing.
+
+    `--clearenv` answers what the engine process sees, which is not the same
+    question. Bubblewrap leaves a reaper at PID 1 inside the namespace and that
+    reaper is Bubblewrap, which never execs, so `/proc/1/environ` in there is
+    whatever Bubblewrap was started with. A model that thought to read it would
+    find every operator credential the reviewer holds: the upstream provider
+    key, `GH_TOKEN`, the archive token. `--clearenv` cannot help, because by
+    then it has already done its job on a different process.
+
+    So the reviewer hands Bubblewrap an environment with nothing in it worth
+    reading. `PATH` is kept because it names directories rather than secrets,
+    and dropping it would change how an operator's own tooling resolves.
+    """
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
 def _run(
     command: list[str],
     *,
@@ -200,6 +222,9 @@ def _run(
             capture_output=True,
             timeout=timeout,
             pass_fds=pass_fds,
+            # Every command this runs is a namespace launch, and the namespace
+            # can read the launcher's environment. See above.
+            env=sandbox_process_environment(),
         )
     except subprocess.TimeoutExpired:
         raise EngineError(

@@ -386,6 +386,19 @@ class RefusalTests(unittest.TestCase):
                     {"model": MODEL, "stream": True, "reasoning": {"effort": "low"}},
                 ),
                 ("not an object", [{"model": MODEL}]),
+                (
+                    "a hosted web search tool",
+                    {"model": MODEL, "stream": True, "tools": [{"type": "web_search"}]},
+                ),
+                (
+                    "a hosted tool beside a client one",
+                    {
+                        "model": MODEL,
+                        "stream": True,
+                        "tools": [{"type": "function", "name": "shell"}, {"type": "mcp"}],
+                    },
+                ),
+                ("tools that are not a list", {"model": MODEL, "stream": True, "tools": "all"}),
             ):
                 with self.subTest(request=name):
                     status, _headers, _body = request(base, body=body)
@@ -398,6 +411,20 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(refusals["unexpected stream mode"], 1)
         self.assertEqual(refusals["unexpected reasoning effort"], 1)
         self.assertEqual(refusals["unparsable request body"], 2)
+        self.assertEqual(refusals["unexpected tools"], 3)
+
+    def test_a_client_run_tool_list_is_served(self):
+        with running_broker(self.policy()) as (base, _ledger, _server):
+            status, _headers, _body = request(
+                base,
+                body={
+                    "model": MODEL,
+                    "stream": True,
+                    "tools": [{"type": "function", "name": "shell"}, {"type": "custom", "name": "exec"}],
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.upstream.requests), 1)
 
     def test_an_oversized_or_undeclared_body_is_refused_unread(self):
         with running_broker(self.policy(max_request_bytes=512)) as (base, ledger, _server):
@@ -671,8 +698,14 @@ class PinnedClientTests(unittest.TestCase):
 class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
     """The real Bubblewrap namespace, searched for a credential it must not hold."""
 
+    # `env` is what the engine was given. The environment of every other
+    # process the namespace can see is a separate question, and the one that
+    # matters: Bubblewrap's own reaper is PID 1 in here, and it never execs, so
+    # `/proc/1/environ` is the environment Bubblewrap was launched with rather
+    # than the one `--clearenv` produced.
     PROBE = (
         "echo '=== env'; env; "
+        "echo '=== environs'; cat /proc/*/environ 2>/dev/null | tr '\\0' '\\n'; "
         "echo '=== argv'; cat /proc/*/cmdline 2>/dev/null | tr '\\0' '\\n'; "
         "echo '=== paths'; find /home /output /tmp /workspace -maxdepth 6 2>/dev/null; "
         "echo '=== content'; "
@@ -719,18 +752,15 @@ class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
                         output_dir=output,
                         secret_args_fd=read_fd,
                     )
-                # Everything about the namespace, with the engine replaced by a
-                # probe of it. Nothing else about the command is changed.
-                separator = command.index("--")
-                probe = [*command[: separator + 1], "/bin/sh", "-c", self.PROBE]
-                found = subprocess.run(
-                    probe, capture_output=True, text=True, pass_fds=(read_fd,), timeout=120
-                )
+                    # Everything about the namespace, with the engine replaced
+                    # by a probe of it. Nothing else is changed, and it is
+                    # launched the way a pass launches one, so the environment
+                    # Bubblewrap itself receives is the real one.
+                    separator = command.index("--")
+                    probe = [*command[: separator + 1], "/bin/sh", "-c", self.PROBE]
+                    namespace = engine._run(probe, pass_fds=(read_fd,), timeout=120).stdout
             finally:
                 os.close(read_fd)
-
-        self.assertEqual(found.returncode, 0, found.stderr)
-        namespace = found.stdout
         # The probe is looking at the real namespace: the one credential that
         # belongs there is there.
         self.assertIn(capability, namespace)

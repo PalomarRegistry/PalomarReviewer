@@ -133,6 +133,10 @@ FORWARDED_REQUEST_HEADERS = (
     "x-openai-internal-codex-responses-lite",
 )
 MAX_FORWARDED_HEADER_BYTES = 16 * 1024
+# Tools the client runs itself. A hosted tool would have the provider act on
+# the internet for whoever asked, which is not something this reviewer's policy
+# says its passes can do.
+CLIENT_RUN_TOOL_TYPES = frozenset({"function", "custom"})
 # Returned to the client so a streamed answer is readable, and so a refused or
 # rate-limited upstream keeps the timing the client needs. No upstream header
 # outside this list is repeated.
@@ -500,6 +504,21 @@ class _Handler(BaseHTTPRequestHandler):
             offered = reasoning.get("effort") if isinstance(reasoning, dict) else None
             if offered is not None and offered != effort:
                 return f"this broker serves only reasoning effort {effort}", "unexpected reasoning effort"
+        tools = request.get("tools")
+        if tools is not None:
+            # Pinned Codex sends no top-level `tools` at all: its own tools
+            # travel inside `input`, and the client runs them. What this
+            # refuses is a hosted tool, which the provider would run on the
+            # requester's behalf, and which is how a process in the namespace
+            # would give the reviewer the web research the policy says it does
+            # not have. It is one layer and not a proof: a hosted tool smuggled
+            # into `input` by a future client shape is not inspected here.
+            if not isinstance(tools, list):
+                return "this broker serves only client-run tools", "unexpected tools"
+            for tool in tools:
+                kind = tool.get("type") if isinstance(tool, dict) else None
+                if kind not in CLIENT_RUN_TOOL_TYPES:
+                    return "this broker serves only client-run tools", "unexpected tools"
         return None
 
     def _upstream_headers(self) -> list[tuple[str, str]]:
