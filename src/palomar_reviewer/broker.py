@@ -51,6 +51,7 @@ import json
 import os
 import queue
 import secrets
+import socket
 import ssl
 import subprocess
 import sys
@@ -87,28 +88,40 @@ LOOPBACK_HOST = "127.0.0.1"
 # two hours with reasoning effort high cannot fit many hundreds. This bounds a
 # loop, not a budget.
 MAX_REQUESTS = 250
-# The model's context window is 272,000 input tokens, and the reviewer's
-# rendered prompt is capped at 300,000 bytes well below it. Eight mebibytes of
-# request JSON is several times the largest conversation that window can hold.
-MAX_REQUEST_BYTES = 8 * 1024 * 1024
+# The reviewer's rendered prompt is capped at 300,000 bytes, and a whole
+# conversation at the 272,000-token price threshold is on the order of one
+# mebibyte of request JSON. This is not a statement about the model's context
+# window, which is larger: it is the point past which a body is not a
+# conversation any more.
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # A streamed answer including reasoning summaries and tool arguments, with the
 # same kind of headroom.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 # Cumulative across the pass, so the whole re-sent conversation counts again on
-# every request. The arithmetic ceiling: 250 requests of a full context window
-# would be 68,000,000 tokens, and this refuses well before that.
+# every request. An arithmetic backstop under the spend ceiling below.
 MAX_TOTAL_TOKENS = 20_000_000
-# The ceiling that actually binds, in USD at current list prices. It is a
-# runaway backstop and not a budget: an ordinary pass is orders of magnitude
-# below it, and the intended cost controls remain `--max-reviews` and a
-# provider-side spend limit.
+# The ceiling that actually binds, in USD estimated at current list prices. It
+# is a runaway backstop and not a budget: an ordinary pass is orders of
+# magnitude below it, and the intended cost controls remain `--max-reviews` and
+# a provider-side spend limit, which is the only hard guarantee. Four requests
+# may be in flight when the last of them crosses this, so the true overshoot is
+# the cost of the concurrency ceiling and not zero.
 MAX_SPEND_USD = 30.0
 # Pinned Codex issues one request at a time per turn. Four leaves room for the
 # client's own retry overlap without letting a namespace process open an
 # unbounded number of provider connections.
 MAX_CONCURRENT_REQUESTS = 4
+# Connections, not requests: a process in the namespace that opens sockets and
+# then says nothing must not be able to hold threads open indefinitely. Well
+# above what the client's connection pool needs.
+MAX_CONNECTIONS = 32
 UPSTREAM_CONNECT_SECONDS = 30.0
+# Applies to one read or write on a client connection, not to a whole request.
+CLIENT_SOCKET_SECONDS = 300.0
 # A reasoning model can think for a long time before the first streamed event.
+# Pinned Codex is configured with a longer idle timeout than this, so that a
+# stalled provider is refused here rather than retried from there while this
+# still holds the first billable request open.
 UPSTREAM_READ_SECONDS = 600.0
 STREAM_CHUNK_BYTES = 64 * 1024
 # An SSE event that never ends its line must not grow the usage reader's
@@ -116,6 +129,22 @@ STREAM_CHUNK_BYTES = 64 * 1024
 MAX_STREAM_LINE_BYTES = 1024 * 1024
 BROKER_START_SECONDS = 30.0
 BROKER_STOP_SECONDS = 30.0
+# What a forwarded request is charged when the provider never said what it
+# cost. Deliberately not zero and deliberately not free: a hundred of these
+# reach the spend ceiling, so a pass that hides its usage runs out sooner than
+# one that reports it, which is the right way round.
+UNMEASURED_REQUEST_TOKENS = {
+    "input_tokens": 50_000,
+    "cached_input_tokens": 0,
+    "output_tokens": 4_000,
+    "reasoning_output_tokens": 0,
+}
+# The events that end a response. The provider reports usage on all three, and
+# a pass that stops at the incomplete or failed ones is still a pass that spent
+# what those requests cost.
+TERMINAL_STREAM_EVENTS = frozenset(
+    {"response.completed", "response.incomplete", "response.failed"}
+)
 
 # Exactly what pinned Codex 0.147 sends. Everything else, including anything a
 # process inside the namespace invents, is dropped before the provider sees it.
@@ -131,16 +160,40 @@ FORWARDED_REQUEST_HEADERS = (
     "x-codex-window-id",
     "x-codex-turn-metadata",
     "x-openai-internal-codex-responses-lite",
+    # Sticky routing state the provider issues on the first response of a turn
+    # and pinned Codex replays on the rest of it. Dropping it does not fail a
+    # request, it just sends the later ones of a turn somewhere else, which is
+    # how a turn loses its prompt cache and costs several times what it should.
+    "x-codex-turn-state",
 )
 MAX_FORWARDED_HEADER_BYTES = 16 * 1024
 # Tools the client runs itself. A hosted tool would have the provider act on
 # the internet for whoever asked, which is not something this reviewer's policy
 # says its passes can do.
 CLIENT_RUN_TOOL_TYPES = frozenset({"function", "custom"})
-# Returned to the client so a streamed answer is readable, and so a refused or
-# rate-limited upstream keeps the timing the client needs. No upstream header
-# outside this list is repeated.
-RETURNED_RESPONSE_HEADERS = ("content-type", "retry-after")
+# Request fields pinned Codex never sends, and that would take the request
+# outside what this broker can bound. `background` would have the provider keep
+# working after the connection closes, where no ceiling here can see it;
+# `previous_response_id`, `prompt` and `conversation` reach for provider-side
+# state this reviewer does not keep.
+REFUSED_REQUEST_FIELDS = ("background", "previous_response_id", "prompt", "conversation")
+# Priority processing is billed above the list prices the ceiling is estimated
+# from, so a request asking for it is a request whose cost this cannot bound.
+REFUSED_SERVICE_TIERS = frozenset({"priority", "scale"})
+# Returned to the client: what it needs to read the stream, to keep the timing
+# of a refusal, and to route the rest of its turn. The provider's account-level
+# rate-limit and credit-balance headers are deliberately not among them: they
+# are facts about the Palomar account, and the namespace has no use for them.
+RETURNED_RESPONSE_HEADERS = (
+    "content-type",
+    "retry-after",
+    "x-codex-turn-state",
+    "x-models-etag",
+    "openai-model",
+    "x-openai-model",
+    "x-request-id",
+    "x-reasoning-included",
+)
 
 # The environment the broker child is started with. It holds no GitHub token,
 # no archive token, no state-write authority, and no provider credential: the
@@ -207,13 +260,17 @@ class BrokerPolicy:
 def upstream_origin(origin: str) -> tuple[bool, str, int]:
     """Split a permitted upstream origin into transport, host and port.
 
-    Only two shapes are permitted: an https origin, which is the provider, and
-    an http origin on the loopback address, which is the fake upstream the
-    integration test runs so that proving the wire protocol costs no model
-    tokens. Anything else, including a plaintext origin on a routable address,
-    is a configuration error rather than something to warn about.
+    Two shapes, and no others: the provider itself, and an http origin on the
+    loopback address, which is the fake upstream the integration test runs so
+    that proving the wire protocol costs no model tokens. Another https host is
+    refused rather than trusted, because the one thing this must never do is
+    hand the reusable key to somewhere a typo in a deployment environment
+    named. A plaintext origin on a routable address is refused for the same
+    reason and more obviously.
     """
     text = origin.strip()
+    if text.startswith("https://") and text.rstrip("/") != DEFAULT_UPSTREAM_ORIGIN:
+        raise BrokerError("the only remote upstream this broker serves is the provider")
     for scheme, secure, default_port in (("https://", True, 443), ("http://", False, 80)):
         if not text.startswith(scheme):
             continue
@@ -294,12 +351,19 @@ class Ledger:
                 self._forwarded += 1
 
     def record_usage(self, usage: Any) -> None:
-        """Take the provider's own token counts, and price them if they are usable."""
+        """Take the provider's own token counts, and price them if they are usable.
+
+        A request whose usage never arrives, because the stream was truncated
+        or the client hung up before the terminal event, is charged a standing
+        estimate instead. Otherwise a pass that disconnects every request just
+        before the provider reports it would never approach any ceiling while
+        spending whatever it liked.
+        """
         counts = usage_accounting.responses_usage_tokens(usage)
         with self._lock:
             if counts is None:
                 self._unpriced += 1
-                return
+                counts = dict(UNMEASURED_REQUEST_TOKENS)
             self._input_tokens += counts["input_tokens"]
             self._cached_input_tokens += counts["cached_input_tokens"]
             self._output_tokens += counts["output_tokens"]
@@ -361,12 +425,48 @@ class _UsageReader:
                 event = json.loads(line[len(b"data:"):].strip() or b"null")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-            if not isinstance(event, dict) or event.get("type") != "response.completed":
+            if not isinstance(event, dict) or event.get("type") not in TERMINAL_STREAM_EVENTS:
                 continue
             response = event.get("response")
             if isinstance(response, dict):
                 self.seen = True
                 self._ledger.record_usage(response.get("usage"))
+
+
+class _BoundedServer(ThreadingHTTPServer):
+    """A threading server that will not open unbounded threads.
+
+    A process in the namespace knows the port. Opening connections and then
+    saying nothing costs it nothing and would cost the runner a thread and a
+    stack each, so past a generous cap a new connection is closed rather than
+    handed to a thread. This is a separate bound from the concurrency ceiling,
+    which counts requests that reach the provider.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._connections = threading.Semaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._connections.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connections.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connections.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A client that hangs up mid-exchange is ordinary here, and the
+        # traceback socketserver would print says nothing worth saying.
+        return
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -375,6 +475,12 @@ class _Handler(BaseHTTPRequestHandler):
     # and nothing about what is listening on it.
     server_version = "palomar-broker"
     sys_version = ""
+    # Every socket operation on a connection is bounded, so a process in the
+    # namespace cannot hold threads open by connecting and then saying nothing.
+    # It is per operation rather than per connection, and a long wait here is
+    # for the provider rather than the client, so this does not cut a slow
+    # answer short.
+    timeout = CLIENT_SOCKET_SECONDS
     # Set by the server factory below, which is the only thing that builds one.
     policy: BrokerPolicy
     capability: str
@@ -498,11 +604,24 @@ class _Handler(BaseHTTPRequestHandler):
             return f"this broker serves only {self.policy.model}", "unexpected model"
         if request.get("stream") is not True:
             return "this broker serves only streamed responses", "unexpected stream mode"
+        if request.get("store") is True:
+            # Pinned Codex sends `store: false`. A stored response is provider-
+            # side state this review never asked for and cannot clean up.
+            return "this broker serves only unstored responses", "unexpected store mode"
+        for field in REFUSED_REQUEST_FIELDS:
+            if request.get(field) not in (None, False):
+                return f"this broker does not serve {field}", f"unexpected {field}"
+        tier = request.get("service_tier")
+        if isinstance(tier, str) and tier.lower() in REFUSED_SERVICE_TIERS:
+            return "this broker serves only ordinary processing", "unexpected service tier"
         effort = self.policy.reasoning_effort
         if effort is not None:
             reasoning = request.get("reasoning")
             offered = reasoning.get("effort") if isinstance(reasoning, dict) else None
-            if offered is not None and offered != effort:
+            # Exactly the configured effort, not "the configured effort or
+            # nothing": omitting it is how a request asks for the provider's
+            # default, which is not the effort this review was configured for.
+            if offered != effort:
                 return f"this broker serves only reasoning effort {effort}", "unexpected reasoning effort"
         tools = request.get("tools")
         if tools is not None:
@@ -581,8 +700,18 @@ class _Handler(BaseHTTPRequestHandler):
 
         Nothing is buffered whole: the response can be a long stream of
         reasoning and tool events, and the client is waiting on it. Only the
-        completed-response usage is taken out of the bytes as they pass.
+        terminal-event usage is taken out of the bytes as they pass, and a
+        started response that never reports its usage is charged the standing
+        estimate on the way out, however it ended.
         """
+        reader = _UsageReader(self.ledger)
+        try:
+            return self._relay(response, reader)
+        finally:
+            if response.status == 200 and not reader.seen:
+                self.ledger.record_usage(None)
+
+    def _relay(self, response: http.client.HTTPResponse, reader: _UsageReader) -> bool:
         self.close_connection = True
         try:
             self.send_response(response.status)
@@ -595,7 +724,6 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
         except OSError:
             return False
-        reader = _UsageReader(self.ledger)
         total = 0
         while True:
             try:
@@ -637,11 +765,6 @@ class _Handler(BaseHTTPRequestHandler):
             self.ledger.refuse("upstream truncated")
             self._note("refused: upstream truncated the response")
             return False
-        if response.status == 200 and not reader.seen:
-            # A completed stream that reported nothing. It is counted, because
-            # a provider request whose cost is unknown is exactly what the
-            # ceilings below cannot see.
-            self.ledger.record_usage(None)
         return response.status == 200
 
 
@@ -651,6 +774,7 @@ def build_server(
     capability: str,
     upstream_key: str,
     host: str = LOOPBACK_HOST,
+    listen_socket: socket.socket | None = None,
 ) -> tuple[ThreadingHTTPServer, Ledger]:
     """A bound, not yet serving, loopback broker and its ledger."""
     if host != LOOPBACK_HOST:
@@ -676,7 +800,14 @@ def build_server(
             "scrub": staticmethod(scrub),
         },
     )
-    server = ThreadingHTTPServer((host, 0), handler)
+    server = _BoundedServer((host, 0), handler, bind_and_activate=listen_socket is None)
+    if listen_socket is not None:
+        # The trusted parent bound and listened; this adopts that socket rather
+        # than binding one of its own. See `BrokerProcess.start`.
+        server.socket.close()
+        server.socket = listen_socket
+        server.server_address = listen_socket.getsockname()
+        server.server_port = server.server_address[1]
     server.daemon_threads = True
     return server, ledger
 
@@ -692,12 +823,24 @@ def serve(stdin: Any, stdout: Any, stderr: Any) -> int:
     if not line.strip():
         print("palomar-broker: no configuration was supplied", file=stderr, flush=True)
         return 2
+    listening: socket.socket | None = None
     try:
         config = json.loads(line)
         policy = BrokerPolicy.from_json(config.get("policy"))
         capability = str(config["capability"])
         upstream_key = str(config["upstream_key"])
-        server, ledger = build_server(policy=policy, capability=capability, upstream_key=upstream_key)
+        # The parent bound and listened before this process existed, and holds
+        # its own reference for the whole pass. Adopting that socket is what
+        # keeps the port from becoming available to anything else the moment
+        # this process dies: a listener on the same port could otherwise answer
+        # a retry with a fabricated review.
+        listening = socket.socket(fileno=int(config["listen_fd"]))
+        server, ledger = build_server(
+            policy=policy,
+            capability=capability,
+            upstream_key=upstream_key,
+            listen_socket=listening,
+        )
     except (
         json.JSONDecodeError,
         AttributeError,
@@ -709,6 +852,8 @@ def serve(stdin: Any, stdout: Any, stderr: Any) -> int:
     ) as error:
         # BrokerError text is authored here and quotes no credential; the rest
         # are shapes of a malformed control line, which the parent wrote.
+        if listening is not None:
+            listening.close()
         print(f"palomar-broker: refusing to start: {error}", file=stderr, flush=True)
         return 2
     worker = threading.Thread(target=server.serve_forever, name="palomar-broker", daemon=True)
@@ -742,8 +887,10 @@ class BrokerProcess:
         self.capability = secrets.token_urlsafe(32)
         self._process: subprocess.Popen[str] | None = None
         self._lines: queue.Queue[str] = queue.Queue()
+        self._listener: socket.socket | None = None
         self._port: int | None = None
         self.summary: dict[str, Any] | None = None
+        self.exit_status: int | None = None
 
     @property
     def base_url(self) -> str:
@@ -758,6 +905,21 @@ class BrokerProcess:
         return self._process.pid
 
     def start(self) -> None:
+        # The port is bound here, in the trusted parent, and this reference to
+        # it is held for the whole pass. The child serves on the same socket.
+        # If the child dies, the port stays taken rather than becoming
+        # available: a process in the namespace knows the port and the
+        # capability, and a listener of its own on that port could answer a
+        # client retry with a fabricated review.
+        try:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind((LOOPBACK_HOST, 0))
+            listener.listen(MAX_CONNECTIONS)
+            listener.set_inheritable(True)
+        except OSError as error:
+            raise BrokerError(f"could not bind the model broker: {error}") from error
+        self._listener = listener
+        self._port = listener.getsockname()[1]
         try:
             process = subprocess.Popen(
                 [sys.executable, "-m", "palomar_reviewer.broker"],
@@ -766,8 +928,10 @@ class BrokerProcess:
                 text=True,
                 env=broker_environment(),
                 close_fds=True,
+                pass_fds=(listener.fileno(),),
             )
         except OSError as error:
+            self.close()
             raise BrokerError(f"could not start the model broker: {error}") from error
         self._process = process
         threading.Thread(
@@ -781,6 +945,7 @@ class BrokerProcess:
                         "policy": self._policy.as_json(),
                         "capability": self.capability,
                         "upstream_key": self._upstream_key,
+                        "listen_fd": listener.fileno(),
                     }
                 )
                 + "\n"
@@ -797,15 +962,15 @@ class BrokerProcess:
             self.close()
             raise
         port = started.get("port") if isinstance(started, dict) else None
-        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        if port != self._port:
             self.close()
-            raise BrokerError("the model broker did not report a loopback port")
-        self._port = port
+            raise BrokerError("the model broker did not report the port it was given")
 
     def close(self) -> dict[str, Any] | None:
         """Stop the broker and invalidate the capability, whatever happened."""
         process = self._process
         if process is None:
+            self._release_port()
             return self.summary
         self._process = None
         self._port = None
@@ -828,7 +993,17 @@ class BrokerProcess:
         with contextlib.suppress(OSError):
             if process.stdout is not None:
                 process.stdout.close()
+        self.exit_status = process.returncode
+        # Last, so that the port stays taken until the process that was serving
+        # on it is gone rather than merely asked to stop.
+        self._release_port()
         return self.summary
+
+    def _release_port(self) -> None:
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            with contextlib.suppress(OSError):
+                listener.close()
 
     def _read_lines(self, process: subprocess.Popen[str]) -> None:
         if process.stdout is None:

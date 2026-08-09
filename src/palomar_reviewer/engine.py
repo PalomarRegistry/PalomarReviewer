@@ -83,6 +83,48 @@ CODEX_PROVIDER_ID = "palomar_broker"
 # here, because Codex is installed outside this Python artifact; it is stated so
 # that a drifting client shows up as a named difference rather than a surprise.
 PINNED_CODEX_VERSION = "0.147.0"
+CODEX_VERSION_LINE = f"codex-cli {PINNED_CODEX_VERSION}"
+CODEX_STREAM_IDLE_MS = int((model_broker.UPSTREAM_READ_SECONDS + 60) * 1000)
+
+
+def codex_version() -> str:
+    """What the installed Codex says it is, as one line."""
+    codex = shutil.which("codex")
+    if not codex:
+        raise EngineError("codex is required for the codex review engine")
+    try:
+        found = subprocess.run(
+            [codex, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=sandbox_process_environment(),
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        raise EngineError(f"could not read the Codex version: {error}") from error
+    if found.returncode:
+        raise EngineError(f"codex --version failed ({found.returncode})")
+    return found.stdout.strip()
+
+
+def require_pinned_codex() -> None:
+    """Refuse a Codex this runner's provider and header contract was not read from.
+
+    The broker forwards the headers pinned Codex sends, serves the one route it
+    calls, and enforces the request shape it makes. Those are read off a
+    particular release, and the integration test proves them against that
+    release. A different client is not necessarily wrong, but nothing here has
+    checked it, and quietly running a security boundary against assumptions
+    nobody verified is the failure this refuses. Upgrading Codex means
+    rederiving the contract and moving the pin.
+    """
+    found = codex_version()
+    if found != CODEX_VERSION_LINE:
+        raise EngineError(
+            f"this reviewer is written against {CODEX_VERSION_LINE} and found {found!r}; "
+            "rederive the broker's request and header contract, then move "
+            "PINNED_CODEX_VERSION"
+        )
 
 
 def codex_arguments(
@@ -102,6 +144,14 @@ def codex_arguments(
     either. Nothing in this list is a credential. The per-pass capability is
     passed to the namespace out of band, so that it is not in the argv of any
     process on the host.
+
+    The provider name matters, and not for display. Pinned Codex offers remote
+    compaction, on a second endpoint `{base_url}/responses/compact`, to a
+    provider it believes is OpenAI: one named exactly "OpenAI", or one whose
+    base URL looks like Azure OpenAI. Anything else compacts locally through
+    the ordinary `/responses` call. So a provider named for what it is keeps
+    the whole pass on the one endpoint the broker serves, and a rename to
+    "OpenAI" would send a long pass at a route the broker refuses.
     """
     provider = f"model_providers.{CODEX_PROVIDER_ID}"
     argv = [
@@ -132,6 +182,13 @@ def codex_arguments(
         f'{provider}.wire_api="responses"',
         "-c",
         f'{provider}.env_key="{model_broker.CAPABILITY_ENV}"',
+        # Longer than the broker's own upstream read deadline, so a provider
+        # that stops sending is refused by the broker rather than abandoned and
+        # retried by Codex while the broker still holds the first billable
+        # request open. Codex's default for a custom provider is five minutes,
+        # which is shorter than the broker waits.
+        "-c",
+        f"{provider}.stream_idle_timeout_ms={CODEX_STREAM_IDLE_MS}",
     ]
     if reasoning_effort:
         argv.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
@@ -437,6 +494,7 @@ def _run_brokered_codex(
             "the Codex engine requires --model, because the broker enforces the model "
             "it was configured for"
         )
+    require_pinned_codex()
     policy = model_broker.BrokerPolicy(
         model=model or "",
         reasoning_effort=reasoning_effort,
@@ -476,7 +534,16 @@ def _run_brokered_codex(
                 os.close(read_fd)
     except model_broker.BrokerError as error:
         raise EngineError(f"the loopback model broker failed: {error}") from error
-    return events, broker.summary or {}
+    # A pass that produced output but lost its boundary partway is not a pass
+    # that succeeded. The summary is the broker saying it served every request
+    # this review made and stopped cleanly; without it there is no account of
+    # what the ceilings saw, and the result is refused rather than delivered.
+    if broker.summary is None or broker.exit_status != 0:
+        raise EngineError(
+            "the loopback model broker did not shut down cleanly, so this pass has no "
+            "account of what it served"
+        )
+    return events, broker.summary
 
 
 def _execute(

@@ -15,6 +15,7 @@ import http.client
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -197,6 +198,11 @@ class UpstreamOriginTests(unittest.TestCase):
             "ftp://api.openai.com",
             "api.openai.com",
             "https://api.openai.com/v1/responses",
+            # An https origin is not enough: the key goes to the provider or
+            # nowhere, whatever a deployment environment was told to say.
+            "https://example.com",
+            "https://api-openai.com",
+            "https://api.openai.com.attacker.example",
             "",
         ):
             with self.subTest(origin=refused):
@@ -211,8 +217,10 @@ class UpstreamOriginTests(unittest.TestCase):
             ),
             "http://127.0.0.1:9999",
         )
-        with self.assertRaises(broker.BrokerError):
-            broker.configured_upstream_origin({broker.UPSTREAM_ORIGIN_ENV: "http://example.com"})
+        for refused in ("http://example.com", "https://example.com"):
+            with self.subTest(origin=refused):
+                with self.assertRaises(broker.BrokerError):
+                    broker.configured_upstream_origin({broker.UPSTREAM_ORIGIN_ENV: refused})
 
 
 class BrokerEnvironmentTests(unittest.TestCase):
@@ -372,33 +380,30 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(self.upstream.requests, [])
         self.assertEqual(ledger.summary()["forwarded_requests"], 0)
 
-    def test_the_configured_model_and_effort_are_the_only_ones_served(self):
+    def test_only_the_request_pinned_codex_makes_is_served(self):
         policy = broker.BrokerPolicy(
             model=MODEL, reasoning_effort="high", upstream_origin=self.upstream.origin
         )
+        pinned = {"model": MODEL, "stream": True, "reasoning": {"effort": "high"}}
         with running_broker(policy) as (base, ledger, _server):
             for name, body in (
-                ("another model", {"model": "gpt-4o", "stream": True}),
+                ("another model", {**pinned, "model": "gpt-4o"}),
                 ("no model", {"stream": True}),
-                ("not streamed", {"model": MODEL, "stream": False}),
-                (
-                    "another effort",
-                    {"model": MODEL, "stream": True, "reasoning": {"effort": "low"}},
-                ),
+                ("not streamed", {**pinned, "stream": False}),
+                ("another effort", {**pinned, "reasoning": {"effort": "low"}}),
+                ("no effort at all", {"model": MODEL, "stream": True}),
                 ("not an object", [{"model": MODEL}]),
-                (
-                    "a hosted web search tool",
-                    {"model": MODEL, "stream": True, "tools": [{"type": "web_search"}]},
-                ),
+                ("a stored response", {**pinned, "store": True}),
+                ("a background response", {**pinned, "background": True}),
+                ("priority processing", {**pinned, "service_tier": "Priority"}),
+                ("a continued response", {**pinned, "previous_response_id": "resp_1"}),
+                ("a stored prompt", {**pinned, "prompt": {"id": "pmpt_1"}}),
+                ("a hosted web search tool", {**pinned, "tools": [{"type": "web_search"}]}),
                 (
                     "a hosted tool beside a client one",
-                    {
-                        "model": MODEL,
-                        "stream": True,
-                        "tools": [{"type": "function", "name": "shell"}, {"type": "mcp"}],
-                    },
+                    {**pinned, "tools": [{"type": "function", "name": "shell"}, {"type": "mcp"}]},
                 ),
-                ("tools that are not a list", {"model": MODEL, "stream": True, "tools": "all"}),
+                ("tools that are not a list", {**pinned, "tools": "all"}),
             ):
                 with self.subTest(request=name):
                     status, _headers, _body = request(base, body=body)
@@ -409,8 +414,13 @@ class RefusalTests(unittest.TestCase):
         refusals = ledger.summary()["refusals"]
         self.assertEqual(refusals["unexpected model"], 2)
         self.assertEqual(refusals["unexpected stream mode"], 1)
-        self.assertEqual(refusals["unexpected reasoning effort"], 1)
+        self.assertEqual(refusals["unexpected reasoning effort"], 2)
         self.assertEqual(refusals["unparsable request body"], 2)
+        self.assertEqual(refusals["unexpected store mode"], 1)
+        self.assertEqual(refusals["unexpected background"], 1)
+        self.assertEqual(refusals["unexpected service tier"], 1)
+        self.assertEqual(refusals["unexpected previous_response_id"], 1)
+        self.assertEqual(refusals["unexpected prompt"], 1)
         self.assertEqual(refusals["unexpected tools"], 3)
 
     def test_a_client_run_tool_list_is_served(self):
@@ -531,7 +541,11 @@ class RefusalTests(unittest.TestCase):
         with running_broker(self.policy()) as (base, ledger, _server):
             request(base)
         summary = ledger.summary()
-        self.assertEqual(summary["input_tokens"], 0)
+        # Charged the standing estimate rather than nothing: a request whose
+        # cost the provider never reported still cost something.
+        self.assertEqual(summary["input_tokens"], broker.UNMEASURED_REQUEST_TOKENS["input_tokens"])
+        self.assertEqual(summary["responses_without_usage"], 1)
+        self.assertGreater(summary["estimated_usd"], 0)
         self.assertEqual(summary["refusals"]["upstream truncated"], 1)
 
     def test_a_stream_with_malformed_or_absent_usage_is_counted_not_guessed(self):
@@ -543,9 +557,48 @@ class RefusalTests(unittest.TestCase):
         with running_broker(self.policy()) as (base, ledger, _server):
             self.assertEqual(request(base)[0], 200)
         summary = ledger.summary()
-        self.assertEqual(summary["input_tokens"], 0)
+        self.assertEqual(summary["input_tokens"], broker.UNMEASURED_REQUEST_TOKENS["input_tokens"])
         self.assertEqual(summary["responses_without_usage"], 1)
-        self.assertEqual(summary["estimated_usd"], 0)
+        self.assertGreater(summary["estimated_usd"], 0)
+
+    def test_usage_is_taken_from_every_terminal_event(self):
+        for terminal in ("response.completed", "response.incomplete", "response.failed"):
+            with self.subTest(event=terminal):
+                self.upstream.respond = lambda handler, terminal=terminal: send_stream(
+                    handler,
+                    sse([{"type": terminal, "response": {"id": "resp", "usage": USAGE}}]),
+                )
+                with running_broker(self.policy()) as (base, ledger, _server):
+                    self.assertEqual(request(base)[0], 200)
+                summary = ledger.summary()
+                self.assertEqual(summary["input_tokens"], USAGE["input_tokens"])
+                self.assertEqual(summary["responses_without_usage"], 0)
+
+    def test_the_turn_routing_state_is_carried_in_both_directions(self):
+        """Pinned Codex replays it, so a turn that loses it loses its cache."""
+
+        def routed(handler):
+            payload = completed_stream()
+            handler.send_response(200)
+            handler.send_header("content-type", "text/event-stream")
+            handler.send_header("x-codex-turn-state", "sticky-token")
+            handler.send_header("x-request-id", "req_1")
+            handler.send_header("x-codex-credits-balance", "4200")
+            handler.send_header("content-length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        self.upstream.respond = routed
+        with running_broker(self.policy()) as (base, _ledger, _server):
+            _status, headers, _body = request(base)
+            self.assertEqual(headers["x-codex-turn-state"], "sticky-token")
+            self.assertEqual(headers["x-request-id"], "req_1")
+            # The account's own credit balance is not the namespace's business.
+            self.assertNotIn("x-codex-credits-balance", headers)
+            request(base, headers={"x-codex-turn-state": "sticky-token"})
+        self.assertEqual(
+            self.upstream.requests[1]["headers"]["x-codex-turn-state"], "sticky-token"
+        )
 
     def test_an_upstream_error_keeps_its_status_and_loses_its_headers(self):
         def refused(handler):
@@ -657,25 +710,67 @@ class BrokerProcessTests(unittest.TestCase):
             with self.assertRaises(broker.BrokerError):
                 running.start()
 
-    def test_a_broker_killed_mid_pass_refuses_every_later_request(self):
+    def test_nothing_else_can_take_the_port_when_the_broker_dies(self):
+        """The forgery this is here to stop.
+
+        A process in the namespace knows the port and the capability. If the
+        broker died and left the port free, that process could listen on it and
+        answer the client's retry with a fabricated review, which would arrive
+        looking exactly like a model result. The trusted parent binds the port
+        and holds it for the whole pass, so a dead broker leaves a port nothing
+        can serve on rather than a port going spare.
+        """
         with FakeUpstream() as upstream:
             policy = broker.BrokerPolicy(model=MODEL, upstream_origin=upstream.origin)
             running = broker.BrokerProcess(policy=policy, upstream_key=UPSTREAM_CANARY)
             running.start()
             base = running.base_url.removesuffix("/v1")
+            port = int(base.rsplit(":", 1)[1])
             self.assertEqual(request(base, capability=running.capability)[0], 200)
+
             os.kill(running.pid, 9)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 try:
-                    request(base, capability=running.capability, timeout=5)
+                    request(base, capability=running.capability, timeout=2)
                 except OSError:
+                    # No answer, rather than an answer from something else.
                     break
-                time.sleep(0.1)
+                time.sleep(0.2)
             else:
                 self.fail("the killed broker kept serving")
+            forger = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            forger.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.addCleanup(forger.close)
+            with self.assertRaises(OSError):
+                forger.bind(("127.0.0.1", port))
+
             # And shutting a dead broker down is not itself a failure.
             self.assertIsNone(running.close())
+            self.assertNotEqual(running.exit_status, 0)
+
+        # Once the pass is over the port is released like any other.
+        released = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(released.close)
+        released.bind(("127.0.0.1", port))
+
+    def test_idle_connections_cannot_take_every_thread(self):
+        """Opening sockets and saying nothing is free for the namespace."""
+        with FakeUpstream() as upstream:
+            policy = broker.BrokerPolicy(model=MODEL, upstream_origin=upstream.origin)
+            with running_broker(policy) as (base, _ledger, _server):
+                host, port = base.split("//", 1)[1].split(":")
+                idle = []
+                for _ in range(broker.MAX_CONNECTIONS + 8):
+                    quiet = socket.create_connection((host, int(port)), timeout=5)
+                    self.addCleanup(quiet.close)
+                    idle.append(quiet)
+                # The cap is on threads, not on the listener: the connections
+                # past it are closed rather than served, and the broker is
+                # still there once they are gone.
+                for quiet in idle:
+                    quiet.close()
+                self.assertEqual(request(base)[0], 200)
 
     def test_a_malformed_control_line_starts_nothing(self):
         for line in ("", "not json\n", '{"policy": {}}\n', '{"policy": {"model": ""}}\n'):
@@ -723,6 +818,7 @@ class EnginePassTests(unittest.TestCase):
                     engine, "isolated_command", side_effect=lambda _engine, argv, **_kwargs: argv
                 ),
                 mock.patch.object(engine, "_run", side_effect=timed_out),
+                mock.patch.object(engine, "require_pinned_codex"),
             ):
                 with self.assertRaisesRegex(engine.EngineError, "timed out"):
                     engine.execute(

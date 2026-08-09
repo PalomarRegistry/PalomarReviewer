@@ -4718,6 +4718,16 @@ def doctor(_: argparse.Namespace) -> int:
             failed = True
     for engine in ("codex", "claude"):
         print(f"{engine}: {shutil.which(engine) or 'not installed'}")
+    if shutil.which("codex"):
+        # The pin is not cosmetic: the broker's route, header and request
+        # contract were read off one Codex release, and a pass refuses to run
+        # against another one.
+        try:
+            engine_execution.require_pinned_codex()
+            print(f"codex version: {engine_execution.CODEX_VERSION_LINE} (pinned)")
+        except engine_execution.EngineError as error:
+            print(f"codex version: FAILED ({error})")
+            failed = True
     # Named, never printed. Codex authenticates through the loopback broker
     # and has nothing else to fall back on, so an absent upstream key is a
     # reviewer that cannot review rather than one that reviews differently.

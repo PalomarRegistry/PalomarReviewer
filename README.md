@@ -586,18 +586,36 @@ overrides that the submitted repository cannot reach, and the capability
 arrives in the namespace environment through a Bubblewrap `--args` pipe, so it
 is in no process's command line either.
 
-The broker refuses any other method, path, model, reasoning effort, or
-unstreamed request; forwards only the request headers pinned Codex sends;
-follows no redirect and reaches no origin but the configured one; streams
-events through without buffering an answer whole; and bounds the pass by
-request count, cumulative tokens, estimated spend, request and response size,
-and concurrency. What it counted, and what it refused, is recorded alongside
-the engine's own turn evidence in `spend.json`. Neither credential is written
-to a log, an artifact, an exception, or a returned header.
+The broker serves the request pinned Codex makes and refuses the rest: another
+method, path, model or reasoning effort; an unstreamed, stored or background
+response; priority processing; a continued or provider-stored conversation; a
+provider-hosted tool, which is how a namespace process would buy itself the web
+research the policy says these passes do not have. It forwards only the headers
+pinned Codex sends, returns only the ones it reads, follows no redirect, and
+reaches no origin but the provider. It streams events through without buffering
+an answer whole, and bounds the pass by request count, cumulative tokens,
+estimated spend, request and response size, concurrency and open connections. A
+request whose cost the provider never reported is charged a standing estimate,
+so hiding usage exhausts the ceiling sooner rather than evading it. What it
+counted, and what it refused, is recorded alongside the engine's own turn
+evidence in `spend.json`. Neither credential is written to a log, an artifact,
+an exception, or a returned header.
+
+Two details are the difference between a boundary and the appearance of one.
+The trusted reviewer, not the broker child, binds the loopback port and holds
+it for the whole pass: a broker that dies leaves a port nothing else can take,
+because a namespace process that knows the port and the capability could
+otherwise listen there and answer a retry with a review nobody's model wrote.
+And a pass refuses to start against a Codex other than the pinned release,
+because the route, headers and request shape the broker enforces were read off
+that release and are proven against it.
 
 What this buys: a prompt injection that talks the model into reading and
 transmitting everything it can reach comes away with a capability that only a
-process on this runner can use, and only until the pass ends. What it does not
+process on this runner can use, and only until the pass ends. Bubblewrap is
+itself launched with an environment holding nothing worth reading, because its
+own reaper is PID 1 inside the namespace and `/proc/1/environ` there is
+whatever it was started with; `--clearenv` answers a different question. What it does not
 buy: this is not network isolation. The namespace still shares the runner's
 network, because the Codex transport has to reach the broker. It covers the
 `codex:gpt-5.6-sol` launch path and no other provider; the Claude engine's own
