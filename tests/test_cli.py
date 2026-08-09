@@ -5143,63 +5143,314 @@ class RunReviewAccountingTests(unittest.TestCase):
             prepare.assert_not_called()
 
 
+ABSENT = object()
+
+
 class TrustedRunSelectionTests(unittest.TestCase):
-    """The run is the one the server recorded, not the one that says the right words.
+    """The run is the one the server recorded, fetched by its id and nothing else.
 
     The submission id is public: it is in the run name. Anyone able to dispatch
-    the workflow can therefore produce a run that carries it.
+    the workflow can therefore produce a run that carries it, so the name is not
+    the trust boundary and every property is checked against the one document
+    GitHub returns for the recorded id.
+
+    It is fetched rather than searched for. The listing this replaced read the
+    newest two hundred verification runs, so a valid submission that waited
+    while more than that were dispatched dropped out of the window and could
+    not be reviewed at all.
     """
 
-    def runs(self, *items):
-        return mock.patch.object(cli, "gh", return_value=json.dumps(list(items)))
+    SUBMISSION = "a1b2c3d4e5f6"
+    ENDPOINT = "repos/PalomarRegistry/PalomarSubmission/actions/runs/101"
 
-    def run_entry(self, run_id, title="Verify submission a1b2c3d4e5f6", **overrides):
-        return {
-            "databaseId": run_id,
-            "displayTitle": title,
-            "headBranch": "main",
+    def document(self, run_id=101, **overrides):
+        """What the Actions run API returns for a run worth reviewing."""
+        document = {
+            "id": run_id,
+            "name": "Verify submission",
+            "path": ".github/workflows/submission.yml",
+            "display_title": f"Verify submission {self.SUBMISSION}",
+            "head_branch": "main",
+            "event": "workflow_dispatch",
             "status": "completed",
             "conclusion": "success",
-            "createdAt": "2026-08-01T00:00:00Z",
-            "url": f"https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/{run_id}",
-            **overrides,
+            "head_sha": "9" * 40,
+            "run_attempt": 1,
+            "html_url": (
+                f"https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/{run_id}"
+            ),
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-01T00:10:00Z",
         }
+        document.update(overrides)
+        return {key: value for key, value in document.items() if value is not ABSENT}
+
+    @contextlib.contextmanager
+    def answers(self, payload, *, returncode=0, stderr=""):
+        """One canned `gh` response, and the mock that recorded the argv."""
+        stdout = payload if isinstance(payload, str) else json.dumps(payload)
+        completed = subprocess.CompletedProcess(["gh"], returncode, stdout, stderr)
+        with mock.patch.object(cli, "run", return_value=completed) as ran:
+            yield ran
 
     def state(self, run_id=101):
-        return {"id": "a1b2c3d4e5f6", "run": {"id": run_id}}
+        return {"id": self.SUBMISSION, "run": {"id": run_id}}
 
-    def test_the_recorded_run_is_selected(self):
-        with self.runs(self.run_entry(101)):
-            selected = cli.trusted_verification_runs(self.state())
-        self.assertEqual([item["databaseId"] for item in selected], [101])
+    def refused(self, **overrides):
+        """Assert the run described by `overrides` is refused by name and id."""
+        with self.answers(self.document(**overrides)):
+            with self.assertRaisesRegex(
+                ReviewerError, rf"run 101, which the server recorded for {self.SUBMISSION},"
+            ):
+                cli.trusted_verification_run(self.state())
 
-    def test_a_later_run_replaying_the_public_id_is_refused(self):
-        """The attack the recorded run id exists to stop."""
-        forged = self.run_entry(999, createdAt="2026-08-02T00:00:00Z")
-        with self.runs(forged, self.run_entry(101)):
-            selected = cli.trusted_verification_runs(self.state())
-        self.assertEqual([item["databaseId"] for item in selected], [101])
+    def test_the_recorded_run_is_fetched_by_id(self):
+        with self.answers(self.document()) as ran:
+            run_data = cli.trusted_verification_run(self.state())
+        self.assertEqual(ran.call_count, 1)
+        self.assertEqual(run_data["databaseId"], 101)
+        self.assertEqual(run_data["headSha"], "9" * 40)
+        self.assertEqual(run_data["attempt"], 1)
+        self.assertEqual(run_data["event"], "workflow_dispatch")
+        self.assertEqual(run_data["status"], "completed")
+        self.assertEqual(run_data["conclusion"], "success")
+        self.assertEqual(run_data["createdAt"], "2026-08-01T00:00:00Z")
+        self.assertEqual(run_data["updatedAt"], "2026-08-01T00:10:00Z")
+        self.assertEqual(
+            run_data["url"],
+            "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
+        )
 
-        with self.runs(forged):
-            with self.assertRaisesRegex(ReviewerError, "is not a"):
-                cli.trusted_verification_runs(self.state())
+    def test_the_only_lookup_is_the_recorded_run_itself(self):
+        """No listing, no window, nothing keyed on the public title."""
+        with self.answers(self.document()) as ran:
+            cli.trusted_verification_run(self.state())
+        argv = list(ran.call_args.args[0])
+        self.assertEqual(argv[:2], ["gh", "api"])
+        self.assertIn(self.ENDPOINT, argv)
+        for forbidden in ("list", "--limit", "--paginate", "--page", "--search"):
+            self.assertNotIn(forbidden, argv)
+        self.assertFalse([part for part in argv if "Verify submission" in part])
 
-    def test_a_run_whose_name_merely_contains_the_id_is_refused(self):
-        """The name must be the workflow's, not something that quotes the id."""
+    def test_a_long_history_of_newer_runs_cannot_hide_the_recorded_run(self):
+        """The submission that used to fall out of the two hundredth place."""
+
+        def fake_run(command, **_kwargs):
+            argv = list(command)
+            if "list" in argv:
+                raise AssertionError("the recorded run must not be searched for")
+            self.assertIn(self.ENDPOINT, argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.document()), "")
+
+        newer = [self.document(run_id=101 + index) for index in range(1, 301)]
+        self.assertEqual(len(newer), 300)
+        with mock.patch.object(cli, "run", side_effect=fake_run):
+            run_data = cli.trusted_verification_run(self.state())
+        self.assertEqual(run_data["databaseId"], 101)
+
+    def test_a_document_for_another_run_is_refused(self):
+        self.refused(id=999)
+
+    def test_another_workflow_file_is_refused(self):
+        """The path is why the REST run object is read and not `gh run view`."""
+        self.refused(path=".github/workflows/render-challenge.yml")
+
+    def test_another_workflow_name_is_refused(self):
+        """Independently of the path: a renamed file and a renamed workflow differ."""
+        self.refused(name="Verify submission (staging)")
+
+    def test_a_title_that_merely_contains_the_submission_id_is_refused(self):
         for title in (
-            "Verify submission a1b2c3d4e5f6 (rerun)",
-            "Render a1b2c3d4e5f6",
+            f"Verify submission {self.SUBMISSION} (rerun)",
+            f"Render {self.SUBMISSION}",
+            f"  Verify submission {self.SUBMISSION}",
             "Verify submission ffffffffffff",
         ):
             with self.subTest(title):
-                with self.runs(self.run_entry(101, title=title)):
-                    with self.assertRaisesRegex(ReviewerError, "is not a"):
-                        cli.trusted_verification_runs(self.state())
+                self.refused(display_title=title)
 
-    def test_a_submission_with_no_recorded_run_is_refused(self):
-        with self.runs(self.run_entry(101)):
-            with self.assertRaisesRegex(ReviewerError, "recorded no verification run"):
-                cli.trusted_verification_runs({"id": "a1b2c3d4e5f6"})
+    def test_another_branch_or_another_trigger_is_refused(self):
+        self.refused(head_branch="rehearsal")
+        self.refused(event="push")
+        self.refused(event="workflow_run")
+
+    def test_a_run_that_did_not_finish_and_succeed_is_refused(self):
+        for status in ("queued", "in_progress", "waiting", "pending"):
+            with self.subTest(status=status):
+                self.refused(status=status, conclusion=None)
+        for conclusion in ("failure", "cancelled", "neutral", "timed_out", None):
+            with self.subTest(conclusion=conclusion):
+                self.refused(conclusion=conclusion)
+
+    def test_a_document_that_is_not_one_run_object_is_refused(self):
+        for payload in ("[]", "null", '"run"', "17", json.dumps([{"id": 101}])):
+            with self.subTest(payload=payload):
+                with self.answers(payload):
+                    with self.assertRaisesRegex(ReviewerError, "single run document"):
+                        cli.trusted_verification_run(self.state())
+
+    def test_a_document_that_is_not_json_is_refused(self):
+        with self.answers("<html>not json</html>"):
+            with self.assertRaisesRegex(ReviewerError, "malformed document for run 101"):
+                cli.trusted_verification_run(self.state())
+
+    def test_malformed_field_types_are_refused(self):
+        for field, value in (
+            ("head_sha", "9" * 39),
+            ("head_sha", "9" * 40 + "0"),
+            ("head_sha", ("A" * 40)),
+            ("head_sha", None),
+            ("head_sha", ABSENT),
+            ("run_attempt", 0),
+            ("run_attempt", -1),
+            ("run_attempt", True),
+            ("run_attempt", "1"),
+            ("run_attempt", ABSENT),
+            ("created_at", ""),
+            ("created_at", 20260801),
+            ("created_at", ABSENT),
+            ("updated_at", ABSENT),
+            ("html_url", "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/999"),
+            ("html_url", ABSENT),
+        ):
+            with self.subTest(field=field, value=value):
+                self.refused(**{field: value})
+
+    def test_an_unrecorded_run_id_fails_before_any_github_call(self):
+        for state in (
+            {"id": self.SUBMISSION},
+            {"id": self.SUBMISSION, "run": None},
+            {"id": self.SUBMISSION, "run": {}},
+            {"id": self.SUBMISSION, "run": {"id": None}},
+            {"id": self.SUBMISSION, "run": {"id": True}},
+            {"id": self.SUBMISSION, "run": {"id": False}},
+            {"id": self.SUBMISSION, "run": {"id": 0}},
+            {"id": self.SUBMISSION, "run": {"id": -101}},
+            {"id": self.SUBMISSION, "run": {"id": "101"}},
+            {"id": self.SUBMISSION, "run": {"id": 101.0}},
+        ):
+            with self.subTest(state=state):
+                with mock.patch.object(cli, "run") as ran:
+                    with self.assertRaisesRegex(
+                        ReviewerError, "recorded no verification run"
+                    ):
+                        cli.trusted_verification_run(state)
+                ran.assert_not_called()
+
+    def test_a_run_github_will_not_serve_fails_closed(self):
+        for detail in ("gh: Not Found (HTTP 404)", "gh: Must have admin rights (HTTP 403)"):
+            with self.subTest(detail=detail):
+                with self.answers("", returncode=1, stderr=detail):
+                    with self.assertRaisesRegex(
+                        ReviewerError,
+                        rf"run 101, which the server recorded for {self.SUBMISSION}, "
+                        r"could not be read",
+                    ):
+                        cli.trusted_verification_run(self.state())
+
+
+class TrustedRunConsumptionTests(unittest.TestCase):
+    """What the one trusted run is then held to: artifact, report, ancestry."""
+
+    SUBMISSION = "a1b2c3d4e5f6"
+
+    def state(self):
+        return {
+            "id": self.SUBMISSION,
+            "status": "awaiting-review",
+            "repository": "example/project",
+            "commit": "1" * 40,
+            "run": {"id": 101},
+        }
+
+    def responder(self, calls, *, comparison="ahead"):
+        document = TrustedRunSelectionTests.document(TrustedRunSelectionTests())
+
+        def fake_run(command, **_kwargs):
+            argv = list(command)
+            calls.append(argv)
+            if "list" in argv:
+                raise AssertionError("the recorded run must not be searched for")
+            if any("/actions/runs/101" in part for part in argv):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(document), "")
+            if any("/compare/" in part for part in argv):
+                return subprocess.CompletedProcess(argv, 0, f"{comparison}\n", "")
+            raise AssertionError(f"unexpected command {argv}")
+
+        return fake_run
+
+    def downloader(self, report, downloaded):
+        def download(run_id, submission_id, destination):
+            downloaded.append((run_id, submission_id))
+            destination.mkdir(parents=True)
+            path = destination / "mechanical-report.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            return path
+
+        return download
+
+    def test_the_accepted_run_still_carries_artifact_and_ancestry_checks(self):
+        report = ReviewerTests.mechanical_fixture(ReviewerTests())
+        calls, downloaded = [], []
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(cli, "run", side_effect=self.responder(calls)),
+                mock.patch.object(
+                    cli,
+                    "download_mechanical_artifact",
+                    side_effect=self.downloader(report, downloaded),
+                ),
+            ):
+                mechanical, url, run_data = cli.mechanical_report(
+                    self.state(), Path(directory) / "download"
+                )
+        self.assertEqual(mechanical["submission"]["submission_id"], self.SUBMISSION)
+        self.assertEqual(run_data["databaseId"], 101)
+        self.assertEqual(
+            url, "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101"
+        )
+        # The artifact is downloaded by the recorded id, and the workflow commit
+        # is still checked against main's lineage.
+        self.assertEqual(downloaded, [(101, self.SUBMISSION)])
+        self.assertTrue(
+            any(
+                any(f"/compare/{'9' * 40}...main" in part for part in argv)
+                for argv in calls
+            ),
+            calls,
+        )
+
+    def test_a_workflow_commit_off_main_is_still_refused(self):
+        report = ReviewerTests.mechanical_fixture(ReviewerTests())
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(
+                    cli, "run", side_effect=self.responder([], comparison="diverged")
+                ),
+                mock.patch.object(
+                    cli,
+                    "download_mechanical_artifact",
+                    side_effect=self.downloader(report, []),
+                ),
+            ):
+                with self.assertRaisesRegex(ReviewerError, "not an ancestor of main"):
+                    cli.mechanical_report(self.state(), Path(directory) / "download")
+
+    def test_an_unreadable_run_stops_before_the_artifact_and_the_clone(self):
+        failed = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(cli, "submission_state", return_value=self.state()),
+                mock.patch.object(cli, "run", return_value=failed),
+                mock.patch.object(cli, "download_mechanical_artifact") as download,
+                mock.patch.object(cli, "clone_at") as clone,
+            ):
+                with self.assertRaisesRegex(ReviewerError, "could not be read"):
+                    cli.prepare_workspace(
+                        self.SUBMISSION, root=Path(directory), policy_ref="main"
+                    )
+            download.assert_not_called()
+            clone.assert_not_called()
 
 
 class DeliveredReviewChainTests(unittest.TestCase):
@@ -5640,6 +5891,7 @@ class FailedVerificationTests(unittest.TestCase):
             ),
             "headSha": "9" * 40,
             "event": "workflow_dispatch",
+            "attempt": 1,
         }
 
         def download(_run_id, _submission_id, destination):
@@ -5652,7 +5904,7 @@ class FailedVerificationTests(unittest.TestCase):
             with (
                 mock.patch.object(cli, "submission_state", return_value=state),
                 mock.patch.object(
-                    cli, "trusted_verification_runs", return_value=[run_data]
+                    cli, "trusted_verification_run", return_value=run_data
                 ),
                 mock.patch.object(
                     cli, "download_mechanical_artifact", side_effect=download
