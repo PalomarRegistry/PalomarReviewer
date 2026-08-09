@@ -1,4 +1,6 @@
+import contextlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -6,7 +8,37 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from palomar_reviewer import engine
+from palomar_reviewer import broker, engine
+
+BROKER_CAPABILITY = "capability-for-one-pass"
+BROKER_SUMMARY = {"schema_version": 1, "requests": 2, "refusals": {}}
+
+
+@contextlib.contextmanager
+def pinned_codex():
+    """Take the installed-Codex check as given, for tests that are not it."""
+    with mock.patch.object(engine, "require_pinned_codex"):
+        yield
+
+
+@contextlib.contextmanager
+def fake_broker(summary=None):
+    """A started broker without the child process, for the pass around it."""
+    handle = SimpleNamespace(
+        base_url="http://127.0.0.1:4321/v1",
+        capability=BROKER_CAPABILITY,
+        summary=BROKER_SUMMARY if summary is None else summary,
+        exit_status=0,
+    )
+
+    @contextlib.contextmanager
+    def started(*, policy, upstream_key):
+        handle.policy = policy
+        handle.upstream_key = upstream_key
+        yield handle
+
+    with pinned_codex(), mock.patch.object(engine.model_broker, "started_broker", started):
+        yield handle
 
 
 class EngineConfigurationTests(unittest.TestCase):
@@ -28,6 +60,7 @@ class EngineConfigurationTests(unittest.TestCase):
                 output_name="message.txt",
                 model="gpt-test",
                 reasoning_effort="high",
+                broker_base_url="http://127.0.0.1:4321/v1",
             ),
             [
                 "codex",
@@ -46,10 +79,41 @@ class EngineConfigurationTests(unittest.TestCase):
                 "--model",
                 "gpt-test",
                 "-c",
+                'model_provider="palomar_broker"',
+                "-c",
+                'model_providers.palomar_broker.name="Palomar loopback model broker"',
+                "-c",
+                'model_providers.palomar_broker.base_url="http://127.0.0.1:4321/v1"',
+                "-c",
+                'model_providers.palomar_broker.wire_api="responses"',
+                "-c",
+                'model_providers.palomar_broker.env_key="PALOMAR_MODEL_BROKER_TOKEN"',
+                "-c",
+                "model_providers.palomar_broker.stream_idle_timeout_ms=660000",
+                "-c",
                 "model_reasoning_effort=high",
                 "-",
             ],
         )
+
+    def test_the_provider_is_not_named_as_one_with_a_second_endpoint(self):
+        """Pinned Codex compacts remotely for a provider it takes for OpenAI.
+
+        It decides that from the provider name and the base URL, and it does it
+        on `/responses/compact`, which the broker does not serve. Naming the
+        provider for what it is keeps a long pass on the one endpoint.
+        """
+        argv = engine.codex_arguments(
+            schema_name="schema.json",
+            output_name="message.txt",
+            model="gpt-test",
+            reasoning_effort=None,
+            broker_base_url="http://127.0.0.1:4321/v1",
+        )
+        configured = " ".join(argv).lower()
+        self.assertNotIn('.name="openai"', configured)
+        for azure in ("openai.azure.", "cognitiveservices.azure.", "aoai.azure."):
+            self.assertNotIn(azure, configured)
 
     def test_claude_and_custom_arguments_preserve_current_capabilities(self):
         schema = {"type": "object"}
@@ -160,6 +224,7 @@ class EngineExecutionTests(unittest.TestCase):
                     side_effect=lambda _engine, argv, **_kwargs: argv,
                 ),
                 mock.patch.object(engine, "_run", side_effect=completed) as runner,
+                fake_broker() as handle,
             ):
                 result, usage = engine.execute(
                     "review this",
@@ -172,6 +237,9 @@ class EngineExecutionTests(unittest.TestCase):
                     reasoning_effort="medium",
                 )
 
+            self.assertEqual(handle.policy.model, "gpt-test")
+            self.assertEqual(handle.policy.reasoning_effort, "medium")
+            self.assertEqual(usage["broker"], BROKER_SUMMARY)
             argv = runner.call_args.args[0]
             self.assertEqual(argv[:2], ["codex", "exec"])
             self.assertIn("--ignore-user-config", argv)
@@ -212,10 +280,31 @@ class EngineExecutionTests(unittest.TestCase):
                     "_run",
                     return_value=SimpleNamespace(stdout=""),
                 ),
+                fake_broker(),
             ):
                 with self.assertRaisesRegex(
                     engine.EngineError, "regular final-message file"
                 ):
+                    engine.execute(
+                        "prompt",
+                        engine="codex",
+                        command=None,
+                        model="gpt-test",
+                        cwd=source,
+                        schema={"type": "object"},
+                        raw_path=root / "raw" / "result.txt",
+                    )
+
+    def test_codex_refuses_to_run_without_a_model_the_broker_can_enforce(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            with (
+                mock.patch.object(engine, "_run") as runner,
+                mock.patch.object(engine.model_broker, "started_broker") as started,
+            ):
+                with self.assertRaisesRegex(engine.EngineError, "requires --model"):
                     engine.execute(
                         "prompt",
                         engine="codex",
@@ -225,6 +314,144 @@ class EngineExecutionTests(unittest.TestCase):
                         schema={"type": "object"},
                         raw_path=root / "raw" / "result.txt",
                     )
+            started.assert_not_called()
+            runner.assert_not_called()
+
+    def test_a_broker_that_cannot_start_fails_the_pass_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            with (
+                pinned_codex(),
+                mock.patch.object(engine, "_run") as runner,
+                mock.patch.object(
+                    engine.model_broker,
+                    "started_broker",
+                    side_effect=broker.BrokerError("no upstream credential"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    engine.EngineError, "loopback model broker failed: no upstream credential"
+                ):
+                    engine.execute(
+                        "prompt",
+                        engine="codex",
+                        command=None,
+                        model="gpt-test",
+                        cwd=source,
+                        schema={"type": "object"},
+                        raw_path=root / "raw" / "result.txt",
+                    )
+            # Nothing ran: a pass with no boundary in front of it is not a pass
+            # that runs with the boundary missing.
+            runner.assert_not_called()
+
+    def test_a_codex_that_is_not_the_pinned_one_does_not_run(self):
+        """Every header and route assumption was read off one release."""
+        with mock.patch.object(engine, "codex_version", return_value="codex-cli 0.147.0"):
+            engine.require_pinned_codex()
+        for found in ("codex-cli 0.148.0", "codex-cli 0.146.9", "", "codex 0.147.0"):
+            with self.subTest(version=found):
+                with mock.patch.object(engine, "codex_version", return_value=found):
+                    with self.assertRaisesRegex(engine.EngineError, "0.147.0"):
+                        engine.require_pinned_codex()
+
+    def test_a_pass_whose_broker_left_no_account_is_refused(self):
+        turn = {
+            "input_tokens": 1,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1,
+            "reasoning_output_tokens": 0,
+        }
+        events = json.dumps({"type": "turn.completed", "usage": turn}) + "\n"
+        for name, broken in (
+            ("no summary", {"summary": None, "exit_status": 0}),
+            ("an abnormal exit", {"summary": BROKER_SUMMARY, "exit_status": -9}),
+        ):
+            with self.subTest(broker=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    source = root / "source"
+                    raw = root / "raw" / "metadata.txt"
+                    source.mkdir()
+
+                    def completed(argv, _raw=raw, **kwargs):
+                        output = _raw.parent / ".metadata.txt.engine-output"
+                        (output / "message.txt").write_text("{}", encoding="utf-8")
+                        return SimpleNamespace(stdout=events)
+
+                    with (
+                        mock.patch.object(
+                            engine,
+                            "isolated_command",
+                            side_effect=lambda _engine, argv, **_kwargs: argv,
+                        ),
+                        mock.patch.object(engine, "_run", side_effect=completed),
+                        fake_broker() as handle,
+                    ):
+                        handle.summary = broken["summary"]
+                        handle.exit_status = broken["exit_status"]
+                        with self.assertRaisesRegex(
+                            engine.EngineError, "did not shut down cleanly"
+                        ):
+                            engine.execute(
+                                "prompt",
+                                engine="codex",
+                                command=None,
+                                model="gpt-test",
+                                cwd=source,
+                                schema={"type": "object"},
+                                raw_path=raw,
+                            )
+
+    def test_the_capability_reaches_the_namespace_off_the_command_line(self):
+        """The one credential in the namespace arrives through a pipe, not argv."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            raw = root / "raw" / "metadata.txt"
+            source.mkdir()
+            seen: dict[str, object] = {}
+
+            def completed(argv, **kwargs):
+                fd = seen["fd"]
+                assert isinstance(fd, int)
+                seen["args"] = os.read(fd, 4096)
+                seen["pass_fds"] = kwargs["pass_fds"]
+                output = raw.parent / ".metadata.txt.engine-output"
+                (output / "message.txt").write_text("{}", encoding="utf-8")
+                return SimpleNamespace(stdout="")
+
+            def isolated(_engine, argv, *, secret_args_fd=None, **_kwargs):
+                seen["fd"] = secret_args_fd
+                return ["bwrap", "--args", str(secret_args_fd), "--", *argv]
+
+            with (
+                mock.patch.object(engine, "isolated_command", side_effect=isolated),
+                mock.patch.object(engine, "_run", side_effect=completed) as runner,
+                fake_broker(),
+            ):
+                engine.execute(
+                    "prompt",
+                    engine="codex",
+                    command=None,
+                    model="gpt-test",
+                    cwd=source,
+                    schema={"type": "object"},
+                    raw_path=raw,
+                )
+
+            self.assertEqual(
+                seen["args"],
+                b"--setenv\0PALOMAR_MODEL_BROKER_TOKEN\0" + BROKER_CAPABILITY.encode("utf-8"),
+            )
+            self.assertEqual(seen["pass_fds"], (seen["fd"],))
+            self.assertNotIn(BROKER_CAPABILITY, " ".join(runner.call_args.args[0]))
+            # And the descriptor is closed again, whatever the pass did.
+            with self.assertRaises(OSError):
+                os.fstat(seen["fd"])
 
     def test_custom_command_receives_prompt_and_persists_its_result(self):
         with tempfile.TemporaryDirectory() as directory:

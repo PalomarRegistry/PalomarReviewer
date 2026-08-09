@@ -25,6 +25,7 @@ import jsonschema
 import yaml
 
 from . import authorization as registration_authorization
+from . import broker as model_broker
 from . import checkpoint as registration_checkpoint
 from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
@@ -504,14 +505,15 @@ def _holds_configured_key(text: str, key: bytes) -> bool:
 
 
 def refuse_engine_credential(document: Any, *, context: str) -> None:
-    """Refuse a model-authored document that carries the engine's own credential.
+    """Refuse a model-authored document that carries a provider credential.
 
-    A selected model engine's authentication has to be inside the namespace the
-    pass runs in because the engine reads it: Codex receives
-    `/home/reviewer/.codex/auth.json`, and Claude receives its credential file,
-    in the same namespace as the attacker-authored `/workspace`. A custom
-    command receives no model credential. Everything else the host holds is out
-    of reach in there; the selected engine credential cannot be.
+    Production Codex no longer has one to carry: the real key stays in the
+    loopback broker, and the namespace holds only a per-pass capability that is
+    worthless once the pass ends. This check stayed anyway. It costs a scan of
+    text the review already holds, and it covers the cases the broker does not:
+    the Claude engine, which still binds its own login file into the namespace;
+    a submitted repository with a key of its own committed in it; and a
+    reviewer whose configuration is not what the operator believed it was.
 
     The other end of that is already built: finding messages become the
     `warnings` a registered record carries, and the review document goes whole
@@ -524,8 +526,10 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
     the redaction erases. Failing costs the review and tells somebody.
 
     What is looked for is credential material and not talk about credentials.
-    The exact configured value is available for comparison only for an
-    `OPENAI_API_KEY`; key-shaped output is checked for Codex and Claude.
+    The exact configured value is available for comparison for whichever
+    provider key this runner was given, under either the upstream-only name the
+    broker reads or the older `OPENAI_API_KEY`; key-shaped output is checked
+    for every engine.
     A review that says the README asks you to export `OPENAI_API_KEY`, or that
     `deploy.py` has a key hardcoded in it, is a review doing its job and is
     delivered. The one honest review this does refuse is the one that quotes
@@ -534,16 +538,18 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
     to be named in a registered record, so putting the key in the review as
     well would spread it rather than report it.
 
-    Read it as a backstop and not as containment. It catches the credential
+    Read it as a backstop and not as containment. It catches a credential
     written out plainly, and it does not catch one that base64s the key,
     reverses it, spells it across two findings, writes it in homoglyphs or uses
-    another channel. No amount of pattern work here would. The namespace hides
-    other host credentials and makes the workspace read-only, but it shares
-    the network and deliberately exposes this credential to the engine. The
-    planned broker boundary, which does not exist yet, must keep the provider
-    credential outside the namespace.
+    another channel. No amount of pattern work here would. What keeps the
+    production provider key out of a review is that it is not in the namespace
+    to be found: see `palomar_reviewer.broker`.
     """
-    key = os.environ.get("OPENAI_API_KEY", "").strip().encode("utf-8")
+    keys = [
+        value
+        for name in (model_broker.UPSTREAM_KEY_ENV, "OPENAI_API_KEY")
+        if (value := os.environ.get(name, "").strip().encode("utf-8"))
+    ]
     for text in _strings_in(document):
         # The configured key is looked for with the whitespace taken out as
         # well as in the text as it stands, because a key with a newline
@@ -553,15 +559,10 @@ def refuse_engine_credential(document: Any, *, context: str) -> None:
         # generated names" leaves twenty-odd characters after an `sk-` and a
         # sentence that was never a credential, which is a review refused for
         # nothing.
-        if (
-            _ENGINE_CREDENTIAL_SHAPE.search(text)
-            or (
-                key
-                and (
-                    _holds_configured_key(text, key)
-                    or _holds_configured_key("".join(text.split()), key)
-                )
-            )
+        if _ENGINE_CREDENTIAL_SHAPE.search(text) or any(
+            _holds_configured_key(text, key)
+            or _holds_configured_key("".join(text.split()), key)
+            for key in keys
         ):
             # One message for both findings, and no quotation of what matched.
             # This text is stored in the private record, shown on the status
@@ -4717,6 +4718,24 @@ def doctor(_: argparse.Namespace) -> int:
             failed = True
     for engine in ("codex", "claude"):
         print(f"{engine}: {shutil.which(engine) or 'not installed'}")
+    if shutil.which("codex"):
+        # The pin is not cosmetic: the broker's route, header and request
+        # contract were read off one Codex release, and a pass refuses to run
+        # against another one.
+        try:
+            engine_execution.require_pinned_codex()
+            print(f"codex version: {engine_execution.CODEX_VERSION_LINE} (pinned)")
+        except engine_execution.EngineError as error:
+            print(f"codex version: FAILED ({error})")
+            failed = True
+    # Named, never printed. Codex authenticates through the loopback broker
+    # and has nothing else to fall back on, so an absent upstream key is a
+    # reviewer that cannot review rather than one that reviews differently.
+    if os.environ.get(model_broker.UPSTREAM_KEY_ENV, "").strip():
+        print(f"{model_broker.UPSTREAM_KEY_ENV}: set")
+    else:
+        print(f"{model_broker.UPSTREAM_KEY_ENV}: MISSING")
+        failed = True
     return int(failed)
 
 

@@ -94,6 +94,54 @@ def usage_cost(model: str, evidence: dict[str, Any]) -> float | None:
     return total_per_million / 1_000_000
 
 
+def responses_usage_tokens(usage: Any) -> dict[str, int] | None:
+    """Normalize one Responses API request's usage, or say it is unusable.
+
+    The provider reports a request in a different shape from the turn
+    aggregate Codex emits: totals with nested detail objects. This is the
+    broker's view, one request at a time, and it is deliberately separate from
+    the durable turn evidence above: the record a review keeps remains what the
+    engine reported, not what the broker counted on the way past.
+    """
+    if not isinstance(usage, dict):
+        return None
+    def whole(value: Any) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    input_tokens = whole(usage.get("input_tokens"))
+    output_tokens = whole(usage.get("output_tokens"))
+    if input_tokens is None or output_tokens is None:
+        return None
+    input_details = usage.get("input_tokens_details")
+    output_details = usage.get("output_tokens_details")
+    cached = whole(input_details.get("cached_tokens")) if isinstance(input_details, dict) else 0
+    reasoning = whole(output_details.get("reasoning_tokens")) if isinstance(output_details, dict) else 0
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": min(cached or 0, input_tokens),
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": min(reasoning or 0, output_tokens),
+    }
+
+
+def responses_usage_cost(counts: dict[str, int]) -> float:
+    """Estimated USD for one request, always at the production model's prices.
+
+    The broker enforces one model, and the estimate exists to stop a runaway
+    pass rather than to price anything durable. Charging every token at the
+    production list price is therefore the right direction to be wrong in: a
+    cheaper model is refused early rather than late, and no historical USD
+    value derived from this ever reaches the spend document.
+    """
+    cached = min(counts["cached_input_tokens"], counts["input_tokens"])
+    ordinary = counts["input_tokens"] - cached
+    return (
+        ordinary * GPT_5_6_SOL_INPUT_USD_PER_MTOK
+        + cached * GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK
+        + counts["output_tokens"] * GPT_5_6_SOL_OUTPUT_USD_PER_MTOK
+    ) / 1_000_000
+
+
 def codex_usage(events: str) -> dict[str, Any]:
     """Preserve completed-turn aggregates without mistaking them for requests."""
     turns: list[Any] = []

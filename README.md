@@ -116,14 +116,30 @@ that changes a submission's record refuses
 to run unless `PALOMAR_ALLOW_STATE_WRITES=1` is set, because that record is
 live and private and writing to it should be deliberate. Registration also
 requires `PALOMAR_ARCHIVE_TOKEN`, belonging to the dedicated machine account
-that can create and write forks in the `PalomarArchive` organization. Install
-and authenticate at least one review engine:
+that can create and write forks in the `PalomarArchive` organization.
+
+Install pinned Codex, and give the reviewer the provider key under the
+upstream-only name the broker reads:
 
 ```bash
-codex login
-# or
-claude auth
+npm install --global @openai/codex@0.147.0
+export PALOMAR_OPENAI_UPSTREAM_KEY=...   # a dedicated Palomar API key
+palomar-review doctor
 ```
+
+That key belongs to a dedicated Palomar OpenAI project, not to a person's
+interactive Codex login, and who owns its billing and who can revoke it are
+recorded privately. It is read only by the reviewer process, which hands it to
+the loopback broker described under [Engines](#engines) and never to Codex.
+`OPENAI_API_KEY` is deliberately not consulted: a variable Codex would pick up
+by itself is exactly the ambient authentication the broker exists to remove, so
+a reviewer configured only with that name refuses to run rather than
+authenticating around its own boundary. Provider-side spend limits and alerts
+are worth configuring as a second layer; they do not replace the per-pass
+ceilings the broker enforces.
+
+`claude auth` still authenticates the Claude engine, which is not a production
+engine: see [Engines](#engines).
 
 ## Running the tests
 
@@ -146,6 +162,7 @@ at the end of the run exactly what it therefore did not check:
 | `database` | `PALOMAR_DATABASE_CHECKOUT` | registering into a real PalomarDatabase checkout end to end |
 | `policy` | `PALOMAR_POLICY_CHECKOUT` | checking a review against the live PalomarPolicy rubric |
 | `sandbox` | `bwrap` on `PATH` | running an engine inside a real Bubblewrap namespace |
+| `codex` | `codex` on `PATH` | running pinned Codex through the real broker against a fake upstream |
 
 Interactively an absent capability skips or narrows the tests that need it, and
 is named in a summary the run prints when it finishes. Under CI it fails the
@@ -515,10 +532,16 @@ record that names a different submission.
 ## Engines
 
 - `--engine codex`: runs `codex exec` ephemerally with its normal inspection
-  and shell tools, a read-only Codex sandbox, and a JSON output schema.
+  and shell tools, a read-only Codex sandbox, and a JSON output schema. This is
+  the production engine, and the only one behind the credential broker below.
+  It requires an explicit `--model`, because the broker enforces the model it
+  was configured for.
 - `--engine claude`: runs `claude --print` in safe mode. Its explicit tool
   allowlist is empty for ordinary passes and contains only `WebSearch` and
   `WebFetch` for the literature pass; it has no filesystem or shell tool there.
+  It binds a reusable Claude login into the model namespace and has no broker,
+  so it is not a production engine and refuses to start unless
+  `PALOMAR_ALLOW_UNBROKERED_CLAUDE=1` says the run is not one.
 - `--engine command --command 'program ...'`: runs the named program, sends the
   prompt on stdin, and expects one JSON object on stdout. The program is not a
   tool-restricted model engine; its abilities are those of arbitrary code
@@ -542,26 +565,64 @@ must not award a literature score above the policy's verification ceiling.
 
 Every engine is additionally launched inside a fail-closed Bubblewrap namespace.
 The namespace exposes the submission at `/workspace`, a dedicated output
-directory, an empty scratch home, and only the selected engine's model
-authentication file. It does not expose the runner's GitHub CLI configuration,
-registration credentials, unrelated home files, or other workspaces. The engine
-transport can reach its model API in every pass. Claude web tools are disabled,
-outside the literature/notability pass; this runner never enables Codex web
-search and ignores Codex user configuration. General host-level egress
-filtering would require a separate API-aware proxy.
+directory, and an empty scratch home. It does not expose the runner's GitHub
+CLI configuration, registration credentials, unrelated home files, or other
+workspaces. The engine transport can reach its model API in every pass. Claude
+web tools are disabled, outside the literature/notability pass; this runner
+never enables Codex web search and ignores Codex user configuration. General
+host-level egress filtering would require a separate API-aware proxy.
 `palomar-review doctor` refuses an installation without `bwrap`.
 
-This containment is not a credential broker. For Codex and Claude, the selected
-engine's own authentication file is deliberately bound into its namespace;
-Codex can read files and run shell commands there. The namespace keeps other
-operator credentials out and prevents repository writes, but its shared
-network and engine-process-visible authentication material leave a residual
-prompt-injection and exfiltration risk. The output credential check catches a
-key copied out in plain text; it is a backstop, not proof against encoding or
-another channel.
-The planned broker boundary will keep provider credentials outside the engine
-namespace and expose only a narrow authenticated model transport. That broker
-does not exist yet.
+### The model credential broker
+
+For the production Codex path, no reusable provider credential is inside that
+namespace at all. `palomar_reviewer.broker` starts a short-lived child process
+before Codex and shuts it down in a `finally`. That child holds the real
+upstream key, binds one automatically allocated port on `127.0.0.1`, and serves
+exactly one call: `POST /v1/responses`, authenticated by a random per-pass
+capability compared in constant time and replaced with the real upstream
+authorization on the way out. Codex is pointed at it by machine-level provider
+overrides that the submitted repository cannot reach, and the capability
+arrives in the namespace environment through a Bubblewrap `--args` pipe, so it
+is in no process's command line either.
+
+The broker serves the request pinned Codex makes and refuses the rest: another
+method, path, model or reasoning effort; an unstreamed, stored or background
+response; priority processing; a continued or provider-stored conversation; a
+provider-hosted tool, which is how a namespace process would buy itself the web
+research the policy says these passes do not have. It forwards only the headers
+pinned Codex sends, returns only the ones it reads, follows no redirect, and
+reaches no origin but the provider. It streams events through without buffering
+an answer whole, and bounds the pass by request count, cumulative tokens,
+estimated spend, request and response size, concurrency and open connections. A
+request whose cost the provider never reported is charged a standing estimate,
+so hiding usage exhausts the ceiling sooner rather than evading it. What it
+counted, and what it refused, is recorded alongside the engine's own turn
+evidence in `spend.json`. Neither credential is written to a log, an artifact,
+an exception, or a returned header.
+
+Two details are the difference between a boundary and the appearance of one.
+The trusted reviewer, not the broker child, binds the loopback port and holds
+it for the whole pass: a broker that dies leaves a port nothing else can take,
+because a namespace process that knows the port and the capability could
+otherwise listen there and answer a retry with a review nobody's model wrote.
+And a pass refuses to start against a Codex other than the pinned release,
+because the route, headers and request shape the broker enforces were read off
+that release and are proven against it.
+
+What this buys: a prompt injection that talks the model into reading and
+transmitting everything it can reach comes away with a capability that only a
+process on this runner can use, and only until the pass ends. Bubblewrap is
+itself launched with an environment holding nothing worth reading, because its
+own reaper is PID 1 inside the namespace and `/proc/1/environ` there is
+whatever it was started with; `--clearenv` answers a different question. What it does not
+buy: this is not network isolation. The namespace still shares the runner's
+network, because the Codex transport has to reach the broker. It covers the
+`codex:gpt-5.6-sol` launch path and no other provider; the Claude engine's own
+login is still bound into its namespace, which is why that engine is not a
+production engine. The output credential check remains as a backstop for the
+cases the broker does not cover, and it catches a key copied out in plain text
+rather than one that is encoded or sent another way.
 
 The reviewer is told the repository, commit, authorization, update intent and
 the submitter's notes. It is deliberately not told who submitted: a review
@@ -595,7 +656,7 @@ policy/                        # detached policy commit
 prompts/                       # fully rendered prompts
 raw/                           # exact engine final messages
 passes/                        # normalized per-pass JSON
-spend.json                     # raw turn-aggregate usage evidence; no historical USD value
+spend.json                     # raw turn-aggregate usage evidence and broker counts; no historical USD value
 review.json                    # schema-validated final report
 review-sha256                  # digest of the review delivered to the submitter
 render-result/                 # validated immutable Challenge render and provenance
@@ -614,9 +675,10 @@ submitter's notes, and prior model results may contain prompt-injection
 attempts. The reviewer puts them in hashed JSON evidence envelopes, repeats the
 binding instruction after all evidence, exposes the submission read-only,
 restricts Claude's tool list, runs Codex with a read-only sandbox, isolates host
-files with Bubblewrap, and validates strict output schemas. Codex still has
-shell tools, a custom command is arbitrary code inside the namespace, and the
-selected engine credential remains exposed as described above. These controls
-reduce accidental instruction following; they do not create the planned
-credential-broker boundary. While the private packet remains available, it lets
-an operator audit the decision.
+files with Bubblewrap, keeps the provider key outside the namespace behind the
+loopback broker, and validates strict output schemas. Codex still has shell
+tools and a custom command is arbitrary code inside the namespace, so these
+controls reduce accidental instruction following rather than preventing it;
+what the broker adds is that succeeding at it wins nothing that outlives the
+pass. While the private packet remains available, it lets an operator audit the
+decision.

@@ -83,6 +83,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+          # The pinned Codex release the provider wiring and the broker's
+          # forwarded-header allowlist were derived from. Without it the
+          # integration test that proves a whole pass runs through the broker
+          # against a fake provider would silently stop running.
+          npm install --global @openai/codex@0.147.0
           # Ubuntu 24.04 AppArmor blocks unprivileged user namespaces by
           # default even on the disposable hosted runner. Enable them here so
           # the fail-closed namespace integration test exercises real bwrap.
