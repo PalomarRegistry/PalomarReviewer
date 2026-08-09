@@ -32,11 +32,13 @@ def sha256(data: bytes) -> str:
 
 
 def clean_environment() -> dict[str, str]:
-    return {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith(("PYTHON", "UV_"))
+    environment = {
+        name: os.environ[name]
+        for name in ("HOME", "PATH")
+        if name in os.environ
     }
+    environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC"})
+    return environment
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -150,6 +152,7 @@ def git_modes() -> dict[str, str]:
     output = subprocess.check_output(
         ["git", "ls-files", "--stage", "--", str(ARTIFACT_DIR.relative_to(ROOT))],
         cwd=ROOT,
+        env=clean_environment(),
         text=True,
     )
     result: dict[str, str] = {}
