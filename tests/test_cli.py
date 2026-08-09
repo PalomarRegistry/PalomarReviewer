@@ -116,6 +116,11 @@ TEST_CAPABILITIES = {
         "bwrap",
         "running an engine inside a real Bubblewrap namespace",
     ),
+    "codex": (
+        (),
+        "codex",
+        "running pinned Codex through the real broker against a fake upstream",
+    ),
 }
 
 _DECLARED_ABSENT = {
@@ -209,7 +214,14 @@ def say_what_this_run_did_not_check() -> None:
     print("\n".join(lines), file=sys.stderr)
 
 
-class ReviewerTests(unittest.TestCase):
+class UsesCapabilities:
+    """How a test case asks for something this repository cannot carry itself.
+
+    Held apart from the case below because the broker's namespace and Codex
+    integration tests live in their own file and need exactly this, and a test
+    that reaches around it is a test whose coverage can disappear silently.
+    """
+
     def available(self, capability):
         """Where `capability` is, or `None` once this run has said so.
 
@@ -251,6 +263,8 @@ class ReviewerTests(unittest.TestCase):
             )
         return sources
 
+
+class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def mechanical_fixture(self, submission="a1b2c3d4e5f6", run_id=101):
         workflow_url = f"https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/{run_id}"
         return {

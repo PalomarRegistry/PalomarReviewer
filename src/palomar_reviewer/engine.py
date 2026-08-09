@@ -4,8 +4,16 @@ This module owns the executable/config boundary for Codex, Claude, and custom
 commands: exact argument construction, the Bubblewrap namespace, subprocess
 collection, Codex event evidence, and the final JSON result. It deliberately
 does not own prompts, rubric policy, delivery, or the credential-output
-backstop. Keeping the provider credential outside the namespace requires the
-separate broker redesign; this extraction preserves the current containment.
+backstop.
+
+The production Codex path authenticates through `palomar_reviewer.broker`: a
+loopback broker holds the real provider key outside the namespace, and the
+namespace receives only a per-pass capability that is worthless once the pass
+ends. There is no direct-authentication fallback, because a fallback is what an
+attacker would aim for. The Claude and custom-command engines have no such
+boundary: a custom command is given no provider credential at all, and Claude
+still binds its own login file into the namespace, so it refuses to run unless
+an operator says out loud that this run is not production.
 """
 
 from __future__ import annotations
@@ -15,12 +23,12 @@ import os
 import shlex
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
 import jsonschema
 
+from . import broker as model_broker
 from . import usage as usage_accounting
 
 
@@ -42,7 +50,11 @@ SYSTEM_RESOLUTION_PATHS = (
     Path("/etc/host.conf"),
     Path("/etc/ld.so.cache"),
 )
-_ENGINE_CREDENTIAL_DIR: Path | None = None
+# The Claude engine binds a reusable provider login into the same namespace as
+# the attacker-authored workspace, which is exactly what the Codex broker
+# exists to stop. It has no broker of its own yet, so it is not a production
+# engine, and running it has to be a decision somebody made on purpose.
+UNBROKERED_CLAUDE_ENV = "PALOMAR_ALLOW_UNBROKERED_CLAUDE"
 
 
 def validate_config(engine: str, command: str | None) -> None:
@@ -64,14 +76,34 @@ def parse_json(text: str) -> dict[str, Any]:
     return result
 
 
+CODEX_PROVIDER_ID = "palomar_broker"
+# The Codex release the provider wiring below and the broker's forwarded-header
+# allowlist were both derived from, and the one CI installs to run the
+# integration test against a fake provider. A different release is not refused
+# here, because Codex is installed outside this Python artifact; it is stated so
+# that a drifting client shows up as a named difference rather than a surprise.
+PINNED_CODEX_VERSION = "0.147.0"
+
+
 def codex_arguments(
     *,
     schema_name: str,
     output_name: str,
-    model: str | None,
+    model: str,
     reasoning_effort: str | None,
+    broker_base_url: str,
 ) -> list[str]:
-    """The exact Codex invocation for one rubric pass."""
+    """The exact Codex invocation for one rubric pass.
+
+    The provider is stated here rather than in a configuration file because
+    `--ignore-user-config` means Codex loads no `config.toml` at all, not even
+    from the temporary `CODEX_HOME`: the trusted machine-level configuration
+    has to arrive as overrides, where the submitted repository cannot reach it
+    either. Nothing in this list is a credential. The per-pass capability is
+    passed to the namespace out of band, so that it is not in the argv of any
+    process on the host.
+    """
+    provider = f"model_providers.{CODEX_PROVIDER_ID}"
     argv = [
         "codex",
         "exec",
@@ -88,9 +120,19 @@ def codex_arguments(
         f"/output/{output_name}",
         "--cd",
         "/workspace",
+        "--model",
+        model,
+        "-c",
+        f'model_provider="{CODEX_PROVIDER_ID}"',
+        "-c",
+        f'{provider}.name="Palomar loopback model broker"',
+        "-c",
+        f'{provider}.base_url="{broker_base_url}"',
+        "-c",
+        f'{provider}.wire_api="responses"',
+        "-c",
+        f'{provider}.env_key="{model_broker.CAPABILITY_ENV}"',
     ]
-    if model:
-        argv.extend(["--model", model])
     if reasoning_effort:
         argv.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
     argv.append("-")
@@ -148,6 +190,7 @@ def _run(
     *,
     input_text: str | None = None,
     timeout: int = 3600,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     try:
         proc = subprocess.run(
@@ -156,6 +199,7 @@ def _run(
             text=True,
             capture_output=True,
             timeout=timeout,
+            pass_fds=pass_fds,
         )
     except subprocess.TimeoutExpired:
         raise EngineError(
@@ -179,30 +223,20 @@ def _bind_if_present(command: list[str], source: Path, destination: str) -> None
         command.extend(["--ro-bind", str(source), destination])
 
 
-def engine_credential_file(api_key: str) -> Path:
-    """A private, 0600 credential file for the engine to read inside its namespace.
+def sandbox_environment_args(values: dict[str, str]) -> bytes:
+    """Bubblewrap `--setenv` arguments for values that must not appear in argv.
 
-    Held for the lifetime of the process, in a directory only this user can
-    enter, and never under the workspace or the engine's output directory: the
-    model can read anything bound into its namespace, and an output directory is
-    exactly where a prompt-injected model would try to copy a secret to.
-
-    None of which keeps the key from the model. It cannot: the engine has to
-    read this file, and the read-only sandbox the engine runs under is read-only
-    about writing. Every other host credential remains outside the namespace.
-    The CLI's credential-output backstop checks what the model writes for a
-    plainly copied key, but it cannot stop an encoding or another channel. The
-    planned broker boundary will remove the provider key from this namespace;
-    it is not implemented here.
+    Bubblewrap reads NUL-separated arguments from a file descriptor with
+    `--args`, which is how the per-pass capability reaches the namespace
+    environment without also reaching the process table, where every account on
+    the host could read it.
     """
-    global _ENGINE_CREDENTIAL_DIR
-    if _ENGINE_CREDENTIAL_DIR is None:
-        _ENGINE_CREDENTIAL_DIR = Path(tempfile.mkdtemp(prefix="palomar-engine-"))
-        _ENGINE_CREDENTIAL_DIR.chmod(0o700)
-    path = _ENGINE_CREDENTIAL_DIR / "auth.json"
-    path.write_text(json.dumps({"OPENAI_API_KEY": api_key}), encoding="utf-8")
-    path.chmod(0o600)
-    return path
+    parts: list[str] = []
+    for name, value in values.items():
+        if "\0" in name or "\0" in value:
+            raise EngineError("a sandbox environment value contains a NUL byte")
+        parts.extend(("--setenv", name, value))
+    return b"\0".join(part.encode("utf-8") for part in parts)
 
 
 def isolated_command(
@@ -211,6 +245,7 @@ def isolated_command(
     *,
     cwd: Path,
     output_dir: Path,
+    secret_args_fd: int | None = None,
 ) -> list[str]:
     """Build a fail-closed Linux namespace with no ambient operator home."""
     bwrap = shutil.which("bwrap")
@@ -290,23 +325,28 @@ def isolated_command(
         except StopIteration as error:
             raise EngineError("could not locate the installed Codex package") from error
         _bind_if_present(command, codex_root, "/engine/codex")
-        # An API key, when one is configured, is written to a private file and
-        # bound in as the engine's credential rather than passed with --setenv,
-        # which would put it in argv where any process on the host can read it.
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if api_key:
-            auth = engine_credential_file(api_key)
-        else:
-            auth = host_home / ".codex" / "auth.json"
-            if not auth.is_file() or auth.is_symlink():
-                raise EngineError(
-                    "set OPENAI_API_KEY, or sign in with `codex login`: the Codex engine "
-                    "has no credential"
-                )
-        _bind_if_present(command, auth, "/home/reviewer/.codex/auth.json")
+        # No credential is bound in, and no Codex login file is reachable. The
+        # only authentication in this namespace is the per-pass broker
+        # capability, which arrives through `secret_args_fd`. Without that
+        # channel there is nothing to authenticate with, and rather than
+        # falling back to a reusable key the pass refuses to start.
+        if secret_args_fd is None:
+            raise EngineError(
+                "the Codex engine runs only through the loopback model broker, and no "
+                "per-pass capability channel was supplied"
+            )
+        # CODEX_HOME is an empty tmpfs directory. `--ephemeral` keeps sessions
+        # out of it, and `--ignore-user-config` means no config.toml is read
+        # from it, so nothing an earlier run or the host left behind applies.
         command.extend(["--setenv", "CODEX_HOME", "/home/reviewer/.codex"])
         argv = [str(Path(node).resolve(strict=True)), "/engine/codex/bin/codex.js", *argv[1:]]
     elif engine == "claude":
+        if os.environ.get(UNBROKERED_CLAUDE_ENV, "").strip() != "1":
+            raise EngineError(
+                "the Claude engine binds a reusable provider login into the model "
+                "namespace and has no broker, so it is not a production engine; set "
+                f"{UNBROKERED_CLAUDE_ENV}=1 to run it anyway"
+            )
         claude = shutil.which("claude")
         if not claude:
             raise EngineError("claude is required for the Claude review engine")
@@ -343,7 +383,75 @@ def isolated_command(
             argv[0] = f"/engine/custom-root/{resolved.relative_to(root)}"
     else:
         raise EngineError(f"unsupported isolated review engine: {engine}")
+    if secret_args_fd is not None:
+        # Last, so that the `--clearenv` above has already run when Bubblewrap
+        # reads these and sets them.
+        command.extend(["--args", str(secret_args_fd)])
     return [*command, "--", *argv]
+
+
+def _run_brokered_codex(
+    prompt: str,
+    *,
+    model: str | None,
+    reasoning_effort: str | None,
+    cwd: Path,
+    engine_output: Path,
+    schema_name: str,
+    output_name: str,
+) -> tuple[str, dict[str, Any]]:
+    """One Codex pass, authenticated only by a broker that outlives nothing.
+
+    The broker starts before Codex and is shut down in a `finally`, so a
+    timeout, a cancellation, a schema failure, or an exception all invalidate
+    the capability on the way out. Anything that stops the broker from starting
+    stops the pass: there is no unbrokered path to fall back to.
+    """
+    if not (model or "").strip():
+        raise EngineError(
+            "the Codex engine requires --model, because the broker enforces the model "
+            "it was configured for"
+        )
+    policy = model_broker.BrokerPolicy(
+        model=model or "",
+        reasoning_effort=reasoning_effort,
+        upstream_origin=model_broker.configured_upstream_origin(),
+    )
+    upstream_key = os.environ.get(model_broker.UPSTREAM_KEY_ENV, "").strip()
+    try:
+        with model_broker.started_broker(policy=policy, upstream_key=upstream_key) as broker:
+            argv = codex_arguments(
+                schema_name=schema_name,
+                output_name=output_name,
+                model=model or "",
+                reasoning_effort=reasoning_effort,
+                broker_base_url=broker.base_url,
+            )
+            payload = sandbox_environment_args({model_broker.CAPABILITY_ENV: broker.capability})
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, payload)
+                os.close(write_fd)
+                write_fd = -1
+                events = _run(
+                    isolated_command(
+                        "codex",
+                        argv,
+                        cwd=cwd,
+                        output_dir=engine_output,
+                        secret_args_fd=read_fd,
+                    ),
+                    input_text=prompt,
+                    timeout=7200,
+                    pass_fds=(read_fd,),
+                ).stdout
+            finally:
+                if write_fd != -1:
+                    os.close(write_fd)
+                os.close(read_fd)
+    except model_broker.BrokerError as error:
+        raise EngineError(f"the loopback model broker failed: {error}") from error
+    return events, broker.summary or {}
 
 
 def _execute(
@@ -374,21 +482,23 @@ def _execute(
         schema_path = engine_output / "schema.json"
         output_path = engine_output / "message.txt"
         _write_json(schema_path, schema)
-        argv = codex_arguments(
-            schema_name=schema_path.name,
-            output_name=output_path.name,
+        events, broker_summary = _run_brokered_codex(
+            prompt,
             model=model,
             reasoning_effort=reasoning_effort,
+            cwd=cwd,
+            engine_output=engine_output,
+            schema_name=schema_path.name,
+            output_name=output_path.name,
         )
-        events = _run(
-            isolated_command("codex", argv, cwd=cwd, output_dir=engine_output),
-            input_text=prompt,
-            timeout=7200,
-        ).stdout
         (raw_path.parent / f"{raw_path.stem}.events.jsonl").write_text(
             events, encoding="utf-8"
         )
         usage = usage_accounting.codex_usage(events)
+        # Alongside the engine's own turn aggregate, never instead of it: the
+        # durable spend evidence stays what Codex reported, and this records
+        # what the boundary in front of it saw, including anything it refused.
+        usage["broker"] = broker_summary
         if output_path.is_symlink() or not output_path.is_file():
             raise EngineError("Codex did not create a regular final-message file")
         text = output_path.read_text(encoding="utf-8")
