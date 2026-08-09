@@ -21,6 +21,7 @@ from unittest import mock
 import jsonschema
 
 import palomar_reviewer.authorization as registration_authorization
+import palomar_reviewer.checkpoint as registration_checkpoint
 import palomar_reviewer.cli as cli
 import palomar_reviewer.engine as engine_execution
 import palomar_reviewer.mechanical as mechanical_evidence
@@ -2402,7 +2403,7 @@ class ReviewerTests(unittest.TestCase):
                 ) as projection_reader,
                 mock.patch.object(cli, "stage_registration_change") as staged,
                 mock.patch.object(cli, "push_registration_branch") as pushed,
-                mock.patch.object(cli, "open_registration_pr") as opened,
+                mock.patch.object(registration_checkpoint, "open_pr") as opened,
                 mock.patch.object(cli, "gh") as public_gh,
                 self.assertRaisesRegex(ReviewerError, "poisoned registration authority"),
             ):
@@ -6646,38 +6647,16 @@ class RegistrationProjectionCostTests(unittest.TestCase):
 
 
 class RegistrationRetryTests(unittest.TestCase):
-    """A registration that failed after pushing must still be retriable.
-
-    The first real registration needed six attempts. One of them pushed the
-    branch and then failed, and every attempt after that failed
-    non-fast-forward, because each allocates a fresh identifier and so builds
-    a commit the abandoned branch is not an ancestor of. It took deleting the
-    branch by hand to get past.
-    """
+    """Branch publication is one-way; checkpoint recovery handles retries."""
 
     def test_a_new_branch_is_pushed_plainly(self):
         with mock.patch.object(cli, "registry_git_environment", return_value={}), \
              mock.patch.object(cli, "complete_database_history_for_push"), \
-             mock.patch.object(cli, "remote_branch_commit", return_value=None), \
              mock.patch.object(cli, "run") as runner:
             cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
         command = runner.call_args.args[0]
         self.assertIn("HEAD:refs/heads/submission-abc-v1", command)
         self.assertFalse([part for part in command if part.startswith("--force")])
-
-    def test_an_abandoned_branch_is_replaced_under_a_lease(self):
-        with mock.patch.object(cli, "registry_git_environment", return_value={}), \
-             mock.patch.object(cli, "complete_database_history_for_push"), \
-             mock.patch.object(cli, "remote_branch_commit", return_value="a" * 40), \
-             mock.patch.object(cli, "run") as runner:
-            cli.push_registration_branch(Path("/tmp/database"), "submission-abc-v1")
-        command = runner.call_args.args[0]
-        # Leased against what was actually observed, so a branch that moved
-        # underneath this process is refused rather than overwritten.
-        self.assertIn(
-            f"--force-with-lease=refs/heads/submission-abc-v1:{'a' * 40}", command
-        )
-        self.assertNotIn("--force", command)
 
     def test_only_a_branch_that_will_be_pushed_completes_filtered_history(self):
         shallow = SimpleNamespace(stdout="true\n")
@@ -6700,14 +6679,84 @@ class RegistrationRetryTests(unittest.TestCase):
         self.assertEqual(len(runner.call_args_list), 1)
 
     def test_an_open_pull_request_is_found_rather_than_duplicated(self):
-        with mock.patch.object(cli, "gh", return_value="34\n"):
-            self.assertEqual(cli.open_registration_pr("submission-abc-v1"), 34)
-        with mock.patch.object(cli, "gh", return_value="\n"):
-            self.assertIsNone(cli.open_registration_pr("submission-abc-v1"))
+        same_repository = {
+            "number": 34,
+            "state": "open",
+            "head": {
+                "ref": "submission-abc-v1",
+                "repository": cli.DATABASE_REPO,
+            },
+            "base": {"ref": "main", "repository": cli.DATABASE_REPO},
+        }
+        github = mock.Mock(return_value=json.dumps([same_repository]))
+        with mock.patch.object(cli, "gh", github):
+            self.assertEqual(
+                registration_checkpoint.open_pr(
+                    cli.gh, cli.DATABASE_REPO, "submission-abc-v1"
+                ),
+                34,
+            )
+        self.assertEqual(
+            github.call_args.args[0],
+            [
+                "api",
+                "--method",
+                "GET",
+                f"repos/{cli.DATABASE_REPO}/pulls",
+                "-f",
+                "state=open",
+                "-f",
+                "head=PalomarRegistry:submission-abc-v1",
+                "-f",
+                "per_page=100",
+                "--jq",
+                (
+                    "[.[] | {number, state, head: {ref: .head.ref, "
+                    "repository: .head.repo.full_name}, base: {ref: .base.ref, "
+                    "repository: .base.repo.full_name}}]"
+                ),
+            ],
+        )
+        with mock.patch.object(cli, "gh", return_value="[]"):
+            self.assertIsNone(
+                registration_checkpoint.open_pr(
+                    cli.gh, cli.DATABASE_REPO, "submission-abc-v1"
+                )
+            )
+
+    def test_a_fork_pull_request_cannot_claim_the_reserved_branch(self):
+        fork = {
+            "number": 33,
+            "state": "open",
+            "head": {
+                "ref": "submission-abc-v1",
+                "repository": "attacker/PalomarDatabase",
+            },
+            "base": {"ref": "main", "repository": cli.DATABASE_REPO},
+        }
+        with mock.patch.object(cli, "gh", return_value=json.dumps([fork])):
+            self.assertIsNone(
+                registration_checkpoint.open_pr(
+                    cli.gh, cli.DATABASE_REPO, "submission-abc-v1"
+                )
+            )
 
     def test_a_branch_that_is_not_there_is_not_a_failure(self):
-        with mock.patch.object(cli, "gh", side_effect=ReviewerError("404")):
-            self.assertIsNone(cli.remote_branch_commit("submission-abc-v1"))
+        with mock.patch.object(cli, "gh", return_value="\n"):
+            self.assertIsNone(
+                registration_checkpoint.remote_branch_commit(
+                    cli.gh, cli.DATABASE_REPO, "submission-abc-v1"
+                )
+            )
+
+    def test_a_branch_lookup_failure_is_not_misreported_as_absence(self):
+        with (
+            mock.patch.object(cli, "gh", side_effect=ReviewerError("authentication failed")),
+            self.assertRaisesRegex(ReviewerError, "authentication failed"),
+        ):
+            registration_checkpoint.remote_branch_commit(
+                cli.gh, cli.DATABASE_REPO, "submission-abc-v1"
+            )
 
 
 class RenderFailureTests(unittest.TestCase):

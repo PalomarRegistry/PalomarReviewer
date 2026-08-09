@@ -25,6 +25,7 @@ import jsonschema
 import yaml
 
 from . import authorization as registration_authorization
+from . import checkpoint as registration_checkpoint
 from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
 from . import registration as registration_authority
@@ -2480,54 +2481,42 @@ def complete_database_history_for_push(database: Path) -> None:
         raise ReviewerError("could not determine whether the database checkout is shallow")
 
 
-def remote_branch_commit(branch: str) -> str | None:
-    """The commit a registration branch already points at, or None."""
-    try:
-        sha = gh(
-            ["api", f"repos/{DATABASE_REPO}/git/ref/heads/{branch}", "--jq", ".object.sha"]
-        ).strip()
-    except ReviewerError:
-        return None
-    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+def _write_registration_checkpoint(
+    state: dict[str, Any], pr_number: int, created_at: str
+) -> None:
+    advance_state(
+        state,
+        state.get("status", "review-ready"),
+        "Prepared the registry record; registration is pending review of the database change",
+        registration_pr=pr_number,
+        registration_pr_at=created_at,
+    )
 
 
-def open_registration_pr(branch: str) -> int | None:
-    """The open pull request for a registration branch, if one exists."""
-    listed = gh(
-        [
-            "pr", "list", "--repo", DATABASE_REPO, "--head", branch,
-            "--state", "open", "--json", "number", "--jq", ".[0].number // empty",
-        ]
-    ).strip()
-    return int(listed) if listed.isdigit() else None
+def recover_registration_change(submission_id: str, review: dict[str, Any]) -> int | None:
+    """Recover a reserved branch/PR before repeating public side effects."""
+    return registration_checkpoint.recover_change(
+        gh,
+        DATABASE_REPO,
+        STATE_REPO,
+        submission_id=submission_id,
+        review=review,
+        read_state=submission_state,
+        write_checkpoint=_write_registration_checkpoint,
+    )
 
 
 def push_registration_branch(database: Path, branch: str) -> None:
-    """Push the registration branch, replacing an abandoned attempt.
+    """Push a new reserved branch without replacing remote work.
 
-    Registration is retried, and every attempt allocates a fresh identifier,
-    so the branch an earlier attempt left behind holds a different commit that
-    this one is not descended from. Without this, the first attempt to push and
-    then fail made every later attempt fail too, non-fast-forward, until
-    somebody deleted the branch by hand.
-
-    The replacement is leased against the commit that was actually observed, so
-    a branch that changed underneath this process is not overwritten.
+    Existing branches are recovered before registration side effects begin. If
+    one appears after that preflight, this ordinary push refuses it and the next
+    pass validates and checkpoints it; registration never overwrites a branch.
     """
     complete_database_history_for_push(database)
     remote = ["git", "push", f"https://github.com/{DATABASE_REPO}.git"]
     git_env = registry_git_environment()
-    existing = remote_branch_commit(branch)
-    if existing is None:
-        run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
-        return
-    print(f"replacing abandoned registration branch {branch} at {existing[:12]}")
-    run(
-        [*remote, f"--force-with-lease=refs/heads/{branch}:{existing}",
-         f"HEAD:refs/heads/{branch}"],
-        cwd=database,
-        env=git_env,
-    )
+    run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
 
 
 def render_failure(work: Path, run_id: str, request_id: str, url: str) -> str:
@@ -3702,33 +3691,13 @@ def registration_attempt_identity(
     source_commit = mechanical["source"]["commit"]
     existing_id = mechanical.get("existing_id") or None
     attempt = state.get("registration_attempt")
-    reserved: tuple[str, str, str, int] | None = None
-
-    if attempt is not None:
-        if not isinstance(attempt, dict) or attempt.get("schema_version") != 1:
-            raise ReviewerError("saved registration attempt is malformed")
-        bindings = {
-            "review_sha256": review_sha256,
-            "source_repository": source_repository,
-            "source_commit": source_commit,
-            "existing_id": existing_id,
-        }
-        if any(attempt.get(field) != value for field, value in bindings.items()):
-            raise ReviewerError("saved registration attempt belongs to different accepted evidence")
-        identifier = attempt.get("id")
-        accepted_at = attempt.get("accepted_at")
-        registered_at = attempt.get("registered_at")
-        version = attempt.get("version")
-
-        if (
-            not isinstance(identifier, str)
-            or not isinstance(accepted_at, str)
-            or not isinstance(registered_at, str)
-            or not isinstance(version, int)
-            or isinstance(version, bool)
-        ):
-            raise ReviewerError("saved registration attempt has an invalid permanent identity")
-        reserved = (identifier, accepted_at, registered_at, version)
+    reserved = registration_checkpoint.saved_identity(
+        state,
+        review_sha256=review_sha256,
+        source_repository=source_repository,
+        source_commit=source_commit,
+        existing_id=existing_id,
+    )
 
     resolved = registration_authority.registration_identity(
         database,
@@ -3799,6 +3768,11 @@ def register(args: argparse.Namespace) -> int:
     # manually edited consent flag cheap to reject on every unattended pass.
     if review.get("decision") != "accept":
         raise ReviewerError("only an accepted review can be registered")
+    if not args.dry_run:
+        recovered_pr = recover_registration_change(args.submission, review)
+        if recovered_pr is not None:
+            print(f"https://github.com/{DATABASE_REPO}/pull/{recovered_pr}")
+            return 0
     if not (work / "mechanical-report.json").is_file():
         work, _, _, _ = prepare_workspace(
             args.submission,
@@ -4037,7 +4011,7 @@ def register(args: argparse.Namespace) -> int:
     scores_destination = database / "scores" / filename
     write_json(scores_destination, scores_document)
     registration_authority.materialize_changes(database, projections)
-    branch = f"submission-{args.submission}-v{version}"
+    branch = registration_checkpoint.branch(args.submission, version)
     run(["git", "checkout", "-b", branch], cwd=database)
     stage_registration_change(
         database,
@@ -4069,50 +4043,47 @@ def register(args: argparse.Namespace) -> int:
         print(f"Prepared {destination}; dry run, branch was not pushed.")
         return 0
     push_registration_branch(database, branch)
-    open_pr = open_registration_pr(branch)
+    open_pr = registration_checkpoint.open_pr(gh, DATABASE_REPO, branch)
     if open_pr is not None:
-        # An earlier attempt got this far and then failed. The branch now holds
-        # this attempt's record, and a second pull request for the same branch
-        # is not possible anyway.
+        # Another process may have opened the exact PR after the preflight read.
+        # The checkpoint below validates its head and immutable record before
+        # State is allowed to name it.
         print(f"{args.submission}: reusing open database PR #{open_pr}")
-        pr_url = f"https://github.com/{DATABASE_REPO}/pull/{open_pr}"
     else:
-        pr_url = gh(
-        [
-            "pr",
-            "create",
-            "--repo",
+        open_pr = registration_checkpoint.create_pr(
+            gh,
             DATABASE_REPO,
-            "--head",
             branch,
-            "--base",
-            "main",
-            "--title",
-            f"Add {record['id']} v{version}: {record['title']}",
-            "--body",
-            (
-                f"Registers accepted submission `{args.submission}`.\n\n"
-                f"- Source: `{record['source']['repository']}@{record['source']['commit']}`\n"
-                f"- Mechanical run: {record['verification']['workflow_url']}\n"
-                f"- Render run: {render_report['workflow_url']}\n"
-                f"- Policy: `{record['review']['policy_commit']}`\n\n"
-                "This PR was prepared by PalomarReviewer. Merging is the registration event."
-            ),
-        ]
-        ).strip()
-    # Recorded so the next pass knows a PR is already open for this submission
-    # and does not build a second one. The time is recorded with it because a
-    # registration that never goes green is otherwise indistinguishable from one
-    # opened a minute ago, and nobody is reading the log line that says so.
-    fresh = submission_state(args.submission)
-    if fresh is not None:
-        advance_state(
-            fresh,
-            fresh.get("status", "review-ready"),
-            "Prepared the registry record; registration is pending review of the database change",
-            registration_pr=int(pr_url.rstrip("/").rsplit("/", 1)[-1]),
-            registration_pr_at=utc_now(),
+            submission_id=args.submission,
+            record=record,
+            render_workflow_url=render_report["workflow_url"],
         )
+    fresh = registration_authorization.validate_registration_checkpoint(
+        args.submission,
+        review,
+        submission_state(args.submission),
+        state_repository=STATE_REPO,
+    )
+    saved_identity = registration_checkpoint.saved_identity(
+        fresh,
+        review_sha256=registration_authorization.document_digest(review),
+        source_repository=mechanical["source"]["repository"],
+        source_commit=mechanical["source"]["commit"],
+        existing_id=mechanical.get("existing_id") or None,
+    )
+    if saved_identity != (permanent_id, accepted_at, registered_at, version):
+        raise ReviewerError("saved registration attempt changed before PR checkpointing")
+    registration_checkpoint.checkpoint_pr(
+        gh,
+        DATABASE_REPO,
+        submission_id=args.submission,
+        review=review,
+        state=fresh,
+        identity=saved_identity,
+        pr_number=open_pr,
+        write_checkpoint=_write_registration_checkpoint,
+    )
+    pr_url = f"https://github.com/{DATABASE_REPO}/pull/{open_pr}"
     print(pr_url)
     return 0
 

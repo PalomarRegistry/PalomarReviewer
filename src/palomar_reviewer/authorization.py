@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 from .errors import ReviewerError
@@ -107,6 +108,85 @@ def validate_push_proof(state: dict[str, Any]) -> None:
         raise ReviewerError("push_proof principal.id must be a positive integer")
 
 
+def _validate_registration_standing(
+    submission_id: str,
+    review: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    """Require current consent and authority for one delivered review."""
+    if state.get("push_verified") is not True:
+        raise ReviewerError("the submitter never proved write access to the repository")
+    validate_push_proof(state)
+    # A positive status, not merely "not withdrawn": a stale consent flag on a
+    # record that has gone back to any other state must not authorize anything.
+    if state.get("status") != "review-ready":
+        raise ReviewerError(
+            f"submission {submission_id} is {state.get('status')}, and only a submission "
+            "holding a delivered review may be registered"
+        )
+    if state.get("registered_entry"):
+        raise ReviewerError(
+            f"submission {submission_id} was already registered as {state['registered_entry']}"
+        )
+    if state.get("registration_consent") is not True:
+        raise ReviewerError(
+            "the submitter has not consented to registration; "
+            "nothing is registered until they choose to"
+        )
+    # Consent is to the exact review the submitter read. The digest recorded at
+    # delivery, the digest they consented to, and the review about to be
+    # archived must all be the same canonical document.
+    delivered = state.get("review_sha256")
+    consented = state.get("registration_consent_review_sha256")
+    registering = document_digest(review)
+    if delivered != registering:
+        raise ReviewerError(
+            "the review being registered is not the review delivered to the submitter"
+        )
+    if consented != registering:
+        raise ReviewerError("the submitter consented to a different review")
+
+
+def validate_registration_checkpoint(
+    submission_id: str,
+    review: dict[str, Any],
+    state: dict[str, Any] | None,
+    *,
+    state_repository: str,
+) -> dict[str, Any]:
+    """Authorize recovery of an already-created registration branch.
+
+    The public branch is inspected separately. This narrower check exists so a
+    retry can recover that branch before rebuilding a workspace or repeating
+    archive/render side effects, while still re-reading the private consent and
+    exact delivered-review binding which authorize registration.
+    """
+    if state is None:
+        raise ReviewerError(
+            f"submission {submission_id} has no record in {state_repository}: "
+            "the submission server never created it"
+        )
+    if state.get("id") != submission_id:
+        raise ReviewerError("state record is filed under a different submission id")
+    if review.get("submission_id") != submission_id:
+        raise ReviewerError("review and state disagree on the submission id")
+    source = review.get("source")
+    if not isinstance(source, dict):
+        raise ReviewerError("review has no source identity for registration recovery")
+    if (
+        not isinstance(source.get("repository"), str)
+        or not source["repository"]
+        or not isinstance(source.get("commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", source["commit"]) is None
+    ):
+        raise ReviewerError("review has a malformed source identity for registration recovery")
+    for field in ("repository", "commit"):
+        if source.get(field) != state.get(field):
+            raise ReviewerError(f"review and state disagree on {field}")
+    _validate_registration_standing(submission_id, review, state)
+    return state
+
+
 def validate_registration(
     submission_id: str,
     mechanical: dict[str, Any],
@@ -158,35 +238,5 @@ def validate_registration(
         raise ReviewerError("mechanical report and state disagree on the authorization")
     if (mechanical.get("existing_id") or None) != (state.get("existing_id") or None):
         raise ReviewerError("mechanical report and state disagree on the update intent")
-    if state.get("push_verified") is not True:
-        raise ReviewerError("the submitter never proved write access to the repository")
-    validate_push_proof(state)
-    # A positive status, not merely "not withdrawn": a stale consent flag on a
-    # record that has gone back to any other state must not authorize anything.
-    if state.get("status") != "review-ready":
-        raise ReviewerError(
-            f"submission {submission_id} is {state.get('status')}, and only a submission "
-            "holding a delivered review may be registered"
-        )
-    if state.get("registered_entry"):
-        raise ReviewerError(
-            f"submission {submission_id} was already registered as {state['registered_entry']}"
-        )
-    if state.get("registration_consent") is not True:
-        raise ReviewerError(
-            "the submitter has not consented to registration; "
-            "nothing is registered until they choose to"
-        )
-    # Consent is to the exact review the submitter read. The digest recorded at
-    # delivery, the digest they consented to, and the review about to be
-    # archived must all be the same canonical document.
-    delivered = state.get("review_sha256")
-    consented = state.get("registration_consent_review_sha256")
-    registering = document_digest(review)
-    if delivered != registering:
-        raise ReviewerError(
-            "the review being registered is not the review delivered to the submitter"
-        )
-    if consented != registering:
-        raise ReviewerError("the submitter consented to a different review")
+    _validate_registration_standing(submission_id, review, state)
     return state

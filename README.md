@@ -47,11 +47,19 @@ workflow-run digest before using an inspected workspace.
 contract. It owns the accepted push-proof methods, binds the private State
 record to the report and review, requires the positive one-time consent state,
 and checks that the delivered, consented-to, and registering review have one
-canonical digest. The CLI applies this contract, on the State record it
-retrieved, only after the credential-output backstop, accepted-decision check,
-and stored report/run/policy bindings, and before source preservation, render,
-database, or other public work. The module performs no retrieval, filesystem
-access, subprocess, network, State write, or public action.
+canonical digest. New work applies the complete contract after the
+credential-output backstop, accepted-decision check, and stored
+report/run/policy bindings and before source preservation, render, or database
+work. Recovery of an already-created branch applies the narrower current
+State/review/source standing first, then validates the reserved public record
+instead of repeating those side effects. The module performs no retrieval,
+filesystem access, subprocess, network, State write, or public action.
+
+`palomar_reviewer.checkpoint` owns the saved-attempt, deterministic-branch,
+same-repository PR, immutable-record, and idempotent State-checkpoint contract.
+The CLI supplies its GitHub read/create and conditional State-write adapters;
+the module has no dependency back into the CLI and exposes no compatibility
+path for a branch or record outside the one current reserved shape.
 
 ## Install
 
@@ -298,7 +306,12 @@ palomar-review register --submission a1b2c3d4e5f6
 
 `register` first reads the private delivered review and refuses anything but an
 acceptance, before it clones a policy or source, downloads an artifact, or
-writes a workspace. It then checks the exact reviewed policy and evidence. No
+writes a workspace. A real retry with a saved registration identity first
+rechecks the current private consent and exact delivered-review/source binding,
+then looks for that identity's deterministic Database branch and same-repository
+open PR. An existing change is recovered at that boundary instead of rebuilding
+the workspace or repeating archive and render side effects. It then checks the
+exact reviewed policy and evidence when no recoverable change exists. No
 submission is grandfathered past authorization: every registration requires
 the private record to describe how push access was proved and not merely assert
 that it was, to name no previous registration, to carry the submitter's
@@ -435,6 +448,18 @@ A renderer or infrastructure failure does not undo acceptance. Before making
 any public archive changes, `register` reserves the permanent ID and version in
 the private submission state. A retry reuses that identity and verifies or
 finishes the same archive refs instead of allocating an orphaned second ID.
+If the earlier process reached the Database branch, the retry fetches the exact
+reserved entry from that branch before doing other work. It creates the missing
+PR from a valid branch or, for an existing PR, requires the exact branch, base,
+same Database repository, head commit, creation time, record identity, source,
+review, and submission binding before checkpointing the PR in State. Fork PRs
+that reuse the predictable branch name are ignored. A checkpoint already named
+by State is validated before any replacement PR could be created. GitHub read
+or authentication failure is not treated as branch absence. The recorded
+creation time retains honest stale-change diagnostics, and a retry of an
+already-recorded checkpoint is idempotent. A new attempt uses an ordinary
+branch push and never force-replaces remote work; a branch that appears after
+preflight is recovered on the next pass.
 If another same-day registration merges first, the contiguous day counter
 invalidates the saved serial and the attempt needs operator coordination; it
 is never silently reallocated under a second identity.

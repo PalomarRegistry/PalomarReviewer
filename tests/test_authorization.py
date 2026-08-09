@@ -29,7 +29,11 @@ def current_contract():
         },
         "source": {"repository": "example/project", "commit": "1" * 40},
     }
-    review = {"submission_id": SUBMISSION_ID, "decision": "accept"}
+    review = {
+        "submission_id": SUBMISSION_ID,
+        "decision": "accept",
+        "source": {"repository": "example/project", "commit": "1" * 40},
+    }
     digest = authorization.document_digest(review)
     state = {
         "id": SUBMISSION_ID,
@@ -165,6 +169,40 @@ class RegistrationAuthorizationOrderTests(unittest.TestCase):
         state["review_sha256"] = authorization.document_digest(review)
         with self.assertRaisesRegex(ReviewerError, "consented to a different review"):
             validate(mechanical, review, state)
+
+
+class RegistrationCheckpointAuthorizationTests(unittest.TestCase):
+    def validate(self, review, state):
+        return authorization.validate_registration_checkpoint(
+            SUBMISSION_ID,
+            review,
+            state,
+            state_repository=STATE_REPOSITORY,
+        )
+
+    def test_current_private_standing_authorizes_checkpoint_recovery(self):
+        _mechanical, review, state = current_contract()
+        self.assertIs(self.validate(review, state), state)
+
+    def test_recovery_binds_the_delivered_review_source_to_state(self):
+        _mechanical, review, state = current_contract()
+        for field, value in (("repository", "attacker/project"), ("commit", "2" * 40)):
+            with self.subTest(field=field):
+                changed = {**review, "source": {**review["source"], field: value}}
+                digest = authorization.document_digest(changed)
+                standing = {
+                    **state,
+                    "review_sha256": digest,
+                    "registration_consent_review_sha256": digest,
+                }
+                with self.assertRaisesRegex(ReviewerError, f"disagree on {field}"):
+                    self.validate(changed, standing)
+
+    def test_recovery_rechecks_consent_before_checkpointing_public_work(self):
+        _mechanical, review, state = current_contract()
+        state["registration_consent"] = False
+        with self.assertRaisesRegex(ReviewerError, "has not consented"):
+            self.validate(review, state)
 
 
 if __name__ == "__main__":
