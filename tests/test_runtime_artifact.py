@@ -2,6 +2,7 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import tempfile
@@ -18,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "runtime"
 WHEEL = RUNTIME / "palomar_reviewer-0.1.0-py3-none-any.whl"
 REQUIREMENTS = RUNTIME / "requirements.txt"
+CODEX_PACKAGE = RUNTIME / "codex-package.json"
+CODEX_LOCK = RUNTIME / "codex-package-lock.json"
 SUMS = RUNTIME / "SHA256SUMS"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 HASH_LINE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)")
@@ -32,6 +35,12 @@ class RuntimeArtifactTests(unittest.TestCase):
         self.assertEqual(
             manifest,
             {
+                "codex-package-lock.json": hashlib.sha256(
+                    CODEX_LOCK.read_bytes()
+                ).hexdigest(),
+                "codex-package.json": hashlib.sha256(
+                    CODEX_PACKAGE.read_bytes()
+                ).hexdigest(),
                 "palomar_reviewer-0.1.0-py3-none-any.whl": hashlib.sha256(
                     WHEEL.read_bytes()
                 ).hexdigest(),
@@ -41,6 +50,47 @@ class RuntimeArtifactTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in RUNTIME.iterdir()}, set(manifest) | {"SHA256SUMS"}
         )
+
+    def test_codex_lock_closes_every_platform_artifact_and_linux_x64_bytes(self):
+        package = json.loads(CODEX_PACKAGE.read_text(encoding="utf-8"))
+        lock = json.loads(CODEX_LOCK.read_text(encoding="utf-8"))
+        self.assertEqual(package["dependencies"], {"@openai/codex": "0.147.0"})
+        self.assertEqual(lock["lockfileVersion"], 3)
+        self.assertEqual(lock["packages"][""]["dependencies"], package["dependencies"])
+        platforms = {
+            "darwin-arm64",
+            "darwin-x64",
+            "linux-arm64",
+            "linux-x64",
+            "win32-arm64",
+            "win32-x64",
+        }
+        expected = {"", "node_modules/@openai/codex"} | {
+            f"node_modules/@openai/codex-{platform}" for platform in platforms
+        }
+        self.assertEqual(set(lock["packages"]), expected)
+        wrapper = lock["packages"]["node_modules/@openai/codex"]
+        self.assertEqual(wrapper["version"], "0.147.0")
+        self.assertEqual(
+            wrapper["optionalDependencies"],
+            {
+                f"@openai/codex-{platform}": f"npm:@openai/codex@0.147.0-{platform}"
+                for platform in platforms
+            },
+        )
+        for path in sorted(expected - {""}):
+            entry = lock["packages"][path]
+            self.assertRegex(entry["integrity"], r"^sha512-[A-Za-z0-9+/]+={0,2}$")
+            self.assertRegex(
+                entry["resolved"],
+                r"^https://registry\.npmjs\.org/@openai/codex/-/codex-0\.147\.0(?:-[a-z0-9-]+)?\.tgz$",
+            )
+        linux = lock["packages"]["node_modules/@openai/codex-linux-x64"]
+        self.assertEqual(
+            (linux["name"], linux["version"]),
+            ("@openai/codex", "0.147.0-linux-x64"),
+        )
+        self.assertEqual((linux["os"], linux["cpu"]), (["linux"], ["x64"]))
 
     def test_runtime_lock_names_the_local_wheel_and_hashes_every_requirement(self):
         requirements = REQUIREMENTS.read_text(encoding="utf-8")
@@ -217,6 +267,10 @@ class RuntimeArtifactTests(unittest.TestCase):
         self.assertIn("--no-deps --no-index", workflow)
         self.assertIn("runtime/palomar_reviewer-0.1.0-py3-none-any.whl", workflow)
         self.assertIn('uv pip check --python "$runtime_env/bin/python"', workflow)
+        self.assertIn("npm ci --prefix \"$codex_runtime\"", workflow)
+        self.assertIn("--ignore-scripts --no-audit --no-fund", workflow)
+        self.assertIn('codex-cli 0.147.0', workflow)
+        self.assertNotIn("npm install --global @openai/codex", workflow)
         self.assertIn("--no-cache --no-config", workflow)
         for command in ("", "auto", "rebuild-queue", "doctor", "star-registered"):
             self.assertIn(

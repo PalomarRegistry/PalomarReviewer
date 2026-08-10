@@ -264,6 +264,61 @@ class EngineExecutionTests(unittest.TestCase):
                 schema,
             )
 
+    def test_codex_namespace_binds_the_exact_native_platform_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "node_modules" / "@openai"
+            wrapper = scope / "codex" / "bin" / "codex.js"
+            native = scope / "codex-linux-x64"
+            binary = root / "node_modules" / ".bin" / "codex"
+            wrapper.parent.mkdir(parents=True)
+            native.mkdir()
+            binary.parent.mkdir(parents=True)
+            wrapper.write_text("", encoding="utf-8")
+            (native / "package.json").write_text("{}\n", encoding="utf-8")
+            binary.symlink_to(Path("../@openai/codex/bin/codex.js"))
+            source = root / "source"
+            source.mkdir()
+
+            programs = {
+                "bwrap": "/usr/bin/bwrap",
+                "codex": str(binary),
+                "node": str(Path(engine.shutil.which("node") or "").resolve()),
+            }
+            with (
+                mock.patch.object(engine.shutil, "which", side_effect=programs.get),
+                mock.patch.object(engine.sys, "platform", "linux"),
+                mock.patch.object(engine.platform, "machine", return_value="x86_64"),
+            ):
+                command = engine.isolated_command(
+                    "codex",
+                    ["codex", "exec"],
+                    cwd=source,
+                    output_dir=root / "output",
+                    secret_args_fd=9,
+                )
+
+            bind = command.index("/engine/node_modules/@openai/codex-linux-x64")
+            self.assertEqual(
+                command[bind - 2 : bind + 1],
+                ["--ro-bind", str(native), command[bind]],
+            )
+
+            (native / "package.json").unlink()
+            native.rmdir()
+            with (
+                mock.patch.object(engine.shutil, "which", side_effect=programs.get),
+                mock.patch.object(engine.sys, "platform", "linux"),
+                mock.patch.object(engine.platform, "machine", return_value="x86_64"),
+                self.assertRaisesRegex(engine.EngineError, "codex-linux-x64"),
+            ):
+                engine.isolated_command(
+                    "codex",
+                    ["codex", "exec"],
+                    cwd=source,
+                    output_dir=root / "other-output",
+                    secret_args_fd=9,
+                )
     def test_codex_requires_a_regular_final_message(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

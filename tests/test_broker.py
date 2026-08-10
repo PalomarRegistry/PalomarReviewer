@@ -782,12 +782,19 @@ class BrokerProcessTests(unittest.TestCase):
 
 
 class PinnedClientTests(unittest.TestCase):
-    def test_ci_and_the_readme_install_the_codex_release_this_was_written_for(self):
-        pinned = f"@openai/codex@{engine.PINNED_CODEX_VERSION}"
+    def test_ci_and_the_readme_install_the_integrity_locked_codex_release(self):
         root = Path(__file__).resolve().parents[1]
-        for relative in (".github/workflows/ci.yml", "README.md"):
-            with self.subTest(relative=relative):
-                self.assertIn(pinned, (root / relative).read_text(encoding="utf-8"))
+        workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        package = json.loads((root / "codex-runtime/package.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            package["dependencies"],
+            {"@openai/codex": engine.PINNED_CODEX_VERSION},
+        )
+        for text in (workflow, readme):
+            self.assertIn("npm ci", text)
+            self.assertIn("--ignore-scripts", text)
+        self.assertNotIn("npm install --global @openai/codex", workflow)
 
 
 class EnginePassTests(unittest.TestCase):

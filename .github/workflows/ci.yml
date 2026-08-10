@@ -65,6 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           runtime_env="$RUNNER_TEMP/palomar-reviewer-runtime"
+          codex_runtime="$RUNNER_TEMP/palomar-codex-runtime"
           uv venv --no-project --python 3.11.10 --no-managed-python "$runtime_env"
           (cd runtime && sha256sum --check SHA256SUMS)
           (cd runtime && uv pip install --python "$runtime_env/bin/python" \
@@ -78,16 +79,22 @@ jobs:
           "$runtime_env/bin/palomar-review" rebuild-queue --help >/dev/null
           "$runtime_env/bin/palomar-review" doctor --help >/dev/null
           "$runtime_env/bin/palomar-review" star-registered --help >/dev/null
+          mkdir -m 700 "$codex_runtime"
+          install -m 0644 runtime/codex-package.json "$codex_runtime/package.json"
+          install -m 0644 runtime/codex-package-lock.json "$codex_runtime/package-lock.json"
+          npm ci --prefix "$codex_runtime" --ignore-scripts --no-audit --no-fund \
+            --cache "$RUNNER_TEMP/palomar-codex-npm-cache"
+          [ "$("$codex_runtime/node_modules/.bin/codex" --version)" = \
+            "codex-cli 0.147.0" ]
+          printf '%s\n' "$codex_runtime/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Install
         working-directory: reviewer
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
-          # The pinned Codex release the provider wiring and the broker's
-          # forwarded-header allowlist were derived from. Without it the
-          # integration test that proves a whole pass runs through the broker
-          # against a fake provider would silently stop running.
-          npm install --global @openai/codex@0.147.0
+          # Codex was installed from the promoted, integrity-locked artifact in
+          # the previous step. The provider wiring and broker allowlist are
+          # tested only against those exact wrapper and Linux binary bytes.
           # Ubuntu 24.04 AppArmor blocks unprivileged user namespaces by
           # default even on the disposable hosted runner. Enable them here so
           # the fail-closed namespace integration test exercises real bwrap.
