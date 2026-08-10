@@ -70,19 +70,19 @@ uv tool install git+https://github.com/PalomarRegistry/PalomarReviewer.git
 palomar-review doctor
 ```
 
-Production will not use that source-install command after the dependent State
-activation lands. `runtime/` holds the
-promoted Reviewer wheel, its complete hash-locked runtime requirements, and a
-`SHA256SUMS` manifest. Those workflows will independently pin both the Git
-commit containing the files and the digest of `SHA256SUMS`, then use Python
-3.11.10. Until that activation lands, this artifact is reviewed and
-reproducible but not yet consumed by State. The activated workflows install the
-third-party runtime wheels under
+Production does not use that source-install command. `runtime/` holds the
+promoted Reviewer wheel, its complete hash-locked Python requirements, the
+reviewed Codex npm package and platform-binary lock, and a `SHA256SUMS`
+manifest. State workflows independently pin both the Git commit containing the
+files and the digest of `SHA256SUMS`, then use Python 3.11.10. They install the
+third-party Python wheels under
 `--require-hashes --no-deps --only-binary :all:` before installing the verified
 local Reviewer wheel with `--no-deps --no-index`. There is no package-version
 or source-build choice at runtime: the only acceptable local Reviewer wheel and
 downloaded dependency wheels are the bytes reviewed in the manifest and
-`uv.lock`.
+`uv.lock`. `npm ci` similarly verifies the exact SRI digest of both the Codex
+wrapper and the Linux x64 binary selected by the reviewed lock; lifecycle
+scripts are disabled and the installed CLI must identify itself as 0.147.0.
 
 Regenerate a proposed promotion with exact uv 0.12.1 on x86-64 Linux:
 
@@ -93,15 +93,15 @@ python3 tools/runtime_artifact.py --check
 
 The build uses Python 3.11.10, a hash-locked Hatchling build graph, and a fixed
 ZIP epoch; CI reproduces the wheel byte-for-byte and performs a cold install.
-The current `runtime/` tree is about 110 KiB. Any commit that changes the
+The current `runtime/` metadata and Reviewer wheel are about 137 KiB; npm still
+downloads the 116 MiB compressed Codex Linux artifact on each run. Any commit that changes the
 packaged Reviewer source, `README.md`, `LICENSE`, or project packaging metadata
-must regenerate its roughly 95 KiB wheel and tiny manifest; a dependency change
-also replaces the roughly 15 KiB requirements file. The install still depends
-on PyPI availability, but the index cannot substitute a
-different distribution without a SHA-256 collision. The pinned checkout,
-GitHub runner image and exact setup actions/uv binary remain bootstrap trust;
-the separately pinned Codex package and Ubuntu packages are outside this Python
-artifact.
+must regenerate its roughly 118 KiB wheel and tiny manifest; a dependency change
+also replaces the roughly 15 KiB requirements file. Python installation still
+depends on PyPI and Codex installation on the npm registry, but neither index
+can substitute different bytes without breaking the reviewed digest. The
+pinned checkout, GitHub runner image, Node/npm, and exact setup actions/uv
+binary remain bootstrap trust; Ubuntu packages remain outside this artifact.
 
 `gh` must be authenticated as an account with access to the private
 `PalomarSubmissionState` and private `PalomarDatabase` repositories. `doctor`
@@ -118,11 +118,12 @@ live and private and writing to it should be deliberate. Registration also
 requires `PALOMAR_ARCHIVE_TOKEN`, belonging to the dedicated machine account
 that can create and write forks in the `PalomarArchive` organization.
 
-Install pinned Codex, and give the reviewer the provider key under the
-upstream-only name the broker reads:
+Install the reviewed Codex lock, and give the reviewer the provider key under
+the upstream-only name the broker reads:
 
 ```bash
-npm install --global @openai/codex@0.147.0
+npm ci --prefix codex-runtime --ignore-scripts --no-audit --no-fund
+export PATH="$PWD/codex-runtime/node_modules/.bin:$PATH"
 export PALOMAR_OPENAI_UPSTREAM_KEY=...   # a dedicated Palomar API key
 palomar-review doctor
 ```

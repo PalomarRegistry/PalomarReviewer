@@ -1,0 +1,9 @@
+{
+  "name": "palomar-codex-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reviewed production Codex CLI closure for Palomar",
+  "dependencies": {
+    "@openai/codex": "0.147.0"
+  }
+}

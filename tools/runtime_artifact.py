@@ -13,8 +13,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = ROOT / "runtime"
+CODEX_INPUT_DIR = ROOT / "codex-runtime"
 WHEEL_NAME = "palomar_reviewer-0.1.0-py3-none-any.whl"
 REQUIREMENTS_NAME = "requirements.txt"
+CODEX_PACKAGE_NAME = "codex-package.json"
+CODEX_LOCK_NAME = "codex-package-lock.json"
 SUMS_NAME = "SHA256SUMS"
 PYTHON_VERSION = "3.11.10"
 UV_VERSION = "0.12.1"
@@ -115,6 +118,8 @@ def reproduce() -> dict[str, bytes]:
         files = {
             WHEEL_NAME: wheel,
             REQUIREMENTS_NAME: requirements,
+            CODEX_PACKAGE_NAME: (CODEX_INPUT_DIR / "package.json").read_bytes(),
+            CODEX_LOCK_NAME: (CODEX_INPUT_DIR / "package-lock.json").read_bytes(),
         }
         sums = "".join(
             f"{sha256(content)}  {name}\n" for name, content in sorted(files.items())
