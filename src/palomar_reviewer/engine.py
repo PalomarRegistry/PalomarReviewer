@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,17 @@ CODEX_PROVIDER_ID = "palomar_broker"
 PINNED_CODEX_VERSION = "0.147.0"
 CODEX_VERSION_LINE = f"codex-cli {PINNED_CODEX_VERSION}"
 CODEX_STREAM_IDLE_MS = int((model_broker.UPSTREAM_READ_SECONDS + 60) * 1000)
+
+
+def codex_platform_package() -> str:
+    """The optional native package selected by pinned Codex on this host."""
+    systems = {"linux": "linux", "darwin": "darwin", "win32": "win32"}
+    machines = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}
+    system = systems.get(sys.platform)
+    machine = machines.get(platform.machine().casefold())
+    if system is None or machine is None:
+        raise EngineError("the Codex engine does not support this platform")
+    return f"codex-{system}-{machine}"
 
 
 def codex_version() -> str:
@@ -403,10 +416,20 @@ def isolated_command(
             raise EngineError("codex and node are required for the codex review engine")
         codex_entry = Path(codex).resolve(strict=True)
         try:
-            codex_root = next(parent for parent in codex_entry.parents if parent.name == "@openai") / "codex"
+            codex_scope = next(parent for parent in codex_entry.parents if parent.name == "@openai")
         except StopIteration as error:
             raise EngineError("could not locate the installed Codex package") from error
+        codex_root = codex_scope / "codex"
+        platform_name = codex_platform_package()
+        platform_root = codex_scope / platform_name
+        if not platform_root.is_dir() or platform_root.is_symlink():
+            raise EngineError(f"could not locate the installed Codex package {platform_name}")
         _bind_if_present(command, codex_root, "/engine/codex")
+        _bind_if_present(
+            command,
+            platform_root,
+            f"/engine/node_modules/@openai/{platform_name}",
+        )
         # No credential is bound in, and no Codex login file is reachable. The
         # only authentication in this namespace is the per-pass broker
         # capability, which arrives through `secret_args_fd`. Without that
