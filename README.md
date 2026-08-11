@@ -236,11 +236,14 @@ may continue over the queue it derived after a refused cache write, because the
 concurrent live index remains intact for its next pass. A pass that cannot
 enumerate its work fails; it never reports having found nothing.
 
-The reviewer accepts only the current rubric contract (schema version 7). It
+The current rubric contract is schema version 8. The reviewer temporarily also
+accepts version 7 so existing reviews and the separately deployed policy can
+roll forward safely; new policy work targets version 8. It
 rejects an internally inconsistent positive review: synthesis must reproduce
 the evidence-pass scores exactly, acceptance
-cannot override a failed pass, and every completed evidence score
-must meet the policy's acceptance minimum. These structural checks are the whole
+cannot override a failed pass, clean passes must meet the rubric minimum, and
+mandatory floors cannot be softened. Non-blocking warnings on other dimensions
+may accompany acceptance. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
 substantive judgments is not separately confirmed. The private State workflow
 uploads the complete packet as operator evidence with a requested 90-day
@@ -252,8 +255,10 @@ the mechanically verified Comparator configuration, in configuration order.
 This prevents a multi-declaration submission from being reduced to a
 reviewer-selected headline. Clean declarations need no public comment; the
 policy requires every distinct material criticism to survive synthesis, and
-the runner checks that the final AI-comment list reproduces every warning and
-error from the evidence passes in order.
+the runner checks that the final AI-comment list reproduces every finding in
+order. Positive checks, harmless edge cases, and excluded failure modes are
+retained privately in `internal_notes` and removed from the served review. The
+classification pass has an equivalent exact manifest for submitted codes.
 
 One review consumes the single Comparator configuration path explicitly chosen
 at intake. Different configuration paths at the same repository and commit are
