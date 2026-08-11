@@ -110,6 +110,8 @@ class RuntimeArtifactTests(unittest.TestCase):
                 "pyyaml",
                 "referencing",
                 "rpds-py",
+                "ruamel-yaml",
+                "ruamel-yaml-clib",
                 "typing-extensions",
             ],
         )
@@ -165,7 +167,11 @@ class RuntimeArtifactTests(unittest.TestCase):
             self.assertEqual(metadata["Version"], "0.1.0")
             self.assertEqual(
                 metadata.get_all("Requires-Dist"),
-                ["jsonschema<5,>=4.25", "pyyaml<7,>=6"],
+                [
+                    "jsonschema<5,>=4.25",
+                    "pyyaml<7,>=6",
+                    "ruamel-yaml<0.19,>=0.18",
+                ],
             )
             self.assertEqual(
                 archive.read("palomar_reviewer-0.1.0.dist-info/licenses/LICENSE"),

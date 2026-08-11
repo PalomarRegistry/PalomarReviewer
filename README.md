@@ -43,6 +43,25 @@ subprocess, environment, clock, or state-repository access.
 Registration separately rechecks the stored report bytes, semantic digest, and
 workflow-run digest before using an inspected workspace.
 
+Failed preflight and full runs use the same trust boundary. `ingest-failures`
+downloads the exact recorded run's mode-specific artifact, validates its
+submission/source binding, redacts it to the diagnostics-v1 contract, and writes
+the failure together with its terminal status. A missing or untrusted artifact
+becomes an explicit Palomar-owned diagnostic rather than a submitter fault.
+
+`repair-queue` handles the separate metadata-repair outbox. It accepts only the
+profile's scalar/list allowlist, round-trips valid YAML without replacing the
+whole file, refuses aliases and malformed YAML, and pushes only to an
+Actions-disabled fork in `PalomarRepairs` using `PALOMAR_REPAIR_TOKEN`. Before
+opening a PR it runs the candidate commit through
+`PalomarSubmission/scripts/verify_submission.py prepare` from `main`, the same
+entry point as ordinary preflight. That subprocess receives an allowlisted
+non-secret environment: neither State write authority nor either GitHub token
+crosses into candidate-controlled intake. Failed candidate validation leaves an
+actionable explanation and manual patch, removes the temporary repair branch,
+and never opens a knowingly failing PR. Finished pull requests also have their
+exact deterministic repair branch removed on a best-effort basis.
+
 `palomar_reviewer.authorization` is the pure registration-authorization
 contract. It owns the accepted push-proof methods, binds the private State
 record to the report and review, requires the positive one-time consent state,
