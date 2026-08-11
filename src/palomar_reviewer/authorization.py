@@ -114,6 +114,20 @@ def _validate_registration_standing(
     state: dict[str, Any],
 ) -> None:
     """Require current consent and authority for one delivered review."""
+    state_authorization = state.get("authorization")
+    state_proof = state.get("push_proof")
+    if (
+        state.get("test_submission") is True
+        or (
+            isinstance(state_authorization, dict)
+            and state_authorization.get("relationship") == "technical-test"
+        )
+        or (
+            isinstance(state_proof, dict)
+            and state_proof.get("method") == "technical-team-test"
+        )
+    ):
+        raise ReviewerError("a technical-team test submission cannot be registered")
     if state.get("push_verified") is not True:
         raise ReviewerError("the submitter never proved write access to the repository")
     validate_push_proof(state)

@@ -3755,6 +3755,9 @@ class MechanicalReportContractTests(unittest.TestCase):
     def test_the_block_the_workflow_emits_is_accepted(self):
         self.validate(self.submission_block())
         self.validate(self.submission_block(requested_paths={"project_path": "examples/one"}))
+        self.validate(self.submission_block(
+            authorization={"relationship": "technical-test"}
+        ))
 
     def test_an_identity_cannot_ride_in_the_archived_report(self):
         for extra in ({"submitter": "someone"}, {"issue": 12}, {"owner": "someone"}):

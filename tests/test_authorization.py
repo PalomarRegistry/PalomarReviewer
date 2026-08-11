@@ -77,6 +77,22 @@ class RegistrationAuthorizationOrderTests(unittest.TestCase):
         mechanical, review, state = current_contract()
         self.assertIs(validate(mechanical, review, state), state)
 
+    def test_a_technical_team_test_cannot_be_registered_even_with_forged_consent(self):
+        mechanical, review, state = current_contract()
+        mechanical["submission"]["authorization"] = {"relationship": "technical-test"}
+        state.update({
+            "authorization": {"relationship": "technical-test"},
+            "test_submission": True,
+            "push_verified": False,
+            "push_proof": {
+                **push_proof(),
+                "method": "technical-team-test",
+                "binding": "active-technical-team-membership",
+            },
+        })
+        with self.assertRaisesRegex(ReviewerError, "technical-team test.*cannot be registered"):
+            validate(mechanical, review, state)
+
     def test_missing_state_fails_with_the_retrieval_context(self):
         mechanical, review, _ = current_contract()
         with self.assertRaisesRegex(
