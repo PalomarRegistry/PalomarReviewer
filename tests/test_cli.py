@@ -46,6 +46,7 @@ from palomar_reviewer.cli import (
     render_prompt,
     request_render,
     step_schema_for_rubric,
+    validate_classification_coverage,
     validate_declaration_coverage,
     validate_render_result,
     validate_rubric,
@@ -1081,42 +1082,48 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def step_result(self, step, scores, verdict="pass"):
         all_scores = {key: None for key in STEP_SCORE_KEYS}
         all_scores.update(scores)
+        findings = []
+        if verdict != "pass":
+            findings = [
+                {
+                    "severity": "error" if verdict == "fail" else "warning",
+                    "evidence": f"{step} evidence",
+                    "message": f"{step} finding",
+                }
+            ]
         return {
             "step": step,
             "verdict": verdict,
             "summary": f"{step} summary",
-            "findings": [
-                {
-                    "severity": "info",
-                    "evidence": f"{step} evidence",
-                    "message": f"{step} finding",
-                }
-            ],
+            "findings": findings,
             "scores": all_scores,
             "trust_level": "high" if step == "definition_fidelity" else None,
             "sources_checked": ["fixture"],
             "declarations_checked": ["Example.result"],
+            "codes_checked": ["arxiv:math.CO"] if step == "classification" else [],
+            "internal_notes": [
+                {"evidence": f"{step} evidence", "message": f"{step} clean audit"}
+            ],
         }
 
     def synthesis_warnings_for(self, passes, policy_checkout):
         """The `warnings` list the live rubric will accept for these passes.
 
-        A fixture that hard-codes this list is a fixture that goes stale the
-        next time PalomarPolicy changes `finding_comment_policy`, and that is
-        exactly what happened: the integration test carried `[]`, PalomarPolicy
-        moved to rubric schema_version 7 with `all`, and the test began failing
+        A fixture that hard-codes this list is a fixture that goes stale when
+        the policy's comment contract changes. That happened when an integration
+        fixture carried `[]` and the policy began requiring all findings; it failed
         with "synthesis warnings must reproduce every required pass finding in
         pass order". Deriving it here means a policy change moves this fixture
         with it, and a policy change the reviewer genuinely cannot satisfy
         still fails, in `validate_synthesis_policy`, where it belongs.
         """
         rubric = json.loads((Path(policy_checkout) / "rubric.json").read_text())
-        policy = rubric.get("finding_comment_policy", "material")
+        policy = rubric.get("finding_comment_policy")
         return [
             finding["message"]
             for result in passes
             for finding in result["findings"]
-            if policy == "all" or finding["severity"] in {"warning", "error"}
+            if policy == "all"
         ]
 
     def review_policy_fixture(self):
@@ -1132,36 +1139,52 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             self.step_result("statement_alignment", {"statement_alignment": 4}),
             self.step_result("definition_fidelity", {"definition_fidelity": 4, "auditability": 4}),
             self.step_result("literature_notability", {"notability": 4, "literature": 4}),
+            self.step_result("classification", {"classification": 4}),
         ]
         rubric = {
-            "schema_version": 7,
+            "schema_version": 8,
+            "finding_comment_policy": "all",
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
-            "step_result": {"verdicts": ["pass", "warn", "fail"]},
+            "step_result": {
+                "verdicts": ["pass", "warn", "fail"],
+                "required_fields": list(STEP_SCHEMA["required"]),
+            },
             "steps": [
                 {
                     "id": "metadata",
                     "required": True,
                     "score_keys": ["clarity", "provenance"],
+                    "inputs": ["policy:prompts/materiality.md"],
                 },
                 {
                     "id": "statement_alignment",
                     "requires_declaration_coverage": True,
                     "required": True,
                     "score_keys": ["statement_alignment"],
+                    "inputs": ["policy:prompts/materiality.md"],
                 },
                 {
                     "id": "definition_fidelity",
                     "requires_declaration_coverage": True,
                     "required": True,
                     "score_keys": ["definition_fidelity", "auditability"],
+                    "inputs": ["policy:prompts/materiality.md"],
                 },
                 {
                     "id": "literature_notability",
                     "requires_declaration_coverage": True,
                     "required": True,
                     "score_keys": ["notability", "literature"],
+                    "inputs": ["policy:prompts/materiality.md"],
+                },
+                {
+                    "id": "classification",
+                    "requires_classification_coverage": True,
+                    "required": True,
+                    "score_keys": ["classification"],
+                    "inputs": ["policy:prompts/materiality.md"],
                 },
             ]
             + [
@@ -1170,8 +1193,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     "requires_declaration_coverage": True,
                     "required": False,
                     "score_keys": ["proof_alignment"],
+                    "inputs": ["policy:prompts/materiality.md"],
                 },
-                {"id": "synthesis", "required": True},
+                {"id": "synthesis", "required": True, "inputs": []},
             ],
         }
         synthesis = {
@@ -1204,12 +1228,29 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "exactly match every Comparator-selected"):
             validate_declaration_coverage(result, step, mechanical)
 
+    def test_classification_pass_requires_every_submitted_code_in_order(self):
+        step = {
+            "id": "classification",
+            "score_keys": ["classification"],
+            "requires_classification_coverage": True,
+        }
+        mechanical = self.mechanical_fixture()
+        result = self.step_result("classification", {"classification": 4})
+        result["codes_checked"] = ["arxiv:math.CO", "msc2020:05C10"]
+        jsonschema.validate(result, step_schema_for_rubric(step))
+        validate_classification_coverage(result, step, mechanical)
+
+        result["codes_checked"].reverse()
+        with self.assertRaisesRegex(ReviewerError, "exactly match every submitted"):
+            validate_classification_coverage(result, step, mechanical)
+
     def test_synthesis_cannot_drop_material_findings(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[1]["findings"] = [
             {"severity": "warning", "evidence": "Example.result", "message": "Fix result A."},
-            {"severity": "error", "evidence": "Example.result", "message": "Fix result B."},
+            {"severity": "warning", "evidence": "Example.result", "message": "Fix result B."},
         ]
+        passes[1]["verdict"] = "warn"
         synthesis["warnings"] = ["Fix result A."]
         with self.assertRaisesRegex(ReviewerError, "every required pass finding"):
             validate_synthesis_policy(
@@ -1226,33 +1267,81 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             mechanical={"status": "pass"},
         )
 
-    def test_all_finding_policy_preserves_informational_comments(self):
+    def test_private_audit_notes_are_not_synthesis_comments(self):
         synthesis, passes, rubric = self.review_policy_fixture()
-        rubric["finding_comment_policy"] = "all"
         passes[1]["findings"] = [
-            {"severity": "info", "evidence": "Example.result", "message": "Useful context."},
             {"severity": "warning", "evidence": "Example.result", "message": "Fix result."},
         ]
-        all_comments = [
-            finding["message"]
-            for result in passes
-            for finding in result["findings"]
+        passes[1]["verdict"] = "warn"
+        passes[1]["internal_notes"] = [
+            {"evidence": "Example.result", "message": "Useful private context."}
         ]
-        synthesis["warnings"] = [comment for comment in all_comments if comment != "Useful context."]
-        with self.assertRaisesRegex(ReviewerError, "every required pass finding"):
-            validate_synthesis_policy(
-                synthesis,
-                passes=passes,
-                rubric=rubric,
-                mechanical={"status": "pass"},
-            )
-        synthesis["warnings"] = all_comments
+        synthesis["warnings"] = ["Fix result."]
         validate_synthesis_policy(
             synthesis,
             passes=passes,
             rubric=rubric,
             mechanical={"status": "pass"},
         )
+
+    def test_clean_passes_can_have_empty_findings_but_not_info_findings(self):
+        result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
+        jsonschema.validate(result, STEP_SCHEMA)
+        result["findings"] = [
+            {"severity": "info", "evidence": "metadata", "message": "Public praise."}
+        ]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(result, STEP_SCHEMA)
+
+    def test_verdicts_must_agree_with_material_findings(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        passes[0]["findings"] = [
+            {"severity": "warning", "evidence": "metadata", "message": "Clarify metadata."}
+        ]
+        synthesis["warnings"] = ["Clarify metadata."]
+        with self.assertRaisesRegex(ReviewerError, "passing metadata pass"):
+            validate_synthesis_policy(
+                synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
+            )
+
+        passes[0]["verdict"] = "fail"
+        with self.assertRaisesRegex(ReviewerError, "requires an error finding"):
+            validate_synthesis_policy(
+                synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
+            )
+
+    def test_synthesis_rejects_duplicate_public_findings(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        for result in passes[:2]:
+            result["verdict"] = "warn"
+            result["findings"] = [
+                {"severity": "warning", "evidence": result["step"], "message": "One correction."}
+            ]
+        synthesis["warnings"] = ["One correction.", "One correction."]
+        with self.assertRaisesRegex(ReviewerError, "must not be repeated"):
+            validate_synthesis_policy(
+                synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
+            )
+
+    def test_decision_and_requested_changes_are_consistent(self):
+        synthesis, passes, rubric = self.review_policy_fixture()
+        synthesis["requested_changes"] = ["Unnecessary change."]
+        with self.assertRaisesRegex(ReviewerError, "acceptance cannot request changes"):
+            validate_synthesis_policy(
+                synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
+            )
+
+        passes[0]["verdict"] = "warn"
+        passes[0]["findings"] = [
+            {"severity": "warning", "evidence": "metadata", "message": "Clarify metadata."}
+        ]
+        synthesis["decision"] = "revise"
+        synthesis["warnings"] = ["Clarify metadata."]
+        synthesis["requested_changes"] = []
+        with self.assertRaisesRegex(ReviewerError, "requires at least one requested change"):
+            validate_synthesis_policy(
+                synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
+            )
 
     def test_authors(self):
         data = {"project": {"authors": ["Ada", {"name": "Emmy", "github": "@emmy"}]}}
@@ -1576,6 +1665,41 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                         policy_commit="2" * 40,
                     )
                     self.assertIn(f'"name": "{name}"', prompt)
+
+    def test_later_passes_see_findings_but_not_private_audit_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "policy" / "prompts").mkdir(parents=True)
+            (work / "source").mkdir()
+            (work / "policy" / "prompts" / "step.md").write_text("Review prompt")
+            previous = [
+                {
+                    "step": "metadata",
+                    "verdict": "warn",
+                    "summary": "Material summary",
+                    "findings": [
+                        {"severity": "warning", "evidence": "metadata", "message": "Public concern"}
+                    ],
+                    "scores": {"clarity": 3},
+                    "internal_notes": [
+                        {"evidence": "metadata", "message": "Private clean check"}
+                    ],
+                }
+            ]
+            prompt = render_prompt(
+                {
+                    "prompt": "prompts/step.md",
+                    "inputs": ["previous_findings", "all_previous_results"],
+                },
+                work=work,
+                state={"id": "a1b2c3d4e5f6"},
+                mechanical={"source": {"repository": "example/repo", "commit": "1" * 40}},
+                previous=previous,
+                policy_commit="2" * 40,
+            )
+
+        self.assertIn("Public concern", prompt)
+        self.assertNotIn("Private clean check", prompt)
 
     def test_prompt_rejects_missing_or_escaping_binding_policy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2802,7 +2926,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
     def test_prelaunch_rubric_versions_are_rejected(self):
         _, _, rubric = self.review_policy_fixture()
-        for version in [*range(1, 7), 7.0, True]:
+        for version in [*range(1, 7), 8.0, True]:
             with self.subTest(version=version):
                 rubric["schema_version"] = version
                 with self.assertRaisesRegex(
@@ -2810,6 +2934,29 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     "unsupported rubric schema_version.*rerun against current policy",
                 ):
                     validate_rubric(rubric)
+
+    def test_schema_version_seven_remains_usable_during_rollout(self):
+        _, _, rubric = self.review_policy_fixture()
+        rubric["schema_version"] = 7
+        rubric["step_result"]["required_fields"] = [
+            "step",
+            "verdict",
+            "summary",
+            "findings",
+            "scores",
+        ]
+        next(step for step in rubric["steps"] if step["id"] == "classification").pop(
+            "requires_classification_coverage"
+        )
+        validate_rubric(rubric)
+
+        result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
+        result.pop("codes_checked")
+        result.pop("internal_notes")
+        result["findings"] = [
+            {"severity": "info", "evidence": "metadata", "message": "Legacy observation."}
+        ]
+        jsonschema.validate(result, step_schema_for_rubric(rubric["steps"][0], 7))
 
     def test_current_rubric_requires_current_verdicts(self):
         _, _, rubric = self.review_policy_fixture()
@@ -2873,19 +3020,30 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 mechanical={"status": "pass"},
             )
 
-    def test_acceptance_requires_high_enough_nonblocking_passes(self):
+    def test_acceptance_allows_a_disclosed_nonblocking_warning(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[0]["scores"]["provenance"] = 3
-        with self.assertRaisesRegex(ReviewerError, "below the rubric minimum"):
-            validate_synthesis_policy(
-                synthesis,
-                passes=passes,
-                rubric=rubric,
-                mechanical={"status": "pass"},
-            )
+        passes[0]["verdict"] = "warn"
+        passes[0]["findings"] = [
+            {"severity": "warning", "evidence": "metadata", "message": "Clarify provenance."}
+        ]
+        synthesis["warnings"] = ["Clarify provenance."]
+        validate_synthesis_policy(
+            synthesis,
+            passes=passes,
+            rubric=rubric,
+            mechanical={"status": "pass"},
+        )
 
         passes[0]["scores"]["provenance"] = 4
+        passes[0]["verdict"] = "pass"
+        passes[0]["findings"] = []
+        synthesis["warnings"] = []
         passes[1]["verdict"] = "fail"
+        passes[1]["findings"] = [
+            {"severity": "error", "evidence": "statement", "message": "Repair statement."}
+        ]
+        synthesis["warnings"] = ["Repair statement."]
         with self.assertRaisesRegex(ReviewerError, "blocking passes"):
             validate_synthesis_policy(
                 synthesis,
@@ -2898,7 +3056,11 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["notability"] = 3
         passes[3]["verdict"] = "fail"
+        passes[3]["findings"] = [
+            {"severity": "error", "evidence": "result", "message": "Research interest is not established."}
+        ]
         synthesis["scores"]["notability"] = 3
+        synthesis["warnings"] = ["Research interest is not established."]
         synthesis["decision"] = "revise"
         with self.assertRaisesRegex(ReviewerError, "fundamental editorial failures"):
             validate_synthesis_policy(
@@ -2919,7 +3081,12 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_low_notability_requires_a_blocking_pass_verdict(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["notability"] = 3
+        passes[3]["findings"] = [
+            {"severity": "warning", "evidence": "result", "message": "Research interest is not established."}
+        ]
+        passes[3]["verdict"] = "warn"
         synthesis["scores"]["notability"] = 3
+        synthesis["warnings"] = ["Research interest is not established."]
         synthesis["decision"] = "reject"
         with self.assertRaisesRegex(ReviewerError, "requires a fail verdict"):
             validate_synthesis_policy(
@@ -2933,8 +3100,13 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[1]["verdict"] = "fail"
         passes[1]["scores"]["statement_alignment"] = 3
+        passes[1]["findings"] = [
+            {"severity": "error", "evidence": "statement", "message": "Repair statement."}
+        ]
         synthesis["scores"]["statement_alignment"] = 3
         synthesis["decision"] = "revise"
+        synthesis["warnings"] = ["Repair statement."]
+        synthesis["requested_changes"] = ["Repair the statement."]
         validate_synthesis_policy(
             synthesis,
             passes=passes,
@@ -2946,8 +3118,13 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["literature"] = 3
         passes[3]["verdict"] = "fail"
+        passes[3]["findings"] = [
+            {"severity": "error", "evidence": "source", "message": "Correct the source account."}
+        ]
         synthesis["scores"]["literature"] = 3
         synthesis["decision"] = "revise"
+        synthesis["warnings"] = ["Correct the source account."]
+        synthesis["requested_changes"] = ["Correct the source account."]
         validate_synthesis_policy(
             synthesis,
             passes=passes,
@@ -2974,6 +3151,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             mechanical = {
                 "status": "pass",
                 "source": {"repository": "example/repo", "commit": "1" * 40},
+                "classification": {
+                    "arxiv": [{"code": "math.CO"}],
+                    "msc2020": [],
+                },
                 "comparator": {
                     "theorem_names": ["Example.result"],
                     "definition_names": [],
@@ -7128,6 +7309,9 @@ class ArchivedReviewTests(unittest.TestCase):
                     "step": "metadata",
                     "verdict": "pass",
                     "scores": {"provenance": 4},
+                    "internal_notes": [
+                        {"evidence": "metadata", "message": "A private clean check."}
+                    ],
                     "findings": [
                         {"severity": "info", "message": "an observation", "evidence": "e"},
                         {"severity": "warning", "message": "a concern", "evidence": "e"},
@@ -7140,6 +7324,7 @@ class ArchivedReviewTests(unittest.TestCase):
         archived = cli.public_review(self.review())
         self.assertNotIn("scores", archived)
         self.assertNotIn("scores", archived["passes"][0])
+        self.assertNotIn("internal_notes", archived["passes"][0])
         for finding in archived["passes"][0]["findings"]:
             self.assertNotIn("severity", finding)
 

@@ -148,7 +148,8 @@ PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<se
 # emits and what a record's `registered_at` has to be.
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 MAX_CONTEXT_BYTES = 300_000
-CURRENT_RUBRIC_VERSION = 7
+CURRENT_RUBRIC_VERSION = 8
+SUPPORTED_RUBRIC_VERSIONS = (7, CURRENT_RUBRIC_VERSION)
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_DECISIONS = ("accept", "revise", "reject")
 
@@ -166,6 +167,7 @@ STEP_SCORE_KEYS = (
 )
 RUBRIC_EVIDENCE_INPUTS = {
     "all_previous_results",
+    "previous_findings",
     "challenge_source",
     "comparator_config",
     "formalization_metadata",
@@ -188,6 +190,8 @@ STEP_SCHEMA = {
         "trust_level",
         "sources_checked",
         "declarations_checked",
+        "codes_checked",
+        "internal_notes",
     ],
     "properties": {
         "step": {"type": "string"},
@@ -195,13 +199,12 @@ STEP_SCHEMA = {
         "summary": {"type": "string", "minLength": 1},
         "findings": {
             "type": "array",
-            "minItems": 1,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["severity", "evidence", "message"],
                 "properties": {
-                    "severity": {"enum": ["info", "warning", "error"]},
+                    "severity": {"enum": ["warning", "error"]},
                     "evidence": {"type": "string", "minLength": 1},
                     "message": {"type": "string", "minLength": 1},
                 },
@@ -218,6 +221,22 @@ STEP_SCHEMA = {
         "declarations_checked": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
+        },
+        "codes_checked": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "internal_notes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["evidence", "message"],
+                "properties": {
+                    "evidence": {"type": "string", "minLength": 1},
+                    "message": {"type": "string", "minLength": 1},
+                },
+            },
         },
     },
 }
@@ -359,7 +378,10 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     were made.
 
     What survives is the decision, the summary, the requested changes, and
-    every remark the review made with the evidence it made it on.
+    every material finding the review made with the evidence it made it on.
+    Private audit notes are removed too: they record checks that did not produce a
+    criticism and are neither instructions to the submitter nor part of the
+    review the submitter may later choose to register.
 
     This does not by itself keep the scores private. A finding that says "this
     prevents a literature score of 5 but not 4" states one exactly, and no
@@ -386,6 +408,7 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     for step in archived.get("passes") or []:
         if isinstance(step, dict):
             step.pop("scores", None)
+            step.pop("internal_notes", None)
             for finding in step.get("findings") or []:
                 if isinstance(finding, dict):
                     finding.pop("severity", None)
@@ -432,21 +455,15 @@ def registered_comments(review: dict[str, Any]) -> list[str]:
     """The remarks a record carries, in the order the review made them.
 
     Not `review["warnings"]`, and this is the other half of `public_review`
-    above. What that list holds is decided by the rubric's
-    `finding_comment_policy`, in another repository: `all` makes it every
-    finding message, and `material` makes it the messages of the findings
-    whose severity is `warning` or `error`. Under `material` it is a
-    severity-ranked selection from the findings, and the archived review
-    carries every finding with its severity removed. Both are served, from the
-    same origin, so a record repeating that selection lets a reader subtract
-    one list from the other and read back exactly the ranking `public_review`
-    had just taken out. The policy says `all` today, so nothing has leaked;
-    what leaks is one word changed in a file this code never reads.
+    above. Rubric version 8 defines every finding as an author-facing material
+    criticism and mechanically requires the synthesis list to contain all of
+    them. Private audit observations have a different field and are removed
+    from the served review, so there is no severity-ranked subset here.
 
-    Every finding message, once, in pass order, partitions nothing: it is the
-    same set the archived review already shows. A top-level remark that
-    matches no finding is kept as well, because a rubric older than
-    `finding_comment_policy` ties the two lists together not at all, and
+    Every material finding message, once, in pass order, partitions nothing:
+    it is the same set the archived review already shows. A top-level remark that
+    matches no finding is kept as well, because a hand-edited or historical
+    review may tie the two lists together not at all, and
     dropping such a remark would lose something the review said rather than
     something it ranked.
 
@@ -596,11 +613,11 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version != CURRENT_RUBRIC_VERSION
+        or version not in SUPPORTED_RUBRIC_VERSIONS
     ):
         raise ReviewerError(
             f"unsupported rubric schema_version: {version!r}; rerun against current policy "
-            f"(schema version {CURRENT_RUBRIC_VERSION})"
+            f"(supported schema versions {', '.join(map(str, SUPPORTED_RUBRIC_VERSIONS))})"
         )
     steps = rubric.get("steps")
     if not isinstance(steps, list):
@@ -627,10 +644,19 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
     if rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
         raise ReviewerError("the rubric must declare exactly the supported pass verdicts")
-    if rubric.get("finding_comment_policy", "material") not in {"material", "all"}:
-        raise ReviewerError(
-            "the rubric finding_comment_policy must be 'material' or 'all'"
-        )
+    required_fields = rubric.get("step_result", {}).get("required_fields")
+    if version == CURRENT_RUBRIC_VERSION:
+        if required_fields != STEP_SCHEMA["required"]:
+            raise ReviewerError("the rubric must declare exactly the current step-result fields")
+        if rubric.get("finding_comment_policy") != "all":
+            raise ReviewerError(
+                "the current rubric requires every material finding to be shown to the author"
+            )
+    else:
+        if required_fields != ["step", "verdict", "summary", "findings", "scores"]:
+            raise ReviewerError("the legacy rubric has invalid step-result fields")
+        if rubric.get("finding_comment_policy", "material") not in {"material", "all"}:
+            raise ReviewerError("the legacy rubric has an invalid finding-comment policy")
     coverage_steps = {
         step.get("id")
         for step in steps
@@ -646,6 +672,16 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
         raise ReviewerError(
             "the rubric must require declaration coverage for every substantive pass"
         )
+    classification_coverage = {
+        step.get("id")
+        for step in steps
+        if step.get("requires_classification_coverage") is True
+    }
+    expected_classification_coverage = {"classification"} if version == CURRENT_RUBRIC_VERSION else set()
+    if classification_coverage != expected_classification_coverage:
+        raise ReviewerError(
+            "the rubric must require complete classification-code coverage"
+        )
     allowed_step_scores = set(STEP_SCORE_KEYS)
     owned: list[str] = []
     owners: dict[str, dict[str, Any]] = {}
@@ -659,6 +695,10 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
             raise ReviewerError(f"rubric step {step.get('id')!r} has an unknown evidence input")
         if step.get("id") == "synthesis":
             continue
+        if version == CURRENT_RUBRIC_VERSION and "policy:prompts/materiality.md" not in inputs:
+            raise ReviewerError(
+                f"rubric step {step.get('id')!r} is missing the binding materiality policy"
+            )
         score_keys = step.get("score_keys")
         if (
             not isinstance(score_keys, list)
@@ -692,8 +732,20 @@ def validate_current_review_contract(
         )
 
 
-def step_schema_for_rubric(step: dict[str, Any]) -> dict[str, Any]:
+def step_schema_for_rubric(
+    step: dict[str, Any], rubric_version: int = CURRENT_RUBRIC_VERSION
+) -> dict[str, Any]:
     schema = copy.deepcopy(STEP_SCHEMA)
+    if rubric_version == 7:
+        for key in ("codes_checked", "internal_notes"):
+            schema["required"].remove(key)
+            schema["properties"].pop(key)
+        schema["properties"]["findings"]["minItems"] = 1
+        schema["properties"]["findings"]["items"]["properties"]["severity"]["enum"] = [
+            "info",
+            "warning",
+            "error",
+        ]
     owned = set(step["score_keys"])
     score_properties = schema["properties"]["scores"]["properties"]
     for key in schema["properties"]["scores"]["properties"]:
@@ -702,7 +754,12 @@ def step_schema_for_rubric(step: dict[str, Any]) -> dict[str, Any]:
         )
     if step.get("requires_declaration_coverage"):
         schema["properties"]["declarations_checked"]["minItems"] = 1
-        schema["properties"]["findings"].pop("minItems", None)
+        if rubric_version == 7:
+            schema["properties"]["findings"].pop("minItems", None)
+    if rubric_version == CURRENT_RUBRIC_VERSION and step.get("requires_classification_coverage"):
+        schema["properties"]["codes_checked"]["minItems"] = 1
+    if rubric_version == CURRENT_RUBRIC_VERSION:
+        schema["properties"]["sources_checked"]["minItems"] = 1
     return schema
 
 
@@ -721,6 +778,24 @@ def validate_declaration_coverage(
         raise ReviewerError(
             f"{step['id']} declaration coverage must exactly match every Comparator-selected "
             "theorem and definition, in configuration order"
+        )
+
+
+def validate_classification_coverage(
+    result: dict[str, Any], step: dict[str, Any], mechanical: dict[str, Any]
+) -> None:
+    """Require the classification pass to name every submitted code in order."""
+    if not step.get("requires_classification_coverage"):
+        return
+    classification = mechanical.get("classification", {})
+    expected = [
+        *(f"arxiv:{item['code']}" for item in classification.get("arxiv", [])),
+        *(f"msc2020:{item['code']}" for item in classification.get("msc2020", [])),
+    ]
+    if result.get("codes_checked") != expected:
+        raise ReviewerError(
+            "classification code coverage must exactly match every submitted arXiv and "
+            "MSC2020 code, in metadata order"
         )
 
 
@@ -2996,9 +3071,10 @@ def render_prompt(
                 (
                     f"This pass assesses only these score keys: {owned}. The enforced output "
                     "schema includes every score key; set every score not owned by this pass "
-                    "to null. Always include trust_level and sources_checked, using null or an "
-                    "empty list when they do not apply. Always include declarations_checked; "
-                    "use an empty list unless this pass requires declaration coverage."
+                    "to null. Always include trust_level and sources_checked. Always include "
+                    "declarations_checked and codes_checked; use empty lists unless this pass "
+                    "requires that coverage. Always include internal_notes; use it for private "
+                    "audit reasoning that is not a material criticism."
                 ),
             ]
         )
@@ -3012,7 +3088,28 @@ def render_prompt(
         elif name == "mechanical_report":
             content = json.dumps(mechanical, indent=2)
         elif name == "all_previous_results":
-            content = json.dumps(previous, indent=2)
+            content = json.dumps(
+                [
+                    {key: value for key, value in result.items() if key != "internal_notes"}
+                    for result in previous
+                ],
+                indent=2,
+            )
+        elif name == "previous_findings":
+            content = json.dumps(
+                [
+                    {
+                        "step": result["step"],
+                        "findings": [
+                            {"evidence": item["evidence"], "message": item["message"]}
+                            for item in result.get("findings", [])
+                        ],
+                    }
+                    for result in previous
+                    if result.get("findings")
+                ],
+                indent=2,
+            )
         elif name == "project_readme":
             evidence_path = mechanical_evidence.project_readme_relative(
                 mechanical, source
@@ -3128,8 +3225,12 @@ def validate_stored_review(
         step_id = result.get("step")
         if step_id not in steps or step_id in seen:
             raise ReviewerError(f"stored review has an unknown or duplicate pass: {step_id!r}")
-        jsonschema.validate(result, step_schema_for_rubric(steps[step_id]))
+        jsonschema.validate(
+            result,
+            step_schema_for_rubric(steps[step_id], rubric_data["schema_version"]),
+        )
         validate_declaration_coverage(result, steps[step_id], mechanical)
+        validate_classification_coverage(result, steps[step_id], mechanical)
         seen.add(step_id)
     synthesis = {
         "decision": report["decision"],
@@ -3154,6 +3255,78 @@ def pass_scores(passes: list[dict[str, Any]], rubric: dict[str, Any]) -> dict[st
     return {key: by_step[owners[key]]["scores"][key] for key in SYNTHESIS_SCORE_KEYS}
 
 
+def _validate_legacy_synthesis_policy(
+    synthesis: dict[str, Any],
+    *,
+    passes: list[dict[str, Any]],
+    rubric: dict[str, Any],
+    mechanical: dict[str, Any],
+) -> None:
+    """Keep schema-v7 reviews usable while the two repositories roll forward."""
+    required_steps = {
+        step["id"]
+        for step in rubric["steps"]
+        if step.get("required") and step["id"] != "synthesis"
+    }
+    by_step = {result["step"]: result for result in passes}
+    missing = required_steps - by_step.keys()
+    if missing:
+        raise ReviewerError(f"review is missing required passes: {', '.join(sorted(missing))}")
+
+    evidence_scores = pass_scores(passes, rubric)
+    if synthesis["scores"] != evidence_scores:
+        raise ReviewerError("synthesis scores must reproduce the evidence-pass scores without inflating them")
+
+    comment_policy = rubric.get("finding_comment_policy", "material")
+    comments = [
+        finding["message"]
+        for result in passes
+        for finding in result["findings"]
+        if comment_policy == "all" or finding["severity"] in {"warning", "error"}
+    ]
+    if synthesis["warnings"] != comments:
+        raise ReviewerError(
+            "synthesis warnings must reproduce every required pass finding in pass order"
+        )
+
+    minimum = rubric["minimum_accept_score"]
+    fundamental = []
+    for key in rubric.get("mandatory_reject_below_minimum", []):
+        if evidence_scores[key] >= minimum:
+            continue
+        owner = next(
+            step["id"]
+            for step in rubric["steps"]
+            if step["id"] != "synthesis" and key in step["score_keys"]
+        )
+        if by_step[owner]["verdict"] != "fail":
+            raise ReviewerError(f"a fundamental {key} score below the minimum requires a fail verdict")
+        fundamental.append((key, evidence_scores[key]))
+    if fundamental and synthesis["decision"] != "reject":
+        details = ", ".join(f"{key}={score}" for key, score in fundamental)
+        raise ReviewerError(
+            f"fundamental editorial failures require reject, not {synthesis['decision']}: {details}"
+        )
+
+    if synthesis["decision"] != "accept":
+        return
+    if mechanical.get("status") != "pass":
+        raise ReviewerError("an acceptance requires a passing mechanical report")
+    blocking = sorted(result["step"] for result in passes if result["verdict"] == "fail")
+    if blocking:
+        raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
+    below_minimum = [
+        f"{result['step']}.{key}={score}"
+        for result in passes
+        for key, score in result["scores"].items()
+        if score is not None and score < minimum
+    ]
+    if below_minimum:
+        raise ReviewerError(
+            "an acceptance cannot use scores below the rubric minimum: " + ", ".join(below_minimum)
+        )
+
+
 def validate_synthesis_policy(
     synthesis: dict[str, Any],
     *,
@@ -3161,6 +3334,14 @@ def validate_synthesis_policy(
     rubric: dict[str, Any],
     mechanical: dict[str, Any],
 ) -> None:
+    if rubric.get("schema_version") == 7:
+        _validate_legacy_synthesis_policy(
+            synthesis,
+            passes=passes,
+            rubric=rubric,
+            mechanical=mechanical,
+        )
+        return
     required_steps = {
         step["id"] for step in rubric["steps"] if step.get("required") and step["id"] != "synthesis"
     }
@@ -3173,19 +3354,22 @@ def validate_synthesis_policy(
     if synthesis["scores"] != evidence_scores:
         raise ReviewerError("synthesis scores must reproduce the evidence-pass scores without inflating them")
 
-    comment_policy = rubric.get("finding_comment_policy", "material")
-    if comment_policy not in {"material", "all"}:
+    comment_policy = rubric.get("finding_comment_policy")
+    if comment_policy != "all":
         raise ReviewerError(f"unsupported finding_comment_policy: {comment_policy!r}")
     comments = [
         finding["message"]
         for result in passes
         for finding in result["findings"]
-        if comment_policy == "all" or finding["severity"] in {"warning", "error"}
     ]
     if synthesis["warnings"] != comments:
         raise ReviewerError(
             "synthesis warnings must reproduce every required pass finding in pass order"
         )
+
+    normalized_comments = [" ".join(comment.split()).casefold() for comment in comments]
+    if len(normalized_comments) != len(set(normalized_comments)):
+        raise ReviewerError("material findings must not be repeated across review passes")
 
     minimum = rubric.get("minimum_accept_score")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
@@ -3197,6 +3381,39 @@ def validate_synthesis_policy(
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
+
+    owners = {
+        key: step["id"]
+        for step in rubric["steps"]
+        if step["id"] != "synthesis"
+        for key in step["score_keys"]
+    }
+    for result in passes:
+        findings = result["findings"]
+        verdict = result["verdict"]
+        if verdict == "pass" and findings:
+            raise ReviewerError(f"a passing {result['step']} pass cannot carry a material finding")
+        if verdict == "warn" and not findings:
+            raise ReviewerError(f"a warning {result['step']} pass requires a material finding")
+        if verdict == "warn" and any(item["severity"] == "error" for item in findings):
+            raise ReviewerError(f"a warning {result['step']} pass cannot carry an error finding")
+        if verdict == "fail" and not any(item["severity"] == "error" for item in findings):
+            raise ReviewerError(f"a failed {result['step']} pass requires an error finding")
+        for key, score in result["scores"].items():
+            if score is None or owners.get(key) != result["step"]:
+                continue
+            if verdict == "pass" and score < minimum:
+                raise ReviewerError(
+                    f"a passing {result['step']} pass cannot score {key} below the rubric minimum"
+                )
+            if score < minimum and not findings:
+                raise ReviewerError(
+                    f"a below-minimum {result['step']}.{key} score requires a material finding"
+                )
+            if score <= 2 and verdict != "fail":
+                raise ReviewerError(
+                    f"a major {result['step']}.{key} deficiency requires a fail verdict"
+                )
     fundamental: list[tuple[str, int, str]] = []
     for key in mandatory_reject:
         if evidence_scores[key] >= minimum:
@@ -3218,22 +3435,21 @@ def validate_synthesis_policy(
                 f"fundamental editorial failures require reject, not {synthesis['decision']}: {details}"
             )
 
-    if synthesis["decision"] != "accept":
+    decision = synthesis["decision"]
+    if decision == "accept" and synthesis["requested_changes"]:
+        raise ReviewerError("an acceptance cannot request changes")
+    if decision == "revise" and not synthesis["requested_changes"]:
+        raise ReviewerError("a revision decision requires at least one requested change")
+    if decision != "accept" and not comments:
+        raise ReviewerError("a non-acceptance requires at least one author-facing material finding")
+
+    if decision != "accept":
         return
     if mechanical.get("status") != "pass":
         raise ReviewerError("an acceptance requires a passing mechanical report")
     blocking = sorted(result["step"] for result in passes if result["verdict"] == "fail")
     if blocking:
         raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
-    below_minimum = []
-    for result in passes:
-        for key, score in result["scores"].items():
-            if score is not None and score < minimum:
-                below_minimum.append(f"{result['step']}.{key}={score}")
-    if below_minimum:
-        raise ReviewerError(
-            "an acceptance cannot use scores below the rubric minimum: " + ", ".join(below_minimum)
-        )
 
 
 def run_review(args: argparse.Namespace) -> int:
@@ -3316,7 +3532,7 @@ def run_review(args: argparse.Namespace) -> int:
         result_schema = (
             SYNTHESIS_SCHEMA
             if step["id"] == "synthesis"
-            else step_schema_for_rubric(step)
+            else step_schema_for_rubric(step, rubric.get("schema_version", CURRENT_RUBRIC_VERSION))
         )
         try:
             result, usage = engine_execution.execute(
@@ -3346,6 +3562,7 @@ def run_review(args: argparse.Namespace) -> int:
             if result["step"] != step["id"]:
                 raise ReviewerError(f"engine returned step {result['step']!r}, expected {step['id']!r}")
             validate_declaration_coverage(result, step, mechanical)
+            validate_classification_coverage(result, step, mechanical)
             passes.append(result)
             write_json(work / "passes" / f"{step['id']}.json", result)
     if synthesis is None:
