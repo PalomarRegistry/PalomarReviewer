@@ -7790,3 +7790,217 @@ class StarRaceTests(unittest.TestCase):
         ):
             self.assertEqual(cli.star_registered_sources(SimpleNamespace(dry_run=False)), 1)
         put_state.assert_not_called()
+
+
+class FailureDiagnosticTests(unittest.TestCase):
+    def state(self, status="preflight-reporting"):
+        return {
+            "id": "a1b2c3d4e5f6",
+            "status": status,
+            "repository": "owner/project",
+            "commit": "a" * 40,
+            "preflight_run": {"id": 101, "url": "https://example.test/preflight"},
+            "run": {"id": 202, "url": "https://example.test/verify"},
+            "events": [],
+            "_blob_sha": "state-sha",
+        }
+
+    def diagnostic(self, *, owner="submitter", repairable=True):
+        return {
+            "code": "formalization.invalid_field",
+            "stage": "formalization",
+            "owner": owner,
+            "summary": "project.name is required",
+            "explanation": "formalization.yaml field project.name is required",
+            "next_action": "Enter the project name and create a repair pull request.",
+            "retryable": False,
+            "repairable": repairable,
+            "field": "project.name",
+            "location": {"path": "formalization.yaml", "line": 2, "column": 3},
+        }
+
+    def report(self, diagnostic):
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "submission": {"submission_id": "a1b2c3d4e5f6"},
+            "source": {"repository": "owner/project", "commit": "a" * 40},
+            "diagnostics_schema_version": 1,
+            "formalization_profile_version": 1,
+            "diagnostics": [diagnostic],
+        }
+
+    def test_failure_report_is_bound_and_redacted(self):
+        result = cli.validated_failure_report(self.report(self.diagnostic()), self.state())
+        self.assertEqual(result["profile_version"], 1)
+        self.assertEqual(result["diagnostics"][0]["field"], "project.name")
+        self.assertEqual(result["diagnostics"][0]["location"]["line"], 2)
+        self.assertNotIn("unexpected", result["diagnostics"][0])
+
+    def test_only_submitter_diagnostics_produce_changes_required(self):
+        state = self.state()
+        run_data = {
+            "databaseId": 101,
+            "url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/101",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "mechanical-report.json"
+            artifact.write_text(json.dumps(self.report(self.diagnostic())))
+            with (
+                mock.patch.object(cli, "trusted_submission_run", return_value=run_data),
+                mock.patch.object(cli, "validate_workflow_commit_on_main"),
+                mock.patch.object(cli, "download_mechanical_artifact", return_value=artifact),
+                mock.patch.object(
+                    cli,
+                    "advance_state",
+                    return_value={"status": "changes-required"},
+                ) as advance,
+            ):
+                result = cli.ingest_failure_diagnostics(state, Path(directory))
+        self.assertEqual(result["status"], "changes-required")
+        self.assertEqual(advance.call_args.args[1], "changes-required")
+        failure = advance.call_args.kwargs["failure"]
+        self.assertTrue(failure["diagnostics"][0]["repairable"])
+
+    def test_submitter_work_remains_actionable_beside_a_provider_failure(self):
+        state = self.state()
+        report = self.report(self.diagnostic())
+        report["diagnostics"].append(self.diagnostic(owner="provider", repairable=False))
+        run_data = {"databaseId": 101, "url": "https://example.test/run"}
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "mechanical-report.json"
+            artifact.write_text(json.dumps(report))
+            with (
+                mock.patch.object(cli, "trusted_submission_run", return_value=run_data),
+                mock.patch.object(cli, "validate_workflow_commit_on_main"),
+                mock.patch.object(cli, "download_mechanical_artifact", return_value=artifact),
+                mock.patch.object(cli, "advance_state", return_value={}) as advance,
+            ):
+                cli.ingest_failure_diagnostics(state, Path(directory))
+        self.assertEqual(advance.call_args.args[1], "changes-required")
+
+    def test_untrusted_artifact_becomes_a_palomar_failure(self):
+        state = self.state()
+        with (
+            mock.patch.object(
+                cli, "trusted_submission_run", side_effect=ReviewerError("wrong run")
+            ),
+            mock.patch.object(
+                cli,
+                "advance_state",
+                return_value={"status": "preflight-failed"},
+            ) as advance,
+        ):
+            cli.ingest_failure_diagnostics(state, Path("unused"))
+        self.assertEqual(advance.call_args.args[1], "preflight-failed")
+        diagnostic = advance.call_args.kwargs["failure"]["diagnostics"][0]
+        self.assertEqual(diagnostic["owner"], "palomar")
+        self.assertTrue(diagnostic["retryable"])
+
+    def test_new_terminal_statuses_leave_the_reviewer_queue(self):
+        for status in (
+            "changes-required",
+            "preflight-failed",
+            "verification-failed",
+            "verification-error",
+        ):
+            with self.subTest(status=status):
+                self.assertTrue(cli.finished_with({"status": status}))
+
+
+class MetadataRepairTests(unittest.TestCase):
+    def repair(self, value="Example"):
+        return {
+            "schema_version": 1,
+            "submission_id": "a1b2c3d4e5f6",
+            "revision": "a" * 16,
+            "status": "queued",
+            "requested_at": "2026-08-11T00:00:00Z",
+            "failure_digest": "f" * 64,
+            "source": {"repository": "owner/project", "commit": "1" * 40,
+                       "formalization_path": "formalization.yaml"},
+            "edits": [{"field": "project.name", "value": value}],
+        }
+
+    def test_repair_values_are_revalidated_at_the_privileged_boundary(self):
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        cli._validate_repair(self.repair(), state)
+        with self.assertRaisesRegex(ReviewerError, "value.*malformed"):
+            cli._validate_repair(self.repair({"unexpected": "mapping"}), state)
+        wrong_path = self.repair()
+        wrong_path["source"]["formalization_path"] = "metadata.yaml"
+        with self.assertRaisesRegex(ReviewerError, "named formalization.yaml"):
+            cli._validate_repair(wrong_path, state)
+
+    def test_successful_prepare_report_is_the_repair_preflight_success_contract(self):
+        self.assertTrue(cli._repair_preflight_passed({"status": "pending", "stage": "prepared"}))
+        self.assertFalse(cli._repair_preflight_passed({"status": "ready", "stage": "prepared"}))
+        self.assertFalse(cli._repair_preflight_passed({"status": "pending", "stage": "license"}))
+
+    def test_repair_preflight_environment_contains_no_workflow_credentials(self):
+        with mock.patch.dict(os.environ, {
+            "PATH": "/bin", "HOME": "/tmp/home", "BUNDLE_PATH": "/tmp/gems",
+            "GH_TOKEN": "reviewer", "PALOMAR_REPAIR_TOKEN": "repair",
+            "PALOMAR_ALLOW_STATE_WRITES": "1", "GITHUB_TOKEN": "actions",
+            "OPENAI_API_KEY": "model",
+        }, clear=True):
+            environment = cli._repair_preflight_environment(Path("/pipeline"), Path("/safe-home"))
+        self.assertEqual(environment["PATH"], "/bin")
+        self.assertEqual(environment["HOME"], "/safe-home")
+        self.assertEqual(environment["BUNDLE_PATH"], "/tmp/gems")
+        self.assertTrue(environment["BUNDLE_GEMFILE"].endswith("/pipeline/Gemfile"))
+        for secret in (
+            "GH_TOKEN", "PALOMAR_REPAIR_TOKEN", "PALOMAR_ALLOW_STATE_WRITES",
+            "GITHUB_TOKEN", "OPENAI_API_KEY",
+        ):
+            self.assertNotIn(secret, environment)
+
+    def test_round_trip_repair_changes_only_approved_fields(self):
+        long_note = "This quoted value crosses the default eighty column emitter width unchanged."
+        source = f"""# project comment
+project:
+  name: Old name
+  authors:
+    - Old Author
+  license: MIT
+classification:
+  arxiv: [math.LO]
+  msc2020: [03B35]
+review:
+  status: unreviewed
+notes: "{long_note}"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            path.write_text(source, encoding="utf-8")
+            cli._apply_repair(path, [
+                {"field": "project.name", "value": "New name"},
+                {"field": "classification.msc2020", "value": ["03B35", "68V15"]},
+            ])
+            repaired = path.read_text(encoding="utf-8")
+        self.assertIn("# project comment", repaired)
+        self.assertIn("name: New name", repaired)
+        self.assertIn("68V15", repaired)
+        self.assertIn("license: MIT", repaired)
+        self.assertIn(f'notes: "{long_note}"', repaired)
+
+    def test_malformed_yaml_is_manual_not_edited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            original = "project: [\n"
+            path.write_text(original, encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "correct the YAML manually"):
+                cli._apply_repair(path, [{"field": "project.name", "value": "Name"}])
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_yaml_aliases_are_not_automatically_rewritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            original = "project: &project\n  name: Old\ncopy: *project\n"
+            path.write_text(original, encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "uses aliases"):
+                cli._apply_repair(path, [{"field": "project.name", "value": "Name"}])
+            self.assertEqual(path.read_text(encoding="utf-8"), original)

@@ -7,6 +7,7 @@ import copy
 import datetime as dt
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from urllib.parse import quote
 
 import jsonschema
 import yaml
+from ruamel.yaml import YAML
 
 from . import authorization as registration_authorization
 from . import broker as model_broker
@@ -74,6 +76,9 @@ PASS_BUDGET_SECONDS = 5400
 # and a pass drops one when the record says there is nothing left to do to it.
 OPEN_INDEX_PATH = "index/open.json"
 OPEN_INDEX_SCHEMA_VERSION = 1
+REPAIR_INDEX_PATH = "index/repairs.json"
+REPAIR_OWNER = "PalomarRepairs"
+REPAIR_TERMINAL_STATUSES = frozenset({"merged", "closed", "needs-input", "failed"})
 # The index is derivable, so it is rebuilt on a clock as well as on damage: a
 # record edited by hand, or an index write the server lost, is picked up within
 # this rather than never. Deleting index/open.json forces one immediately.
@@ -103,7 +108,15 @@ OPEN_INDEX_REBUILD_SECONDS = 7 * 24 * 3600
 # again on every pass for ever. A status the reviewer does not recognise is not
 # inert: it is a queue entry that never drains.
 FINISHED_STATUSES = frozenset(
-    {"verification-failed", "review-failed", "withdrawn", "dispatch-lost"}
+    {
+        "changes-required",
+        "preflight-failed",
+        "verification-failed",
+        "verification-error",
+        "review-failed",
+        "withdrawn",
+        "dispatch-lost",
+    }
 )
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
@@ -1684,10 +1697,13 @@ def download_mechanical_artifact(
     run_id: int,
     submission_id: str,
     destination: Path,
+    *,
+    mode: str = "full",
 ) -> Path:
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
+    artifact = "preflight-report" if mode == "preflight" else "mechanical-report"
     proc = run(
         [
             "gh",
@@ -1697,7 +1713,7 @@ def download_mechanical_artifact(
             "--repo",
             mechanical_evidence.SUBMISSION_REPO,
             "--name",
-            f"mechanical-report-{submission_id}",
+            f"{artifact}-{submission_id}",
             "--dir",
             str(destination),
         ],
@@ -1715,10 +1731,20 @@ def validate_trusted_mechanical_artifact(
 ) -> None:
     """Bind a valid report contract to a workflow commit still on main's lineage."""
     head_sha = mechanical_evidence.validate_report_contract(report, state, run_data)
+    validate_workflow_commit_on_main(run_data, head_sha=head_sha)
+
+
+def validate_workflow_commit_on_main(
+    run_data: dict[str, Any], *, head_sha: str | None = None
+) -> None:
+    """Require a recorded Submission workflow commit to remain on main's lineage."""
+    workflow_commit = head_sha or run_data.get("headSha")
+    if not isinstance(workflow_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", workflow_commit):
+        raise ReviewerError("verification run has no valid workflow commit")
     comparison = gh(
         [
             "api",
-            f"repos/{mechanical_evidence.SUBMISSION_REPO}/compare/{head_sha}...main",
+            f"repos/{mechanical_evidence.SUBMISSION_REPO}/compare/{workflow_commit}...main",
             "--jq",
             ".status",
         ]
@@ -1727,8 +1753,13 @@ def validate_trusted_mechanical_artifact(
         raise ReviewerError("verification workflow commit is not an ancestor of main")
 
 
-def normalized_verification_run(
-    document: Any, recorded: int, submission_id: str
+def normalized_submission_run(
+    document: Any,
+    recorded: int,
+    submission_id: str,
+    *,
+    mode: str = "full",
+    conclusion: str | None = "success",
 ) -> dict[str, Any]:
     """Check every trust property of a run document and put it in run_data shape.
 
@@ -1744,7 +1775,13 @@ def normalized_verification_run(
     # `submission.yml` declares `run-name`, so a run's `name` is that run name
     # and not the workflow's own `name:`. Both fields therefore read "Verify
     # submission <id>" here, and the workflow's identity comes from the path.
-    title = f"Verify submission {submission_id}"
+    if mode not in {"preflight", "full"}:
+        raise ReviewerError(f"submission run mode {mode!r} is not recognized")
+    title = (
+        f"Preflight submission {submission_id}"
+        if mode == "preflight"
+        else f"Verify submission {submission_id}"
+    )
     # Not folded into the exact comparisons below, which are equality: `True`
     # equals 1, so a document saying `"id": true` would answer for run 1.
     returned = document.get("id")
@@ -1757,13 +1794,16 @@ def normalized_verification_run(
         "head_branch": "main",
         "event": "workflow_dispatch",
         "status": "completed",
-        "conclusion": "success",
     }
+    if conclusion is not None:
+        expected["conclusion"] = conclusion
     for field, wanted in expected.items():
         if document.get(field) != wanted:
-            raise ReviewerError(
-                f"{refusal} has {field} {document.get(field)!r}, not {wanted!r}"
-            )
+            raise ReviewerError(f"{refusal} has {field} {document.get(field)!r}, not {wanted!r}")
+    if conclusion is None:
+        actual_conclusion = document.get("conclusion")
+        if not isinstance(actual_conclusion, str) or not actual_conclusion:
+            raise ReviewerError(f"{refusal} has no completed conclusion")
     head_sha = document.get("head_sha")
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise ReviewerError(f"{refusal} has no full workflow commit")
@@ -1797,8 +1837,15 @@ def normalized_verification_run(
     }
 
 
-def trusted_verification_run(state: dict[str, Any]) -> dict[str, Any]:
-    """The one run the submission server recorded for this submission.
+def normalized_verification_run(document: Any, recorded: int, submission_id: str) -> dict[str, Any]:
+    """Compatibility wrapper for the successful full-verification trust path."""
+    return normalized_submission_run(document, recorded, submission_id)
+
+
+def trusted_submission_run(
+    state: dict[str, Any], *, mode: str = "full", conclusion: str | None = "success"
+) -> dict[str, Any]:
+    """The one mode-specific run the submission server recorded for a submission.
 
     The submission id is public: it is in the run name, so anyone who can
     dispatch the workflow can produce a run carrying it. The name is therefore
@@ -1813,11 +1860,11 @@ def trusted_verification_run(state: dict[str, Any]) -> dict[str, Any]:
     for it again bought no trust and could only lose the run.
     """
     submission_id = state["id"]
-    recorded = (state.get("run") or {}).get("id")
+    run_field = "preflight_run" if mode == "preflight" else "run"
+    recorded = (state.get(run_field) or {}).get("id")
     if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 1:
-        raise ReviewerError(
-            f"the submission server recorded no verification run for {submission_id}"
-        )
+        kind = "verification" if mode == "full" else "preflight"
+        raise ReviewerError(f"the submission server recorded no {kind} run for {submission_id}")
     proc = run(
         [
             "gh",
@@ -1839,7 +1886,21 @@ def trusted_verification_run(state: dict[str, Any]) -> dict[str, Any]:
             f"GitHub returned a malformed document for run {recorded}, which the server "
             f"recorded for {submission_id}: {error}"
         ) from error
-    return normalized_verification_run(document, recorded, submission_id)
+    normalized = normalized_submission_run(
+        document,
+        recorded,
+        submission_id,
+        mode=mode,
+        conclusion=conclusion,
+    )
+    if conclusion is None and normalized.get("conclusion") == "success":
+        raise ReviewerError(f"recorded failed {mode} run {recorded} unexpectedly succeeded")
+    return normalized
+
+
+def trusted_verification_run(state: dict[str, Any]) -> dict[str, Any]:
+    """The successful full-verification run used as registration evidence."""
+    return trusted_submission_run(state)
 
 
 def mechanical_report(
@@ -1858,6 +1919,156 @@ def mechanical_report(
         raise ReviewerError("trusted mechanical report artifact must be a JSON object")
     validate_trusted_mechanical_artifact(report, state, run_data)
     return report, str(run_data["url"]), run_data
+
+
+DIAGNOSTICS_SCHEMA_VERSION = 1
+MAX_FAILURE_DIAGNOSTICS = 50
+DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
+
+
+def _bounded_diagnostic(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ReviewerError("failure report contains a non-object diagnostic")
+    required_strings = ("code", "stage", "owner", "summary", "explanation", "next_action")
+    for field in required_strings:
+        item = value.get(field)
+        limit = 2_000 if field in {"explanation", "next_action"} else 500
+        if not isinstance(item, str) or not item or len(item) > limit:
+            raise ReviewerError(f"failure diagnostic {field} is missing or too long")
+    if not DIAGNOSTIC_CODE_RE.fullmatch(value["code"]):
+        raise ReviewerError("failure diagnostic code is malformed")
+    if value["owner"] not in {"submitter", "palomar", "provider"}:
+        raise ReviewerError("failure diagnostic owner is not recognized")
+    for field in ("retryable", "repairable"):
+        if type(value.get(field)) is not bool:
+            raise ReviewerError(f"failure diagnostic {field} must be boolean")
+    result = {field: value[field] for field in required_strings}
+    result.update(
+        {
+            "retryable": value["retryable"],
+            "repairable": value["repairable"] and value["owner"] == "submitter",
+        }
+    )
+    field = value.get("field")
+    if field is not None:
+        if not isinstance(field, str) or not field or len(field) > 400:
+            raise ReviewerError("failure diagnostic field is malformed")
+        result["field"] = field
+    location = value.get("location")
+    if location is not None:
+        if not isinstance(location, dict) or set(location) - {"path", "line", "column"}:
+            raise ReviewerError("failure diagnostic location is malformed")
+        path = location.get("path")
+        if not isinstance(path, str) or not path or len(path) > 400:
+            raise ReviewerError("failure diagnostic location path is malformed")
+        bounded_location: dict[str, Any] = {"path": path}
+        for field_name in ("line", "column"):
+            coordinate = location.get(field_name)
+            if coordinate is not None:
+                if not isinstance(coordinate, int) or isinstance(coordinate, bool) or coordinate < 1:
+                    raise ReviewerError(f"failure diagnostic location {field_name} is malformed")
+                bounded_location[field_name] = coordinate
+        result["location"] = bounded_location
+    return result
+
+
+def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        raise ReviewerError("failure artifact is not a schema-version-1 report")
+    if report.get("status") not in {"fail", "error"}:
+        raise ReviewerError("failure artifact does not record a failed outcome")
+    if report.get("diagnostics_schema_version") != DIAGNOSTICS_SCHEMA_VERSION:
+        raise ReviewerError("failure artifact has no supported diagnostics contract")
+    submission = report.get("submission")
+    source = report.get("source")
+    if not isinstance(submission, dict) or submission.get("submission_id") != state.get("id"):
+        raise ReviewerError("failure artifact names a different submission")
+    if not isinstance(source, dict):
+        raise ReviewerError("failure artifact has no source binding")
+    if source.get("repository") != state.get("repository") or source.get("commit") != state.get("commit"):
+        raise ReviewerError("failure artifact does not match the submitted repository and commit")
+    diagnostics = report.get("diagnostics")
+    if not isinstance(diagnostics, list) or not 1 <= len(diagnostics) <= MAX_FAILURE_DIAGNOSTICS:
+        raise ReviewerError("failure artifact has no bounded diagnostic list")
+    profile_version = report.get("formalization_profile_version")
+    if profile_version is not None and (
+        not isinstance(profile_version, int) or isinstance(profile_version, bool) or profile_version < 1
+    ):
+        raise ReviewerError("failure artifact has an invalid formalization profile version")
+    return {
+        "diagnostics": [_bounded_diagnostic(item) for item in diagnostics],
+        "profile_version": profile_version,
+    }
+
+
+def _diagnostics_unavailable(error: BaseException) -> list[dict[str, Any]]:
+    return [
+        {
+            "code": "palomar.diagnostics_unavailable",
+            "stage": "reporting",
+            "owner": "palomar",
+            "summary": "Palomar could not retrieve the detailed failure report.",
+            "explanation": str(error)[:2_000],
+            "next_action": (
+                "Do not change the repository. Retry the same commit later and report the "
+                "workflow URL if this happens again."
+            ),
+            "retryable": True,
+            "repairable": False,
+        }
+    ]
+
+
+def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Trust, redact, and atomically expose one failed run's actionable result."""
+    reporting = state.get("status")
+    if reporting not in {"preflight-reporting", "verification-reporting"}:
+        return state
+    mode = "preflight" if reporting == "preflight-reporting" else "full"
+    run_data: dict[str, Any] | None = None
+    try:
+        run_data = trusted_submission_run(state, mode=mode, conclusion=None)
+        validate_workflow_commit_on_main(run_data)
+        report_path = download_mechanical_artifact(
+            run_data["databaseId"],
+            state["id"],
+            root / state["id"] / f"{mode}-failure",
+            mode=mode,
+        )
+        validated = validated_failure_report(load_json(report_path), state)
+        diagnostics = validated["diagnostics"]
+        profile_version = validated["profile_version"]
+    except Exception as error:  # a diagnosis failure must itself be explained
+        diagnostics = _diagnostics_unavailable(error)
+        profile_version = None
+
+    submitter_work = any(item["owner"] == "submitter" for item in diagnostics)
+    if mode == "preflight":
+        terminal = "changes-required" if submitter_work else "preflight-failed"
+        note = (
+            "Preflight found repository changes that are required"
+            if submitter_work
+            else "Palomar could not complete preflight"
+        )
+    else:
+        terminal = "verification-failed" if submitter_work else "verification-error"
+        note = (
+            "Mechanical verification found repository changes that are required"
+            if submitter_work
+            else "Palomar could not complete mechanical verification"
+        )
+    recorded_run = state.get("preflight_run" if mode == "preflight" else "run") or {}
+    failure = {
+        "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+        "mode": mode,
+        "run": {
+            "id": recorded_run.get("id"),
+            "url": (run_data or {}).get("url") or recorded_run.get("url"),
+        },
+        "profile_version": profile_version,
+        "diagnostics": diagnostics,
+    }
+    return advance_state(state, terminal, note, failure=failure)
 
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
@@ -4521,9 +4732,677 @@ def submissions_needing_work() -> tuple[
             elif record.get("registration_consent") is True:
                 (to_finalize if record.get("registration_pr") else to_register).append(record)
     order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))  # noqa: E731
-    return (
-        order(to_review), order(to_register), order(to_finalize), order(exhausted), order(cooling)
+    return (order(to_review), order(to_register), order(to_finalize), order(exhausted), order(cooling))
+
+
+def ingest_reporting_queue(root: Path) -> int:
+    """Turn completed failed runs into durable, submitter-facing diagnostics."""
+    failures = 0
+    for record in open_submissions():
+        if record.get("status") not in {"preflight-reporting", "verification-reporting"}:
+            continue
+        print(f"::group::Ingest {record['status']} {record['id']}", flush=True)
+        try:
+            ingest_failure_diagnostics(record, root)
+        except Exception as error:
+            failures += 1
+            print(
+                f"error: ingesting diagnostics for {record['id']} failed: {error}",
+                file=sys.stderr,
+            )
+        finally:
+            print("::endgroup::", flush=True)
+    return failures
+
+
+def ingest_failures(args: argparse.Namespace) -> int:
+    """CLI entry point run before the editorial review pass."""
+    return 1 if ingest_reporting_queue(Path(args.work_dir)) else 0
+
+
+def repair_api(
+    endpoint: str,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Call GitHub as the dedicated repair identity, never the reviewer token."""
+    token = os.environ.get("PALOMAR_REPAIR_TOKEN", "").strip()
+    if not token:
+        raise ReviewerError("PALOMAR_REPAIR_TOKEN is required for repair operations")
+    command = [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "--method",
+        method,
+        endpoint,
+    ]
+    if body is not None:
+        command.extend(["--input", "-"])
+    environment = os.environ.copy()
+    environment["GH_TOKEN"] = token
+    return run(
+        command,
+        input_text=json.dumps(body) if body is not None else None,
+        check=check,
+        env=environment,
     )
+
+
+def _repair_get(endpoint: str, context: str) -> dict[str, Any] | None:
+    response = repair_api(endpoint, check=False)
+    if response.returncode == 0:
+        return _json_response(response, context)
+    detail = f"{response.stderr}\n{response.stdout}"
+    if "HTTP 404" in detail or "404 Not Found" in detail:
+        return None
+    raise ReviewerError(f"GitHub API failed while {context}: {detail.strip()[-1000:]}")
+
+
+def _repair_index() -> dict[str, Any]:
+    index = state_json(REPAIR_INDEX_PATH)
+    if not isinstance(index, dict) or index.get("schema_version") != 1:
+        raise ReviewerError(f"{REPAIR_INDEX_PATH} must be a schema-version 1 object")
+    ids = index.get("open")
+    if (
+        not isinstance(ids, list)
+        or any(not isinstance(item, str) or not SUBMISSION_ID_RE.fullmatch(item) for item in ids)
+        or len(ids) != len(set(ids))
+    ):
+        raise ReviewerError(f"{REPAIR_INDEX_PATH} has an invalid open queue")
+    return index
+
+
+def _drop_repair_queue(index: dict[str, Any], submission_id: str) -> None:
+    if submission_id not in index["open"]:
+        return
+    put_state(
+        REPAIR_INDEX_PATH,
+        {**index, "open": [item for item in index["open"] if item != submission_id]},
+        f"Finish metadata repair for {submission_id}",
+        blob_sha=index.get("_blob_sha"),
+    )
+
+
+def _repair_record(submission_id: str) -> dict[str, Any] | None:
+    return state_json(f"submissions/{submission_id}/repair.json")
+
+
+def _record_repair(repair: dict[str, Any], status: str, explanation: str, **fields: Any) -> dict[str, Any]:
+    updated = {
+        **repair,
+        **fields,
+        "status": status,
+        "updated_at": utc_now(),
+        "explanation": explanation[:2_000],
+    }
+    put_state(
+        f"submissions/{repair['submission_id']}/repair.json",
+        updated,
+        f"Record metadata repair {status} for {repair['submission_id']}",
+        blob_sha=repair.get("_blob_sha"),
+    )
+    fresh = submission_state(repair["submission_id"])
+    if fresh is not None and fresh.get("status") == "changes-required":
+        try:
+            advance_state(
+                fresh,
+                "changes-required",
+                {
+                    "pr-open": "Palomar opened the requested formalization.yaml pull request",
+                    "merged": "The requested formalization.yaml pull request was merged",
+                    "closed": "The requested formalization.yaml pull request was closed",
+                    "needs-input": "The requested metadata change needs manual input",
+                    "failed": "Palomar could not create the requested metadata pull request",
+                }.get(status, "Palomar updated the metadata repair request"),
+                repair={"revision": repair["revision"], "status": status},
+            )
+        except Exception as error:
+            # repair.json is the authoritative status and the server reads it
+            # whenever the original marker exists. A concurrent record event
+            # must not turn a successfully opened PR into a failed repair.
+            print(f"::warning::could not mirror repair status into submission state: {error}")
+    return updated
+
+
+def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
+    if repair.get("schema_version") != 1 or repair.get("submission_id") != state.get("id"):
+        raise ReviewerError("repair request does not match its submission")
+    if repair.get("revision") != (state.get("repair") or {}).get("revision"):
+        raise ReviewerError("repair request revision does not match the submission")
+    if not isinstance(repair.get("revision"), str) or not re.fullmatch(
+        r"[0-9a-f]{16}", repair["revision"]
+    ):
+        raise ReviewerError("repair request revision is malformed")
+    if repair.get("status") not in {"queued", "pr-open", *REPAIR_TERMINAL_STATUSES}:
+        raise ReviewerError("repair request status is not recognized")
+    try:
+        dt.datetime.strptime(repair.get("requested_at", ""), "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError) as error:
+        raise ReviewerError("repair request timestamp is malformed") from error
+    if not isinstance(repair.get("failure_digest"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", repair["failure_digest"]
+    ):
+        raise ReviewerError("repair request failure digest is malformed")
+    source = repair.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("repository") != state.get("repository")
+        or source.get("commit") != state.get("commit")
+    ):
+        raise ReviewerError("repair source does not match the submitted repository and commit")
+    path = source.get("formalization_path")
+    if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
+        raise ReviewerError("repair formalization path is unsafe")
+    if Path(path).name != "formalization.yaml":
+        raise ReviewerError("repair target must be named formalization.yaml")
+    edits = repair.get("edits")
+    allowed = {
+        "project.name": "text",
+        "project.license": "text",
+        "classification.arxiv": "list",
+        "classification.msc2020": "list",
+        "review.status": "text",
+    }
+    if not isinstance(edits, list) or not edits or len(edits) > len(allowed):
+        raise ReviewerError("repair request has no bounded edit list")
+    fields = [item.get("field") for item in edits if isinstance(item, dict)]
+    if len(fields) != len(edits) or len(fields) != len(set(fields)) or not set(fields) <= set(allowed):
+        raise ReviewerError("repair request contains an unsupported or duplicate field")
+    for edit in edits:
+        field = edit["field"]
+        value = edit.get("value")
+        if allowed[field] == "text":
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 500
+                or "\n" in value
+                or "\r" in value
+            ):
+                raise ReviewerError(f"repair value for {field} is malformed")
+        elif not isinstance(value, list) or not 1 <= len(value) <= 100 or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > 500
+            or "\n" in item
+            or "\r" in item
+            for item in value
+        ):
+            raise ReviewerError(f"repair value for {field} is malformed")
+        if field == "classification.arxiv" and len(value) > 2:
+            raise ReviewerError("repair has too many arXiv classifications")
+        if field == "classification.msc2020" and len(value) > 8:
+            raise ReviewerError("repair has too many MSC classifications")
+
+
+def _refuse_yaml_aliases(value: Any, seen: set[int] | None = None) -> None:
+    """Reject shared mutable nodes, which are YAML aliases under round-trip loading."""
+    seen = seen if seen is not None else set()
+    if isinstance(value, (dict, list)):
+        identity = id(value)
+        if identity in seen:
+            raise ReviewerError("formalization.yaml uses aliases; update this file manually")
+        seen.add(identity)
+        children = value.values() if isinstance(value, dict) else value
+        for child in children:
+            _refuse_yaml_aliases(child, seen)
+
+
+def _apply_repair(path: Path, edits: list[dict[str, Any]]) -> None:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 1_048_576:
+        raise ReviewerError("formalization.yaml is not a regular file within the size limit")
+    round_trip = YAML(typ="rt")
+    round_trip.allow_duplicate_keys = False
+    round_trip.preserve_quotes = True
+    round_trip.width = 1 << 20
+    try:
+        original = path.read_text(encoding="utf-8")
+        document = round_trip.load(original)
+    except Exception as error:
+        raise ReviewerError(
+            "formalization.yaml cannot be safely parsed; correct the YAML manually first"
+        ) from error
+    if not isinstance(document, dict):
+        raise ReviewerError("formalization.yaml is not a mapping; correct it manually first")
+    _refuse_yaml_aliases(document)
+    before = yaml.safe_load(original)
+    for edit in edits:
+        parent: Any = document
+        parts = edit["field"].split(".")
+        for part in parts[:-1]:
+            parent = parent.get(part) if isinstance(parent, dict) else None
+            if not isinstance(parent, dict):
+                raise ReviewerError(f"{'.'.join(parts[:-1])} is not a mapping; update this field manually")
+        parent[parts[-1]] = edit["value"]
+    stream = io.StringIO()
+    round_trip.dump(document, stream)
+    rendered = stream.getvalue()
+    try:
+        after = yaml.safe_load(rendered)
+    except yaml.YAMLError as error:
+        raise ReviewerError("generated formalization.yaml could not be validated") from error
+    changed = _semantic_changed_paths(before, after)
+    expected = {edit["field"] for edit in edits}
+    if changed != expected:
+        raise ReviewerError(
+            "generated formalization.yaml changed fields outside the approved repair set"
+        )
+    path.write_text(rendered, encoding="utf-8")
+
+
+def _semantic_changed_paths(before: Any, after: Any, prefix: str = "") -> set[str]:
+    """Return changed dotted paths, treating lists as one replaceable value."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        changed: set[str] = set()
+        for key in set(before) | set(after):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in before or key not in after:
+                changed.add(path)
+            else:
+                changed.update(_semantic_changed_paths(before[key], after[key], path))
+        return changed
+    return {prefix} if before != after else set()
+
+
+def _repair_git_environment() -> dict[str, str]:
+    token = os.environ.get("PALOMAR_REPAIR_TOKEN", "").strip()
+    if not token:
+        raise ReviewerError("PALOMAR_REPAIR_TOKEN is required for repair operations")
+    authorization = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {authorization}",
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": "/dev/null",
+        }
+    )
+    return environment
+
+
+def _ensure_repair_fork(source_repository: str) -> str:
+    source = _repair_get(f"repos/{source_repository}", f"checking {source_repository}")
+    if source is None:
+        raise ReviewerError("submitted repository no longer exists")
+    network_root = _network_root(source)
+    name = archive_repository_name(network_root)
+    expected = f"{REPAIR_OWNER}/{name}"
+    fork = _repair_get(f"repos/{expected}", f"checking repair fork {expected}")
+    if fork is None:
+        repair_api(
+            f"repos/{source_repository}/forks",
+            method="POST",
+            body={"organization": REPAIR_OWNER, "name": name, "default_branch_only": False},
+        )
+        for _ in range(30):
+            fork = _repair_get(f"repos/{expected}", f"waiting for repair fork {expected}")
+            if fork is not None:
+                break
+            time.sleep(2)
+        else:
+            raise ReviewerError(f"repair fork {expected} was not ready after one minute")
+    if _network_root(fork).casefold() != network_root.casefold():
+        raise ReviewerError(f"repair repository collision: {expected} is in another fork network")
+    permissions = _json_response(
+        repair_api(f"repos/{expected}/actions/permissions"),
+        f"checking Actions on {expected}",
+    )
+    if permissions.get("enabled") is not False:
+        raise ReviewerError(
+            f"GitHub Actions is enabled on {expected}; disable it before Palomar pushes repairs"
+        )
+    return expected
+
+
+def _run_repair_preflight(
+    fork_repository: str, commit: str, state: dict[str, Any], work: Path
+) -> dict[str, Any]:
+    configured = os.environ.get("PALOMAR_SUBMISSION_CHECKOUT", "").strip()
+    if not configured:
+        raise ReviewerError("PALOMAR_SUBMISSION_CHECKOUT is required for repair validation")
+    pipeline = Path(configured)
+    verifier = pipeline / "scripts" / "verify_submission.py"
+    bundle = shutil.which("bundle")
+    if not verifier.is_file() or not bundle:
+        raise ReviewerError("repair runner is missing the submission verifier or Licensee")
+    options = {
+        **state.get("requested_paths", {}),
+        "authorization_relationship": (state.get("authorization") or {}).get("relationship", ""),
+        "authorization_evidence": (state.get("authorization") or {}).get("evidence", ""),
+    }
+    event = {
+        "inputs": {
+            "repository": fork_repository,
+            "commit": commit,
+            "request_id": state["id"],
+            "mode": "preflight",
+            "options": json.dumps(options),
+        }
+    }
+    event_path = work / "event.json"
+    report_path = work / "preflight-report.json"
+    write_json(event_path, event)
+    # The shared verifier processes attacker-chosen public repository content.
+    # It needs ordinary process and Ruby/Bundler configuration, never either
+    # credential held by the repair workflow or State write authority.
+    isolated_home = work / "preflight-home"
+    isolated_home.mkdir()
+    environment = _repair_preflight_environment(pipeline, isolated_home)
+    run(
+        [
+            sys.executable,
+            str(verifier),
+            "prepare",
+            "--event",
+            str(event_path),
+            "--work-dir",
+            str(work / "preflight"),
+            "--output",
+            str(report_path),
+            "--licensee",
+            bundle,
+        ],
+        timeout=1800,
+        env=environment,
+    )
+    return load_json(report_path)
+
+
+def _repair_preflight_environment(pipeline: Path, home: Path) -> dict[str, str]:
+    """Build the non-secret environment used for candidate-controlled intake."""
+    safe_names = {
+        "LANG", "LC_ALL", "LC_CTYPE", "PATH", "SHELL", "SSL_CERT_DIR",
+        "SSL_CERT_FILE", "TMP", "TMPDIR", "TEMP", "HTTPS_PROXY", "HTTP_PROXY",
+        "NO_PROXY",
+    }
+    safe_prefixes = ("BUNDLE_", "GEM_", "RUBY")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in safe_names or key.startswith(safe_prefixes)
+    }
+    environment["HOME"] = str(home.resolve())
+    environment["BUNDLE_GEMFILE"] = str((pipeline / "Gemfile").resolve())
+    return environment
+
+
+def _repair_preflight_passed(report: dict[str, Any]) -> bool:
+    """The prepare report contract; `ready` is a workflow output, not a status."""
+    return report.get("status") == "pending" and report.get("stage") == "prepared"
+
+
+def _existing_repair_pr(source_repository: str, branch: str) -> dict[str, Any] | None:
+    query = quote(f"{REPAIR_OWNER}:{branch}", safe="")
+    response = repair_api(f"repos/{source_repository}/pulls?state=all&head={query}&per_page=10")
+    values = json.loads(response.stdout)
+    if not isinstance(values, list):
+        raise ReviewerError("GitHub returned a malformed repair pull-request list")
+    return values[0] if values else None
+
+
+def _delete_repair_branch(checkout: Path, branch: str) -> None:
+    """Best-effort cleanup of an exact branch created by this repair request."""
+    result = run(
+        ["git", "push", "repair", "--delete", branch],
+        cwd=checkout,
+        env=_repair_git_environment(),
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()[-1_000:]
+        print(f"::warning::could not remove abandoned repair branch {branch}: {detail}")
+
+
+def _delete_recorded_repair_branch(repair: dict[str, Any]) -> None:
+    """Best-effort cleanup after the submitter closes or merges the exact PR."""
+    fork = repair.get("fork_repository")
+    branch = repair.get("branch")
+    expected_branch = f"palomar/repair-{repair.get('submission_id')}-{repair.get('revision')}"
+    if (
+        not isinstance(fork, str)
+        or not fork.startswith(f"{REPAIR_OWNER}/")
+        or branch != expected_branch
+    ):
+        return
+    result = repair_api(
+        f"repos/{fork}/git/refs/heads/{quote(branch, safe='')}",
+        method="DELETE",
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()[-1_000:]
+        if "HTTP 422" not in detail and "Reference does not exist" not in detail:
+            print(f"::warning::could not remove finished repair branch {branch}: {detail}")
+
+
+def _advance_open_repair(repair: dict[str, Any]) -> str:
+    number = repair.get("pr_number")
+    source = repair.get("source") or {}
+    if not isinstance(number, int):
+        raise ReviewerError("open repair has no pull-request number")
+    pr = _json_response(
+        repair_api(f"repos/{source['repository']}/pulls/{number}"),
+        "checking the repair pull request",
+    )
+    if pr.get("merged_at"):
+        _record_repair(
+            repair,
+            "merged",
+            "The pull request was merged. Make a new submission using the merged commit.",
+            pr_url=pr.get("html_url"),
+            merge_commit_sha=pr.get("merge_commit_sha"),
+        )
+        _delete_recorded_repair_branch(repair)
+        return "merged"
+    if pr.get("state") == "closed":
+        _record_repair(
+            repair,
+            "closed",
+            "The pull request was closed without merging. Update the file manually or request "
+            "a new submission after changing it.",
+            pr_url=pr.get("html_url"),
+        )
+        _delete_recorded_repair_branch(repair)
+        return "closed"
+    return "pr-open"
+
+
+def _prepare_repair(repair: dict[str, Any], state: dict[str, Any], root: Path) -> str:
+    source = repair["source"]
+    with tempfile.TemporaryDirectory(prefix=f"palomar-repair-{state['id']}-", dir=root) as name:
+        work = Path(name)
+        checkout = work / "source"
+        run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "clone",
+                "--no-checkout",
+                "--filter=blob:none",
+                "--quiet",
+                f"https://github.com/{source['repository']}.git",
+                str(checkout),
+            ]
+        )
+        run(["git", "checkout", "--detach", source["commit"]], cwd=checkout)
+        metadata = (checkout / source["formalization_path"]).resolve()
+        try:
+            metadata.relative_to(checkout.resolve())
+        except ValueError as error:
+            raise ReviewerError("formalization.yaml resolves outside the repository") from error
+        _apply_repair(metadata, repair["edits"])
+        run(["git", "config", "user.name", "Palomar Repairs"], cwd=checkout)
+        run(["git", "config", "user.email", "repairs@palomar-registry.org"], cwd=checkout)
+        commit_env = os.environ.copy()
+        commit_env["GIT_AUTHOR_DATE"] = repair["requested_at"]
+        commit_env["GIT_COMMITTER_DATE"] = repair["requested_at"]
+        run(["git", "add", "--", source["formalization_path"]], cwd=checkout)
+        run(
+            ["git", "commit", "-m", f"Repair Palomar metadata for {state['id']}"],
+            cwd=checkout,
+            env=commit_env,
+        )
+        candidate = run(["git", "rev-parse", "HEAD"], cwd=checkout).stdout.strip()
+        patch = run(
+            ["git", "diff", f"{source['commit']}..HEAD", "--", source["formalization_path"]], cwd=checkout
+        ).stdout
+        if len(patch) > 100_000:
+            raise ReviewerError("the generated metadata patch exceeds the 100 kB safety limit")
+        source_metadata = _repair_get(
+            f"repos/{source['repository']}", "checking the source default branch"
+        )
+        base = source_metadata.get("default_branch") if source_metadata else None
+        if not isinstance(base, str) or not base:
+            raise ReviewerError("source repository has no default branch")
+        ancestry = run(
+            ["git", "merge-base", "--is-ancestor", source["commit"], f"origin/{base}"],
+            cwd=checkout,
+            check=False,
+        )
+        if ancestry.returncode != 0:
+            _record_repair(
+                repair,
+                "needs-input",
+                "The submitted commit is no longer on the repository's default branch. "
+                "Apply the patch manually to the branch where this change belongs.",
+                patch=patch,
+            )
+            return "needs-input"
+        fork = _ensure_repair_fork(source["repository"])
+        branch = f"palomar/repair-{state['id']}-{repair['revision']}"
+        run(["git", "remote", "add", "repair", f"https://github.com/{fork}.git"], cwd=checkout)
+        run(
+            ["git", "push", "repair", f"HEAD:refs/heads/{branch}"],
+            cwd=checkout,
+            env=_repair_git_environment(),
+        )
+        keep_branch = False
+        try:
+            report = _run_repair_preflight(fork, candidate, state, work)
+            if not _repair_preflight_passed(report):
+                diagnostics = report.get("diagnostics") or []
+                explanation = (
+                    " ".join(
+                        str(item.get("summary") or item.get("explanation") or "")
+                        for item in diagnostics
+                        if isinstance(item, dict)
+                    ).strip()
+                    or "The generated change did not pass Palomar preflight."
+                )
+                _record_repair(
+                    repair,
+                    "needs-input",
+                    "Palomar checked the proposed change, but more repository changes are "
+                    f"needed: {explanation}",
+                    patch=patch,
+                )
+                return "needs-input"
+            existing = _existing_repair_pr(source["repository"], branch)
+            if existing is not None and (existing.get("merged_at") or existing.get("state") == "closed"):
+                status = "merged" if existing.get("merged_at") else "closed"
+                _record_repair(
+                    repair,
+                    status,
+                    "The existing repair pull request was already merged. Make a new submission."
+                    if status == "merged"
+                    else "The existing repair pull request was closed. Update the file manually.",
+                    pr_number=existing.get("number"),
+                    pr_url=existing.get("html_url"),
+                )
+                return status
+            if existing is None:
+                existing = _json_response(
+                    repair_api(
+                        f"repos/{source['repository']}/pulls",
+                        method="POST",
+                        body={
+                            "title": "Repair Palomar formalization.yaml metadata",
+                            "head": f"{REPAIR_OWNER}:{branch}",
+                            "base": base,
+                            "body": (
+                                "Palomar preflight found actionable metadata issues in submission "
+                                f"`{state['id']}`. This pull request contains only the values "
+                                "supplied by the submitter and passed the same preflight code path "
+                                "as a new submission. "
+                                "Review and merge it, then make a new Palomar submission from "
+                                "the merged commit."
+                            ),
+                        },
+                    ),
+                    "opening the repair pull request",
+                )
+            keep_branch = True
+            _record_repair(
+                repair,
+                "pr-open",
+                "Palomar validated the change and opened a pull request. Review and merge it, "
+                "then make a new submission.",
+                pr_number=existing.get("number"),
+                pr_url=existing.get("html_url"),
+                fork_repository=fork,
+                branch=branch,
+                candidate_commit=candidate,
+            )
+            return "pr-open"
+        finally:
+            if not keep_branch:
+                _delete_repair_branch(checkout, branch)
+
+
+def repair_queue(args: argparse.Namespace) -> int:
+    """Advance durable metadata repair requests by one idempotent step."""
+    root = Path(args.work_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    index = _repair_index()
+    failures = 0
+    for submission_id in list(index["open"]):
+        print(f"::group::Repair metadata {submission_id}", flush=True)
+        terminal = False
+        try:
+            repair = _repair_record(submission_id)
+            state = submission_state(submission_id)
+            if repair is None or state is None:
+                raise ReviewerError("repair request or submission record is unavailable")
+            _validate_repair(repair, state)
+            status = repair.get("status")
+            if status == "pr-open":
+                status = _advance_open_repair(repair)
+            elif status == "queued":
+                status = _prepare_repair(repair, state, root)
+            elif status not in REPAIR_TERMINAL_STATUSES:
+                raise ReviewerError(f"repair request has unknown status {status!r}")
+            terminal = status in REPAIR_TERMINAL_STATUSES
+        except Exception as error:
+            failures += 1
+            print(f"error: metadata repair for {submission_id} failed: {error}", file=sys.stderr)
+            repair = _repair_record(submission_id)
+            if repair is not None:
+                try:
+                    _record_repair(
+                        repair,
+                        "failed",
+                        f"Palomar could not create the pull request: {str(error)[:1_500]}. "
+                        "You can still update formalization.yaml manually and submit the new "
+                        "commit.",
+                    )
+                    terminal = True
+                except Exception as recording_error:
+                    print(f"error: recording repair failure failed: {recording_error}", file=sys.stderr)
+        finally:
+            if terminal:
+                fresh_index = _repair_index()
+                _drop_repair_queue(fresh_index, submission_id)
+            print("::endgroup::", flush=True)
+    return 1 if failures else 0
 
 
 def auto(args: argparse.Namespace) -> int:
@@ -4766,6 +5645,16 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command_name", required=True)
     list_parser = commands.add_parser("list", help="list open mechanically passing submissions")
     list_parser.set_defaults(func=list_queue)
+    ingest_parser = commands.add_parser(
+        "ingest-failures",
+        help="store actionable diagnostics from completed failed submission runs",
+    )
+    ingest_parser.set_defaults(func=ingest_failures)
+    repair_parser = commands.add_parser(
+        "repair-queue",
+        help="validate queued formalization.yaml edits and open repair pull requests",
+    )
+    repair_parser.set_defaults(func=repair_queue)
     auto_parser = commands.add_parser(
         "auto",
         help="advance every live submission by one step; safe to run on a schedule",

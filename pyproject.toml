@@ -12,6 +12,7 @@ license = {text = "MIT"}
 dependencies = [
   "jsonschema>=4.25,<5",
   "PyYAML>=6,<7",
+  "ruamel.yaml>=0.18,<0.19",
 ]
 
 [dependency-groups]
