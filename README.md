@@ -50,8 +50,10 @@ the failure together with its terminal status. A missing or untrusted artifact
 becomes an explicit Palomar-owned diagnostic rather than a submitter fault.
 
 `repair-queue` handles the separate metadata-repair outbox. It accepts only the
-profile's scalar/list allowlist, round-trips valid YAML without replacing the
-whole file, refuses aliases and malformed YAML, and pushes only to an
+exact versioned profile allowlist, including bounded structured people, source,
+automation, and substantive-repository values. It creates missing mappings and
+round-trips valid YAML without replacing the whole file, refuses aliases and
+malformed YAML, and pushes only to an
 Actions-disabled fork in `PalomarRepairs` using `PALOMAR_REPAIR_TOKEN`. Before
 opening a PR it runs the candidate commit through
 `PalomarSubmission/scripts/verify_submission.py prepare` from `main`, the same
@@ -61,6 +63,14 @@ crosses into candidate-controlled intake. Failed candidate validation leaves an
 actionable explanation and manual patch, removes the temporary repair branch,
 and never opens a knowingly failing PR. Finished pull requests also have their
 exact deterministic repair branch removed on a best-effort basis.
+
+`upgrade-repair-failures` reruns current preflight for settled profile-1
+`formalization.missing_sections` failures and replaces only their failure
+guidance with profile-2 diagnostics and safe draft values. The submission id,
+status, original run link, and history are retained, and a migration event is
+appended. Pass `--submission ID` for one record or omit it for all eligible
+records; as with every State mutation, the operator must explicitly set
+`PALOMAR_ALLOW_STATE_WRITES=1`.
 
 `palomar_reviewer.authorization` is the pure registration-authorization
 contract. It owns the accepted push-proof methods, binds the private State
