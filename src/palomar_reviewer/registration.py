@@ -1,16 +1,18 @@
 """Read and extend the Database's segmented registration authority.
 
-Registration has no whole-registry index.  A submission binding answers
-whether one intake already registered, a result projection owns one result's
-stable identity and bounded version history, and a day projection owns the
-next serial for that date.  Ordinary work is therefore independent of the
-number of results in the registry.
+Registration has no whole-registry index. An immutable identity binding owns
+one repository/project/configuration tuple, a submission binding answers
+whether one intake already registered, a result projection owns bounded
+version history, and a day projection owns the next serial for that date.
+Ordinary work is therefore independent of the number of results in the
+registry.
 """
 
 from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -29,6 +31,7 @@ MAX_VERSIONS_PER_RESULT = 500
 RESULTS_DIRECTORY = "registrations/results"
 SUBMISSIONS_DIRECTORY = "registrations/submissions"
 DAYS_DIRECTORY = "registrations/days"
+IDENTITIES_DIRECTORY = "registrations/identities"
 PALOMAR_ID_RE = re.compile(
     r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})\Z"
 )
@@ -36,6 +39,7 @@ SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
 TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
 )
+COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class _InvalidJSON(ValueError):
@@ -61,6 +65,21 @@ def submission_path(submission_id: str) -> str:
 
 def day_path(day: str) -> str:
     return f"{DAYS_DIRECTORY}/{day}.json"
+
+
+def identity_digest(identity: dict[str, Any]) -> str:
+    preimage = "\0".join(
+        (
+            str(identity["source_repository"]),
+            str(identity["project_path"] or ""),
+            str(identity["comparator_config_path"]),
+        )
+    ).encode("utf-8")
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def identity_path(identity: dict[str, Any]) -> str:
+    return f"{IDENTITIES_DIRECTORY}/{identity_digest(identity)}.json"
 
 
 def allocate_identifier(registered_on: str, last_serial: int) -> str:
@@ -231,6 +250,11 @@ def materialize_changes(
                 except ValueError:
                     real_day = False
                 exact_path = real_day and change.path == day_path(name)
+            elif directory == "identities":
+                exact_path = (
+                    re.fullmatch(r"[0-9a-f]{64}", name) is not None
+                    and change.path == f"{IDENTITIES_DIRECTORY}/{name}.json"
+                )
         if (
             change.status not in {"A", "M"}
             or relative.is_absolute()
@@ -427,6 +451,29 @@ def load_result(
     return document
 
 
+def load_identity(
+    database: Path,
+    identity: dict[str, Any],
+    *,
+    git_env: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    relative = identity_path(identity)
+    document = _load_projection(database, relative, git_env=git_env)
+    if document is None:
+        return None
+    identifier = document.get("registration_id")
+    if (
+        set(document) != {"schema_version", "identity", "registration_id"}
+        or type(document.get("schema_version")) is not int
+        or document["schema_version"] != SCHEMA_VERSION
+        or document.get("identity") != identity
+        or not isinstance(identifier, str)
+        or PALOMAR_ID_RE.fullmatch(identifier) is None
+    ):
+        raise ReviewerError(f"{relative}: has a malformed identity binding")
+    return document
+
+
 def load_submission(
     database: Path,
     submission_id: str,
@@ -495,8 +542,13 @@ def _mechanical_identity(mechanical: dict[str, Any]) -> dict[str, Any]:
         }
     except (AttributeError, KeyError, TypeError) as error:
         raise ReviewerError("mechanical report has no complete registration identity") from error
-    if not isinstance(identity["source_repository"], str) or not isinstance(
-        identity["comparator_config_path"], str
+    if (
+        not isinstance(identity["source_repository"], str)
+        or not isinstance(identity["comparator_config_path"], str)
+        or (
+            identity["project_path"] is not None
+            and not isinstance(identity["project_path"], str)
+        )
     ):
         raise ReviewerError("mechanical report has no complete registration identity")
     return identity
@@ -525,6 +577,37 @@ def _assert_identity_matches(
             f"{submitted['comparator_config_path']}, not "
             f"{current['comparator_config_path']}"
         )
+
+
+def _assert_commit_is_new(
+    database: Path,
+    identifier: str,
+    registered: dict[str, Any],
+    mechanical: dict[str, Any],
+    *,
+    git_env: dict[str, str] | None = None,
+) -> None:
+    source = mechanical.get("source")
+    commit = source.get("commit") if isinstance(source, dict) else None
+    if not isinstance(commit, str) or COMMIT_RE.fullmatch(commit) is None:
+        raise ReviewerError("mechanical report has no complete source commit")
+    for row in reversed(registered["versions"]):
+        relative = str(row["path"])
+        entry = _load_projection(database, relative, git_env=git_env)
+        entry_source = entry.get("source") if isinstance(entry, dict) else None
+        if (
+            not isinstance(entry, dict)
+            or entry.get("id") != identifier
+            or entry.get("version") != row["version"]
+            or not isinstance(entry_source, dict)
+            or not isinstance(entry_source.get("commit"), str)
+            or COMMIT_RE.fullmatch(entry_source["commit"]) is None
+        ):
+            raise ReviewerError(f"{relative}: has no complete registered source identity")
+        if entry_source["commit"] == commit:
+            raise ReviewerError(
+                f"{identifier} already has a registered version at source commit {commit}"
+            )
 
 
 def registration_identity(
@@ -562,15 +645,44 @@ def registration_identity(
         if result is None:
             raise ReviewerError(f"requested existing ID is not in the database: {identifier}")
         _assert_identity_matches(identifier, result, submitted_identity)
+        identity_binding = load_identity(
+            database, submitted_identity, git_env=git_env
+        )
+        if identity_binding is None:
+            raise ReviewerError(
+                f"requested existing ID has no stable identity binding: {identifier}"
+            )
+        if identity_binding["registration_id"] != identifier:
+            raise ReviewerError(
+                "this repository, project, and Comparator configuration already belong "
+                f"to {identity_binding['registration_id']}"
+            )
         versions = result["versions"]
         if len(versions) >= MAX_VERSIONS_PER_RESULT:
             raise ReviewerError(
                 f"{identifier} has reached the {MAX_VERSIONS_PER_RESULT}-version limit"
             )
+        _assert_commit_is_new(
+            database,
+            identifier,
+            result,
+            mechanical,
+            git_env=git_env,
+        )
         resolved = (identifier, str(result["accepted_at"]), registered_at, len(versions) + 1)
         if reserved is not None and reserved != resolved:
             raise ReviewerError("saved registration attempt disagrees with the requested update")
         return resolved
+
+    identity_binding = load_identity(
+        database, submitted_identity, git_env=git_env
+    )
+    if identity_binding is not None:
+        raise ReviewerError(
+            "this repository, project, and Comparator configuration are already "
+            f"registered as {identity_binding['registration_id']}; submit an update "
+            "using that Palomar ID"
+        )
 
     try:
         dt.date.fromisoformat(str(reviewed_at)[:10])
@@ -661,9 +773,17 @@ def projection_changes(
     }
     result_relative = result_path(identifier)
     current = load_result(database, identifier, git_env=git_env)
+    identity_binding = load_identity(
+        database, registered_identity, git_env=git_env
+    )
     if version == 1:
         if current is not None:
             raise ReviewerError(f"result projection already exists: {result_relative}")
+        if identity_binding is not None:
+            raise ReviewerError(
+                "registration identity is already bound to "
+                f"{identity_binding['registration_id']}"
+            )
         result = {
             "schema_version": SCHEMA_VERSION,
             "id": identifier,
@@ -675,6 +795,10 @@ def projection_changes(
     else:
         if current is None:
             raise ReviewerError(f"result projection does not exist: {result_relative}")
+        if identity_binding is None or identity_binding["registration_id"] != identifier:
+            raise ReviewerError(
+                f"{result_relative}: stable identity binding is missing or disagrees"
+            )
         _assert_identity_matches(identifier, current, registered_identity)
         if record.get("accepted_at") != current["accepted_at"]:
             raise ReviewerError(f"{result_relative}: stable acceptance date changed")
@@ -720,6 +844,17 @@ def projection_changes(
                     "last_serial": serial,
                 },
                 "M" if current_day is not None else "A",
+            )
+        )
+        changes.append(
+            ProjectionChange(
+                identity_path(registered_identity),
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "identity": registered_identity,
+                    "registration_id": identifier,
+                },
+                "A",
             )
         )
     return tuple(changes)

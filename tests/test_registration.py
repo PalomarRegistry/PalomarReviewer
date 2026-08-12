@@ -63,6 +63,20 @@ def result_document(*, versions: int = 1) -> dict:
     }
 
 
+def identity_document(identifier: str = FIRST) -> dict:
+    identity = result_document()["identity"]
+    return {
+        "schema_version": 1,
+        "identity": identity,
+        "registration_id": identifier,
+    }
+
+
+def write_identity(root: Path, identifier: str = FIRST) -> None:
+    document = identity_document(identifier)
+    write_json(root, registration.identity_path(document["identity"]), document)
+
+
 def record(*, identifier: str = FIRST, version: int = 1, submission: str = "a1b2c3d4e5f6") -> dict:
     return {
         "id": identifier,
@@ -73,7 +87,7 @@ def record(*, identifier: str = FIRST, version: int = 1, submission: str = "a1b2
         "status": "accepted",
         "abstract": "An abstract",
         "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
-        "source": {"repository": "example/project"},
+        "source": {"repository": "example/project", "commit": "1" * 40},
         "formalization": {"comparator_config_path": "comparator.json"},
         "submission": {"submission_id": submission},
     }
@@ -121,6 +135,10 @@ class RegistrationProjectionTests(unittest.TestCase):
                 registration.day_path("2026-08-09"),
                 {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
             ),
+            "identity": (
+                registration.identity_path(result_document()["identity"]),
+                identity_document(),
+            ),
         }
         for kind, (relative, document) in documents.items():
             with self.subTest(kind=kind):
@@ -136,6 +154,8 @@ class RegistrationProjectionTests(unittest.TestCase):
                         registration.load_result(repo, FIRST)
                     elif kind == "submission":
                         registration.load_submission(repo, "a1b2c3d4e5f6")
+                    elif kind == "identity":
+                        registration.load_identity(repo, result_document()["identity"])
                     else:
                         registration.load_day(repo, "2026-08-09")
 
@@ -156,6 +176,10 @@ class RegistrationProjectionTests(unittest.TestCase):
                 registration.day_path("2026-08-09"),
                 {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
             ),
+            "identity": (
+                registration.identity_path(result_document()["identity"]),
+                identity_document(),
+            ),
         }
         for kind, (relative, document) in documents.items():
             with self.subTest(kind=kind):
@@ -168,6 +192,8 @@ class RegistrationProjectionTests(unittest.TestCase):
                         registration.load_result(repo, FIRST)
                     elif kind == "submission":
                         registration.load_submission(repo, "a1b2c3d4e5f6")
+                    elif kind == "identity":
+                        registration.load_identity(repo, result_document()["identity"])
                     else:
                         registration.load_day(repo, "2026-08-09")
 
@@ -266,6 +292,8 @@ class RegistrationProjectionTests(unittest.TestCase):
     def test_update_repository_identity_uses_the_github_comparison_key(self):
         repo = self.repo()
         write_json(repo, registration.result_path(FIRST), result_document())
+        write_json(repo, f"entries/{FIRST}-v1.json", record())
+        write_identity(repo)
         commit(repo)
         identity = registration.registration_identity(
             repo,
@@ -274,7 +302,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             reviewed_at="2026-08-09T10:00:00Z",
             registered_at="2026-08-09T12:00:00Z",
             mechanical={
-                "source": {"repository": "Example/Project"},
+                "source": {"repository": "Example/Project", "commit": "2" * 40},
                 "comparator": {"path": "comparator.json"},
             },
         )
@@ -303,6 +331,23 @@ class RegistrationProjectionTests(unittest.TestCase):
                 registered_at="2026-08-09T12:00:00Z",
                 mechanical={
                     "source": {"repository": "example/project"},
+                    "comparator": {"path": "comparator.json"},
+                },
+            )
+
+    def test_an_existing_identity_cannot_be_allocated_again_without_its_id(self):
+        repo = self.repo()
+        write_identity(repo)
+        commit(repo)
+        with self.assertRaisesRegex(ReviewerError, f"registered as {FIRST}"):
+            registration.registration_identity(
+                repo,
+                submission_id="newresult123",
+                existing_id=None,
+                reviewed_at="2026-08-09T10:00:00Z",
+                registered_at="2026-08-09T12:00:00Z",
+                mechanical={
+                    "source": {"repository": "example/project", "commit": "2" * 40},
                     "comparator": {"path": "comparator.json"},
                 },
             )
@@ -340,7 +385,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "canonical YYYY-MM-DD"):
             registration.load_day(self.repo(), "20260809")
 
-    def test_first_projection_transition_is_exactly_result_submission_and_day(self):
+    def test_first_projection_transition_includes_the_stable_identity_binding(self):
         first = record()
         first["source"]["repository"] = "Example/Project"
         changes = registration.projection_changes(
@@ -354,6 +399,7 @@ class RegistrationProjectionTests(unittest.TestCase):
                 (registration.result_path(FIRST), "A"),
                 (registration.submission_path("a1b2c3d4e5f6"), "A"),
                 (registration.day_path("2026-08-09"), "A"),
+                (registration.identity_path(result_document()["identity"]), "A"),
             },
         )
         result = next(
@@ -387,6 +433,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             "registrations/results",
             "registrations/submissions",
             "registrations/days",
+            "registrations/identities",
         ):
             with self.subTest(planted=planted):
                 repo = self.repo()
@@ -464,6 +511,7 @@ class RegistrationProjectionTests(unittest.TestCase):
     def test_a_501st_version_is_refused_before_building_a_projection(self):
         repo = self.repo()
         write_json(repo, registration.result_path(FIRST), result_document(versions=500))
+        write_identity(repo)
         commit(repo)
         with self.assertRaisesRegex(ReviewerError, "500-version limit"):
             registration.registration_identity(

@@ -427,7 +427,7 @@ accepted.
 
 The proposed commit is validated with the real `tools/validate.py --since` the
 exact Database `main` commit it extends, so the validator hashes the new
-immutable entry and bundles and proves the exact result, submission, and day
+immutable entry and bundles and proves the exact identity, result, submission, and day
 projection transitions. Before invoking it, the reviewer asks the exact
 checked-out `tools/validation_scope.py` owner to derive its scope; a fallback
 stops with a sparse-checkout error instead of running an unscoped check over
@@ -448,7 +448,7 @@ Registration identity reads only the immutable binding for this submission and
 either this result's projection or this date's constant-size serial counter.
 A source repository is stored there by its case-folded GitHub owner/name
 comparison key; project and Comparator paths remain exact.
-A first version reads submission/day/result state and writes those three paths;
+A first version reads identity/submission/day/result state and writes those four paths;
 an update reads submission/result state and writes those two. The only growing
 ordinary term is the touched result's ordered version list, which is capped at
 500. No registry-sized JSON document is read, written, or staged, and the
