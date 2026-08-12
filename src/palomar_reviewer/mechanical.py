@@ -65,7 +65,9 @@ MECHANICAL_REPORT_SCHEMA = {
                     "additionalProperties": False,
                     "required": ["relationship"],
                     "properties": {
-                        "relationship": {"enum": ["maintainer", "approved"]},
+                        "relationship": {
+                            "enum": ["maintainer", "approved", "technical-test"]
+                        },
                         "evidence": {"type": "string", "minLength": 1, "maxLength": 4000},
                     },
                 },

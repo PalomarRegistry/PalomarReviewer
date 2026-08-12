@@ -74,6 +74,11 @@ State/review/source standing first, then validates the reserved public record
 instead of repeating those side effects. The module performs no retrieval,
 filesystem access, subprocess, network, State write, or public action.
 
+Mechanical review accepts the explicit `technical-test` relationship so an
+operator can exercise the pipeline honestly. Registration authorization rejects
+that relationship, its State marker, or its distinct proof method before any
+public side effect, even if a consent flag was forged.
+
 `palomar_reviewer.checkpoint` owns the saved-attempt, deterministic-branch,
 same-repository PR, immutable-record, and idempotent State-checkpoint contract.
 The CLI supplies its GitHub read/create and conditional State-write adapters;
