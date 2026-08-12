@@ -31,7 +31,7 @@ PUSH_PROOF_METHODS = {
 }
 
 # Registration is an allowlist. A future relationship may be valid for review
-# without being valid for publication, and must not become registrable merely
+# without being valid for registration, and must not become registrable merely
 # because a mechanical-report enum was widened elsewhere.
 REGISTRABLE_RELATIONSHIPS = frozenset({"maintainer", "approved"})
 
