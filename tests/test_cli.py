@@ -3501,6 +3501,9 @@ class PublicationIdentityTests(unittest.TestCase):
             path = root / registration_authority.submission_path(submission_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(binding) + "\n")
+            entry_path = root / row["path"]
+            entry_path.parent.mkdir(parents=True, exist_ok=True)
+            entry_path.write_text(json.dumps(record) + "\n")
             if version == 1:
                 match = registration_authority.PALOMAR_ID_RE.fullmatch(identifier)
                 assert match is not None
@@ -3511,6 +3514,20 @@ class PublicationIdentityTests(unittest.TestCase):
             path = root / registration_authority.result_path(identifier)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(document) + "\n")
+            identity_path = root / registration_authority.identity_path(
+                document["identity"]
+            )
+            identity_path.parent.mkdir(parents=True, exist_ok=True)
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "identity": document["identity"],
+                        "registration_id": identifier,
+                    }
+                )
+                + "\n"
+            )
         for day, last_serial in days.items():
             path = root / registration_authority.day_path(day)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -3543,7 +3560,7 @@ class PublicationIdentityTests(unittest.TestCase):
             "id": identifier,
             "version": version,
             "accepted_at": "2026-08-01",
-            "source": {"repository": "example/project"},
+            "source": {"repository": "example/project", "commit": "1" * 40},
             "formalization": {"comparator_config_path": "comparator.json"},
             "submission": {"submission_id": submission},
         }
@@ -3562,6 +3579,7 @@ class PublicationIdentityTests(unittest.TestCase):
         existing_id=None,
         registered_at="2026-08-11T09:00:00Z",
         reviewed_at="2026-08-01T12:00:00Z",
+        commit="2" * 40,
     ):
         """Resolve an identity for a review of the first, acted on ten days later.
 
@@ -3577,7 +3595,7 @@ class PublicationIdentityTests(unittest.TestCase):
             reviewed_at=reviewed_at,
             registered_at=registered_at,
             mechanical={
-                "source": {"repository": "example/project"},
+                "source": {"repository": "example/project", "commit": commit},
                 "comparator": {"path": "comparator.json"},
             },
         )
@@ -3594,6 +3612,7 @@ class PublicationIdentityTests(unittest.TestCase):
     def test_a_new_submission_follows_the_last_one_registered_that_day(self):
         earlier_today = self.prior(identifier="PALOMAR-2026-08-11-000042")
         earlier_today["accepted_at"] = "2026-08-11"
+        earlier_today["formalization"]["comparator_config_path"] = "earlier.json"
         database = self.database(earlier_today)
         identifier, _, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
         self.assertEqual(identifier, "PALOMAR-2026-08-11-000043")
@@ -3611,7 +3630,9 @@ class PublicationIdentityTests(unittest.TestCase):
         result that entered the registry on the fifth is already in the
         database. The waiting submitter must land behind it, not in front.
         """
-        database = self.database(self.registered_on("PALOMAR-2026-08-05-000001"))
+        earlier = self.registered_on("PALOMAR-2026-08-05-000001")
+        earlier["formalization"]["comparator_config_path"] = "earlier.json"
+        database = self.database(earlier)
         identifier, accepted_at, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
         self.assertEqual((identifier, accepted_at), ("PALOMAR-2026-08-11-000001", "2026-08-11"))
         self.assertGreater(identifier, "PALOMAR-2026-08-05-000001")
@@ -3643,6 +3664,16 @@ class PublicationIdentityTests(unittest.TestCase):
     def test_an_update_to_an_unpublished_identifier_is_refused(self):
         with self.assertRaisesRegex(ReviewerError, "not in the database"):
             self.resolve(self.database(), existing_id="PALOMAR-2026-08-01-999999")
+
+    def test_an_update_cannot_register_the_same_source_commit_again(self):
+        identifier = "PALOMAR-2026-08-01-000012"
+        with self.assertRaisesRegex(ReviewerError, "already has a registered version"):
+            self.resolve(
+                self.database(self.prior()),
+                submission="b2c3d4e5f6a1",
+                existing_id=identifier,
+                commit="1" * 40,
+            )
 
     def test_an_update_from_another_project_in_the_repository_is_refused(self):
         """One repository can hold many formalizations; identifiers are not shared."""
@@ -7004,17 +7035,18 @@ class RegistrationProjectionCostTests(unittest.TestCase):
             (results / f"PALOMAR-2025-01-01-{number:06d}.json").write_text("{}\n")
         if with_result:
             identifier = "PALOMAR-2026-08-01-000012"
+            registered_identity = {
+                "source_repository": "example/project",
+                "project_path": None,
+                "comparator_config_path": "comparator.json",
+            }
             (results / f"{identifier}.json").write_text(
                 json.dumps(
                     {
                         "schema_version": 1,
                         "id": identifier,
                         "accepted_at": "2026-08-01",
-                        "identity": {
-                            "source_repository": "example/project",
-                            "project_path": None,
-                            "comparator_config_path": "comparator.json",
-                        },
+                        "identity": registered_identity,
                         "versions": [
                             {
                                 "version": 1,
@@ -7030,6 +7062,35 @@ class RegistrationProjectionCostTests(unittest.TestCase):
                                 },
                             }
                         ],
+                    }
+                )
+                + "\n"
+            )
+            identity_binding = database / registration_authority.identity_path(
+                registered_identity
+            )
+            identity_binding.parent.mkdir(parents=True)
+            identity_binding.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "identity": registered_identity,
+                        "registration_id": identifier,
+                    }
+                )
+                + "\n"
+            )
+            entry = database / "entries" / f"{identifier}-v1.json"
+            entry.parent.mkdir(parents=True)
+            entry.write_text(
+                json.dumps(
+                    {
+                        "id": identifier,
+                        "version": 1,
+                        "source": {
+                            "repository": "example/project",
+                            "commit": "1" * 40,
+                        },
                     }
                 )
                 + "\n"
@@ -7071,7 +7132,7 @@ class RegistrationProjectionCostTests(unittest.TestCase):
             reviewed_at="2026-08-09T11:00:00Z",
             registered_at="2026-08-09T12:00:00Z",
             mechanical={
-                "source": {"repository": "example/project"},
+                "source": {"repository": "example/project", "commit": "2" * 40},
                 "comparator": {"path": "comparator.json"},
             },
         )
@@ -7096,6 +7157,13 @@ class RegistrationProjectionCostTests(unittest.TestCase):
                 costs[unrelated] = opened
         expected = [
             "registrations/submissions/b2c3d4e5f6a1.json",
+            registration_authority.identity_path(
+                {
+                    "source_repository": "example/project",
+                    "project_path": None,
+                    "comparator_config_path": "comparator.json",
+                }
+            ),
             "registrations/days/2026-08-09.json",
             "registrations/results/PALOMAR-2026-08-09-000001.json",
         ]
@@ -7125,6 +7193,14 @@ class RegistrationProjectionCostTests(unittest.TestCase):
         expected = [
             "registrations/submissions/b2c3d4e5f6a1.json",
             "registrations/results/PALOMAR-2026-08-01-000012.json",
+            registration_authority.identity_path(
+                {
+                    "source_repository": "example/project",
+                    "project_path": None,
+                    "comparator_config_path": "comparator.json",
+                }
+            ),
+            "entries/PALOMAR-2026-08-01-000012-v1.json",
         ]
         self.assertEqual(costs[1], costs[200])
         self.assertEqual(costs[1], expected)
