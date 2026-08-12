@@ -93,6 +93,46 @@ class RegistrationAuthorizationOrderTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "technical-team test.*cannot be registered"):
             validate(mechanical, review, state)
 
+    def test_each_technical_team_marker_independently_blocks_registration(self):
+        for marker in ("state", "relationship", "proof"):
+            with self.subTest(marker=marker):
+                mechanical, review, state = current_contract()
+                if marker == "state":
+                    state["test_submission"] = True
+                elif marker == "relationship":
+                    authorization_value = {"relationship": "technical-test"}
+                    mechanical["submission"]["authorization"] = authorization_value
+                    state["authorization"] = authorization_value
+                else:
+                    state["push_proof"] = push_proof(
+                        method="technical-team-test",
+                        binding="active-technical-team-membership",
+                    )
+                with self.assertRaisesRegex(
+                    ReviewerError,
+                    "technical-team test.*cannot be registered",
+                ):
+                    validate(mechanical, review, state)
+
+    def test_a_future_nonregistrable_relationship_fails_closed(self):
+        mechanical, review, state = current_contract()
+        relationship = {"relationship": "future-review-only"}
+        mechanical["submission"]["authorization"] = relationship
+        state["authorization"] = relationship
+        with self.assertRaisesRegex(ReviewerError, "future-review-only.*not registrable"):
+            validate(mechanical, review, state)
+
+    def test_registration_recovery_checkpoint_also_refuses_a_technical_test(self):
+        _, review, state = current_contract()
+        state["test_submission"] = True
+        with self.assertRaisesRegex(ReviewerError, "technical-team test.*cannot be registered"):
+            authorization.validate_registration_checkpoint(
+                SUBMISSION_ID,
+                review,
+                state,
+                state_repository=STATE_REPOSITORY,
+            )
+
     def test_missing_state_fails_with_the_retrieval_context(self):
         mechanical, review, _ = current_contract()
         with self.assertRaisesRegex(

@@ -30,6 +30,11 @@ PUSH_PROOF_METHODS = {
     "tag-and-gist": "separately-attested",
 }
 
+# Registration is an allowlist. A future relationship may be valid for review
+# without being valid for publication, and must not become registrable merely
+# because a mechanical-report enum was widened elsewhere.
+REGISTRABLE_RELATIONSHIPS = frozenset({"maintainer", "approved"})
+
 
 def document_digest(document: dict[str, Any]) -> str:
     """Hash one JSON document in the canonical form used by evidence bindings."""
@@ -108,15 +113,11 @@ def validate_push_proof(state: dict[str, Any]) -> None:
         raise ReviewerError("push_proof principal.id must be a positive integer")
 
 
-def _validate_registration_standing(
-    submission_id: str,
-    review: dict[str, Any],
-    state: dict[str, Any],
-) -> None:
-    """Require current consent and authority for one delivered review."""
+def is_technical_team_test(state: dict[str, Any]) -> bool:
+    """Recognize every redundant marker emitted for an operator test."""
     state_authorization = state.get("authorization")
     state_proof = state.get("push_proof")
-    if (
+    return (
         state.get("test_submission") is True
         or (
             isinstance(state_authorization, dict)
@@ -126,8 +127,25 @@ def _validate_registration_standing(
             isinstance(state_proof, dict)
             and state_proof.get("method") == "technical-team-test"
         )
-    ):
+    )
+
+
+def _validate_registration_standing(
+    submission_id: str,
+    review: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    """Require current consent and authority for one delivered review."""
+    state_authorization = state.get("authorization")
+    if is_technical_team_test(state):
         raise ReviewerError("a technical-team test submission cannot be registered")
+    relationship = (
+        state_authorization.get("relationship")
+        if isinstance(state_authorization, dict)
+        else None
+    )
+    if relationship not in REGISTRABLE_RELATIONSHIPS:
+        raise ReviewerError(f"authorization relationship {relationship!r} is not registrable")
     if state.get("push_verified") is not True:
         raise ReviewerError("the submitter never proved write access to the repository")
     validate_push_proof(state)
