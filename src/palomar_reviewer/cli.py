@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import concurrent.futures
 import copy
@@ -2043,15 +2044,19 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
         return _repair_line(value, field)
     if kind in {"list", "people"}:
         items = _repair_lines(value, field)
-        if field == "classification.arxiv" and len(items) > 2:
+        if complete and field == "classification.arxiv" and len(items) > 2:
             raise ReviewerError("repair has too many arXiv classifications")
-        if field == "classification.msc2020" and len(items) > 8:
+        if complete and field == "classification.msc2020" and len(items) > 8:
             raise ReviewerError("repair has too many MSC classifications")
+        if complete and kind == "list" and len(items) != len(set(items)):
+            raise ReviewerError(f"repair value for {field} contains duplicates")
         return items
     if kind == "substantive-repository":
         if not isinstance(value, dict) or set(value) != {"id", "revision"}:
             raise ReviewerError(f"repair value for {field} is malformed")
         identifier = _repair_line(value.get("id"), f"{field}.id")
+        if complete and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", identifier):
+            raise ReviewerError(f"repair value for {field}.id is malformed")
         revision = value.get("revision")
         if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise ReviewerError(f"repair value for {field}.revision is malformed")
@@ -2087,9 +2092,9 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
             item: dict[str, Any] = {"title": _repair_line(raw.get("title"), "sources.title")}
             if "authors" in raw:
                 item["authors"] = _repair_lines(raw["authors"], "sources.authors")
-            for name in ("id", "location", "license"):
+            for name, maximum in (("id", 2_048), ("location", 1_000), ("license", 500)):
                 if name in raw:
-                    item[name] = _repair_line(raw[name], f"sources.{name}", 2_048)
+                    item[name] = _repair_line(raw[name], f"sources.{name}", maximum)
             if "type" in raw:
                 if raw["type"] not in SOURCE_TYPES:
                     raise ReviewerError("repair source type is unsupported")
@@ -5459,9 +5464,15 @@ def _run_repair_preflight(
     bundle = shutil.which("bundle")
     if not verifier.is_file() or not bundle:
         raise ReviewerError("repair runner is missing the submission verifier or Licensee")
+    relationship = (state.get("authorization") or {}).get("relationship", "")
+    relationship_label = _submission_authorization_label(pipeline, relationship)
     options = {
         **state.get("requested_paths", {}),
-        "authorization_relationship": (state.get("authorization") or {}).get("relationship", ""),
+        # State deliberately stores the bounded canonical value. The shared
+        # Submission verifier deliberately accepts the exact dispatch label.
+        # Repair preflight crosses that representation boundary just like the
+        # ordinary submission dispatcher does.
+        "authorization_relationship": relationship_label,
         "authorization_evidence": (state.get("authorization") or {}).get("evidence", ""),
     }
     event = {
@@ -5500,6 +5511,33 @@ def _run_repair_preflight(
         env=environment,
     )
     return load_json(report_path)
+
+
+def _submission_authorization_label(pipeline: Path, relationship: Any) -> str:
+    """Read the verifier-owned dispatch spelling for one canonical State value."""
+    contract = pipeline / "scripts" / "submission_contract.py"
+    try:
+        module = ast.parse(contract.read_text(encoding="utf-8"), filename=str(contract))
+        mappings = []
+        for node in module.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == "AUTHORIZATION_RELATIONSHIPS"
+                for target in node.targets
+            ):
+                mappings.append(ast.literal_eval(node.value))
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ReviewerError("repair runner cannot read the submission authorization contract") from error
+    if len(mappings) != 1 or not isinstance(mappings[0], dict):
+        raise ReviewerError("repair runner found an ambiguous submission authorization contract")
+    labels = [
+        label for label, canonical in mappings[0].items()
+        if canonical == relationship and isinstance(label, str)
+    ]
+    if len(labels) != 1:
+        raise ReviewerError("repair submission authorization relationship is not recognized")
+    return labels[0]
 
 
 def _repair_preflight_environment(pipeline: Path, home: Path) -> dict[str, str]:

@@ -8236,6 +8236,92 @@ class MetadataRepairTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, environment)
 
+    def test_repair_preflight_translates_canonical_authorization_to_dispatch_label(self):
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "requested_paths": {"comparator_config_path": "comparator.json"},
+            "authorization": {"relationship": "approved", "evidence": "maintainer approval"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = root / "submission"
+            (pipeline / "scripts").mkdir(parents=True)
+            (pipeline / "scripts" / "verify_submission.py").write_text("", encoding="utf-8")
+            (pipeline / "scripts" / "submission_contract.py").write_text(
+                'AUTHORIZATION_RELATIONSHIPS = {\n'
+                '    "I am a responsible author or maintainer": "maintainer",\n'
+                '    "I have approval from a responsible author or maintainer": "approved",\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            def fake_run(command, **kwargs):
+                event_path = Path(command[command.index("--event") + 1])
+                event = json.loads(event_path.read_text(encoding="utf-8"))
+                options = json.loads(event["inputs"]["options"])
+                self.assertEqual(
+                    options["authorization_relationship"],
+                    "I have approval from a responsible author or maintainer",
+                )
+                self.assertEqual(options["authorization_evidence"], "maintainer approval")
+                report_path = Path(command[command.index("--output") + 1])
+                report_path.write_text(json.dumps({"status": "pending", "stage": "prepared"}))
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(os.environ, {"PALOMAR_SUBMISSION_CHECKOUT": str(pipeline)}),
+                mock.patch.object(cli.shutil, "which", return_value="/usr/bin/bundle"),
+                mock.patch.object(cli, "_repair_preflight_environment", return_value={}),
+                mock.patch.object(cli, "run", side_effect=fake_run),
+            ):
+                result = cli._run_repair_preflight(
+                    "palomar-repairs/project", "1" * 40, state, root
+                )
+        self.assertEqual(result, {"status": "pending", "stage": "prepared"})
+
+    def test_repair_preflight_refuses_unknown_canonical_authorization(self):
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "requested_paths": {},
+            "authorization": {"relationship": "delegated"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = root / "submission"
+            (pipeline / "scripts").mkdir(parents=True)
+            (pipeline / "scripts" / "verify_submission.py").write_text("", encoding="utf-8")
+            (pipeline / "scripts" / "submission_contract.py").write_text(
+                'AUTHORIZATION_RELATIONSHIPS = {"Maintainer": "maintainer"}\n',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(os.environ, {"PALOMAR_SUBMISSION_CHECKOUT": str(pipeline)}),
+                mock.patch.object(cli.shutil, "which", return_value="/usr/bin/bundle"),
+                self.assertRaisesRegex(ReviewerError, "authorization relationship"),
+            ):
+                cli._run_repair_preflight("palomar-repairs/project", "1" * 40, state, root)
+
+    def test_repair_drafts_preserve_invalid_values_for_the_guided_form(self):
+        draft = cli._bounded_repair_draft({
+            "values": {
+                "classification.msc2020": ["03B35", "03B35"],
+                "repository.substantive_formalization": {
+                    "id": "https://github.com/owner/project", "revision": "b" * 40,
+                },
+            },
+            "origins": {
+                "classification.msc2020": "classification.msc2020",
+                "repository.substantive_formalization":
+                    "repository.substantive_formalization",
+            },
+        })
+        self.assertEqual(
+            draft["values"]["classification.msc2020"], ["03B35", "03B35"]
+        )
+        self.assertEqual(
+            draft["values"]["repository.substantive_formalization"]["id"],
+            "https://github.com/owner/project",
+        )
+
     def test_round_trip_repair_changes_only_approved_fields(self):
         long_note = "This quoted value crosses the default eighty column emitter width unchanged."
         source = f"""# project comment
@@ -8316,6 +8402,37 @@ notes: keep this
         }
         with self.assertRaisesRegex(ReviewerError, "needs a relationship"):
             cli._validate_repair(repair, state)
+
+    def test_profile_two_rejects_values_the_submission_contract_will_refuse(self):
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        duplicate = self.repair()
+        duplicate["schema_version"] = 2
+        duplicate["edits"] = [{
+            "field": "classification.msc2020", "value": ["03B35", "03B35"],
+        }]
+        with self.assertRaisesRegex(ReviewerError, "duplicates"):
+            cli._validate_repair(duplicate, state)
+
+        long_location = self.repair()
+        long_location["schema_version"] = 2
+        long_location["edits"] = [{"field": "sources", "value": [{
+            "title": "A theorem", "relationship": "formalizes",
+            "location": "x" * 1_001,
+        }]}]
+        with self.assertRaisesRegex(ReviewerError, "malformed"):
+            cli._validate_repair(long_location, state)
+
+        bad_repository = self.repair()
+        bad_repository["schema_version"] = 2
+        bad_repository["edits"] = [{
+            "field": "repository.substantive_formalization",
+            "value": {"id": "not-a-repository", "revision": "b" * 40},
+        }]
+        with self.assertRaisesRegex(ReviewerError, "id is malformed"):
+            cli._validate_repair(bad_repository, state)
 
     def test_malformed_yaml_is_manual_not_edited(self):
         with tempfile.TemporaryDirectory() as directory:
