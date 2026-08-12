@@ -1999,6 +1999,145 @@ def mechanical_report(
 DIAGNOSTICS_SCHEMA_VERSION = 1
 MAX_FAILURE_DIAGNOSTICS = 50
 DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
+REPAIR_FIELDS_V1 = {
+    "project.name": "text",
+    "project.license": "text",
+    "classification.arxiv": "list",
+    "classification.msc2020": "list",
+    "review.status": "text",
+}
+REPAIR_FIELDS_V2 = {
+    **REPAIR_FIELDS_V1,
+    "project.authors": "people",
+    "project.responsible_maintainers": "people",
+    "sources": "sources",
+    "automation.methods": "methods",
+    "repository.substantive_formalization": "substantive-repository",
+}
+SOURCE_TYPES = {"paper", "book", "web discussion", "folklore", "original-proof", "other"}
+SOURCE_RELATIONSHIPS = {"formalizes", "adapts", "independently-proves", "background", "other"}
+SOURCE_ENDORSEMENTS = {
+    "participated", "endorsed", "no-response", "not-contacted", "declined", "n/a",
+}
+AUTOMATION_METHODS = {"manual", "copilot", "agent", "autonomous", "other"}
+
+
+def _repair_line(value: Any, field: str, maximum: int = 500) -> str:
+    if (
+        not isinstance(value, str) or not value or len(value) > maximum
+        or "\n" in value or "\r" in value
+    ):
+        raise ReviewerError(f"repair value for {field} is malformed")
+    return value
+
+
+def _repair_lines(value: Any, field: str, maximum: int = 100) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= maximum:
+        raise ReviewerError(f"repair value for {field} is malformed")
+    return [_repair_line(item, field) for item in value]
+
+
+def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
+    kind = REPAIR_FIELDS_V2.get(field)
+    if kind == "text":
+        return _repair_line(value, field)
+    if kind in {"list", "people"}:
+        items = _repair_lines(value, field)
+        if field == "classification.arxiv" and len(items) > 2:
+            raise ReviewerError("repair has too many arXiv classifications")
+        if field == "classification.msc2020" and len(items) > 8:
+            raise ReviewerError("repair has too many MSC classifications")
+        return items
+    if kind == "substantive-repository":
+        if not isinstance(value, dict) or set(value) != {"id", "revision"}:
+            raise ReviewerError(f"repair value for {field} is malformed")
+        identifier = _repair_line(value.get("id"), f"{field}.id")
+        revision = value.get("revision")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ReviewerError(f"repair value for {field}.revision is malformed")
+        return {"id": identifier, "revision": revision}
+    if kind == "methods":
+        if not isinstance(value, list) or not 1 <= len(value) <= 20:
+            raise ReviewerError(f"repair value for {field} is malformed")
+        methods: list[dict[str, Any]] = []
+        for raw in value:
+            if not isinstance(raw, dict) or set(raw) - {"method", "framework", "models"}:
+                raise ReviewerError(f"repair value for {field} is malformed")
+            method_name = _repair_line(raw.get("method"), f"{field}.method")
+            if complete and method_name not in AUTOMATION_METHODS:
+                raise ReviewerError(f"repair value for {field}.method is unsupported")
+            item: dict[str, Any] = {"method": method_name}
+            if "framework" in raw:
+                item["framework"] = _repair_line(raw["framework"], f"{field}.framework")
+            if "models" in raw:
+                item["models"] = _repair_lines(raw["models"], f"{field}.models")
+            methods.append(item)
+        return methods
+    if kind == "sources":
+        if not isinstance(value, list) or not 1 <= len(value) <= 20:
+            raise ReviewerError(f"repair value for {field} is malformed")
+        allowed = {
+            "title", "authors", "id", "type", "location", "relationship", "license",
+            "author_endorsement",
+        }
+        sources: list[dict[str, Any]] = []
+        for raw in value:
+            if not isinstance(raw, dict) or set(raw) - allowed:
+                raise ReviewerError(f"repair value for {field} is malformed")
+            item: dict[str, Any] = {"title": _repair_line(raw.get("title"), "sources.title")}
+            if "authors" in raw:
+                item["authors"] = _repair_lines(raw["authors"], "sources.authors")
+            for name in ("id", "location", "license"):
+                if name in raw:
+                    item[name] = _repair_line(raw[name], f"sources.{name}", 2_048)
+            if "type" in raw:
+                if raw["type"] not in SOURCE_TYPES:
+                    raise ReviewerError("repair source type is unsupported")
+                item["type"] = raw["type"]
+            if "relationship" in raw:
+                if raw["relationship"] not in SOURCE_RELATIONSHIPS:
+                    raise ReviewerError("repair source relationship is unsupported")
+                item["relationship"] = raw["relationship"]
+            elif complete:
+                raise ReviewerError("every repair source needs a relationship")
+            if "author_endorsement" in raw:
+                if raw["author_endorsement"] not in SOURCE_ENDORSEMENTS:
+                    raise ReviewerError("repair source endorsement is unsupported")
+                item["author_endorsement"] = raw["author_endorsement"]
+            sources.append(item)
+        if complete:
+            original = any(item.get("type") == "original-proof" for item in sources)
+            substantive = {"formalizes", "adapts", "independently-proves"}
+            if original and any(item.get("relationship") in substantive for item in sources):
+                raise ReviewerError("original-proof sources cannot have a substantive relationship")
+            if original and any(
+                item.get("type") == "original-proof" and item.get("relationship") != "other"
+                for item in sources
+            ):
+                raise ReviewerError("original-proof sources must use relationship other")
+            if not original and not any(item.get("relationship") in substantive for item in sources):
+                raise ReviewerError("source-based repairs need a substantive source relationship")
+        return sources
+    raise ReviewerError(f"unsupported repair field: {field}")
+
+
+def _bounded_repair_draft(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"values", "origins"}:
+        raise ReviewerError("formalization repair draft is malformed")
+    values, origins = value.get("values"), value.get("origins")
+    if not isinstance(values, dict) or not isinstance(origins, dict):
+        raise ReviewerError("formalization repair draft is malformed")
+    if len(values) > len(REPAIR_FIELDS_V2) or set(origins) - set(values):
+        raise ReviewerError("formalization repair draft has inconsistent fields")
+    result_values: dict[str, Any] = {}
+    result_origins: dict[str, str] = {}
+    for field, item in values.items():
+        if field not in REPAIR_FIELDS_V2:
+            raise ReviewerError("formalization repair draft names an unsupported field")
+        result_values[field] = _normalized_repair_value(field, item, complete=False)
+    for field, origin in origins.items():
+        result_origins[field] = _repair_line(origin, f"draft origin {field}", 400)
+    return {"values": result_values, "origins": result_origins}
 
 
 def _bounded_diagnostic(value: Any) -> dict[str, Any]:
@@ -2070,10 +2209,16 @@ def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, An
         not isinstance(profile_version, int) or isinstance(profile_version, bool) or profile_version < 1
     ):
         raise ReviewerError("failure artifact has an invalid formalization profile version")
-    return {
+    result = {
         "diagnostics": [_bounded_diagnostic(item) for item in diagnostics],
         "profile_version": profile_version,
     }
+    draft = report.get("formalization_repair_draft")
+    if draft is not None:
+        if profile_version != 2:
+            raise ReviewerError("formalization repair draft requires profile version 2")
+        result["repair_draft"] = _bounded_repair_draft(draft)
+    return result
 
 
 def _diagnostics_unavailable(error: BaseException) -> list[dict[str, Any]]:
@@ -2113,9 +2258,11 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         validated = validated_failure_report(load_json(report_path), state)
         diagnostics = validated["diagnostics"]
         profile_version = validated["profile_version"]
+        repair_draft = validated.get("repair_draft")
     except Exception as error:  # a diagnosis failure must itself be explained
         diagnostics = _diagnostics_unavailable(error)
         profile_version = None
+        repair_draft = None
 
     submitter_work = any(item["owner"] == "submitter" for item in diagnostics)
     if mode == "preflight":
@@ -2143,6 +2290,8 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         "profile_version": profile_version,
         "diagnostics": diagnostics,
     }
+    if repair_draft is not None:
+        failure["repair_draft"] = repair_draft
     return advance_state(state, terminal, note, failure=failure)
 
 
@@ -5088,7 +5237,8 @@ def _record_repair(repair: dict[str, Any], status: str, explanation: str, **fiel
 
 
 def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
-    if repair.get("schema_version") != 1 or repair.get("submission_id") != state.get("id"):
+    schema_version = repair.get("schema_version")
+    if schema_version not in {1, 2} or repair.get("submission_id") != state.get("id"):
         raise ReviewerError("repair request does not match its submission")
     if repair.get("revision") != (state.get("repair") or {}).get("revision"):
         raise ReviewerError("repair request revision does not match the submission")
@@ -5119,13 +5269,7 @@ def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
     if Path(path).name != "formalization.yaml":
         raise ReviewerError("repair target must be named formalization.yaml")
     edits = repair.get("edits")
-    allowed = {
-        "project.name": "text",
-        "project.license": "text",
-        "classification.arxiv": "list",
-        "classification.msc2020": "list",
-        "review.status": "text",
-    }
+    allowed = REPAIR_FIELDS_V2 if schema_version == 2 else REPAIR_FIELDS_V1
     if not isinstance(edits, list) or not edits or len(edits) > len(allowed):
         raise ReviewerError("repair request has no bounded edit list")
     fields = [item.get("field") for item in edits if isinstance(item, dict)]
@@ -5133,29 +5277,7 @@ def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
         raise ReviewerError("repair request contains an unsupported or duplicate field")
     for edit in edits:
         field = edit["field"]
-        value = edit.get("value")
-        if allowed[field] == "text":
-            if (
-                not isinstance(value, str)
-                or not value
-                or len(value) > 500
-                or "\n" in value
-                or "\r" in value
-            ):
-                raise ReviewerError(f"repair value for {field} is malformed")
-        elif not isinstance(value, list) or not 1 <= len(value) <= 100 or any(
-            not isinstance(item, str)
-            or not item
-            or len(item) > 500
-            or "\n" in item
-            or "\r" in item
-            for item in value
-        ):
-            raise ReviewerError(f"repair value for {field} is malformed")
-        if field == "classification.arxiv" and len(value) > 2:
-            raise ReviewerError("repair has too many arXiv classifications")
-        if field == "classification.msc2020" and len(value) > 8:
-            raise ReviewerError("repair has too many MSC classifications")
+        _normalized_repair_value(field, edit.get("value"), complete=True)
 
 
 def _refuse_yaml_aliases(value: Any, seen: set[int] | None = None) -> None:
@@ -5171,6 +5293,34 @@ def _refuse_yaml_aliases(value: Any, seen: set[int] | None = None) -> None:
             _refuse_yaml_aliases(child, seen)
 
 
+REPAIR_CHILD_ORDER = {
+    "project": ["name", "authors", "license", "responsible_maintainers"],
+    "classification": ["arxiv", "msc2020"],
+    "automation": ["methods"],
+    "review": ["status"],
+    "repository": ["role", "substantive_formalization"],
+}
+
+
+def _set_round_trip_repair_value(parent: Any, parent_path: str, key: str, value: Any) -> None:
+    """Insert a missing canonical child before legacy/trailing-comment fields."""
+    if key in parent:
+        parent[key] = value
+        return
+    order = REPAIR_CHILD_ORDER.get(parent_path)
+    insert = getattr(parent, "insert", None)
+    if order is None or key not in order or not callable(insert):
+        parent[key] = value
+        return
+    rank = order.index(key)
+    position = len(parent)
+    for index, current in enumerate(parent):
+        if current not in order or order.index(current) > rank:
+            position = index
+            break
+    insert(position, key, value)
+
+
 def _apply_repair(path: Path, edits: list[dict[str, Any]]) -> None:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 1_048_576:
         raise ReviewerError("formalization.yaml is not a regular file within the size limit")
@@ -5178,6 +5328,11 @@ def _apply_repair(path: Path, edits: list[dict[str, Any]]) -> None:
     round_trip.allow_duplicate_keys = False
     round_trip.preserve_quotes = True
     round_trip.width = 1 << 20
+    # Match the conventional two-space mapping / four-space block-sequence
+    # indentation used by the profile and legacy examples. Without this,
+    # ruamel preserves comments and values but shifts every untouched list in
+    # the document, burying the requested repair in a formatting rewrite.
+    round_trip.indent(mapping=2, sequence=4, offset=2)
     try:
         original = path.read_text(encoding="utf-8")
         document = round_trip.load(original)
@@ -5189,14 +5344,30 @@ def _apply_repair(path: Path, edits: list[dict[str, Any]]) -> None:
         raise ReviewerError("formalization.yaml is not a mapping; correct it manually first")
     _refuse_yaml_aliases(document)
     before = yaml.safe_load(original)
+    expected_after = copy.deepcopy(before)
     for edit in edits:
         parent: Any = document
+        expected_parent: Any = expected_after
         parts = edit["field"].split(".")
         for part in parts[:-1]:
-            parent = parent.get(part) if isinstance(parent, dict) else None
-            if not isinstance(parent, dict):
-                raise ReviewerError(f"{'.'.join(parts[:-1])} is not a mapping; update this field manually")
-        parent[parts[-1]] = edit["value"]
+            current = parent.get(part) if isinstance(parent, dict) else None
+            expected_current = expected_parent.get(part) if isinstance(expected_parent, dict) else None
+            if current is None:
+                parent[part] = {}
+                current = parent[part]
+            if expected_current is None:
+                expected_parent[part] = {}
+                expected_current = expected_parent[part]
+            if not isinstance(current, dict) or not isinstance(expected_current, dict):
+                raise ReviewerError(
+                    f"{'.'.join(parts[:-1])} is not a mapping; update this field manually"
+                )
+            parent = current
+            expected_parent = expected_current
+        _set_round_trip_repair_value(
+            parent, ".".join(parts[:-1]), parts[-1], edit["value"]
+        )
+        expected_parent[parts[-1]] = copy.deepcopy(edit["value"])
     stream = io.StringIO()
     round_trip.dump(document, stream)
     rendered = stream.getvalue()
@@ -5204,9 +5375,7 @@ def _apply_repair(path: Path, edits: list[dict[str, Any]]) -> None:
         after = yaml.safe_load(rendered)
     except yaml.YAMLError as error:
         raise ReviewerError("generated formalization.yaml could not be validated") from error
-    changed = _semantic_changed_paths(before, after)
-    expected = {edit["field"] for edit in edits}
-    if changed != expected:
+    if after != expected_after:
         raise ReviewerError(
             "generated formalization.yaml changed fields outside the approved repair set"
         )
@@ -5622,6 +5791,114 @@ def repair_queue(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _eligible_legacy_repair_failure(state: dict[str, Any]) -> bool:
+    failure = state.get("failure")
+    diagnostics = failure.get("diagnostics") if isinstance(failure, dict) else None
+    return (
+        state.get("status") == "changes-required"
+        and not state.get("repair")
+        and failure.get("profile_version") == 1
+        and isinstance(diagnostics, list)
+        and any(
+            isinstance(item, dict) and item.get("code") == "formalization.missing_sections"
+            for item in diagnostics
+        )
+    )
+
+
+def _legacy_repair_candidates(submission_id: str | None) -> list[dict[str, Any]]:
+    if submission_id is not None:
+        if not SUBMISSION_ID_RE.fullmatch(submission_id):
+            raise ReviewerError("submission id is malformed")
+        state = submission_state(submission_id)
+        return [state] if state is not None and _eligible_legacy_repair_failure(state) else []
+    candidates: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="palomar-repair-migration-") as work:
+        checkout = Path(work) / "state"
+        run(
+            [
+                "git", "-c", "core.hooksPath=/dev/null", "clone", "--depth=1", "--quiet",
+                f"https://github.com/{STATE_REPO}.git", str(checkout),
+            ],
+            env=registry_git_environment(),
+        )
+        for path in sorted((checkout / "submissions").glob("*/state.json")):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if _eligible_legacy_repair_failure(state):
+                candidates.append(state)
+    return candidates
+
+
+def upgrade_repair_failures(args: argparse.Namespace) -> int:
+    """Upgrade settled aggregate metadata failures without changing their identity."""
+    candidates = _legacy_repair_candidates(args.submission)
+    if not candidates:
+        print("No eligible legacy metadata failures.")
+        return 0
+    failures = 0
+    root = Path(args.work_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    for candidate in candidates:
+        submission_id = candidate["id"]
+        print(f"::group::Upgrade repair guidance {submission_id}", flush=True)
+        try:
+            fresh = submission_state(submission_id)
+            if fresh is None or not _eligible_legacy_repair_failure(fresh):
+                print(f"{submission_id}: no longer eligible")
+                continue
+            with tempfile.TemporaryDirectory(
+                prefix=f"palomar-repair-migration-{submission_id}-", dir=root
+            ) as work:
+                report = _run_repair_preflight(
+                    fresh["repository"], fresh["commit"], fresh, Path(work)
+                )
+            validated = validated_failure_report(report, fresh)
+            diagnostics = validated["diagnostics"]
+            if (
+                validated.get("profile_version") != 2
+                or "repair_draft" not in validated
+                or not diagnostics
+                or any(item.get("owner") != "submitter" for item in diagnostics)
+            ):
+                raise ReviewerError("current preflight did not produce guided profile-v2 metadata")
+            old_failure = fresh["failure"]
+            failure = {
+                "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+                "mode": "preflight",
+                "run": old_failure.get("run"),
+                "profile_version": 2,
+                "diagnostics": diagnostics,
+                "repair_draft": validated["repair_draft"],
+            }
+            updated = {
+                **{key: value for key, value in fresh.items() if key != "_blob_sha"},
+                "failure": failure,
+                "events": [
+                    *fresh.get("events", []),
+                    {
+                        "at": utc_now(), "status": fresh["status"],
+                        "note": "Palomar upgraded the metadata failure to guided repair",
+                    },
+                ],
+            }
+            put_state(
+                f"submissions/{submission_id}/state.json",
+                updated,
+                f"Upgrade guided metadata repair for {submission_id}",
+                blob_sha=fresh.get("_blob_sha"),
+            )
+            print(f"{submission_id}: upgraded")
+        except Exception as error:
+            failures += 1
+            print(f"error: upgrading {submission_id} failed: {error}", file=sys.stderr)
+        finally:
+            print("::endgroup::", flush=True)
+    return 1 if failures else 0
+
+
 def auto(args: argparse.Namespace) -> int:
     """One pass of the loop: advance every live submission as far as it goes.
 
@@ -5872,6 +6149,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate queued formalization.yaml edits and open repair pull requests",
     )
     repair_parser.set_defaults(func=repair_queue)
+    upgrade_parser = commands.add_parser(
+        "upgrade-repair-failures",
+        help="upgrade settled aggregate metadata failures to the guided repair profile",
+    )
+    upgrade_parser.add_argument("--submission")
+    upgrade_parser.set_defaults(func=upgrade_repair_failures)
     auto_parser = commands.add_parser(
         "auto",
         help="advance every live submission by one step; safe to run on a schedule",

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import jsonschema
+import yaml
 
 import palomar_reviewer.authorization as registration_authorization
 import palomar_reviewer.checkpoint as registration_checkpoint
@@ -8101,6 +8102,19 @@ class FailureDiagnosticTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"][0]["location"]["line"], 2)
         self.assertNotIn("unexpected", result["diagnostics"][0])
 
+    def test_profile_two_repair_draft_is_bounded_and_ingested(self):
+        report = self.report(self.diagnostic())
+        report["formalization_profile_version"] = 2
+        report["formalization_repair_draft"] = {
+            "values": {"project.name": "Legacy name"},
+            "origins": {"project.name": "artifact.name"},
+        }
+        result = cli.validated_failure_report(report, self.state())
+        self.assertEqual(result["repair_draft"]["values"]["project.name"], "Legacy name")
+        report["formalization_repair_draft"]["values"]["unexpected"] = "value"
+        with self.assertRaisesRegex(ReviewerError, "unsupported field"):
+            cli.validated_failure_report(report, self.state())
+
     def test_only_submitter_diagnostics_produce_changes_required(self):
         state = self.state()
         run_data = {
@@ -8250,6 +8264,58 @@ notes: "{long_note}"
         self.assertIn("68V15", repaired)
         self.assertIn("license: MIT", repaired)
         self.assertIn(f'notes: "{long_note}"', repaired)
+        self.assertIn("  authors:\n    - Old Author", repaired)
+
+    def test_profile_two_creates_missing_sections_and_preserves_legacy_metadata(self):
+        source = """# legacy metadata
+schema_version: "0.1"
+artifact:
+  name: Legacy project
+notes: keep this
+"""
+        edits = [
+            {"field": "project.name", "value": "Legacy project"},
+            {"field": "project.authors", "value": ["Ada Lovelace"]},
+            {"field": "project.license", "value": "MIT"},
+            {"field": "project.responsible_maintainers", "value": ["Ada Lovelace"]},
+            {"field": "classification.arxiv", "value": ["math.LO"]},
+            {"field": "classification.msc2020", "value": ["03B35"]},
+            {"field": "sources", "value": [{
+                "title": "A theorem", "type": "paper", "relationship": "formalizes",
+            }]},
+            {"field": "automation.methods", "value": [{"method": "manual"}]},
+            {"field": "review.status", "value": "unchecked"},
+        ]
+        repair = self.repair()
+        repair["schema_version"] = 2
+        repair["edits"] = edits
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        cli._validate_repair(repair, state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            path.write_text(source, encoding="utf-8")
+            cli._apply_repair(path, edits)
+            repaired = yaml.safe_load(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("# legacy metadata", text)
+        self.assertEqual(repaired["schema_version"], "0.1")
+        self.assertEqual(repaired["artifact"]["name"], "Legacy project")
+        self.assertEqual(repaired["project"]["authors"], ["Ada Lovelace"])
+        self.assertEqual(repaired["sources"][0]["relationship"], "formalizes")
+
+    def test_profile_two_rejects_incomplete_or_inconsistent_sources(self):
+        repair = self.repair()
+        repair["schema_version"] = 2
+        repair["edits"] = [{"field": "sources", "value": [{"title": "No relationship"}]}]
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        with self.assertRaisesRegex(ReviewerError, "needs a relationship"):
+            cli._validate_repair(repair, state)
 
     def test_malformed_yaml_is_manual_not_edited(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8268,3 +8334,60 @@ notes: "{long_note}"
             with self.assertRaisesRegex(ReviewerError, "uses aliases"):
                 cli._apply_repair(path, [{"field": "project.name", "value": "Name"}])
             self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+
+class RepairFailureMigrationTests(unittest.TestCase):
+    def state(self):
+        return {
+            "id": "a1b2c3d4e5f6", "status": "changes-required",
+            "repository": "owner/project", "commit": "a" * 40,
+            "requested_paths": {}, "authorization": {"relationship": "maintainer"},
+            "preflight_run": {"id": 101, "url": "https://example.test/run"},
+            "failure": {
+                "schema_version": 1, "mode": "preflight", "profile_version": 1,
+                "run": {"id": 101, "url": "https://example.test/run"},
+                "diagnostics": [{"code": "formalization.missing_sections"}],
+            },
+            "events": [], "_blob_sha": "old-state",
+        }
+
+    def report(self):
+        diagnostic = {
+            "code": "formalization.invalid_field", "stage": "formalization",
+            "owner": "submitter", "summary": "project.name is required",
+            "explanation": "project.name is required", "next_action": "Complete the form.",
+            "retryable": False, "repairable": True, "field": "project.name",
+        }
+        return {
+            "schema_version": 1, "status": "fail",
+            "submission": {"submission_id": "a1b2c3d4e5f6"},
+            "source": {"repository": "owner/project", "commit": "a" * 40},
+            "diagnostics_schema_version": 1, "formalization_profile_version": 2,
+            "diagnostics": [diagnostic],
+            "formalization_repair_draft": {
+                "values": {"project.name": "Legacy name"},
+                "origins": {"project.name": "artifact.name"},
+            },
+        }
+
+    def test_existing_settled_failure_is_upgraded_in_place(self):
+        state = self.state()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "_legacy_repair_candidates", return_value=[state]),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "_run_repair_preflight", return_value=self.report()),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            result = cli.upgrade_repair_failures(SimpleNamespace(
+                submission=state["id"], work_dir=directory,
+            ))
+        self.assertEqual(result, 0)
+        path, updated = put_state.call_args.args[:2]
+        self.assertEqual(path, f"submissions/{state['id']}/state.json")
+        self.assertEqual(updated["id"], state["id"])
+        self.assertEqual(updated["status"], "changes-required")
+        self.assertEqual(updated["preflight_run"], state["preflight_run"])
+        self.assertEqual(updated["failure"]["profile_version"], 2)
+        self.assertEqual(updated["failure"]["run"], state["failure"]["run"])
+        self.assertNotIn("_blob_sha", updated)
