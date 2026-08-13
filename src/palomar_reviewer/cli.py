@@ -34,7 +34,7 @@ from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
 from . import registration as registration_authority
 from . import usage as usage_accounting
-from .errors import ReviewerError
+from .errors import DeterministicRegistrationError, ReviewerError
 
 STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
@@ -64,6 +64,8 @@ MAX_PASSES = 5
 # a submission that nothing was wrong with.
 REVIEW_RETRY_BACKOFF_SECONDS = 1800
 REGISTRATIONS_PER_PASS = 1
+REGISTRATION_ATTEMPT_LIMIT = 3
+REGISTRATION_RETRY_BACKOFF_SECONDS = 1800
 REGISTRATION_WAIT_SECONDS = 1800
 REGISTRATION_STALE_SECONDS = 6 * 3600
 PASS_BUDGET_SECONDS = 5400
@@ -115,6 +117,7 @@ FINISHED_STATUSES = frozenset(
         "verification-failed",
         "verification-error",
         "review-failed",
+        "registration-paused",
         "withdrawn",
         "dispatch-lost",
     }
@@ -1737,7 +1740,11 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
         timeout=6000,
     )
     if watched.returncode:
-        raise ReviewerError(render_failure(work, run_id, request_id, run_data["url"]))
+        message, deterministic = render_failure_details(
+            work, run_id, request_id, run_data["url"]
+        )
+        error_type = DeterministicRegistrationError if deterministic else ReviewerError
+        raise error_type(message)
     download = work / "render-download"
     if download.exists():
         shutil.rmtree(download)
@@ -2529,6 +2536,53 @@ def abandon_review(state: dict[str, Any], reason: str) -> dict[str, Any]:
     )
 
 
+def begin_registration(state: dict[str, Any]) -> dict[str, Any]:
+    """Durably count a registration attempt before it can perform side effects."""
+    return advance_state(
+        state,
+        "review-ready",
+        "Registration is starting",
+        registration_attempts=int(state.get("registration_attempts") or 0) + 1,
+        registration_started_at=utc_now(),
+        registration_retry_after=None,
+        registration_error=None,
+        registration_failure=None,
+    )
+
+
+def record_registration_failure(
+    state: dict[str, Any], error: Exception, *, deterministic: bool
+) -> dict[str, Any]:
+    """Back off a transient failure or pause one that needs an operator."""
+    attempts = int(state.get("registration_attempts") or 0)
+    detail = str(error).strip()[:500] or error.__class__.__name__
+    category = "deterministic" if deterministic else "transient"
+    failure = {
+        "schema_version": 1,
+        "category": category,
+        "failed_at": utc_now(),
+        "attempts": attempts,
+        "detail": detail,
+    }
+    if deterministic or attempts >= REGISTRATION_ATTEMPT_LIMIT:
+        return advance_state(
+            state,
+            "registration-paused",
+            "Registration needs operator attention",
+            registration_error=detail,
+            registration_failure=failure,
+            registration_retry_after=None,
+        )
+    return advance_state(
+        state,
+        "review-ready",
+        "Registration could not complete and will be tried again",
+        registration_error=detail,
+        registration_failure=failure,
+        registration_retry_after=utc_after(REGISTRATION_RETRY_BACKOFF_SECONDS),
+    )
+
+
 # A review runs six model passes over a Lean repository. Anything faster than
 # this did not happen: it is a stubbed engine or a path that failed early, and
 # recording it would put a figure on the page that no review ever took.
@@ -2563,6 +2617,8 @@ def deliver_review(
     state: dict[str, Any],
     review: dict[str, Any],
     spend: dict[str, Any] | None = None,
+    *,
+    mechanical: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Hand the review to the submitter privately, and to nobody else.
 
@@ -2585,6 +2641,12 @@ def deliver_review(
     # sufficient, a current base-rate summary is derived during the run; it is
     # never stored as history.
     previous = state.get("spend") or []
+    cache = (mechanical or {}).get("mathlib_cache")
+    cache_available = (
+        cache.get("available")
+        if isinstance(cache, dict) and cache.get("required") is True
+        else None
+    )
     return advance_state(
         state,
         "review-ready",
@@ -2594,6 +2656,7 @@ def deliver_review(
         registration_consent=False,
         registration_consent_review_sha256=None,
         registration_attempt=None,
+        mathlib_cache_available=cache_available,
         spend=[*previous, spend] if spend else previous,
     )
 
@@ -3048,7 +3111,9 @@ def push_registration_branch(database: Path, branch: str) -> None:
     run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
 
 
-def render_failure(work: Path, run_id: str, request_id: str, url: str) -> str:
+def render_failure_details(
+    work: Path, run_id: str, request_id: str, url: str
+) -> tuple[str, bool]:
     """Say what a failed render run actually failed at.
 
     Every failed render used to be reported as infrastructure whose retry might
@@ -3075,12 +3140,19 @@ def render_failure(work: Path, run_id: str, request_id: str, url: str) -> str:
         return (
             "Challenge rendering failed, and will fail the same way until it is fixed: "
             + "; ".join(str(problem) for problem in problems)
-            + f" ({url})"
+            + f" ({url})",
+            True,
         )
     return (
         "Challenge rendering did not complete, and no report says why, so this may be "
-        f"transient; the acceptance remains valid and registration may be retried: {url}"
+        f"transient; the acceptance remains valid and registration may be retried: {url}",
+        False,
     )
+
+
+def render_failure(work: Path, run_id: str, request_id: str, url: str) -> str:
+    """Return the operator diagnostic while preserving the historical API."""
+    return render_failure_details(work, run_id, request_id, url)[0]
 
 
 def resolve_remote_commit(repository: str, revision: str) -> str:
@@ -3664,7 +3736,7 @@ def run_review(args: argparse.Namespace) -> int:
         # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
         spend = load_json(spend_path) if spend_path.is_file() else None
-        state = deliver_review(state, stored, spend)
+        state = deliver_review(state, stored, spend, mechanical=mechanical)
         write_json(work / "state.json", state)
         (work / "review-sha256").write_text(
             registration_authorization.document_digest(stored) + "\n"
@@ -5119,7 +5191,10 @@ def submissions_needing_work() -> tuple[
             if _delivered_review_needs_rerun(record):
                 to_review.append(record)
             elif record.get("registration_consent") is True:
-                (to_finalize if record.get("registration_pr") else to_register).append(record)
+                if record.get("registration_pr"):
+                    to_finalize.append(record)
+                elif _before_now(record.get("registration_retry_after")):
+                    to_register.append(record)
     order = lambda rows: sorted(rows, key=lambda row: (row.get("created_at") or "", row["id"]))  # noqa: E731
     return (order(to_review), order(to_register), order(to_finalize), order(exhausted), order(cooling))
 
@@ -6058,6 +6133,7 @@ def auto(args: argparse.Namespace) -> int:
             continue
         print(f"::group::Register {record['id']}", flush=True)
         try:
+            begin_registration(record)
             register(argparse.Namespace(
                 submission=record["id"],
                 work_dir=args.work_dir,
@@ -6076,6 +6152,19 @@ def auto(args: argparse.Namespace) -> int:
         except Exception as error:
             failures += 1
             print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if (
+                fresh is not None
+                and fresh.get("status") == "review-ready"
+                and fresh.get("registration_consent") is True
+                and not fresh.get("registration_pr")
+            ):
+                record_registration_failure(
+                    fresh,
+                    error,
+                    deterministic=isinstance(error, DeterministicRegistrationError),
+                )
+                advanced += 1
         finally:
             print("::endgroup::", flush=True)
 
@@ -6186,6 +6275,50 @@ def list_queue(_: argparse.Namespace) -> int:
     return 0
 
 
+def retry_registration(args: argparse.Namespace) -> int:
+    """Requeue a paused registration after an operator has addressed its cause."""
+    submission_id = str(args.submission)
+    if not SUBMISSION_ID_RE.fullmatch(submission_id):
+        raise ReviewerError("submission id is malformed")
+    state = submission_state(submission_id)
+    review = delivered_review(submission_id)
+    checked = registration_authorization.validate_registration_retry(
+        submission_id,
+        review,
+        state,
+        state_repository=STATE_REPO,
+    )
+
+    # Queue first: if the following conditional state update races, the record
+    # remains safely paused. The reverse order could leave eligible work absent
+    # from the index until its weekly rebuild.
+    index = open_index()
+    if submission_id not in index["open"]:
+        updated_index = {
+            key: value for key, value in index.items() if key != "_blob_sha"
+        }
+        updated_index["open"] = [*index["open"], submission_id]
+        put_state(
+            OPEN_INDEX_PATH,
+            updated_index,
+            f"Requeue paused registration {submission_id}",
+            blob_sha=index.get("_blob_sha"),
+        )
+
+    advance_state(
+        checked,
+        "review-ready",
+        "Registration was queued again by an operator",
+        registration_attempts=0,
+        registration_started_at=None,
+        registration_retry_after=None,
+        registration_error=None,
+        registration_failure=None,
+    )
+    print(f"requeued registration for {submission_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="palomar-review")
     parser.add_argument(
@@ -6272,6 +6405,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_parser.add_argument("--dry-run", action="store_true")
     register_parser.set_defaults(func=register)
+    retry_parser = commands.add_parser(
+        "retry-registration",
+        help="requeue a paused registration after its cause has been addressed",
+    )
+    retry_parser.add_argument("--submission", type=str, required=True)
+    retry_parser.set_defaults(func=retry_registration)
     finalize_parser = commands.add_parser(
         "finalize",
         help="verify a merged database PR and close out the private submission record",

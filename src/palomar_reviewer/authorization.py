@@ -134,6 +134,8 @@ def _validate_registration_standing(
     submission_id: str,
     review: dict[str, Any],
     state: dict[str, Any],
+    *,
+    allowed_statuses: frozenset[str] = frozenset({"review-ready"}),
 ) -> None:
     """Require current consent and authority for one delivered review."""
     state_authorization = state.get("authorization")
@@ -151,11 +153,14 @@ def _validate_registration_standing(
     validate_push_proof(state)
     # A positive status, not merely "not withdrawn": a stale consent flag on a
     # record that has gone back to any other state must not authorize anything.
-    if state.get("status") != "review-ready":
-        raise ReviewerError(
-            f"submission {submission_id} is {state.get('status')}, and only a submission "
-            "holding a delivered review may be registered"
-        )
+    if state.get("status") not in allowed_statuses:
+        if allowed_statuses == frozenset({"review-ready"}):
+            raise ReviewerError(
+                f"submission {submission_id} is {state.get('status')}, and only a submission "
+                "holding a delivered review may be registered"
+            )
+        expected = " or ".join(sorted(allowed_statuses))
+        raise ReviewerError(f"submission {submission_id} is {state.get('status')}, not {expected}")
     if state.get("registered_entry"):
         raise ReviewerError(
             f"submission {submission_id} was already registered as {state['registered_entry']}"
@@ -185,6 +190,7 @@ def validate_registration_checkpoint(
     state: dict[str, Any] | None,
     *,
     state_repository: str,
+    allowed_statuses: frozenset[str] = frozenset({"review-ready"}),
 ) -> dict[str, Any]:
     """Authorize recovery of an already-created registration branch.
 
@@ -215,8 +221,35 @@ def validate_registration_checkpoint(
     for field in ("repository", "commit"):
         if source.get(field) != state.get(field):
             raise ReviewerError(f"review and state disagree on {field}")
-    _validate_registration_standing(submission_id, review, state)
+    _validate_registration_standing(
+        submission_id,
+        review,
+        state,
+        allowed_statuses=allowed_statuses,
+    )
     return state
+
+
+def validate_registration_retry(
+    submission_id: str,
+    review: dict[str, Any],
+    state: dict[str, Any] | None,
+    *,
+    state_repository: str,
+) -> dict[str, Any]:
+    """Authorize an operator retry without weakening registration consent.
+
+    A retry is only a queue operation. It does not manufacture fresh consent:
+    the same repository, commit, delivered review, write proof, and explicit
+    registration choice must still be present on the paused record.
+    """
+    return validate_registration_checkpoint(
+        submission_id,
+        review,
+        state,
+        state_repository=state_repository,
+        allowed_statuses=frozenset({"registration-paused"}),
+    )
 
 
 def validate_registration(

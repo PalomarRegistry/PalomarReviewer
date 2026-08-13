@@ -505,6 +505,20 @@ A renderer or infrastructure failure does not undo acceptance. Before making
 any public archive changes, `register` reserves the permanent ID and version in
 the private submission state. A retry reuses that identity and verifies or
 finishes the same archive refs instead of allocating an orphaned second ID.
+The automatic loop records each registration attempt before starting it. A
+render run with a concrete failure report pauses the registration immediately;
+an unexplained operational failure waits 30 minutes and pauses after three
+attempts. Paused work leaves the automatic queue, so it cannot keep the next
+consented submission behind it. After correcting the cause, an operator uses
+the State workflow's `retry_registration` input, or runs
+`palomar-review retry-registration --submission ID` with explicit State-write
+authority. That command revalidates the repository, commit, write proof,
+delivered review, and existing consent before restoring the queue entry.
+Full verification also records whether Mathlib's trusted cache client could
+supply the pinned dependency closure. Review delivery copies that typed result
+to private State, so the consent page can warn about a missing cache before the
+submitter chooses registration; an older cache client with no recognizable
+summary is reported as unknown rather than available or missing.
 If the earlier process reached the Database branch, the retry fetches the exact
 reserved entry from that branch before doing other work. It creates the missing
 PR from a valid branch or, for an existing PR, requires the exact branch, base,
