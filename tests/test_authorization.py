@@ -260,6 +260,28 @@ class RegistrationCheckpointAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "has not consented"):
             self.validate(review, state)
 
+    def test_operator_retry_only_authorizes_a_still_consented_paused_record(self):
+        _mechanical, review, state = current_contract()
+        state["status"] = "registration-paused"
+        self.assertIs(
+            authorization.validate_registration_retry(
+                SUBMISSION_ID,
+                review,
+                state,
+                state_repository=STATE_REPOSITORY,
+            ),
+            state,
+        )
+
+        state["status"] = "review-ready"
+        with self.assertRaisesRegex(ReviewerError, "not registration-paused"):
+            authorization.validate_registration_retry(
+                SUBMISSION_ID,
+                review,
+                state,
+                state_repository=STATE_REPOSITORY,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

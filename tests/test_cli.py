@@ -4377,6 +4377,83 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(first["review_attempts"], 1)
         self.assertEqual(second["review_attempts"], 2)
 
+    def test_a_registration_attempt_is_counted_before_work_starts(self):
+        with mock.patch.object(cli, "put_state"):
+            first = cli.begin_registration({
+                "id": "a1b2c3d4e5f6", "status": "review-ready", "events": []
+            })
+            second = cli.begin_registration(first)
+        self.assertEqual(first["registration_attempts"], 1)
+        self.assertEqual(second["registration_attempts"], 2)
+
+    def test_deterministic_registration_failure_pauses_immediately(self):
+        state = {
+            "id": "a1b2c3d4e5f6", "status": "review-ready", "events": [],
+            "registration_attempts": 1,
+        }
+        with mock.patch.object(cli, "put_state"):
+            updated = cli.record_registration_failure(
+                state,
+                ReviewerError("render input is invalid"),
+                deterministic=True,
+            )
+        self.assertEqual(updated["status"], "registration-paused")
+        self.assertEqual(updated["registration_failure"]["category"], "deterministic")
+        self.assertIsNone(updated["registration_retry_after"])
+
+    def test_transient_registration_failure_backs_off_then_pauses_at_the_limit(self):
+        with mock.patch.object(cli, "put_state"):
+            retrying = cli.record_registration_failure(
+                {"id": "a" * 12, "status": "review-ready", "events": [],
+                 "registration_attempts": 1},
+                ReviewerError("GitHub unavailable"),
+                deterministic=False,
+            )
+            paused = cli.record_registration_failure(
+                {"id": "b" * 12, "status": "review-ready", "events": [],
+                 "registration_attempts": cli.REGISTRATION_ATTEMPT_LIMIT},
+                ReviewerError("GitHub unavailable"),
+                deterministic=False,
+            )
+        self.assertEqual(retrying["status"], "review-ready")
+        self.assertIsNotNone(retrying["registration_retry_after"])
+        self.assertEqual(paused["status"], "registration-paused")
+
+    def test_operator_retry_requeues_before_unpausing_and_clears_attempt_state(self):
+        submission_id = "a1b2c3d4e5f6"
+        state = {
+            "id": submission_id,
+            "status": "registration-paused",
+            "events": [],
+            "_blob_sha": "state-sha",
+            "registration_attempts": 3,
+            "registration_error": "old failure",
+            "registration_failure": {"detail": "old failure"},
+        }
+        index = {"schema_version": 1, "open": [], "_blob_sha": "index-sha"}
+        review = {"submission_id": submission_id}
+        with (
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "delivered_review", return_value=review),
+            mock.patch.object(
+                cli.registration_authorization,
+                "validate_registration_retry",
+                return_value=state,
+            ),
+            mock.patch.object(cli, "open_index", return_value=index),
+            mock.patch.object(cli, "put_state") as write,
+        ):
+            self.assertEqual(
+                cli.retry_registration(SimpleNamespace(submission=submission_id)), 0
+            )
+        self.assertEqual(write.call_args_list[0].args[0], cli.OPEN_INDEX_PATH)
+        self.assertEqual(write.call_args_list[0].args[1]["open"], [submission_id])
+        updated = write.call_args_list[1].args[1]
+        self.assertEqual(updated["status"], "review-ready")
+        self.assertEqual(updated["registration_attempts"], 0)
+        self.assertIsNone(updated["registration_failure"])
+        self.assertIsNone(updated["registration_error"])
+
     def test_giving_up_says_so_to_the_submitter(self):
         with mock.patch.object(cli, "put_state") as write:
             state = cli.abandon_review(
@@ -4543,6 +4620,7 @@ class AutomaticLoopTests(unittest.TestCase):
         with (
             mock.patch.object(cli, "open_index", return_value={"open": ["aaaaaaaaaaaa"]}),
             mock.patch.object(cli, "submission_state", side_effect=read),
+            mock.patch.object(cli, "begin_registration", side_effect=lambda row: row),
             mock.patch.object(cli, "register", return_value=0) as registered,
             mock.patch.object(
                 cli, "gh",
@@ -4646,11 +4724,56 @@ class AutomaticLoopTests(unittest.TestCase):
         listing, state = self.records(*rows)
         with (
             listing, state,
+            mock.patch.object(cli, "begin_registration", side_effect=lambda row: row),
             mock.patch.object(cli, "register", return_value=0) as registered,
             mock.patch.object(cli, "finalize"),
         ):
             cli.auto(self.opts())
         self.assertEqual(registered.call_count, 1)
+
+    def test_a_registration_in_backoff_does_not_block_the_next_one(self):
+        cooling = self.row(
+            "aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+            registration_retry_after=cli.utc_after(600),
+        )
+        ready = self.row(
+            "bbbbbbbbbbbb", status="review-ready", registration_consent=True,
+        )
+        self.assertEqual(self.split(cooling, ready), [[], ["bbbbbbbbbbbb"], []])
+
+    def test_a_deterministic_failure_advances_the_queue_to_the_next_pass(self):
+        first = self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True)
+        second = self.row("bbbbbbbbbbbb", status="review-ready", registration_consent=True)
+        listing, state = self.records(first, second)
+        with (
+            listing, state,
+            mock.patch.object(cli, "begin_registration", side_effect=lambda row: row),
+            mock.patch.object(
+                cli, "register", side_effect=cli.DeterministicRegistrationError("bad render")
+            ) as registered,
+            mock.patch.object(cli, "record_registration_failure", return_value={
+                **first, "status": "registration-paused"
+            }) as recorded,
+            mock.patch.object(cli, "request_another_pass") as again,
+        ):
+            self.assertEqual(cli.auto(self.opts(self_dispatch=True)), 1)
+        registered.assert_called_once()
+        self.assertTrue(recorded.call_args.kwargs["deterministic"])
+        again.assert_called_once_with(0, 5)
+
+    def test_a_failure_after_the_database_pr_exists_stays_on_finalization_recovery(self):
+        before = self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True)
+        after = {**before, "registration_pr": 7}
+        with (
+            mock.patch.object(cli, "open_index", return_value={"open": [before["id"]]}),
+            mock.patch.object(cli, "submission_state", side_effect=[before, after, after]),
+            mock.patch.object(cli, "begin_registration", side_effect=lambda row: row),
+            mock.patch.object(cli, "register", return_value=0),
+            mock.patch.object(cli, "advance_registration", side_effect=ReviewerError("API down")),
+            mock.patch.object(cli, "record_registration_failure") as recorded,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        recorded.assert_not_called()
 
     def test_finalizing_waits_for_the_database_change_to_merge(self):
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
@@ -5753,6 +5876,30 @@ class DeliveredReviewChainTests(unittest.TestCase):
         self.assertIsNone(updated["registration_attempt"])
         self.assertEqual(written["submissions/a1b2c3d4e5f6/review.json"][0], review)
         self.assertEqual(written["submissions/a1b2c3d4e5f6/state.json"][1], "blob-1")
+
+    def test_delivery_carries_a_missing_mathlib_cache_to_the_consent_page(self):
+        state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": []}
+        review = {
+            "schema_version": 2,
+            "submission_id": state["id"],
+            "decision": "accept",
+        }
+        with (
+            mock.patch.object(cli, "put_state"),
+            mock.patch.object(cli, "state_json", return_value=None),
+        ):
+            missing = cli.deliver_review(
+                state,
+                review,
+                mechanical={"mathlib_cache": {"required": True, "available": False}},
+            )
+            absent = cli.deliver_review(
+                state,
+                review,
+                mechanical={"mathlib_cache": {"required": False, "available": None}},
+            )
+        self.assertIs(missing["mathlib_cache_available"], False)
+        self.assertIsNone(absent["mathlib_cache_available"])
 
     def test_the_delivered_bytes_are_what_the_record_cites(self):
         """Delivered digest, consented digest, archived bytes, and record agree."""

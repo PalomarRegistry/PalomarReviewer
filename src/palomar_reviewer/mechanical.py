@@ -51,6 +51,15 @@ MECHANICAL_REPORT_SCHEMA = {
         "schema_version": {"const": 1},
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
+        "mathlib_cache": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["required", "available"],
+            "properties": {
+                "required": {"type": "boolean"},
+                "available": {"type": ["boolean", "null"]},
+            },
+        },
         # Closed, and deliberately narrow: the whole report is archived in the
         # public evidence bundle, so anything this block accepts becomes public.
         # A submitter identity must not be able to ride in here.
