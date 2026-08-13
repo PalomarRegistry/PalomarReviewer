@@ -8088,6 +8088,8 @@ class FailureDiagnosticTests(unittest.TestCase):
         return {
             "schema_version": 1,
             "status": "fail",
+            "stage": "preflight",
+            "phase": "preparation",
             "submission": {"submission_id": "a1b2c3d4e5f6"},
             "source": {"repository": "owner/project", "commit": "a" * 40},
             "diagnostics_schema_version": 1,
@@ -8098,6 +8100,7 @@ class FailureDiagnosticTests(unittest.TestCase):
     def test_failure_report_is_bound_and_redacted(self):
         result = cli.validated_failure_report(self.report(self.diagnostic()), self.state())
         self.assertEqual(result["profile_version"], 1)
+        self.assertEqual(result["phase"], "preparation")
         self.assertEqual(result["diagnostics"][0]["field"], "project.name")
         self.assertEqual(result["diagnostics"][0]["location"]["line"], 2)
         self.assertNotIn("unexpected", result["diagnostics"][0])
@@ -8113,6 +8116,18 @@ class FailureDiagnosticTests(unittest.TestCase):
         self.assertEqual(result["repair_draft"]["values"]["project.name"], "Legacy name")
         report["formalization_repair_draft"]["values"]["unexpected"] = "value"
         with self.assertRaisesRegex(ReviewerError, "unsupported field"):
+            cli.validated_failure_report(report, self.state())
+
+    def test_legacy_failure_report_without_phase_remains_valid(self):
+        report = self.report(self.diagnostic())
+        del report["phase"]
+        result = cli.validated_failure_report(report, self.state())
+        self.assertNotIn("phase", result)
+
+    def test_unknown_report_phase_is_rejected(self):
+        report = self.report(self.diagnostic())
+        report["phase"] = "some-new-phase"
+        with self.assertRaisesRegex(ReviewerError, "unsupported report phase"):
             cli.validated_failure_report(report, self.state())
 
     def test_only_submitter_diagnostics_produce_changes_required(self):
@@ -8174,6 +8189,55 @@ class FailureDiagnosticTests(unittest.TestCase):
         diagnostic = advance.call_args.kwargs["failure"]["diagnostics"][0]
         self.assertEqual(diagnostic["owner"], "palomar")
         self.assertTrue(diagnostic["retryable"])
+
+    def test_full_preparation_failure_remains_repairable(self):
+        state = self.state("verification-reporting")
+        report = self.report(self.diagnostic())
+        report["stage"] = "formalization"
+        run_data = {"databaseId": 202, "url": "https://example.test/verify"}
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "mechanical-report.json"
+            artifact.write_text(json.dumps(report))
+            with (
+                mock.patch.object(cli, "trusted_submission_run", return_value=run_data),
+                mock.patch.object(cli, "validate_workflow_commit_on_main"),
+                mock.patch.object(cli, "download_mechanical_artifact", return_value=artifact),
+                mock.patch.object(cli, "advance_state", return_value={}) as advance,
+            ):
+                cli.ingest_failure_diagnostics(state, Path(directory))
+        self.assertEqual(advance.call_args.args[1], "changes-required")
+        self.assertEqual(advance.call_args.kwargs["failure"]["phase"], "preparation")
+
+    def test_full_execution_failure_keeps_verification_terminal(self):
+        state = self.state("verification-reporting")
+        report = self.report(self.diagnostic())
+        report["stage"] = "comparator"
+        report["phase"] = "verification"
+        run_data = {"databaseId": 202, "url": "https://example.test/verify"}
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "mechanical-report.json"
+            artifact.write_text(json.dumps(report))
+            with (
+                mock.patch.object(cli, "trusted_submission_run", return_value=run_data),
+                mock.patch.object(cli, "validate_workflow_commit_on_main"),
+                mock.patch.object(cli, "download_mechanical_artifact", return_value=artifact),
+                mock.patch.object(cli, "advance_state", return_value={}) as advance,
+            ):
+                cli.ingest_failure_diagnostics(state, Path(directory))
+        self.assertEqual(advance.call_args.args[1], "verification-failed")
+        self.assertEqual(advance.call_args.kwargs["failure"]["phase"], "verification")
+
+    def test_missing_full_artifact_defaults_to_provider_verification_error(self):
+        state = self.state("verification-reporting")
+        with (
+            mock.patch.object(
+                cli, "trusted_submission_run", side_effect=ReviewerError("wrong run")
+            ),
+            mock.patch.object(cli, "advance_state", return_value={}) as advance,
+        ):
+            cli.ingest_failure_diagnostics(state, Path("unused"))
+        self.assertEqual(advance.call_args.args[1], "verification-error")
+        self.assertEqual(advance.call_args.kwargs["failure"]["phase"], "verification")
 
     def test_new_terminal_statuses_leave_the_reviewer_queue(self):
         for status in (
@@ -8476,7 +8540,7 @@ class RepairFailureMigrationTests(unittest.TestCase):
             "retryable": False, "repairable": True, "field": "project.name",
         }
         return {
-            "schema_version": 1, "status": "fail",
+            "schema_version": 1, "status": "fail", "stage": "preflight",
             "submission": {"submission_id": "a1b2c3d4e5f6"},
             "source": {"repository": "owner/project", "commit": "a" * 40},
             "diagnostics_schema_version": 1, "formalization_profile_version": 2,

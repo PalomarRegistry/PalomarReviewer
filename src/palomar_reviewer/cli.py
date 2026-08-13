@@ -2196,6 +2196,9 @@ def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, An
         raise ReviewerError("failure artifact is not a schema-version-1 report")
     if report.get("status") not in {"fail", "error"}:
         raise ReviewerError("failure artifact does not record a failed outcome")
+    phase = report.get("phase")
+    if phase is not None and phase not in {"preparation", "verification"}:
+        raise ReviewerError("failure artifact has an unsupported report phase")
     if report.get("diagnostics_schema_version") != DIAGNOSTICS_SCHEMA_VERSION:
         raise ReviewerError("failure artifact has no supported diagnostics contract")
     submission = report.get("submission")
@@ -2218,6 +2221,8 @@ def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, An
         "diagnostics": [_bounded_diagnostic(item) for item in diagnostics],
         "profile_version": profile_version,
     }
+    if phase is not None:
+        result["phase"] = phase
     draft = report.get("formalization_repair_draft")
     if draft is not None:
         if profile_version != 2:
@@ -2251,6 +2256,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         return state
     mode = "preflight" if reporting == "preflight-reporting" else "full"
     run_data: dict[str, Any] | None = None
+    phase = "preparation" if mode == "preflight" else "verification"
     try:
         run_data = trusted_submission_run(state, mode=mode, conclusion=None)
         validate_workflow_commit_on_main(run_data)
@@ -2263,11 +2269,15 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         validated = validated_failure_report(load_json(report_path), state)
         diagnostics = validated["diagnostics"]
         profile_version = validated["profile_version"]
+        phase = validated.get("phase", phase)
+        if mode == "preflight" and phase != "preparation":
+            raise ReviewerError("preflight failure artifact names a verification phase")
         repair_draft = validated.get("repair_draft")
     except Exception as error:  # a diagnosis failure must itself be explained
         diagnostics = _diagnostics_unavailable(error)
         profile_version = None
         repair_draft = None
+        phase = "preparation" if mode == "preflight" else "verification"
 
     submitter_work = any(item["owner"] == "submitter" for item in diagnostics)
     if mode == "preflight":
@@ -2276,6 +2286,13 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
             "Preflight found repository changes that are required"
             if submitter_work
             else "Palomar could not complete preflight"
+        )
+    elif phase == "preparation":
+        terminal = "changes-required" if submitter_work else "verification-error"
+        note = (
+            "Preparation found repository changes that are required"
+            if submitter_work
+            else "Palomar could not complete submission preparation"
         )
     else:
         terminal = "verification-failed" if submitter_work else "verification-error"
@@ -2288,6 +2305,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
     failure = {
         "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "mode": mode,
+        "phase": phase,
         "run": {
             "id": recorded_run.get("id"),
             "url": (run_data or {}).get("url") or recorded_run.get("url"),
@@ -5905,7 +5923,8 @@ def upgrade_repair_failures(args: argparse.Namespace) -> int:
             old_failure = fresh["failure"]
             failure = {
                 "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
-                "mode": "preflight",
+                "mode": old_failure.get("mode", "preflight"),
+                "phase": old_failure.get("phase", "preparation"),
                 "run": old_failure.get("run"),
                 "profile_version": 2,
                 "diagnostics": diagnostics,
