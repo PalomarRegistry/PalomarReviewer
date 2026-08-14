@@ -490,7 +490,11 @@ an ordinary organization member and store its credential as
 creates a repository-level ruleset on each new public fork that permits new
 `refs/tags/palomar/**/*` tags but prevents updating or deleting existing ones,
 and then removes the machine account's repository-admin grant so it falls back
-to the organization's base Write role. The account makes native forks, adds
+to the organization's base Write role. Preservation refs carry submitter-authored
+trees, workflow files included, so before pushing to an archive fork the reviewer
+reads that fork's own Actions setting and refuses to push while Actions is
+enabled or the setting cannot be read; the `PalomarRepairs` fork is checked the
+same way. The account makes native forks, adds
 new preservation refs, and stars the original top-level source after its
 registration completes. `palomar-review star-registered` is idempotent: it
 verifies each star before recording it in private state, and an interrupted or

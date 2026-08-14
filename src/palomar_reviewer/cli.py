@@ -1146,6 +1146,31 @@ def _network_root(metadata: dict[str, Any]) -> str:
     return candidate
 
 
+def _ensure_archive_actions_disabled(fork_repository: str) -> None:
+    """Refuse to hand submitter-authored commits to a fork that can run them.
+
+    A preservation ref carries whatever the submitter committed, workflow files
+    included. GitHub disables Actions on a new fork by default and the
+    organization disables it outright, but a default and an organization
+    setting are both observable state rather than invariants this code holds,
+    so confirm the fork's own setting before pushing to it. The repair fork is
+    checked the same way before Palomar pushes repairs to it.
+    """
+    response = archive_api(f"repos/{fork_repository}/actions/permissions", check=False)
+    if response.returncode != 0:
+        detail = f"{response.stderr}\n{response.stdout}".strip()[-1000:]
+        raise ReviewerError(
+            f"cannot confirm GitHub Actions is disabled on {fork_repository}, so Palomar "
+            f"will not push preservation refs to it: {detail}"
+        )
+    permissions = _json_response(response, f"checking Actions on {fork_repository}")
+    if permissions.get("enabled") is not False:
+        raise ReviewerError(
+            f"GitHub Actions is enabled on {fork_repository}; disable it before Palomar "
+            "pushes preservation refs"
+        )
+
+
 def _ensure_archive_fork(source_repository: str, network_root: str) -> str:
     name = archive_repository_name(network_root)
     expected = f"{ARCHIVE_OWNER}/{name}"
@@ -1169,7 +1194,9 @@ def _ensure_archive_fork(source_repository: str, network_root: str) -> str:
             raise ReviewerError(f"archive fork {expected} was not ready after five minutes")
     if _network_root(existing).casefold() != network_root.casefold():
         raise ReviewerError(f"archive repository collision: {expected} is in another fork network")
-    return str(existing.get("full_name") or expected)
+    fork = str(existing.get("full_name") or expected)
+    _ensure_archive_actions_disabled(fork)
+    return fork
 
 
 def _archive_ruleset_body() -> dict[str, Any]:
