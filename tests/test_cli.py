@@ -9069,12 +9069,31 @@ class MetadataRepairTests(UsesCapabilities, unittest.TestCase):
                 {"PATH", "GEM_HOME", "NO_PROXY", "HTTPS_PROXY", "HOME", "BUNDLE_GEMFILE", "TMPDIR"},
             )
 
-            with mock.patch.dict(os.environ, {
-                "PATH": "/bin",
-                "HTTPS_PROXY": "https://operator:hunter2@proxy.example.invalid:3128",
-            }, clear=True):
-                with self.assertRaisesRegex(ReviewerError, "carries credentials in its URL"):
+            # The scheme is optional in the proxy syntax Git and curl accept,
+            # and a scheme-less value has no netloc to look in at all, so each
+            # spelling is read as the authority it is.
+            for value in (
+                "https://operator:hunter2@proxy.example.invalid:3128",
+                "https://operator@proxy.example.invalid:3128",
+                "operator:hunter2@proxy.example.invalid:3128",
+                "operator@proxy.example.invalid:3128",
+            ):
+                with (
+                    mock.patch.dict(
+                        os.environ, {"PATH": "/bin", "HTTPS_PROXY": value}, clear=True
+                    ),
+                    self.assertRaisesRegex(ReviewerError, "carries credentials in its URL"),
+                ):
                     cli._repair_preflight_environment(root / "pipeline", home)
+
+            # A proxy that names no credential is carried, with or without a
+            # scheme, so the check is not just refusing everything.
+            for value in ("https://proxy.example.invalid:3128", "proxy.example.invalid:3128"):
+                with mock.patch.dict(
+                    os.environ, {"PATH": "/bin", "HTTP_PROXY": value}, clear=True
+                ):
+                    environment = cli._repair_preflight_environment(root / "pipeline", home)
+                self.assertEqual(environment["HTTP_PROXY"], value)
 
     def test_repair_preflight_exports_the_tracked_pipeline_only(self):
         # A working checkout holds .git, whose config carries the credential a

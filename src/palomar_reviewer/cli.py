@@ -5966,6 +5966,24 @@ PREFLIGHT_ENVIRONMENT_NAMES = (
 PREFLIGHT_PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY")
 
 
+def _proxy_carries_userinfo(value: str) -> bool:
+    """Whether a proxy setting names a user or a password, however it is spelt.
+
+    The scheme is optional in the proxy syntax Git and curl accept, and a value
+    with no `://` has no network location as far as `urlsplit` is concerned:
+    `operator:hunter2@proxy.example:3128` parses as a path, and asking that
+    result about userinfo answers no about a value that plainly has some. So a
+    scheme-less value is read as the authority it is. Anything that will not
+    parse at all is treated as carrying a credential, because the alternative
+    is passing an unread string into a namespace on a shared network.
+    """
+    try:
+        parsed = urlsplit(value if "://" in value else f"//{value}")
+        return parsed.username is not None or parsed.password is not None
+    except ValueError:
+        return True
+
+
 def _repair_preflight_environment(
     checkout: Path, home: Path, vendored: Path | None = None
 ) -> dict[str, str]:
@@ -5979,7 +5997,7 @@ def _repair_preflight_environment(
         value = os.environ.get(name, "").strip()
         if not value:
             continue
-        if "@" in urlsplit(value).netloc:
+        if _proxy_carries_userinfo(value):
             raise ReviewerError(
                 f"{name} carries credentials in its URL, and repair preflight will not hand "
                 "them to candidate-controlled intake; give the proxy no userinfo, or unset it"
