@@ -23,9 +23,12 @@ The contract, exactly:
   upstream authorization before forwarding; the capability never leaves the
   runner and the upstream key never enters the namespace.
 * The request body must be one JSON object of the shape pinned Codex sends: the
-  configured model, the configured reasoning effort exactly, `stream` true, and
-  no stored, background, continued, priority or provider-hosted-tool request,
-  because those are the ones whose cost or reach nothing here could bound.
+  configured model, the configured reasoning effort exactly, `stream` true,
+  `store` false, and no background, continued, priority or provider-hosted-tool
+  request, because those are the ones whose cost or reach nothing here could
+  bound. `store` is required to be there and to be `false`, not merely not
+  `true`: omitting it asks the provider for its default, and that default is to
+  keep the response for thirty days.
 * Request headers are forwarded from a fixed allowlist of what pinned Codex
   sends, and response headers from what it reads. Anything else a process in
   the namespace invents is dropped rather than handed to the provider, and
@@ -615,9 +618,12 @@ class _Handler(BaseHTTPRequestHandler):
             return f"this broker serves only {self.policy.model}", "unexpected model"
         if request.get("stream") is not True:
             return "this broker serves only streamed responses", "unexpected stream mode"
-        if request.get("store") is True:
-            # Pinned Codex sends `store: false`. A stored response is provider-
-            # side state this review never asked for and cannot clean up.
+        if request.get("store") is not False:
+            # Exactly `store: false`, which is what pinned Codex sends on every
+            # call, and not "false or nothing": the Responses API stores the
+            # response for thirty days when `store` is omitted, so an omitted
+            # or null field is a request for provider-side state this review
+            # never asked for and cannot clean up.
             return "this broker serves only unstored responses", "unexpected store mode"
         for field in REFUSED_REQUEST_FIELDS:
             if request.get(field) not in (None, False):
