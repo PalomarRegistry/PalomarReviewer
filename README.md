@@ -491,10 +491,22 @@ creates a repository-level ruleset on each new public fork that permits new
 `refs/tags/palomar/**/*` tags but prevents updating or deleting existing ones,
 and then removes the machine account's repository-admin grant so it falls back
 to the organization's base Write role. Preservation refs carry submitter-authored
-trees, workflow files included, so before pushing to an archive fork the reviewer
-reads that fork's own Actions setting and refuses to push while Actions is
-enabled or the setting cannot be read; the `PalomarRepairs` fork is checked the
-same way. The account makes native forks, adds
+trees, workflow files included, so before anything is pushed to a fork the
+reviewer reads that fork's own Actions setting. On the run that creates the
+fork, while the account is still its administrator, the setting must read back
+disabled or nothing is pushed, no ruleset is written, and the account is not
+demoted. Later runs preserving into the same fork ask again, and an enabled
+setting still refuses; but reading that setting needs the administrator grant
+the creating run gave up, so GitHub answers those reads with a 403. That
+specific 403 is announced as a warning and preservation continues, because
+refusing it would refuse every re-preservation for a state the reviewer created
+itself. What covers the residual is the organization-wide Actions policy
+(`enabled_repositories=none` on `PalomarArchive`) and the fact that only an
+organization administrator can turn Actions on for a repository; giving the
+reviewer a second credential with `Administration: read` would close it, at the
+cost of another credential to hold. Any other failed read still refuses, and the
+`PalomarRepairs` fork, whose account is never demoted, is checked strictly every
+time. The account makes native forks, adds
 new preservation refs, and stars the original top-level source after its
 registration completes. `palomar-review star-registered` is idempotent: it
 verifies each star before recording it in private state, and an interrupted or

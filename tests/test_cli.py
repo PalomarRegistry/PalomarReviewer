@@ -506,8 +506,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             mock.patch.object(
                 cli,
                 "_ensure_archive_fork",
-                return_value="PalomarArchive/upstream--network-root--fixture",
+                return_value=("PalomarArchive/upstream--network-root--fixture", False),
             ) as ensure_fork,
+            mock.patch.object(cli, "_ensure_archive_actions_disabled") as ensure_actions,
             mock.patch.object(cli, "_ensure_archive_ruleset") as ensure_ruleset,
             mock.patch.object(cli, "_drop_archive_admin") as drop_admin,
             mock.patch.object(cli, "_ensure_archive_ref") as ensure_ref,
@@ -522,6 +523,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
         validate_token.assert_called_once_with()
         ensure_fork.assert_called_once_with("example/project", "upstream/network-root")
+        ensure_actions.assert_called_once_with(
+            "PalomarArchive/upstream--network-root--fixture", strict=False
+        )
         ensure_ruleset.assert_called_once_with("PalomarArchive/upstream--network-root--fixture")
         drop_admin.assert_called_once_with("PalomarArchive/upstream--network-root--fixture")
         self.assertEqual(ensure_ref.call_count, 2)
@@ -546,8 +550,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             mock.patch.object(cli, "_archive_get", side_effect=archive_get),
             mock.patch.object(cli, "validate_archive_token"),
             mock.patch.object(
-                cli, "_ensure_archive_fork", return_value="PalomarArchive/new-owner--project"
+                cli, "_ensure_archive_fork", return_value=("PalomarArchive/new-owner--project", True)
             ) as ensure_fork,
+            mock.patch.object(cli, "_ensure_archive_actions_disabled") as ensure_actions,
             mock.patch.object(cli, "_ensure_archive_ruleset"),
             mock.patch.object(cli, "_drop_archive_admin"),
             mock.patch.object(cli, "_ensure_archive_ref") as ensure_ref,
@@ -561,6 +566,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             )
 
         ensure_fork.assert_called_once_with("new-owner/project", "new-owner/project")
+        ensure_actions.assert_called_once_with("PalomarArchive/new-owner--project", strict=True)
         self.assertEqual(ensure_ref.call_args.args[0], "new-owner/project")
         self.assertEqual(preservation["repositories"][0]["source_repository"], "example/project")
 
@@ -725,96 +731,225 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             method="DELETE",
         )
 
-    def test_archive_fork_is_refused_while_it_can_run_actions(self):
-        network_root = "upstream/network-root"
-        fork = f"{cli.ARCHIVE_OWNER}/{cli.archive_repository_name(network_root)}"
-        endpoints = []
+    ARCHIVE_DEMOTED_403 = "gh: Must have admin rights to Repository. (HTTP 403)"
 
-        def answering(payload):
-            def archive_api(endpoint, *, method="GET", body=None, check=True):
-                endpoints.append((endpoint, method, check))
-                return subprocess.CompletedProcess(["gh", "api"], 0, json.dumps(payload), "")
-
-            return archive_api
-
-        metadata = {"full_name": fork, "source": {"full_name": network_root}}
-        # An enabled setting, an absent one, and anything that is not the
-        # boolean false all leave the fork able to run submitted workflows.
-        for payload in ({"enabled": True}, {}, {"enabled": "false"}, {"enabled": None}):
-            with (
-                mock.patch.object(cli, "_archive_get", return_value=metadata),
-                mock.patch.object(cli, "archive_api", side_effect=answering(payload)),
-                self.assertRaisesRegex(ReviewerError, "Actions is enabled"),
-            ):
-                cli._ensure_archive_fork("example/project", network_root)
-
-        with (
-            mock.patch.object(cli, "_archive_get", return_value=metadata),
-            mock.patch.object(cli, "archive_api", side_effect=answering({"enabled": False})),
-        ):
-            self.assertEqual(cli._ensure_archive_fork("example/project", network_root), fork)
-
-        self.assertEqual(set(endpoints), {(f"repos/{fork}/actions/permissions", "GET", False)})
-
-    def test_archive_fork_is_refused_when_the_actions_setting_cannot_be_read(self):
-        network_root = "upstream/network-root"
-        fork = f"{cli.ARCHIVE_OWNER}/{cli.archive_repository_name(network_root)}"
-
-        def archive_api(endpoint, *, method="GET", body=None, check=True):
-            return subprocess.CompletedProcess(
-                ["gh", "api"], 1, "", "gh: Must have admin rights to Repository. (HTTP 403)"
-            )
-
-        with (
-            mock.patch.object(
-                cli,
-                "_archive_get",
-                return_value={"full_name": fork, "source": {"full_name": network_root}},
-            ),
-            mock.patch.object(cli, "archive_api", side_effect=archive_api),
-            self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
-        ):
-            cli._ensure_archive_fork("example/project", network_root)
-
-    def test_preservation_pushes_nothing_while_the_fork_can_run_actions(self):
+    def one_network_fixture(self):
+        """One submitted repository, so one fork and one archive lifecycle."""
         mechanical = self.mechanical_fixture()
+        mechanical["project_dependencies"] = []
+        return mechanical
+
+    def archive_world(self, answer, *, fork_exists, events=None):
+        """Fakes for one fork network: the reads, and the Actions answer.
+
+        `answer` is what `gh api .../actions/permissions` returns. `events`
+        records the order the archive steps happen in, which is the whole point
+        of the check's placement: the setting is read while the account can
+        still read it and before anything is pushed.
+        """
+        network_root = "upstream/network-root"
+        fork = f"{cli.ARCHIVE_OWNER}/{cli.archive_repository_name(network_root)}"
+        state = {"forked": fork_exists}
+        log = events if events is not None else []
 
         def archive_get(endpoint, _context):
             if "/git/commits/" in endpoint:
                 return {"sha": endpoint.rsplit("/", 1)[-1]}
             repository = endpoint.removeprefix("repos/")
-            return {
-                "full_name": repository,
-                "source": {"full_name": "upstream/network-root"},
-            }
+            if repository == fork and not state["forked"]:
+                return None
+            return {"full_name": repository, "source": {"full_name": network_root}}
 
         def archive_api(endpoint, *, method="GET", body=None, check=True):
-            self.assertTrue(endpoint.endswith("/actions/permissions"))
-            return subprocess.CompletedProcess(
-                ["gh", "api"], 0, json.dumps({"enabled": True}), ""
+            if endpoint.endswith("/forks"):
+                log.append("fork")
+                state["forked"] = True
+                return subprocess.CompletedProcess(["gh", "api"], 0, "{}", "")
+            self.assertEqual((endpoint, method, check), (f"repos/{fork}/actions/permissions", "GET", False))
+            log.append("actions")
+            return answer
+
+        return fork, archive_get, archive_api
+
+    def test_archive_actions_answer_must_be_exactly_disabled(self):
+        # An enabled setting, an absent one, and anything that is not the
+        # boolean false all leave the fork able to run submitted workflows.
+        for payload in ({"enabled": True}, {}, {"enabled": "false"}, {"enabled": None}):
+            for strict in (True, False):
+                answer = subprocess.CompletedProcess(["gh", "api"], 0, json.dumps(payload), "")
+                with (
+                    mock.patch.object(cli, "archive_api", return_value=answer),
+                    self.assertRaisesRegex(ReviewerError, "Actions is enabled"),
+                ):
+                    cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=strict)
+
+        answer = subprocess.CompletedProcess(["gh", "api"], 0, json.dumps({"enabled": False}), "")
+        for strict in (True, False):
+            with mock.patch.object(cli, "archive_api", return_value=answer) as archive_api:
+                cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=strict)
+            archive_api.assert_called_once_with(
+                "repos/PalomarArchive/fixture/actions/permissions", check=False
             )
 
+    def test_only_the_demotion_this_code_performs_excuses_an_unreadable_setting(self):
+        # The 403 GitHub gives a secondary rate limit says nothing about the
+        # grant, and a fork that has stopped answering at all says less.
+        self.assertTrue(cli._archive_actions_read_denied(self.ARCHIVE_DEMOTED_403))
+        self.assertTrue(
+            cli._archive_actions_read_denied("HTTP 403: Resource not accessible by integration")
+        )
+        self.assertFalse(
+            cli._archive_actions_read_denied("HTTP 403: You have exceeded a secondary rate limit")
+        )
+        self.assertFalse(cli._archive_actions_read_denied("HTTP 404: Not Found"))
+        self.assertFalse(cli._archive_actions_read_denied("HTTP 502: Bad Gateway"))
+
+        # The creating run holds the grant, so nothing excuses it there.
+        answer = subprocess.CompletedProcess(["gh", "api"], 1, "", self.ARCHIVE_DEMOTED_403)
+        with (
+            mock.patch.object(cli, "archive_api", return_value=answer),
+            self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
+        ):
+            cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=True)
+        printed = io.StringIO()
+        with (
+            mock.patch.object(cli, "archive_api", return_value=answer),
+            contextlib.redirect_stdout(printed),
+        ):
+            cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
+        self.assertIn("::warning::cannot read the Actions setting", printed.getvalue())
+
+    def test_new_archive_fork_is_verified_before_a_ruleset_a_demotion_or_a_push(self):
+        events = []
+        fork, archive_get, archive_api = self.archive_world(
+            subprocess.CompletedProcess(["gh", "api"], 0, json.dumps({"enabled": False}), ""),
+            fork_exists=False,
+            events=events,
+        )
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(cli, "_archive_get", side_effect=archive_get),
             mock.patch.object(cli, "validate_archive_token"),
             mock.patch.object(cli, "archive_api", side_effect=archive_api),
-            mock.patch.object(cli, "_ensure_archive_ruleset") as ensure_ruleset,
-            mock.patch.object(cli, "_drop_archive_admin") as drop_admin,
-            mock.patch.object(cli, "_push_archive_ref") as push,
-            self.assertRaisesRegex(ReviewerError, "Actions is enabled"),
+            mock.patch.object(cli.time, "sleep"),
+            mock.patch.object(
+                cli, "_ensure_archive_ruleset", side_effect=lambda _fork: events.append("ruleset")
+            ),
+            mock.patch.object(
+                cli, "_drop_archive_admin", side_effect=lambda _fork: events.append("demote")
+            ),
+            mock.patch.object(
+                cli, "_ensure_archive_ref", side_effect=lambda *_args: events.append("push")
+            ),
         ):
-            preserve_sources(
+            preservation = preserve_sources(
                 Path(directory),
-                mechanical,
+                self.one_network_fixture(),
                 permanent_id="PALOMAR-2026-08-01-000012",
                 version=1,
                 dry_run=False,
             )
 
+        self.assertEqual(events, ["fork", "actions", "ruleset", "demote", "push"])
+        self.assertEqual(preservation["repositories"][0]["fork_repository"], fork)
+
+    def test_new_archive_fork_that_can_run_actions_stops_the_whole_lifecycle(self):
+        fork, archive_get, archive_api = self.archive_world(
+            subprocess.CompletedProcess(["gh", "api"], 0, json.dumps({"enabled": True}), ""),
+            fork_exists=False,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+            mock.patch.object(cli, "validate_archive_token"),
+            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(cli.time, "sleep"),
+            mock.patch.object(cli, "_ensure_archive_ruleset") as ensure_ruleset,
+            mock.patch.object(cli, "_drop_archive_admin") as drop_admin,
+            mock.patch.object(cli, "_push_archive_ref") as push,
+            self.assertRaisesRegex(ReviewerError, f"Actions is enabled on {fork}"),
+        ):
+            preserve_sources(
+                Path(directory),
+                self.one_network_fixture(),
+                permanent_id="PALOMAR-2026-08-01-000012",
+                version=1,
+                dry_run=False,
+            )
+
+        # No submitted commit reached the fork, no ruleset was written to it,
+        # and the account was not demoted out of being able to look again.
         push.assert_not_called()
         ensure_ruleset.assert_not_called()
         drop_admin.assert_not_called()
+
+    def test_re_preservation_continues_and_says_so_when_the_demotion_hides_the_setting(self):
+        events = []
+        fork, archive_get, archive_api = self.archive_world(
+            subprocess.CompletedProcess(["gh", "api"], 1, "", self.ARCHIVE_DEMOTED_403),
+            fork_exists=True,
+            events=events,
+        )
+        printed = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+            mock.patch.object(cli, "validate_archive_token"),
+            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(cli, "_ensure_archive_ruleset"),
+            mock.patch.object(cli, "_drop_archive_admin"),
+            mock.patch.object(
+                cli, "_ensure_archive_ref", side_effect=lambda *_args: events.append("push")
+            ),
+            contextlib.redirect_stdout(printed),
+        ):
+            preservation = preserve_sources(
+                Path(directory),
+                self.one_network_fixture(),
+                permanent_id="PALOMAR-2026-08-01-000012",
+                version=2,
+                dry_run=False,
+            )
+
+        # The fork this run preserves into is one an earlier run created and
+        # then demoted itself out of reading, so the run carries on saying what
+        # it could not check and what stands in for it.
+        self.assertEqual(events, ["actions", "push"])
+        self.assertEqual(preservation["repositories"][0]["fork_repository"], fork)
+        warning = printed.getvalue()
+        self.assertIn(f"::warning::cannot read the Actions setting on {fork}", warning)
+        self.assertIn("demoted", warning)
+        self.assertIn(f"{cli.ARCHIVE_OWNER} organization policy disabling Actions", warning)
+
+    def test_re_preservation_refuses_when_the_setting_fails_to_read_for_any_other_reason(self):
+        for stderr in (
+            "gh: Not Found (HTTP 404)",
+            "gh: Bad gateway (HTTP 502)",
+            "gh: You have exceeded a secondary rate limit (HTTP 403)",
+        ):
+            fork, archive_get, archive_api = self.archive_world(
+                subprocess.CompletedProcess(["gh", "api"], 1, "", stderr),
+                fork_exists=True,
+            )
+            with (
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+                mock.patch.object(cli, "validate_archive_token"),
+                mock.patch.object(cli, "archive_api", side_effect=archive_api),
+                mock.patch.object(cli, "_ensure_archive_ruleset") as ensure_ruleset,
+                mock.patch.object(cli, "_drop_archive_admin"),
+                mock.patch.object(cli, "_push_archive_ref") as push,
+                self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
+            ):
+                preserve_sources(
+                    Path(directory),
+                    self.one_network_fixture(),
+                    permanent_id="PALOMAR-2026-08-01-000012",
+                    version=2,
+                    dry_run=False,
+                )
+            push.assert_not_called()
+            ensure_ruleset.assert_not_called()
 
     def test_archive_ref_retries_until_an_asynchronous_fork_is_ready(self):
         fork = "PalomarArchive/example--fixture"
