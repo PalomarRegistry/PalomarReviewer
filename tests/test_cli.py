@@ -2373,6 +2373,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             validated_repository_license(mechanical, metadata)
 
     def test_registry_record_preserves_qualified_allowlisted_provenance(self):
+        # `TauCetiProject/TauCeti` is the allowlist's one qualified-trust root
+        # (`FormalFrontier/TauCeti` is its former name), and `registry_record`
+        # names Tau Ceti in the reason it writes for `qualified`. Not a fixture name.
         mechanical = self.nested_mechanical_fixture()
         revision = "8" * 40
         mechanical["challenge"].update(
@@ -2567,6 +2570,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 text=True,
             ).stdout.strip()
             mechanical = self.mechanical_fixture()
+            # The same real allowlist root as above, and for the same reason.
             qualified_repository = "TauCetiProject/TauCeti"
             qualified_revision = "7" * 40
             mechanical["challenge"].update(
