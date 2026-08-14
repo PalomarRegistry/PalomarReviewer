@@ -659,7 +659,8 @@ is in no process's command line either.
 The broker serves the request pinned Codex makes and refuses the rest: another
 method, path, model or reasoning effort; an unstreamed or background response;
 any response not explicitly asked to go unstored, because the provider keeps
-one it was not told to discard for thirty days; priority processing; a
+one it was not told to discard for at least thirty days; a body that names a
+field twice, which two parsers could read two ways; priority processing; a
 continued or provider-stored conversation; a
 provider-hosted tool, which is how a namespace process would buy itself the web
 research the policy says these passes do not have. It forwards only the headers

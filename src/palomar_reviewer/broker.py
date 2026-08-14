@@ -28,7 +28,10 @@ The contract, exactly:
   request, because those are the ones whose cost or reach nothing here could
   bound. `store` is required to be there and to be `false`, not merely not
   `true`: omitting it asks the provider for its default, and that default is to
-  keep the response for thirty days.
+  keep the response for at least thirty days. No object at any depth may name
+  a field twice, because the decision is made on the parsed object and the
+  original bytes are what get forwarded, and a duplicate name is where two
+  parsers can read two different requests out of the same body.
 * Request headers are forwarded from a fixed allowlist of what pinned Codex
   sends, and response headers from what it reads. Anything else a process in
   the namespace invents is dropped rather than handed to the provider, and
@@ -46,8 +49,12 @@ The contract, exactly:
 What this does not do: it is not general network isolation. The namespace still
 shares the runner's network because the Codex transport has to reach this
 listener, and a custom provider other than the pinned Codex path is out of
-scope. It also does nothing for the Claude engine, whose credential is a
-different provider's and needs its own broker.
+scope. Nor is `store: false` the same as no provider-side state: it keeps the
+provider from retaining a retrievable Response object, but not from holding,
+say, a prompt cache for around a day, and zero application state would take
+organizational zero-data-retention controls on the account rather than anything
+a request field can say. It also does nothing for the Claude engine, whose
+credential is a different provider's and needs its own broker.
 """
 
 from __future__ import annotations
@@ -220,6 +227,36 @@ BROKER_ENVIRONMENT_NAMES = (
 
 class BrokerError(RuntimeError):
     """A broker configuration, startup, or shutdown failure."""
+
+
+class DuplicateFieldError(ValueError):
+    """A request object that names the same field twice."""
+
+
+def one_value_per_name(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build the object, refusing any name that appears twice.
+
+    What this closes is a differential, not a shape. The broker decides on the
+    object Python parsed and then forwards the original bytes, so any place the
+    two parsers disagree is a place the decision does not describe what the
+    provider receives. Duplicate names are exactly such a place: Python keeps
+    the last value, and a first-value-wins parser upstream would read the
+    first, so `{"store": true, "store": false}` would be judged unstored and
+    stored anyway. Escaping the name changes nothing here, because the decoder
+    unescapes before this runs.
+
+    Refusing rather than reserialising keeps the bytes the client signed the
+    length of, and keeps the failure closed: there is no repaired request. It
+    is applied at every nesting level, since `reasoning` and `text` are read
+    the same way and a future field may be.
+    """
+    seen: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in seen:
+            # The name is not carried out: it is namespace-authored text.
+            raise DuplicateFieldError
+        seen[name] = value
+    return seen
 
 
 @dataclass(frozen=True)
@@ -608,7 +645,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _policy_problem(self, body: bytes) -> tuple[str, str] | None:
         try:
-            request = json.loads(body)
+            request = json.loads(body, object_pairs_hook=one_value_per_name)
+        except DuplicateFieldError:
+            return "this broker serves only requests that name each field once", "duplicate request field"
         except (json.JSONDecodeError, UnicodeDecodeError):
             return "the request body is not JSON", "unparsable request body"
         if not isinstance(request, dict):
