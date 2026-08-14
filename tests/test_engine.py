@@ -670,6 +670,75 @@ class EngineExecutionTests(unittest.TestCase):
                 raw_path=Path("result.txt"),
             )
 
+    def test_an_intake_namespace_grants_only_what_it_was_asked_for(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            output = root / "output"
+            checkout.mkdir()
+            output.mkdir()
+            with mock.patch.object(engine.shutil, "which", return_value="/usr/bin/bwrap"):
+                command = engine.isolated_intake_command(
+                    ["/usr/bin/python3", "verify.py"],
+                    chdir=checkout,
+                    read_only=[checkout],
+                    writable=[output],
+                    environment={"HOME": "/nowhere"},
+                    network=False,
+                )
+            separator = command.index("--")
+            namespace, argv = command[: separator], command[separator + 1 :]
+            self.assertEqual(argv, ["/usr/bin/python3", "verify.py"])
+            for flag in ("--die-with-parent", "--new-session", "--unshare-all", "--clearenv"):
+                self.assertIn(flag, namespace)
+            # A pass that did not ask for a network does not get one, and gets
+            # no resolver configuration to use one with either.
+            self.assertNotIn("--share-net", namespace)
+            self.assertNotIn("/etc/resolv.conf", namespace)
+            binds = [
+                (token, namespace[index + 1], namespace[index + 2])
+                for index, token in enumerate(namespace)
+                if token in ("--ro-bind", "--bind")
+            ]
+            # Named mounts keep the paths they have on the host, so the
+            # absolute paths the caller put in the command still resolve.
+            self.assertIn(("--ro-bind", str(checkout), str(checkout)), binds)
+            # One writable mount, and it is the one that was asked for.
+            self.assertEqual(
+                [entry for entry in binds if entry[0] == "--bind"],
+                [("--bind", str(output), str(output))],
+            )
+            self.assertEqual(
+                namespace[namespace.index("--setenv") : namespace.index("--setenv") + 3],
+                ["--setenv", "HOME", "/nowhere"],
+            )
+            self.assertEqual(namespace[namespace.index("--chdir") + 1], str(checkout))
+
+            with mock.patch.object(engine.shutil, "which", return_value="/usr/bin/bwrap"):
+                # A mount the caller named but the host does not have is a
+                # refusal, not a namespace quietly missing part of itself.
+                with self.assertRaisesRegex(engine.EngineError, "missing path"):
+                    engine.isolated_intake_command(
+                        ["/usr/bin/python3"],
+                        chdir=checkout,
+                        read_only=[root / "absent"],
+                        writable=[output],
+                        environment={},
+                        network=False,
+                    )
+            with (
+                mock.patch.object(engine.shutil, "which", return_value=None),
+                self.assertRaisesRegex(engine.EngineError, "bubblewrap is required"),
+            ):
+                engine.isolated_intake_command(
+                    ["/usr/bin/python3"],
+                    chdir=checkout,
+                    read_only=[checkout],
+                    writable=[output],
+                    environment={},
+                    network=False,
+                )
+
     def test_programmer_and_process_control_exceptions_are_not_hidden(self):
         for error in (TypeError("programmer bug"), KeyboardInterrupt(), SystemExit(3)):
             with self.subTest(error=type(error).__name__):

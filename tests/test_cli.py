@@ -739,13 +739,15 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         mechanical["project_dependencies"] = []
         return mechanical
 
-    def archive_world(self, answer, *, fork_exists, events=None):
+    def archive_world(self, answer, *, fork_exists, events=None, fork_admin=False):
         """Fakes for one fork network: the reads, and the Actions answer.
 
         `answer` is what `gh api .../actions/permissions` returns. `events`
         records the order the archive steps happen in, which is the whole point
         of the check's placement: the setting is read while the account can
-        still read it and before anything is pushed.
+        still read it and before anything is pushed. `fork_admin` is the grant
+        the account holds over an already existing fork, which is what says
+        whether an earlier run really did demote itself.
         """
         network_root = "upstream/network-root"
         fork = f"{cli.ARCHIVE_OWNER}/{cli.archive_repository_name(network_root)}"
@@ -758,7 +760,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             repository = endpoint.removeprefix("repos/")
             if repository == fork and not state["forked"]:
                 return None
-            return {"full_name": repository, "source": {"full_name": network_root}}
+            metadata = {"full_name": repository, "source": {"full_name": network_root}}
+            if repository == fork:
+                metadata["permissions"] = {"admin": fork_admin, "push": True}
+            return metadata
 
         def archive_api(endpoint, *, method="GET", body=None, check=True):
             if endpoint.endswith("/forks"):
@@ -811,13 +816,41 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
         ):
             cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=True)
+        # A fork an earlier run made, whose account it demoted: the 403 is that
+        # demotion, and preservation continues with the residual announced.
         printed = io.StringIO()
         with (
             mock.patch.object(cli, "archive_api", return_value=answer),
+            mock.patch.object(cli, "_archive_get", return_value={"permissions": {"admin": False}}),
             contextlib.redirect_stdout(printed),
         ):
             cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
         self.assertIn("::warning::cannot read the Actions setting", printed.getvalue())
+
+    def test_a_fork_that_still_grants_admin_cannot_blame_the_demotion(self):
+        # `strict=False` only says this run did not create the fork. An
+        # interrupted or hand-made lifecycle leaves the account administering a
+        # fork it never demoted itself out of, and a 403 on a setting it is
+        # entitled to read is then an anomaly, not the expected refusal.
+        answer = subprocess.CompletedProcess(["gh", "api"], 1, "", self.ARCHIVE_DEMOTED_403)
+        for permissions in (
+            {"permissions": {"admin": True, "push": True}},
+            # Nothing established, so nothing excused: no grant in the payload,
+            # a non-boolean grant, or no repository metadata at all.
+            {"permissions": {"push": True}},
+            {"permissions": {"admin": "false"}},
+            {},
+            None,
+        ):
+            with (
+                mock.patch.object(cli, "archive_api", return_value=answer),
+                mock.patch.object(cli, "_archive_get", return_value=permissions) as archive_get,
+                self.assertRaisesRegex(ReviewerError, "has not been demoted there"),
+            ):
+                cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
+            self.assertEqual(
+                archive_get.call_args.args[0], "repos/PalomarArchive/fixture"
+            )
 
     def test_new_archive_fork_is_verified_before_a_ruleset_a_demotion_or_a_push(self):
         events = []
@@ -920,6 +953,41 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertIn(f"::warning::cannot read the Actions setting on {fork}", warning)
         self.assertIn("demoted", warning)
         self.assertIn(f"{cli.ARCHIVE_OWNER} organization policy disabling Actions", warning)
+
+    def test_re_preservation_refuses_the_demotion_excuse_from_a_fork_it_still_administers(self):
+        events = []
+        fork, archive_get, archive_api = self.archive_world(
+            subprocess.CompletedProcess(["gh", "api"], 1, "", self.ARCHIVE_DEMOTED_403),
+            fork_exists=True,
+            events=events,
+            fork_admin=True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "_archive_get", side_effect=archive_get),
+            mock.patch.object(cli, "validate_archive_token"),
+            mock.patch.object(cli, "archive_api", side_effect=archive_api),
+            mock.patch.object(cli, "_ensure_archive_ruleset") as ensure_ruleset,
+            mock.patch.object(cli, "_drop_archive_admin") as drop_admin,
+            mock.patch.object(
+                cli, "_ensure_archive_ref", side_effect=lambda *_args: events.append("push")
+            ) as push,
+            self.assertRaisesRegex(ReviewerError, "has not been demoted there"),
+        ):
+            preserve_sources(
+                Path(directory),
+                self.one_network_fixture(),
+                permanent_id="PALOMAR-2026-08-01-000012",
+                version=2,
+                dry_run=False,
+            )
+
+        # Nothing after the unexplained refusal happened: no ruleset, no
+        # demotion, and no submitted commit in a fork that can still run it.
+        self.assertEqual(events, ["actions"])
+        push.assert_not_called()
+        ensure_ruleset.assert_not_called()
+        drop_admin.assert_not_called()
 
     def test_re_preservation_refuses_when_the_setting_fails_to_read_for_any_other_reason(self):
         for stderr in (
@@ -8632,7 +8700,7 @@ class FailureDiagnosticTests(unittest.TestCase):
                 self.assertTrue(cli.finished_with({"status": status}))
 
 
-class MetadataRepairTests(unittest.TestCase):
+class MetadataRepairTests(UsesCapabilities, unittest.TestCase):
     def repair(self, value="Example"):
         return {
             "schema_version": 1,
@@ -8667,12 +8735,15 @@ class MetadataRepairTests(unittest.TestCase):
     def test_repair_preflight_environment_contains_no_workflow_credentials(self):
         with mock.patch.dict(os.environ, {
             "PATH": "/bin", "HOME": "/tmp/home", "BUNDLE_PATH": "/tmp/gems",
+            "TMPDIR": "/operator/runner-temp",
             "GH_TOKEN": "reviewer", "PALOMAR_REPAIR_TOKEN": "repair",
             "PALOMAR_ALLOW_STATE_WRITES": "1", "GITHUB_TOKEN": "actions",
             "OPENAI_API_KEY": "model",
         }, clear=True):
             environment = cli._repair_preflight_environment(Path("/pipeline"), Path("/safe-home"))
         self.assertEqual(environment["PATH"], "/bin")
+        # The namespace has its own /tmp, and nothing at the runner's path.
+        self.assertEqual(environment["TMPDIR"], "/tmp")
         self.assertEqual(environment["HOME"], "/safe-home")
         self.assertEqual(environment["BUNDLE_PATH"], "/tmp/gems")
         self.assertTrue(environment["BUNDLE_GEMFILE"].endswith("/pipeline/Gemfile"))
@@ -8717,6 +8788,9 @@ class MetadataRepairTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {"PALOMAR_SUBMISSION_CHECKOUT": str(pipeline)}),
                 mock.patch.object(cli.shutil, "which", return_value="/usr/bin/bundle"),
                 mock.patch.object(cli, "_repair_preflight_environment", return_value={}),
+                mock.patch.object(
+                    cli, "_export_submission_checkout", side_effect=self.preflight_export(pipeline)
+                ),
                 mock.patch.object(cli, "run", side_effect=fake_run),
             ):
                 result = cli._run_repair_preflight(
@@ -8745,6 +8819,435 @@ class MetadataRepairTests(unittest.TestCase):
                 self.assertRaisesRegex(ReviewerError, "authorization relationship"),
             ):
                 cli._run_repair_preflight("palomar-repairs/project", "1" * 40, state, root)
+
+    PREFLIGHT_STATE = {
+        "id": "a1b2c3d4e5f6",
+        "requested_paths": {},
+        "authorization": {"relationship": "maintainer"},
+    }
+
+    def git(self, repository, *arguments):
+        """Git in a fixture checkout, reading none of the operator's config."""
+        subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "Palomar Test",
+                "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                "GIT_COMMITTER_NAME": "Palomar Test",
+                "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            },
+        )
+
+    def preflight_pipeline(self, root, verifier=""):
+        """A stand-in PalomarSubmission checkout, committed as a real one is."""
+        pipeline = root / "submission"
+        (pipeline / "scripts").mkdir(parents=True)
+        (pipeline / "scripts" / "verify_submission.py").write_text(verifier, encoding="utf-8")
+        (pipeline / "scripts" / "submission_contract.py").write_text(
+            'AUTHORIZATION_RELATIONSHIPS = {"Maintainer": "maintainer"}\n',
+            encoding="utf-8",
+        )
+        self.git(pipeline, "init", "--quiet")
+        self.git(pipeline, "add", "--all")
+        self.git(pipeline, "commit", "--quiet", "-m", "Submission pipeline")
+        return pipeline
+
+    def preflight_export(self, pipeline):
+        """Stand in for the tracked export, for tests that intercept `run`."""
+        def export(_pipeline, destination):
+            shutil.copytree(pipeline, destination)
+            return destination
+
+        return export
+
+    def preflight_which(self, **overrides):
+        """`shutil.which` answering for named tools and the real host otherwise."""
+        real = shutil.which
+        return lambda name, *args, **kwargs: overrides.get(name, real(name, *args, **kwargs))
+
+    def namespace_binds(self, namespace):
+        """The `{(option, destination): source}` this namespace mounts."""
+        binds = {}
+        index = 0
+        while index < len(namespace):
+            token = namespace[index]
+            if token in ("--ro-bind", "--bind"):
+                binds[(token, namespace[index + 2])] = namespace[index + 1]
+                index += 3
+            else:
+                index += 1
+        return binds
+
+    def namespace_setenv(self, namespace):
+        """The environment this namespace sets, which is all the isolated pass has."""
+        values = {}
+        index = 0
+        while index < len(namespace):
+            if namespace[index] == "--setenv":
+                values[namespace[index + 1]] = namespace[index + 2]
+                index += 3
+            else:
+                index += 1
+        return values
+
+    def test_repair_preflight_runs_the_verifier_inside_the_engine_namespace(self):
+        # The verifier is trusted, but it parses a repository an unrelated
+        # account wrote, so it is contained exactly like a model pass: no
+        # ambient environment, no operator filesystem, and one writable
+        # directory that the caller made for it.
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = kwargs["env"]
+            captured["stdin"] = kwargs.get("stdin")
+            report_path = Path(command[command.index("--output") + 1])
+            report_path.write_text(json.dumps({"status": "pending", "stage": "prepared"}))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            work = root / "work"
+            work.mkdir()
+            pipeline = self.preflight_pipeline(root)
+            bwrap = root / "bwrap"
+            bwrap.write_text("", encoding="utf-8")
+            bundle = root / "bundle"
+            bundle.write_text("", encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {
+                    "PALOMAR_SUBMISSION_CHECKOUT": str(pipeline),
+                    "PATH": "/usr/bin:/bin",
+                    "TMPDIR": str(root / "operator-temp"),
+                    "GH_TOKEN": "reviewer-credential",
+                    "PALOMAR_REPAIR_TOKEN": "repair-credential",
+                    # Bundler's own documented spelling for a gem-source
+                    # credential, which a prefix allowlist would have carried.
+                    "BUNDLE_GITHUB__COM": "gem-source-credential",
+                    "RUBYOPT": "-rleak",
+                }, clear=True),
+                mock.patch.object(
+                    cli.shutil,
+                    "which",
+                    side_effect=self.preflight_which(bwrap=str(bwrap), bundle=str(bundle)),
+                ),
+                mock.patch.object(
+                    cli, "_export_submission_checkout", side_effect=self.preflight_export(pipeline)
+                ),
+                mock.patch.object(cli, "run", side_effect=fake_run),
+            ):
+                cli._run_repair_preflight(
+                    "palomar-repairs/project", "1" * 40, dict(self.PREFLIGHT_STATE), work
+                )
+
+            command = captured["command"]
+            separator = command.index("--")
+            namespace, argv = command[:separator], command[separator + 1 :]
+            self.assertEqual(command[0], str(bwrap))
+            # What runs is the export of the checkout, not the checkout: the
+            # working tree carries .git and whatever else the runner left in it.
+            checkout = Path(argv[1]).parent.parent
+            self.assertNotEqual(checkout, pipeline)
+            self.assertEqual(
+                argv[:3],
+                [sys.executable, str(checkout / "scripts" / "verify_submission.py"), "prepare"],
+            )
+            for flag in ("--die-with-parent", "--new-session", "--unshare-all", "--clearenv"):
+                self.assertIn(flag, namespace)
+            self.assertEqual(namespace[namespace.index("--chdir") + 1], str(checkout))
+            # `prepare` resolves the candidate commit by fetching it, so this
+            # namespace has a network, and the resolver configuration to use it.
+            self.assertIn("--share-net", namespace)
+            self.assertIn(("--ro-bind", "/etc/resolv.conf"), self.namespace_binds(namespace))
+            self.assertIs(captured["stdin"], subprocess.DEVNULL)
+
+            binds = self.namespace_binds(namespace)
+            self.assertEqual(binds[("--ro-bind", str(checkout))], str(checkout))
+            self.assertEqual(binds[("--bind", str(work))], str(work))
+            # One writable mount, and it is the directory this repair made.
+            self.assertEqual(
+                [destination for option, destination in binds if option == "--bind"],
+                [str(work)],
+            )
+            destinations = [destination for _option, destination in binds]
+            # The working checkout itself is not mounted anywhere.
+            self.assertNotIn(str(pipeline), destinations)
+            # The operator's home is not in there, and neither is the checkout
+            # of State the repair workflow holds beside it.
+            self.assertNotIn(str(Path.home()), destinations)
+
+            # `--clearenv` empties the environment and these put back exactly
+            # the allowlist, which the launcher is started with too: Bubblewrap
+            # stays at PID 1 without exec'ing, so anything it was launched with
+            # is readable from inside at /proc/1/environ.
+            setenv = self.namespace_setenv(namespace)
+            self.assertEqual(setenv, captured["env"])
+            self.assertEqual(setenv["HOME"], str(work / "preflight-home"))
+            self.assertEqual(setenv["BUNDLE_GEMFILE"], str(checkout / "Gemfile"))
+            self.assertEqual(setenv["TMPDIR"], "/tmp")
+            self.assertEqual(
+                set(setenv),
+                {"PATH", "HOME", "BUNDLE_GEMFILE", "TMPDIR"},
+            )
+            for name in ("GH_TOKEN", "PALOMAR_REPAIR_TOKEN", "BUNDLE_GITHUB__COM", "RUBYOPT"):
+                self.assertNotIn(name, setenv)
+            for value in ("reviewer-credential", "repair-credential", "gem-source-credential"):
+                self.assertNotIn(value, setenv.values())
+
+        # The export is removed with the pass that needed it.
+        self.assertFalse(checkout.parent.exists())
+
+    def test_repair_preflight_binds_the_checkout_gems_without_the_checkout(self):
+        # Bundler's gems are installed into the checkout and are not tracked,
+        # so the export does not carry them. They are mounted on their own,
+        # and named through BUNDLE_PATH rather than through the checkout's
+        # untracked .bundle/config, which can hold gem source credentials.
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            report_path = Path(command[command.index("--output") + 1])
+            report_path.write_text(json.dumps({"status": "pending", "stage": "prepared"}))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            work = root / "work"
+            work.mkdir()
+            pipeline = self.preflight_pipeline(root)
+            vendored = pipeline / "vendor" / "bundle"
+            vendored.mkdir(parents=True)
+            bwrap = root / "bwrap"
+            bwrap.write_text("", encoding="utf-8")
+            bundle = root / "bundle"
+            bundle.write_text("", encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {"PALOMAR_SUBMISSION_CHECKOUT": str(pipeline)}),
+                mock.patch.object(
+                    cli.shutil,
+                    "which",
+                    side_effect=self.preflight_which(bwrap=str(bwrap), bundle=str(bundle)),
+                ),
+                mock.patch.object(
+                    cli, "_export_submission_checkout", side_effect=self.preflight_export(pipeline)
+                ),
+                mock.patch.object(cli, "run", side_effect=fake_run),
+            ):
+                cli._run_repair_preflight(
+                    "palomar-repairs/project", "1" * 40, dict(self.PREFLIGHT_STATE), work
+                )
+
+            namespace = captured["command"][: captured["command"].index("--")]
+            binds = self.namespace_binds(namespace)
+            self.assertEqual(binds[("--ro-bind", str(vendored))], str(vendored))
+            self.assertNotIn(str(pipeline), [destination for _option, destination in binds])
+            self.assertEqual(self.namespace_setenv(namespace)["BUNDLE_PATH"], str(vendored))
+
+    def test_repair_preflight_carries_an_exact_environment_and_no_proxy_credential(self):
+        # An allowlist by prefix is not an allowlist: `BUNDLE_`-prefixed names
+        # are where Bundler documents gem-source credentials, and a proxy URL
+        # can spell one inside itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            home.mkdir()
+            with mock.patch.dict(os.environ, {
+                "PATH": "/bin", "GEM_HOME": "/gems", "NO_PROXY": "example.invalid",
+                "BUNDLE_GITHUB__COM": "gem-source-credential",
+                "BUNDLE_BITBUCKET__ORG": "another-credential",
+                "RUBYOPT": "-rleak", "SHELL": "/bin/bash",
+                "HTTPS_PROXY": "https://proxy.example.invalid:3128",
+            }, clear=True):
+                environment = cli._repair_preflight_environment(root / "pipeline", home)
+            self.assertEqual(
+                set(environment),
+                {"PATH", "GEM_HOME", "NO_PROXY", "HTTPS_PROXY", "HOME", "BUNDLE_GEMFILE", "TMPDIR"},
+            )
+
+            # The scheme is optional in the proxy syntax Git and curl accept,
+            # and a scheme-less value has no netloc to look in at all, so each
+            # spelling is read as the authority it is.
+            for value in (
+                "https://operator:hunter2@proxy.example.invalid:3128",
+                "https://operator@proxy.example.invalid:3128",
+                "operator:hunter2@proxy.example.invalid:3128",
+                "operator@proxy.example.invalid:3128",
+            ):
+                with (
+                    mock.patch.dict(
+                        os.environ, {"PATH": "/bin", "HTTPS_PROXY": value}, clear=True
+                    ),
+                    self.assertRaisesRegex(ReviewerError, "carries credentials in its URL"),
+                ):
+                    cli._repair_preflight_environment(root / "pipeline", home)
+
+            # A proxy that names no credential is carried, with or without a
+            # scheme, so the check is not just refusing everything.
+            for value in ("https://proxy.example.invalid:3128", "proxy.example.invalid:3128"):
+                with mock.patch.dict(
+                    os.environ, {"PATH": "/bin", "HTTP_PROXY": value}, clear=True
+                ):
+                    environment = cli._repair_preflight_environment(root / "pipeline", home)
+                self.assertEqual(environment["HTTP_PROXY"], value)
+
+    def test_repair_preflight_exports_the_tracked_pipeline_only(self):
+        # A working checkout holds .git, whose config carries the credential a
+        # workflow checked it out with, and whatever else was left beside it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pipeline = self.preflight_pipeline(root)
+            (pipeline / ".git" / "config").write_text(
+                "[http]\n\textraheader = AUTHORIZATION: basic checkout-credential\n",
+                encoding="utf-8",
+            )
+            (pipeline / "untracked-secret").write_text("operator note", encoding="utf-8")
+            checkout = cli._export_submission_checkout(pipeline, root / "export")
+            self.assertTrue((checkout / "scripts" / "verify_submission.py").is_file())
+            self.assertFalse((checkout / ".git").exists())
+            self.assertFalse((checkout / "untracked-secret").exists())
+
+            plain = root / "not-a-checkout"
+            plain.mkdir()
+            with self.assertRaisesRegex(ReviewerError, "must name a Git checkout"):
+                cli._export_submission_checkout(plain, root / "second-export")
+
+    def test_repair_preflight_will_not_mount_a_directory_the_operator_lives_in(self):
+        # `~/bin/bundle` asks for a read-only mount of the whole home
+        # directory. It gets the executable instead, and a gem path that is an
+        # ancestor of the home directory gets a refusal.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            (home / "bin").mkdir(parents=True)
+            loose = home / "bin" / "bundle"
+            loose.write_text("", encoding="utf-8")
+            checkout = root / "export"
+            checkout.mkdir()
+            with mock.patch.object(cli.Path, "home", return_value=home):
+                self.assertEqual(cli._tool_root(str(loose)), loose)
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    paths = cli._repair_preflight_read_only(
+                        checkout, str(loose), root / "absent-gems"
+                    )
+                self.assertIn(loose, paths)
+                self.assertNotIn(home, paths)
+                with (
+                    mock.patch.dict(os.environ, {"GEM_HOME": str(root)}, clear=True),
+                    self.assertRaisesRegex(ReviewerError, "refusing to mount"),
+                ):
+                    cli._repair_preflight_read_only(checkout, str(loose), root / "absent-gems")
+
+    def test_repair_preflight_refuses_to_run_with_no_namespace_to_run_in(self):
+        # A host without bwrap does not get an unisolated preflight instead.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            work = root / "work"
+            work.mkdir()
+            pipeline = self.preflight_pipeline(root)
+            bundle = root / "bundle"
+            bundle.write_text("", encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {"PALOMAR_SUBMISSION_CHECKOUT": str(pipeline)}),
+                mock.patch.object(
+                    cli.shutil,
+                    "which",
+                    side_effect=self.preflight_which(bwrap=None, bundle=str(bundle)),
+                ),
+                mock.patch.object(
+                    cli, "_export_submission_checkout", side_effect=self.preflight_export(pipeline)
+                ),
+                mock.patch.object(cli, "run") as run_command,
+                self.assertRaisesRegex(ReviewerError, "cannot be isolated: bubblewrap is required"),
+            ):
+                cli._run_repair_preflight(
+                    "palomar-repairs/project", "1" * 40, dict(self.PREFLIGHT_STATE), work
+                )
+            run_command.assert_not_called()
+
+    def test_repair_preflight_namespace_holds_no_operator_process_or_file(self):
+        # The residual this replaced: the verifier ran as the repair workflow's
+        # own user, one /proc read away from the tokens that user holds. Here
+        # it is asked to go looking, inside a real namespace, with a credential
+        # planted in every place one is known to sit.
+        self.require("sandbox")
+        marker = "palomar-preflight-must-not-leak"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            work = root / "work"
+            work.mkdir()
+            secret = root / "operator-secret"
+            secret.write_text(marker, encoding="utf-8")
+            verifier = f'''
+import json, os, pathlib, sys
+output = pathlib.Path(sys.argv[sys.argv.index("--output") + 1])
+launcher = pathlib.Path("/proc/1/environ").read_bytes().decode("utf-8", "replace")
+descriptors = {{}}
+for entry in sorted(pathlib.Path("/proc/self/fd").iterdir()):
+    try:
+        descriptors[entry.name] = os.readlink(str(entry))
+    except OSError:
+        continue
+output.write_text(json.dumps({{
+    "status": "pending",
+    "stage": "prepared",
+    "pids": sorted(p.name for p in pathlib.Path("/proc").iterdir() if p.name.isdigit()),
+    "launcher_environment": [item for item in launcher.split("\\0") if item],
+    "environment": dict(os.environ),
+    "secret_visible": os.path.exists({str(secret)!r}),
+    "checkout_visible": os.path.exists({str(root / "submission")!r}),
+    "root_entries": sorted(os.listdir(os.path.dirname(os.path.dirname(__file__)))),
+    "descriptors": descriptors,
+}}))
+'''
+            pipeline = self.preflight_pipeline(root, verifier=verifier)
+            with (pipeline / ".git" / "config").open("a", encoding="utf-8") as config:
+                config.write(f"[http]\n\textraheader = AUTHORIZATION: basic {marker}\n")
+            (pipeline / "untracked-secret").write_text(marker, encoding="utf-8")
+            bundle = root / "bundle"
+            bundle.write_text("", encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {
+                    "PALOMAR_SUBMISSION_CHECKOUT": str(pipeline),
+                    "GH_TOKEN": marker,
+                    "PALOMAR_REPAIR_TOKEN": marker,
+                    "BUNDLE_GITHUB__COM": marker,
+                }),
+                mock.patch.object(
+                    cli.shutil, "which", side_effect=self.preflight_which(bundle=str(bundle))
+                ),
+            ):
+                report = cli._run_repair_preflight(
+                    "palomar-repairs/project", "1" * 40, dict(self.PREFLIGHT_STATE), work
+                )
+
+        # Bubblewrap and the verifier, and nothing else on the host: an
+        # operator process whose environment could be read is not in here.
+        self.assertLessEqual(len(report["pids"]), 3)
+        self.assertIn("1", report["pids"])
+        # What PID 1 was launched with is the allowlist, so the launcher
+        # environment this pass can read holds no credential either.
+        for entry in report["launcher_environment"]:
+            self.assertNotIn(marker, entry)
+        self.assertNotIn(
+            "GH_TOKEN",
+            [entry.split("=", 1)[0] for entry in report["launcher_environment"]],
+        )
+        for name, value in report["environment"].items():
+            self.assertNotIn(marker, value, name)
+        self.assertNotIn("BUNDLE_GITHUB__COM", report["environment"])
+        self.assertFalse(report["secret_visible"])
+        # The working checkout is not reachable, so neither is the credential
+        # its .git/config carries nor the untracked file beside it. What runs
+        # is the export, which holds the tracked tree and nothing else.
+        self.assertFalse(report["checkout_visible"])
+        self.assertEqual(report["root_entries"], ["scripts"])
+        # Nothing is said to this pass, and it inherited no channel back.
+        self.assertEqual(report["descriptors"]["0"], "/dev/null")
 
     def test_repair_drafts_preserve_invalid_values_for_the_guided_form(self):
         draft = cli._bounded_repair_draft({

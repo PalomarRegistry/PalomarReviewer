@@ -25,6 +25,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,18 @@ SYSTEM_RESOLUTION_PATHS = (
     Path("/etc/gai.conf"),
     Path("/etc/host.conf"),
     Path("/etc/ld.so.cache"),
+)
+# The read-only system tree every namespace this module builds is given: the
+# interpreters, shared libraries and command-line tools an isolated pass needs
+# in order to start at all. Nothing here is writable and nothing here is
+# operator state.
+SANDBOX_SYSTEM_ROOTS = (
+    Path("/nix/store"),
+    Path("/run/current-system/sw"),
+    Path("/usr"),
+    Path("/bin"),
+    Path("/lib"),
+    Path("/lib64"),
 )
 # The Claude engine binds a reusable provider login into the same namespace as
 # the attacker-authored workspace, which is exactly what the Codex broker
@@ -397,14 +410,7 @@ def isolated_command(
         "--chdir",
         "/workspace",
     ]
-    for path in (
-        Path("/nix/store"),
-        Path("/run/current-system/sw"),
-        Path("/usr"),
-        Path("/bin"),
-        Path("/lib"),
-        Path("/lib64"),
-    ):
+    for path in SANDBOX_SYSTEM_ROOTS:
         _bind_if_present(command, path, str(path))
     for path in SYSTEM_RESOLUTION_PATHS:
         _bind_if_present(command, path, str(path))
@@ -492,6 +498,79 @@ def isolated_command(
         # Last, so that the `--clearenv` above has already run when Bubblewrap
         # reads these and sets them.
         command.extend(["--args", str(secret_args_fd)])
+    return [*command, "--", *argv]
+
+
+def isolated_intake_command(
+    argv: list[str],
+    *,
+    chdir: Path,
+    read_only: Sequence[Path],
+    writable: Sequence[Path],
+    environment: Mapping[str, str],
+    network: bool,
+) -> list[str]:
+    """Build the same fail-closed namespace for a pass that runs no model.
+
+    A review pass is not the only thing the reviewer points at content an
+    unrelated account wrote. Intake parsing does it too, over a repository that
+    was chosen by whoever submitted it, and a parser that can be made to
+    execute is worth as much to an attacker as a model that can be talked into
+    it. So the containment is the same containment: no operator home, no
+    ambient environment, no filesystem beyond what is named here, and no run at
+    all where Bubblewrap is missing.
+
+    Mounts are made at the paths they already have on the host, because the
+    caller hands the isolated command absolute paths -- an interpreter, a
+    checkout, a Gemfile -- and a namespace that renamed them would only mean
+    the caller had to rewrite every one of them.
+
+    `environment` becomes the whole environment inside, and the caller is
+    expected to start Bubblewrap itself with no more than the same values:
+    `--clearenv` answers for the isolated process, and `/proc/1/environ`
+    answers for the launcher. `network` is a decision, not a default: a pass
+    that only reads bytes already on disk should say no.
+    """
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise EngineError("bubblewrap is required to isolate untrusted editorial evidence")
+    command = [
+        bwrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--clearenv",
+        "--tmpfs",
+        "/tmp",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+    ]
+    if network:
+        command.append("--share-net")
+    for path in SANDBOX_SYSTEM_ROOTS:
+        _bind_if_present(command, path, str(path))
+    if network:
+        for path in SYSTEM_RESOLUTION_PATHS:
+            _bind_if_present(command, path, str(path))
+    for option, paths in (("--ro-bind", read_only), ("--bind", writable)):
+        for path in paths:
+            try:
+                source = path.resolve(strict=True)
+            except OSError as error:
+                raise EngineError(f"cannot isolate a pass over a missing path: {error}") from error
+            command.extend([option, str(source), os.path.abspath(path)])
+    for name, value in environment.items():
+        if "\0" in name or "\0" in value:
+            raise EngineError("a sandbox environment value contains a NUL byte")
+        command.extend(["--setenv", name, value])
+    try:
+        chdir.resolve(strict=True)
+    except OSError as error:
+        raise EngineError(f"cannot isolate a pass with no working directory: {error}") from error
+    # The bind destinations above are host paths, so this is one of them.
+    command.extend(["--chdir", os.path.abspath(chdir)])
     return [*command, "--", *argv]
 
 

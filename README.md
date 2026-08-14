@@ -57,9 +57,30 @@ malformed YAML, and pushes only to an
 Actions-disabled fork in `PalomarRepairs` using `PALOMAR_REPAIR_TOKEN`. Before
 opening a PR it runs the candidate commit through
 `PalomarSubmission/scripts/verify_submission.py prepare` from `main`, the same
-entry point as ordinary preflight. That subprocess receives an allowlisted
-non-secret environment: neither State write authority nor either GitHub token
-crosses into candidate-controlled intake. Failed candidate validation leaves an
+entry point as ordinary preflight. That subprocess runs in the same fail-closed
+Bubblewrap namespace the review engines run in, and no host without bubblewrap
+runs it at all. What it is given is a `git archive` export of the Submission
+checkout at `HEAD` rather than the working tree, so neither `.git/config`, whose
+extraheader can carry the credential the checkout was made with, nor any
+untracked file beside it is reachable; the runner's interpreter, Git and
+Bundler read-only, never through a mount that would carry the operator's home,
+workspace, or temporary directory in with it; one writable directory; `/dev/null`
+on standard input; and an environment built from an exact list of names.
+That list is exact rather than prefixed because Bundler documents credentials in
+`BUNDLE_`-prefixed variables (`BUNDLE_GITHUB__COM` and every other
+`BUNDLE_<HOST>__<TLD>`), and a proxy variable whose URL carries userinfo is a
+refusal rather than something to pass on. Bubblewrap itself is started with that
+same environment, because it stays at PID 1 inside the namespace and
+`/proc/1/environ` is readable from in there. Neither State write authority nor
+either GitHub token crosses into candidate-controlled intake.
+
+The documented residual is the network. `prepare` resolves the candidate commit
+by fetching it, Bubblewrap shares the host's network view or nothing at all, and
+it cannot filter egress; so repair preflight is supported only on an ephemeral
+runner with no private routing and no managed identity or instance-metadata
+endpoint that grants anything, which is what a GitHub-hosted runner is. A
+self-hosted runner that can reach an internal network is not a supported place
+to run it. Failed candidate validation leaves an
 actionable explanation and manual patch, removes the temporary repair branch,
 and never opens a knowingly failing PR. Finished pull requests also have their
 exact deterministic repair branch removed on a best-effort basis.
@@ -498,9 +519,12 @@ disabled or nothing is pushed, no ruleset is written, and the account is not
 demoted. Later runs preserving into the same fork ask again, and an enabled
 setting still refuses; but reading that setting needs the administrator grant
 the creating run gave up, so GitHub answers those reads with a 403. That
-specific 403 is announced as a warning and preservation continues, because
-refusing it would refuse every re-preservation for a state the reviewer created
-itself. What covers the residual is the organization-wide Actions policy
+specific 403 is announced as a warning and preservation continues, but only
+once the fork's own metadata confirms the account no longer administers it:
+an interrupted or hand-made lifecycle leaves the grant in place, and a 403
+that the demotion cannot explain refuses like any other. Where the excuse does
+hold, refusing would refuse every re-preservation for a state the reviewer
+created itself. What covers the residual is the organization-wide Actions policy
 (`enabled_repositories=none` on `PalomarArchive`) and the fact that only an
 organization administrator can turn Actions on for a repository; giving the
 reviewer a second credential with `Administration: read` would close it, at the
