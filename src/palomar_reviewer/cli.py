@@ -1146,10 +1146,75 @@ def _network_root(metadata: dict[str, Any]) -> str:
     return candidate
 
 
-def _ensure_archive_fork(source_repository: str, network_root: str) -> str:
+def _archive_actions_read_denied(detail: str) -> bool:
+    """Whether a failed Actions read is the demotion this code performs itself.
+
+    Reading a repository's Actions setting needs Administration, which the
+    archive account holds only while it is the fork's creator. Once
+    `_drop_archive_admin` has run, GitHub answers the same request with a 403
+    naming the missing rights. Nothing else is read as that: a 404, a 5xx, and
+    the 403 GitHub uses for a secondary rate limit all remain refusals, because
+    treating an unexplained failure as the expected one is how a real loss of
+    access would go unnoticed.
+    """
+    lowered = detail.casefold()
+    return "403" in lowered and (
+        "must have admin rights" in lowered or "resource not accessible" in lowered
+    )
+
+
+def _ensure_archive_actions_disabled(fork_repository: str, *, strict: bool) -> None:
+    """Refuse to hand submitter-authored commits to a fork that can run them.
+
+    A preservation ref carries whatever the submitter committed, workflow files
+    included. GitHub disables Actions on a new fork by default and the
+    organization disables it outright, but a default and an organization
+    setting are both observable state rather than invariants this code holds,
+    so ask the fork itself before pushing to it. The repair fork is checked the
+    same way before Palomar pushes repairs to it.
+
+    `strict` says the archive account still holds the administrator grant its
+    own fork creation gave it, so the setting is readable and an unreadable one
+    is a genuine anomaly. Preserving into a fork created by an earlier run is
+    the other case: that run demoted the account to the organization's base
+    Write role, and the read it would need is exactly what the demotion gave
+    up. Refusing there would refuse every re-preservation on the strength of a
+    state this code created, so an unreadable setting is announced and the run
+    continues. What covers that residual is the organization-wide Actions
+    policy and the fact that only an organization administrator can turn
+    Actions on for a repository; an enabled setting still refuses whenever it
+    can be seen at all.
+    """
+    response = archive_api(f"repos/{fork_repository}/actions/permissions", check=False)
+    if response.returncode != 0:
+        detail = f"{response.stderr}\n{response.stdout}".strip()[-1000:]
+        if strict or not _archive_actions_read_denied(detail):
+            raise ReviewerError(
+                f"cannot confirm GitHub Actions is disabled on {fork_repository}, so Palomar "
+                f"will not push preservation refs to it: {detail}"
+            )
+        print(
+            f"::warning::cannot read the Actions setting on {fork_repository} now that the "
+            f"archive account has been demoted to the organization's Write role: {detail}. "
+            f"Preservation continues; what keeps submitted workflows from running is the "
+            f"{ARCHIVE_OWNER} organization policy disabling Actions and the fact that only an "
+            "organization administrator can turn Actions on for a repository."
+        )
+        return
+    permissions = _json_response(response, f"checking Actions on {fork_repository}")
+    if permissions.get("enabled") is not False:
+        raise ReviewerError(
+            f"GitHub Actions is enabled on {fork_repository}; disable it before Palomar "
+            "pushes preservation refs"
+        )
+
+
+def _ensure_archive_fork(source_repository: str, network_root: str) -> tuple[str, bool]:
+    """Return the fork this network preserves into, and whether this run made it."""
     name = archive_repository_name(network_root)
     expected = f"{ARCHIVE_OWNER}/{name}"
     existing = _archive_get(f"repos/{expected}", f"checking archive fork {expected}")
+    created = existing is None
     if existing is None:
         archive_api(
             f"repos/{source_repository}/forks",
@@ -1169,7 +1234,7 @@ def _ensure_archive_fork(source_repository: str, network_root: str) -> str:
             raise ReviewerError(f"archive fork {expected} was not ready after five minutes")
     if _network_root(existing).casefold() != network_root.casefold():
         raise ReviewerError(f"archive repository collision: {expected} is in another fork network")
-    return str(existing.get("full_name") or expected)
+    return str(existing.get("full_name") or expected), created
 
 
 def _archive_ruleset_body() -> dict[str, Any]:
@@ -1466,7 +1531,14 @@ def preserve_sources(
             # the old `/forks` endpoint. Fork the canonical name returned by
             # the metadata read while retaining the submitted name in the
             # public preservation receipt.
-            fork = _ensure_archive_fork(items[0][2], roots[key])
+            fork, created = _ensure_archive_fork(items[0][2], roots[key])
+            # Nothing below this line is undone by a later refusal: a fork this
+            # run just made still holds only upstream's commits, and one an
+            # earlier run made is untouched. So the fork answers for its own
+            # Actions setting here, before a ruleset is written to it, before
+            # the account demotes itself out of being able to ask, and before
+            # the first submitted commit is pushed into it.
+            _ensure_archive_actions_disabled(fork, strict=created)
             _ensure_archive_ruleset(fork)
             _drop_archive_admin(fork)
             result = []
