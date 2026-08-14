@@ -827,12 +827,18 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
             self.assertIn("::warning::cannot read the Actions setting", printed.getvalue())
 
-    def test_a_sentence_can_refuse_a_read_but_never_excuse_one(self):
+    def test_no_sentence_decides_to_continue(self):
         # The direction is the whole point. Prose that lets a run continue
         # fails total and silent when GitHub rewords it, which is what happened.
         # Prose that only refuses costs a retry when it drifts.
-        self.assertTrue(cli._archive_read_rate_limited("You have exceeded a secondary rate limit"))
-        self.assertFalse(cli._archive_read_rate_limited(self.ARCHIVE_DEMOTED_403))
+        for throttled in (
+            "You have exceeded a secondary rate limit",
+            "You have triggered an abuse detection mechanism",
+            "Access has been temporarily blocked",
+            "Retry-After: 60",
+        ):
+            self.assertTrue(cli._archive_read_throttled(throttled), throttled)
+        self.assertFalse(cli._archive_read_throttled(self.ARCHIVE_DEMOTED_403))
         self.assertEqual(cli._archive_read_statuses(self.ARCHIVE_DEMOTED_403), {403})
         self.assertEqual(cli._archive_read_statuses("gh: Bad gateway (HTTP 502)"), {502})
         # No status at all is not a denial either: a transport failure that
@@ -840,6 +846,46 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(cli._archive_read_statuses("connection reset by peer"), set())
         for detail in ("connection reset by peer", "gh: Not Found (HTTP 404)"):
             answer = subprocess.CompletedProcess(["gh", "api"], 1, "", detail)
+            with (
+                mock.patch.object(cli, "archive_api", return_value=answer),
+                mock.patch.object(
+                    cli, "_archive_get", return_value={"permissions": {"admin": False}}
+                ),
+                self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
+            ):
+                cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
+
+    def test_a_response_body_cannot_name_the_status_of_the_call_that_returned_it(self):
+        # `gh` puts its own message, with the status it received, on stderr and
+        # the response body on stdout. A body is not allowed to supply the
+        # status, and it must not be able to push the real one out of view.
+        for stderr, stdout in (
+            # A 502 whose body claims a 403.
+            ("gh: Bad gateway (HTTP 502)", '{"errors":"HTTP 403"}'),
+            # A body long enough to have truncated the real status away, back
+            # when the two streams were joined and clipped before parsing.
+            ("gh: Bad gateway (HTTP 502)", "HTTP 403 " * 400),
+            # A failure `gh` reported no status for at all.
+            ("gh: something went wrong", '{"message":"HTTP 403"}'),
+        ):
+            answer = subprocess.CompletedProcess(["gh", "api"], 1, stdout, stderr)
+            with (
+                mock.patch.object(cli, "archive_api", return_value=answer),
+                mock.patch.object(
+                    cli, "_archive_get", return_value={"permissions": {"admin": False}}
+                ),
+                self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
+            ):
+                cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
+
+    def test_throttling_refuses_from_either_stream(self):
+        # Every match refuses, so both streams are read for one: the friendly
+        # message and the body can each be where the limit is announced.
+        for stderr, stdout in (
+            ("gh: You have exceeded a secondary rate limit (HTTP 403)", ""),
+            (self.ARCHIVE_DEMOTED_403, '{"message":"You have triggered an abuse detection mechanism"}'),
+        ):
+            answer = subprocess.CompletedProcess(["gh", "api"], 1, stdout, stderr)
             with (
                 mock.patch.object(cli, "archive_api", return_value=answer),
                 mock.patch.object(

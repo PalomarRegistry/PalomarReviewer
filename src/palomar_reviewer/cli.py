@@ -1152,21 +1152,43 @@ def _network_root(metadata: dict[str, Any]) -> str:
     return candidate
 
 
-def _archive_read_statuses(detail: str) -> set[int]:
-    """The HTTP statuses a failed `gh api` reported, if it reported any."""
-    return {int(code) for code in re.findall(r"HTTP\s+(\d{3})", detail)}
+def _archive_read_statuses(reported: str) -> set[int]:
+    """The HTTP statuses `gh` itself reported on a failed call.
+
+    Read from stderr alone, and from the whole of it. `gh` appends the status
+    it received to its own message there, while a response body lands on
+    stdout: a body carrying the characters `HTTP 403` would otherwise be able
+    to name the status of the call that returned it. Truncating before parsing
+    could drop the real status off the front for the same reason, so the
+    truncation that keeps the human message bounded happens separately.
+
+    A call `gh` reports no status for gives an empty set, and an empty set is
+    not `{403}`, so anything unparseable refuses.
+    """
+    return {int(code) for code in re.findall(r"HTTP\s+(\d{3})", reported)}
 
 
-def _archive_read_rate_limited(detail: str) -> bool:
+def _archive_read_throttled(detail: str) -> bool:
     """Whether a refusal is GitHub throttling rather than GitHub refusing.
 
-    A secondary rate limit answers 403, the same status as a denial, so this
-    is the one place a sentence is read. It is read to refuse: an unrecognised
-    wording falls through to the grant, which is a check rather than an
-    assumption. Nothing here can decide to continue, so GitHub rewording it
-    costs a retry at worst, never a fork that was never asked about.
+    A secondary limit answers 403, the same status as a denial, so this is the
+    one place a sentence is read, and it is read across both streams because
+    every match here refuses.
+
+    This is defence in depth and not a proof. Absence of a phrase is a
+    necessary condition for continuing, so throttling worded in a way this
+    does not recognise reaches the grant read instead of refusing here. What
+    covers that is the grant read itself: it is the same credential against the
+    same host a moment later, so whatever is throttling this call throttles
+    that one, `_archive_get` raises, and the run refuses anyway. Closing it
+    outright needs the response headers, which means asking `gh` to return
+    them; that is worth doing and is not this change.
     """
-    return "rate limit" in detail.casefold()
+    lowered = detail.casefold()
+    return any(
+        phrase in lowered
+        for phrase in ("rate limit", "abuse", "temporarily blocked", "retry-after")
+    )
 
 
 def _archive_admin_grant(fork_repository: str) -> bool | None:
@@ -1220,19 +1242,29 @@ def _ensure_archive_actions_disabled(fork_repository: str, *, strict: bool) -> N
     sentence must never be the thing that lets a run continue, because when it
     drifts the failure is total and silent.
 
-    So a sentence can now only refuse, never excuse. A status other than 403
-    refuses: a 404 or a 5xx says something else is wrong with the fork, and
-    learning nothing about Actions is the smaller half of that. A 403 that
-    reads as throttling refuses too, since a rate limit is a reason to come
-    back rather than a statement about the grant. What is left is a plain
-    denial, and there `permissions.admin` decides — a field, answering the
-    question actually being asked. Only a fork that says plainly that the
-    account no longer administers it lets the run continue.
+    So no sentence decides to continue. A status other than 403 refuses: a 404
+    or a 5xx says something else is wrong with the fork, and learning nothing
+    about Actions is the smaller half of that. A 403 that reads as throttling
+    refuses too, since a limit is a reason to come back rather than a statement
+    about the grant. What is left is a plain denial, and there
+    `permissions.admin` decides — a field, answering the question actually
+    being asked. Only a fork that says plainly that the account no longer
+    administers it lets the run continue.
+
+    Two things this does not claim. Unrecognised throttling prose still
+    reaches the grant read rather than refusing here, and what covers it is
+    that the same credential fails that read too; closing it outright wants the
+    response headers. And a grant that is absent is evidence about the account,
+    not about Actions: what stands behind the continue is still the
+    organization policy, which this announces and does not verify. Both are
+    worth closing and neither is closed here.
     """
     response = archive_api(f"repos/{fork_repository}/actions/permissions", check=False)
     if response.returncode != 0:
         detail = f"{response.stderr}\n{response.stdout}".strip()[-1000:]
-        denied = _archive_read_statuses(detail) == {403} and not _archive_read_rate_limited(detail)
+        denied = _archive_read_statuses(response.stderr) == {403} and not _archive_read_throttled(
+            f"{response.stderr}\n{response.stdout}"
+        )
         if strict or not denied:
             raise ReviewerError(
                 f"cannot confirm GitHub Actions is disabled on {fork_repository}, so Palomar "
