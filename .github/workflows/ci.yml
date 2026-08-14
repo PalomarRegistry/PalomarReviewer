@@ -18,10 +18,9 @@ jobs:
           path: reviewer
       # PalomarDatabase is private. Public CI checks the schema contract
       # without granting a cross-repository credential. The full registration
-      # integration, which needs a PalomarDatabase checkout to register into,
-      # runs in PalomarDatabase itself: see `.github/workflows/reviewer-contract.yml`
-      # there, which checks this repository out rather than the other way
-      # round and so needs no credential for anything private. That is stated
+      # integration runs against a committed synthetic database in public
+      # PalomarDatabaseTools CI, which needs no credential or private ledger
+      # bytes. That is stated
       # here as `PALOMAR_TESTS_WITHOUT: database` below, and the suite fails
       # under CI on any capability that is neither available nor named there.
       # "Maintainers run it locally" was the previous answer and it was not

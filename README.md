@@ -210,9 +210,9 @@ it skipped every run and was red for days before anybody looked.
 
 This repository's own CI declares `PALOMAR_TESTS_WITHOUT: database`, because
 PalomarDatabase is private and public CI is deliberately given no credential
-for it. The end-to-end registration test runs instead in PalomarDatabase, in
-`.github/workflows/reviewer-contract.yml`, daily and on any pull request there
-that touches a schema, the validator or the record fixtures.
+for it. The end-to-end registration test runs instead against a committed,
+synthetic database in public PalomarDatabaseTools CI. That contract contains
+the real public schema and validators without any private ledger bytes.
 
 ## Running a review by hand
 

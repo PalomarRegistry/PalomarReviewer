@@ -2168,8 +2168,8 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
         Nothing else exercises it. It runs on a schedule and on the relevant
         pull requests in PalomarDatabase, which is the repository that has the
-        private half of the contract without needing a credential for anything
-        else; see `.github/workflows/reviewer-contract.yml` there.
+        public synthetic half of the contract without needing a credential for
+        anything private; see PalomarDatabaseTools' corresponding workflow.
         """
         database_source, policy_source = self.require("database", "policy")
         # The registry starts empty, so the canonical record comes from the
@@ -2308,6 +2308,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     {"notability": 4, "literature": 4},
                 ),
             ]
+            passes[0]["codes_checked"] = ["arxiv:math.CO", "msc2020:05C10"]
             review = {
                 "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
@@ -2498,7 +2499,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             (work / "review-sha256").write_text(
                 registration_authorization.document_digest(review) + "\n"
             )
-            with self.assertRaisesRegex(ReviewerError, "scores below"):
+            with self.assertRaisesRegex(
+                ReviewerError,
+                "scores below|cannot score classification below",
+            ):
                 register(args)
             classification_pass["scores"]["classification"] = 4
             (work / "review.json").write_text(json.dumps(review))
@@ -6974,6 +6978,7 @@ class RegistrationStagingTests(unittest.TestCase):
             path.write_text("{}\n")
         projection_paths = (
             "registrations/days/2026-08-09.json",
+            f"registrations/identities/{'0' * 64}.json",
             "registrations/results/PALOMAR-2026-08-09-000001.json",
             "registrations/submissions/a1b2c3d4e5f6.json",
         )
@@ -7014,6 +7019,7 @@ class RegistrationStagingTests(unittest.TestCase):
                     "entries/new.json",
                     "evidence/new/hash/report.json",
                     "registrations/days/2026-08-09.json",
+                    f"registrations/identities/{'0' * 64}.json",
                     "registrations/results/PALOMAR-2026-08-09-000001.json",
                     "registrations/submissions/a1b2c3d4e5f6.json",
                     "renders/new/hash/index.html",
@@ -7101,6 +7107,9 @@ class RegistrationStagingTests(unittest.TestCase):
                 )
                 for change in first_projections
                 if change.path != day_path
+                and not change.path.startswith(
+                    f"{registration_authority.IDENTITIES_DIRECTORY}/"
+                )
             )
 
             cli.stage_registration_change(
