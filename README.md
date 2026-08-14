@@ -57,9 +57,13 @@ malformed YAML, and pushes only to an
 Actions-disabled fork in `PalomarRepairs` using `PALOMAR_REPAIR_TOKEN`. Before
 opening a PR it runs the candidate commit through
 `PalomarSubmission/scripts/verify_submission.py prepare` from `main`, the same
-entry point as ordinary preflight. That subprocess receives an allowlisted
-non-secret environment: neither State write authority nor either GitHub token
-crosses into candidate-controlled intake. Failed candidate validation leaves an
+entry point as ordinary preflight. That subprocess runs in the same fail-closed
+Bubblewrap namespace the review engines run in, with the Submission checkout
+and the runner's tooling read-only, one writable directory, and an allowlisted
+non-secret environment that Bubblewrap itself is also started with: neither
+State write authority nor either GitHub token crosses into
+candidate-controlled intake, and no host without bubblewrap runs the pass at
+all. Failed candidate validation leaves an
 actionable explanation and manual patch, removes the temporary repair branch,
 and never opens a knowingly failing PR. Finished pull requests also have their
 exact deterministic repair branch removed on a best-effort basis.
@@ -498,9 +502,12 @@ disabled or nothing is pushed, no ruleset is written, and the account is not
 demoted. Later runs preserving into the same fork ask again, and an enabled
 setting still refuses; but reading that setting needs the administrator grant
 the creating run gave up, so GitHub answers those reads with a 403. That
-specific 403 is announced as a warning and preservation continues, because
-refusing it would refuse every re-preservation for a state the reviewer created
-itself. What covers the residual is the organization-wide Actions policy
+specific 403 is announced as a warning and preservation continues, but only
+once the fork's own metadata confirms the account no longer administers it:
+an interrupted or hand-made lifecycle leaves the grant in place, and a 403
+that the demotion cannot explain refuses like any other. Where the excuse does
+hold, refusing would refuse every re-preservation for a state the reviewer
+created itself. What covers the residual is the organization-wide Actions policy
 (`enabled_repositories=none` on `PalomarArchive`) and the fact that only an
 organization administrator can turn Actions on for a repository; giving the
 reviewer a second credential with `Administration: read` would close it, at the

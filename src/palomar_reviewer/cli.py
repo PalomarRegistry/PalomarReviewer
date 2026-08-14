@@ -1163,6 +1163,17 @@ def _archive_actions_read_denied(detail: str) -> bool:
     )
 
 
+def _archive_admin_grant(fork_repository: str) -> bool | None:
+    """Whether the archive account still administers the fork, or None if unclear."""
+    metadata = _archive_get(
+        f"repos/{fork_repository}",
+        f"checking archive rights on {fork_repository}",
+    )
+    permissions = metadata.get("permissions") if isinstance(metadata, dict) else None
+    admin = permissions.get("admin") if isinstance(permissions, dict) else None
+    return admin if isinstance(admin, bool) else None
+
+
 def _ensure_archive_actions_disabled(fork_repository: str, *, strict: bool) -> None:
     """Refuse to hand submitter-authored commits to a fork that can run them.
 
@@ -1184,6 +1195,15 @@ def _ensure_archive_actions_disabled(fork_repository: str, *, strict: bool) -> N
     policy and the fact that only an organization administrator can turn
     Actions on for a repository; an enabled setting still refuses whenever it
     can be seen at all.
+
+    That excuse is only as good as the demotion it appeals to, and a fork this
+    run did not create is no evidence that any earlier run finished one. An
+    interrupted lifecycle, or a fork somebody made by hand, leaves the account
+    holding administrator rights it never gave up, and a 403 on a setting it is
+    entitled to read is then something other than the demotion. So the grant
+    itself is read before the excuse is accepted, and only an explicit absence
+    of it buys anything: an unreadable grant, an ambiguous one, or one that is
+    still held all refuse.
     """
     response = archive_api(f"repos/{fork_repository}/actions/permissions", check=False)
     if response.returncode != 0:
@@ -1192,6 +1212,12 @@ def _ensure_archive_actions_disabled(fork_repository: str, *, strict: bool) -> N
             raise ReviewerError(
                 f"cannot confirm GitHub Actions is disabled on {fork_repository}, so Palomar "
                 f"will not push preservation refs to it: {detail}"
+            )
+        if _archive_admin_grant(fork_repository) is not False:
+            raise ReviewerError(
+                f"cannot confirm GitHub Actions is disabled on {fork_repository}, and the "
+                f"archive account has not been demoted there, so the refusal is not the one "
+                f"Palomar's own demotion produces: {detail}"
             )
         print(
             f"::warning::cannot read the Actions setting on {fork_repository} now that the "
@@ -5641,10 +5667,18 @@ def _ensure_repair_fork(source_repository: str) -> str:
 def _run_repair_preflight(
     fork_repository: str, commit: str, state: dict[str, Any], work: Path
 ) -> dict[str, Any]:
+    """Ask the shared Submission verifier whether the repaired commit prepares.
+
+    The verifier is trusted code, but everything it reads is a repository
+    somebody else wrote, and it reads it by parsing: TOML, YAML, a Lakefile, a
+    licence. So it runs where the review engines run, inside the Bubblewrap
+    namespace `engine` builds, and not as the repair workflow's own process
+    with that workflow's tokens one `/proc` read away.
+    """
     configured = os.environ.get("PALOMAR_SUBMISSION_CHECKOUT", "").strip()
     if not configured:
         raise ReviewerError("PALOMAR_SUBMISSION_CHECKOUT is required for repair validation")
-    pipeline = Path(configured)
+    pipeline = Path(configured).resolve()
     verifier = pipeline / "scripts" / "verify_submission.py"
     bundle = shutil.which("bundle")
     if not verifier.is_file() or not bundle:
@@ -5678,24 +5712,101 @@ def _run_repair_preflight(
     isolated_home = work / "preflight-home"
     isolated_home.mkdir()
     environment = _repair_preflight_environment(pipeline, isolated_home)
+    command = [
+        sys.executable,
+        str(verifier),
+        "prepare",
+        "--event",
+        str(event_path),
+        "--work-dir",
+        str(work / "preflight"),
+        "--output",
+        str(report_path),
+        "--licensee",
+        bundle,
+    ]
+    try:
+        isolated = engine_execution.isolated_intake_command(
+            command,
+            chdir=pipeline,
+            read_only=_repair_preflight_read_only(pipeline, bundle),
+            # Everything this pass may write is under one directory the caller
+            # made: the event it reads, the checkout of the candidate commit,
+            # the report it returns, and the home it was given.
+            writable=[work],
+            environment=environment,
+            # `prepare` resolves the candidate commit by fetching it from
+            # GitHub, and fetches any substantive-formalization source the
+            # metadata names, so a private network would leave it with nothing
+            # to inspect. It is given no credential to spend on that reach.
+            network=True,
+        )
+    except engine_execution.EngineError as error:
+        raise ReviewerError(f"repair preflight cannot be isolated: {error}") from error
     run(
-        [
-            sys.executable,
-            str(verifier),
-            "prepare",
-            "--event",
-            str(event_path),
-            "--work-dir",
-            str(work / "preflight"),
-            "--output",
-            str(report_path),
-            "--licensee",
-            bundle,
-        ],
+        isolated,
         timeout=1800,
+        # Also the environment Bubblewrap itself is started with. It stays at
+        # PID 1 inside the namespace without ever exec'ing, so whatever it was
+        # launched with is readable at /proc/1/environ by the very code this
+        # namespace exists to contain. Handing it the allowlist leaves nothing
+        # there worth reading.
         env=environment,
     )
     return load_json(report_path)
+
+
+def _repair_preflight_read_only(pipeline: Path, bundle: str) -> list[Path]:
+    """The host paths the isolated verifier reads, and nothing else.
+
+    The verifier runs from this interpreter and shells out to Git and Bundler,
+    all of which it addresses by absolute path or finds on `PATH`. Each one is
+    named here so that the namespace holds the tooling and the trusted
+    Submission checkout while the operator's home, checkouts, and credential
+    files stay outside it.
+    """
+    # Installation directories first and the exact executables last, and
+    # anything already inside something bound is left out: a bind is a mount,
+    # and one made inside a read-only mount has nowhere to attach.
+    candidates = [
+        pipeline,
+        Path(sys.base_prefix),
+        Path(sys.prefix),
+        *(_tool_root(shutil.which(tool)) for tool in ("git", "ruby")),
+        _tool_root(bundle),
+        Path(sys.executable),
+    ]
+    # Bundler resolves the Submission Gemfile against gems installed wherever
+    # the runner put them, which is ordinarily inside the checkout but is a
+    # configured path often enough to be worth binding when it is one.
+    for name in ("GEM_HOME", "GEM_PATH", "BUNDLE_PATH"):
+        for entry in os.environ.get(name, "").split(os.pathsep):
+            if entry.strip():
+                candidates.append(Path(entry.strip()))
+    paths: list[Path] = []
+    for path in candidates:
+        if path is None or not path.exists():
+            continue
+        if any(path == kept or kept in path.parents for kept in paths):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _tool_root(executable: str | None) -> Path | None:
+    """The smallest path to bind so an installed tool still runs.
+
+    A tool in a `bin` directory brings its installation prefix, because that is
+    where its libraries and helper programs are. Anything else brings only
+    itself: the directory a loose executable happens to sit in belongs to
+    whoever put it there, and mounting it would carry in their files too.
+    """
+    if not executable:
+        return None
+    resolved = Path(executable).resolve()
+    if not resolved.is_file():
+        return None
+    return resolved.parent.parent if resolved.parent.name == "bin" else resolved
 
 
 def _submission_authorization_label(pipeline: Path, relationship: Any) -> str:
@@ -5729,8 +5840,7 @@ def _repair_preflight_environment(pipeline: Path, home: Path) -> dict[str, str]:
     """Build the non-secret environment used for candidate-controlled intake."""
     safe_names = {
         "LANG", "LC_ALL", "LC_CTYPE", "PATH", "SHELL", "SSL_CERT_DIR",
-        "SSL_CERT_FILE", "TMP", "TMPDIR", "TEMP", "HTTPS_PROXY", "HTTP_PROXY",
-        "NO_PROXY",
+        "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
     }
     safe_prefixes = ("BUNDLE_", "GEM_", "RUBY")
     environment = {
@@ -5740,6 +5850,10 @@ def _repair_preflight_environment(pipeline: Path, home: Path) -> dict[str, str]:
     }
     environment["HOME"] = str(home.resolve())
     environment["BUNDLE_GEMFILE"] = str((pipeline / "Gemfile").resolve())
+    # The runner's own temporary directory is not carried across: the namespace
+    # this runs in has its own /tmp and nothing at the host's path, so an
+    # inherited TMPDIR would name a directory that does not exist in there.
+    environment["TMPDIR"] = "/tmp"
     return environment
 
 
