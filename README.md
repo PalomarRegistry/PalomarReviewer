@@ -58,12 +58,29 @@ Actions-disabled fork in `PalomarRepairs` using `PALOMAR_REPAIR_TOKEN`. Before
 opening a PR it runs the candidate commit through
 `PalomarSubmission/scripts/verify_submission.py prepare` from `main`, the same
 entry point as ordinary preflight. That subprocess runs in the same fail-closed
-Bubblewrap namespace the review engines run in, with the Submission checkout
-and the runner's tooling read-only, one writable directory, and an allowlisted
-non-secret environment that Bubblewrap itself is also started with: neither
-State write authority nor either GitHub token crosses into
-candidate-controlled intake, and no host without bubblewrap runs the pass at
-all. Failed candidate validation leaves an
+Bubblewrap namespace the review engines run in, and no host without bubblewrap
+runs it at all. What it is given is a `git archive` export of the Submission
+checkout at `HEAD` rather than the working tree, so neither `.git/config`, whose
+extraheader can carry the credential the checkout was made with, nor any
+untracked file beside it is reachable; the runner's interpreter, Git and
+Bundler read-only, never through a mount that would carry the operator's home,
+workspace, or temporary directory in with it; one writable directory; `/dev/null`
+on standard input; and an environment built from an exact list of names.
+That list is exact rather than prefixed because Bundler documents credentials in
+`BUNDLE_`-prefixed variables (`BUNDLE_GITHUB__COM` and every other
+`BUNDLE_<HOST>__<TLD>`), and a proxy variable whose URL carries userinfo is a
+refusal rather than something to pass on. Bubblewrap itself is started with that
+same environment, because it stays at PID 1 inside the namespace and
+`/proc/1/environ` is readable from in there. Neither State write authority nor
+either GitHub token crosses into candidate-controlled intake.
+
+The documented residual is the network. `prepare` resolves the candidate commit
+by fetching it, Bubblewrap shares the host's network view or nothing at all, and
+it cannot filter egress; so repair preflight is supported only on an ephemeral
+runner with no private routing and no managed identity or instance-metadata
+endpoint that grants anything, which is what a GitHub-hosted runner is. A
+self-hosted runner that can reach an internal network is not a supported place
+to run it. Failed candidate validation leaves an
 actionable explanation and manual patch, removes the temporary repair branch,
 and never opens a knowingly failing PR. Finished pull requests also have their
 exact deterministic repair branch removed on a best-effort basis.
