@@ -36,6 +36,7 @@ PALOMAR_ID_RE = re.compile(
     r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<serial>[0-9]{6})\Z"
 )
 SUBMISSION_ID_RE = re.compile(r"[0-9a-z]{12}\Z")
+IDENTITY_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
 )
@@ -252,7 +253,7 @@ def materialize_changes(
                 exact_path = real_day and change.path == day_path(name)
             elif directory == "identities":
                 exact_path = (
-                    re.fullmatch(r"[0-9a-f]{64}", name) is not None
+                    IDENTITY_DIGEST_RE.fullmatch(name) is not None
                     and change.path == f"{IDENTITIES_DIRECTORY}/{name}.json"
                 )
         if (

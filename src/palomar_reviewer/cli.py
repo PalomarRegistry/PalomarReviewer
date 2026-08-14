@@ -4243,6 +4243,17 @@ def _registration_projection_statuses(
             )
         )
     ]
+    identity_changes = [
+        change
+        for change in projections
+        if change.path.startswith(f"{registration_authority.IDENTITIES_DIRECTORY}/")
+        and change.path.endswith(".json")
+        and registration_authority.IDENTITY_DIGEST_RE.fullmatch(
+            change.path.removeprefix(
+                f"{registration_authority.IDENTITIES_DIRECTORY}/"
+            ).removesuffix(".json")
+        )
+    ]
     result_relative = result_changes[0].path if len(result_changes) == 1 else ""
     result_identifier = result_relative.removeprefix(
         f"{registration_authority.RESULTS_DIRECTORY}/"
@@ -4255,9 +4266,18 @@ def _registration_projection_statuses(
     if (
         len(result_changes) != 1
         or len(submission_changes) != 1
-        or len(result_changes) + len(submission_changes) + len(day_changes) != len(projections)
+        or (
+            len(result_changes)
+            + len(submission_changes)
+            + len(day_changes)
+            + len(identity_changes)
+            != len(projections)
+        )
         or not day_matches_result
         or submission_changes[0].status != "A"
+        or (result_changes[0].status == "A" and len(identity_changes) != 1)
+        or (result_changes[0].status == "M" and identity_changes)
+        or any(change.status != "A" for change in identity_changes)
         or (result_changes[0].status == "A" and len(day_changes) != 1)
         or (result_changes[0].status == "M" and day_changes)
     ):
