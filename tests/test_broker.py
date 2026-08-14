@@ -156,7 +156,7 @@ def request(
     """One call at the broker, from where a process in the namespace stands."""
     host = base.split("//", 1)[1]
     payload = body if isinstance(body, bytes) else json.dumps(
-        {"model": MODEL, "stream": True} if body is None else body
+        {"model": MODEL, "stream": True, "store": False} if body is None else body
     ).encode("utf-8")
     connection = http.client.HTTPConnection(host, timeout=timeout)
     try:
@@ -269,7 +269,12 @@ class ForwardingTests(unittest.TestCase):
             with running_broker(policy) as (base, ledger, _server):
                 status, headers, body = request(
                     base,
-                    body={"model": MODEL, "stream": True, "reasoning": {"effort": "high"}},
+                    body={
+                        "model": MODEL,
+                        "stream": True,
+                        "store": False,
+                        "reasoning": {"effort": "high"},
+                    },
                     headers={
                         "accept": "text/event-stream",
                         "x-codex-window-id": "window-1",
@@ -320,7 +325,9 @@ class ForwardingTests(unittest.TestCase):
                 connection.request(
                     "POST",
                     broker.RESPONSES_PATH,
-                    body=json.dumps({"model": MODEL, "stream": True}).encode("utf-8"),
+                    body=json.dumps(
+                        {"model": MODEL, "stream": True, "store": False}
+                    ).encode("utf-8"),
                     headers={"authorization": f"Bearer {CAPABILITY}"},
                 )
                 response = connection.getresponse()
@@ -384,14 +391,21 @@ class RefusalTests(unittest.TestCase):
         policy = broker.BrokerPolicy(
             model=MODEL, reasoning_effort="high", upstream_origin=self.upstream.origin
         )
-        pinned = {"model": MODEL, "stream": True, "reasoning": {"effort": "high"}}
+        # Exactly what pinned Codex puts on the wire, `store: false` included:
+        # every one of its Responses calls carries the field explicitly.
+        pinned = {
+            "model": MODEL,
+            "stream": True,
+            "store": False,
+            "reasoning": {"effort": "high"},
+        }
         with running_broker(policy) as (base, ledger, _server):
             for name, body in (
                 ("another model", {**pinned, "model": "gpt-4o"}),
                 ("no model", {"stream": True}),
                 ("not streamed", {**pinned, "stream": False}),
                 ("another effort", {**pinned, "reasoning": {"effort": "low"}}),
-                ("no effort at all", {"model": MODEL, "stream": True}),
+                ("no effort at all", {"model": MODEL, "stream": True, "store": False}),
                 ("not an object", [{"model": MODEL}]),
                 ("a stored response", {**pinned, "store": True}),
                 ("a background response", {**pinned, "background": True}),
@@ -430,11 +444,79 @@ class RefusalTests(unittest.TestCase):
                 body={
                     "model": MODEL,
                     "stream": True,
+                    "store": False,
                     "tools": [{"type": "function", "name": "shell"}, {"type": "custom", "name": "exec"}],
                 },
             )
         self.assertEqual(status, 200)
         self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_only_an_explicit_store_false_reaches_the_provider(self):
+        """Omitting `store` asks for the provider default, not for none.
+
+        The provider keeps a response it was not told to discard for at least
+        thirty days, so the
+        containment claim cannot rest on a client that happens to send the
+        field. Every request that does not carry `store` explicitly false is
+        refused, including the one that leaves it out.
+        """
+        served = {"model": MODEL, "stream": True, "store": False}
+        with running_broker(self.policy()) as (base, ledger, _server):
+            for name, store in (
+                ("omitted", ...),
+                ("null", None),
+                ("stored", True),
+                ("the string false", "false"),
+                ("the number zero", 0),
+            ):
+                with self.subTest(store=name):
+                    body = dict(served)
+                    if store is ...:
+                        del body["store"]
+                    else:
+                        body["store"] = store
+                    status, _headers, _body = request(base, body=body)
+                    self.assertEqual(status, 403)
+            self.assertEqual(request(base, body=served)[0], 200)
+        self.assertEqual(len(self.upstream.requests), 1)
+        self.assertEqual(json.loads(self.upstream.requests[0]["body"])["store"], False)
+        self.assertEqual(ledger.summary()["refusals"], {"unexpected store mode": 5})
+
+    def test_a_field_named_twice_is_refused_rather_than_read_one_way(self):
+        """The broker judges the parsed object and forwards the original bytes.
+
+        Python keeps the last value for a duplicate name. A provider that keeps
+        the first would read a different request out of the same bytes than the
+        one this approved, so the body that can be read two ways is refused
+        instead, in either order and at any depth, and whether or not the
+        second name arrives escaped.
+        """
+        # Written as bytes, because a duplicate name is not something a `dict`
+        # can carry: it only exists on the wire.
+        head = f'"model": "{MODEL}", "stream": true, '
+        with running_broker(self.policy()) as (base, ledger, _server):
+            for name, tail in (
+                ("stored last", '"store": true, "store": false'),
+                ("stored first", '"store": false, "store": true'),
+                ("an escaped name", '"store": false, "\\u0073tore": true'),
+                (
+                    "a nested duplicate",
+                    '"store": false, "text": {"verbosity": "low", "verbosity": "high"}',
+                ),
+                (
+                    "a duplicate the policy never reads",
+                    '"store": false, "include": [], "include": []',
+                ),
+            ):
+                with self.subTest(body=name):
+                    body = ("{" + head + tail + "}").encode("utf-8")
+                    status, _headers, _body = request(base, body=body)
+                    self.assertEqual(status, 403)
+                    self.assertEqual(self.upstream.requests, [])
+            served = ("{" + head + '"store": false}').encode("utf-8")
+            self.assertEqual(request(base, body=served)[0], 200)
+        self.assertEqual(len(self.upstream.requests), 1)
+        self.assertEqual(ledger.summary()["refusals"], {"duplicate request field": 5})
 
     def test_an_oversized_or_undeclared_body_is_refused_unread(self):
         with running_broker(self.policy(max_request_bytes=512)) as (base, ledger, _server):

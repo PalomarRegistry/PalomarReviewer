@@ -657,8 +657,11 @@ arrives in the namespace environment through a Bubblewrap `--args` pipe, so it
 is in no process's command line either.
 
 The broker serves the request pinned Codex makes and refuses the rest: another
-method, path, model or reasoning effort; an unstreamed, stored or background
-response; priority processing; a continued or provider-stored conversation; a
+method, path, model or reasoning effort; an unstreamed or background response;
+any response not explicitly asked to go unstored, because the provider keeps
+one it was not told to discard for at least thirty days; a body that names a
+field twice, which two parsers could read two ways; priority processing; a
+continued or provider-stored conversation; a
 provider-hosted tool, which is how a namespace process would buy itself the web
 research the policy says these passes do not have. It forwards only the headers
 pinned Codex sends, returns only the ones it reads, follows no redirect, and
