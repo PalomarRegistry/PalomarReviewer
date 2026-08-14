@@ -1152,21 +1152,21 @@ def _network_root(metadata: dict[str, Any]) -> str:
     return candidate
 
 
-def _archive_actions_read_denied(detail: str) -> bool:
-    """Whether a failed Actions read is the demotion this code performs itself.
+def _archive_read_statuses(detail: str) -> set[int]:
+    """The HTTP statuses a failed `gh api` reported, if it reported any."""
+    return {int(code) for code in re.findall(r"HTTP\s+(\d{3})", detail)}
 
-    Reading a repository's Actions setting needs Administration, which the
-    archive account holds only while it is the fork's creator. Once
-    `_drop_archive_admin` has run, GitHub answers the same request with a 403
-    naming the missing rights. Nothing else is read as that: a 404, a 5xx, and
-    the 403 GitHub uses for a secondary rate limit all remain refusals, because
-    treating an unexplained failure as the expected one is how a real loss of
-    access would go unnoticed.
+
+def _archive_read_rate_limited(detail: str) -> bool:
+    """Whether a refusal is GitHub throttling rather than GitHub refusing.
+
+    A secondary rate limit answers 403, the same status as a denial, so this
+    is the one place a sentence is read. It is read to refuse: an unrecognised
+    wording falls through to the grant, which is a check rather than an
+    assumption. Nothing here can decide to continue, so GitHub rewording it
+    costs a retry at worst, never a fork that was never asked about.
     """
-    lowered = detail.casefold()
-    return "403" in lowered and (
-        "must have admin rights" in lowered or "resource not accessible" in lowered
-    )
+    return "rate limit" in detail.casefold()
 
 
 def _archive_admin_grant(fork_repository: str) -> bool | None:
@@ -1207,14 +1207,33 @@ def _ensure_archive_actions_disabled(fork_repository: str, *, strict: bool) -> N
     interrupted lifecycle, or a fork somebody made by hand, leaves the account
     holding administrator rights it never gave up, and a 403 on a setting it is
     entitled to read is then something other than the demotion. So the grant
-    itself is read before the excuse is accepted, and only an explicit absence
-    of it buys anything: an unreadable grant, an ambiguous one, or one that is
-    still held all refuse.
+    itself is what decides, and only an explicit absence of it buys anything:
+    an unreadable grant, an ambiguous one, or one that is still held all
+    refuse.
+
+    Which refusal it is gets decided by status and by grant, not by wording.
+    An earlier version read the refusal's prose for the sentence it expected a
+    demoted account to get; GitHub words it differently, so the branch never
+    matched and every re-preservation into every existing fork refused. The
+    wording it was written against appeared nowhere but in the test asserting
+    it. The lesson is not that the sentence needs updating. It is that a
+    sentence must never be the thing that lets a run continue, because when it
+    drifts the failure is total and silent.
+
+    So a sentence can now only refuse, never excuse. A status other than 403
+    refuses: a 404 or a 5xx says something else is wrong with the fork, and
+    learning nothing about Actions is the smaller half of that. A 403 that
+    reads as throttling refuses too, since a rate limit is a reason to come
+    back rather than a statement about the grant. What is left is a plain
+    denial, and there `permissions.admin` decides — a field, answering the
+    question actually being asked. Only a fork that says plainly that the
+    account no longer administers it lets the run continue.
     """
     response = archive_api(f"repos/{fork_repository}/actions/permissions", check=False)
     if response.returncode != 0:
         detail = f"{response.stderr}\n{response.stdout}".strip()[-1000:]
-        if strict or not _archive_actions_read_denied(detail):
+        denied = _archive_read_statuses(detail) == {403} and not _archive_read_rate_limited(detail)
+        if strict or not denied:
             raise ReviewerError(
                 f"cannot confirm GitHub Actions is disabled on {fork_repository}, so Palomar "
                 f"will not push preservation refs to it: {detail}"

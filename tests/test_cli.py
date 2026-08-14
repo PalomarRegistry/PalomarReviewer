@@ -731,7 +731,21 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             method="DELETE",
         )
 
-    ARCHIVE_DEMOTED_403 = "gh: Must have admin rights to Repository. (HTTP 403)"
+    # What GitHub actually answered a demoted archive account, recorded from
+    # the registration of PALOMAR-2026-08-08-000001 v3 on 2026-08-14. The
+    # string this fixture used to hold was written from memory and matched
+    # nothing GitHub sends, which is how the refusal it fed reached production.
+    ARCHIVE_DEMOTED_403 = (
+        "gh: You must have repository read permissions or have the repository "
+        "Actions policies fine-grained permission. (HTTP 403)"
+    )
+    # Two more shapes the same denial has worn. Nothing reads them; they are
+    # here so a test can show the outcome does not depend on which one arrives.
+    ARCHIVE_DENIAL_WORDINGS = (
+        ARCHIVE_DEMOTED_403,
+        "gh: Must have admin rights to Repository. (HTTP 403)",
+        "HTTP 403: Resource not accessible by integration",
+    )
 
     def one_network_fixture(self):
         """One submitted repository, so one fork and one archive lifecycle."""
@@ -796,19 +810,46 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "repos/PalomarArchive/fixture/actions/permissions", check=False
             )
 
-    def test_only_the_demotion_this_code_performs_excuses_an_unreadable_setting(self):
-        # The 403 GitHub gives a secondary rate limit says nothing about the
-        # grant, and a fork that has stopped answering at all says less.
-        self.assertTrue(cli._archive_actions_read_denied(self.ARCHIVE_DEMOTED_403))
-        self.assertTrue(
-            cli._archive_actions_read_denied("HTTP 403: Resource not accessible by integration")
-        )
-        self.assertFalse(
-            cli._archive_actions_read_denied("HTTP 403: You have exceeded a secondary rate limit")
-        )
-        self.assertFalse(cli._archive_actions_read_denied("HTTP 404: Not Found"))
-        self.assertFalse(cli._archive_actions_read_denied("HTTP 502: Bad Gateway"))
+    def test_the_grant_decides_an_unreadable_setting_whatever_github_calls_it(self):
+        # The refusal's wording is not read. Every shape of the same denial has
+        # to reach the same decision, because the one thing this code cannot
+        # rely on is GitHub keeping a sentence the same.
+        for wording in self.ARCHIVE_DENIAL_WORDINGS:
+            answer = subprocess.CompletedProcess(["gh", "api"], 1, "", wording)
+            printed = io.StringIO()
+            with (
+                mock.patch.object(cli, "archive_api", return_value=answer),
+                mock.patch.object(
+                    cli, "_archive_get", return_value={"permissions": {"admin": False}}
+                ),
+                contextlib.redirect_stdout(printed),
+            ):
+                cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
+            self.assertIn("::warning::cannot read the Actions setting", printed.getvalue())
 
+    def test_a_sentence_can_refuse_a_read_but_never_excuse_one(self):
+        # The direction is the whole point. Prose that lets a run continue
+        # fails total and silent when GitHub rewords it, which is what happened.
+        # Prose that only refuses costs a retry when it drifts.
+        self.assertTrue(cli._archive_read_rate_limited("You have exceeded a secondary rate limit"))
+        self.assertFalse(cli._archive_read_rate_limited(self.ARCHIVE_DEMOTED_403))
+        self.assertEqual(cli._archive_read_statuses(self.ARCHIVE_DEMOTED_403), {403})
+        self.assertEqual(cli._archive_read_statuses("gh: Bad gateway (HTTP 502)"), {502})
+        # No status at all is not a denial either: a transport failure that
+        # never reached GitHub says nothing about the grant.
+        self.assertEqual(cli._archive_read_statuses("connection reset by peer"), set())
+        for detail in ("connection reset by peer", "gh: Not Found (HTTP 404)"):
+            answer = subprocess.CompletedProcess(["gh", "api"], 1, "", detail)
+            with (
+                mock.patch.object(cli, "archive_api", return_value=answer),
+                mock.patch.object(
+                    cli, "_archive_get", return_value={"permissions": {"admin": False}}
+                ),
+                self.assertRaisesRegex(ReviewerError, "cannot confirm GitHub Actions is disabled"),
+            ):
+                cli._ensure_archive_actions_disabled("PalomarArchive/fixture", strict=False)
+
+    def test_only_the_demotion_this_code_performs_excuses_an_unreadable_setting(self):
         # The creating run holds the grant, so nothing excuses it there.
         answer = subprocess.CompletedProcess(["gh", "api"], 1, "", self.ARCHIVE_DEMOTED_403)
         with (
