@@ -2298,6 +2298,33 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         )
         self.assertIn("sk-", record["abstract"])
 
+    def test_the_review_summary_never_becomes_the_registry_abstract(self):
+        review = {
+            "reviewed_at": "2026-08-01T12:34:56Z",
+            "policy_commit": "9" * 40,
+            "reviewer_models": ["codex:test"],
+            "summary": "AI-generated editorial synthesis.",
+            "scores": {
+                "statement_alignment": 4, "definition_fidelity": 4,
+                "notability": 4, "literature": 4, "clarity": 4,
+            },
+            "warnings": [],
+        }
+        classification = {"arxiv": ["math.CO"], "msc2020": ["05C10"]}
+
+        named = self.example_record(
+            review=review,
+            metadata={
+                "project": {"license": "MIT", "name": "Submitter's project name"},
+                "classification": classification,
+            },
+        )
+        unnamed = self.example_record(review=review)
+
+        self.assertEqual(named["abstract"], "Submitter's project name")
+        self.assertEqual(unnamed["abstract"], "example/project")
+        self.assertNotIn(review["summary"], json.dumps([named, unnamed]))
+
     def review_with_ranked_findings(self):
         """A review whose top-level list is the warning-and-error findings.
 
