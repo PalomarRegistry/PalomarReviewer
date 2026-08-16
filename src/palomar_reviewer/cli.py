@@ -4151,9 +4151,11 @@ def registry_record(
                 ("project", "short_description"),
                 ("project", "description"),
                 ("result", "statement"),
+                ("project", "name"),
+                ("result", "name"),
             ],
         )
-        or review["summary"]
+        or title
     )
     license_record = validated_repository_license(mechanical, metadata)
     challenge = mechanical["challenge"]
