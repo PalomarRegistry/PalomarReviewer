@@ -6807,6 +6807,37 @@ class EntryProvenanceTests(unittest.TestCase):
             "endorsed",
         )
 
+    def test_free_text_is_canonicalized_only_at_the_public_entry_boundary(self):
+        report = self.provenance(
+            mathematical_sources=[{
+                "title": "An informal account",
+                "authors": [],
+                "relationship": "suggested the key lemma",
+                "author_endorsement": "reviewed an early draft",
+            }],
+            related_formalizations=[{
+                "identifier": "https://example.com/formalization",
+                "relationship": "shares its computational infrastructure",
+            }],
+        )
+        result = cli.entry_provenance(report)
+        source = result["mathematical_sources"][0]
+        self.assertEqual(source["relationship"], "other")
+        self.assertNotIn("author_endorsement", source)
+        self.assertEqual(result["related_formalizations"][0]["relationship"], "other")
+        self.assertEqual(
+            report["provenance"]["mathematical_sources"][0]["relationship"],
+            "suggested the key lemma",
+        )
+        self.assertEqual(
+            report["provenance"]["mathematical_sources"][0]["author_endorsement"],
+            "reviewed an early draft",
+        )
+        self.assertEqual(
+            report["provenance"]["related_formalizations"][0]["relationship"],
+            "shares its computational infrastructure",
+        )
+
     def test_a_submission_that_declared_nothing_is_not_registered(self):
         """Dropping the block unread would publish defaults as assertions."""
         for field in ("result_origin", "repository_role", "responsible_maintainers"):
@@ -8844,6 +8875,26 @@ class MetadataRepairTests(UsesCapabilities, unittest.TestCase):
         wrong_path["source"]["formalization_path"] = "metadata.yaml"
         with self.assertRaisesRegex(ReviewerError, "named formalization.yaml"):
             cli._validate_repair(wrong_path, state)
+
+    def test_descriptive_metadata_repairs_accept_bounded_free_text(self):
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        repair = self.repair()
+        repair["schema_version"] = 2
+        repair["edits"] = [
+            {"field": "sources", "value": [
+                {"title": "Source", "relationship": "formalizes"},
+                {
+                    "title": "Notes", "type": "private correspondence",
+                    "relationship": "suggested the key lemma",
+                    "author_endorsement": "reviewed an early draft",
+                },
+            ]},
+            {"field": "automation.methods", "value": [{"method": "AI-assisted"}]},
+        ]
+        cli._validate_repair(repair, state)
 
     def test_successful_prepare_report_is_the_repair_preflight_success_contract(self):
         self.assertTrue(cli._repair_preflight_passed({"status": "pending", "stage": "prepared"}))
