@@ -2177,12 +2177,16 @@ REPAIR_FIELDS_V2 = {
     "automation.methods": "methods",
     "repository.substantive_formalization": "substantive-repository",
 }
-SOURCE_TYPES = {"paper", "book", "web discussion", "folklore", "original-proof", "other"}
-SOURCE_RELATIONSHIPS = {"formalizes", "adapts", "independently-proves", "background", "other"}
-SOURCE_ENDORSEMENTS = {
-    "participated", "endorsed", "no-response", "not-contacted", "declined", "n/a",
+SUBSTANTIVE_SOURCE_RELATIONSHIPS = {
+    "formalizes", "adapts", "independently-proves",
 }
-AUTOMATION_METHODS = {"manual", "copilot", "agent", "autonomous", "other"}
+SOURCE_RELATIONSHIP_CATEGORIES = {
+    *SUBSTANTIVE_SOURCE_RELATIONSHIPS, "background", "other",
+}
+
+
+def _source_relationship_category(value: str) -> str:
+    return value if value in SOURCE_RELATIONSHIP_CATEGORIES else "other"
 
 
 def _repair_line(value: Any, field: str, maximum: int = 500) -> str:
@@ -2231,8 +2235,6 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
             if not isinstance(raw, dict) or set(raw) - {"method", "framework", "models"}:
                 raise ReviewerError(f"repair value for {field} is malformed")
             method_name = _repair_line(raw.get("method"), f"{field}.method")
-            if complete and method_name not in AUTOMATION_METHODS:
-                raise ReviewerError(f"repair value for {field}.method is unsupported")
             item: dict[str, Any] = {"method": method_name}
             if "framework" in raw:
                 item["framework"] = _repair_line(raw["framework"], f"{field}.framework")
@@ -2258,31 +2260,37 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
                 if name in raw:
                     item[name] = _repair_line(raw[name], f"sources.{name}", maximum)
             if "type" in raw:
-                if raw["type"] not in SOURCE_TYPES:
-                    raise ReviewerError("repair source type is unsupported")
-                item["type"] = raw["type"]
+                item["type"] = _repair_line(raw["type"], "sources.type", 200)
             if "relationship" in raw:
-                if raw["relationship"] not in SOURCE_RELATIONSHIPS:
-                    raise ReviewerError("repair source relationship is unsupported")
-                item["relationship"] = raw["relationship"]
+                item["relationship"] = _repair_line(
+                    raw["relationship"], "sources.relationship"
+                )
             elif complete:
                 raise ReviewerError("every repair source needs a relationship")
             if "author_endorsement" in raw:
-                if raw["author_endorsement"] not in SOURCE_ENDORSEMENTS:
-                    raise ReviewerError("repair source endorsement is unsupported")
-                item["author_endorsement"] = raw["author_endorsement"]
+                item["author_endorsement"] = _repair_line(
+                    raw["author_endorsement"], "sources.author_endorsement", 100
+                )
             sources.append(item)
         if complete:
             original = any(item.get("type") == "original-proof" for item in sources)
-            substantive = {"formalizes", "adapts", "independently-proves"}
-            if original and any(item.get("relationship") in substantive for item in sources):
+            if original and any(
+                _source_relationship_category(item.get("relationship", ""))
+                in SUBSTANTIVE_SOURCE_RELATIONSHIPS
+                for item in sources
+            ):
                 raise ReviewerError("original-proof sources cannot have a substantive relationship")
             if original and any(
-                item.get("type") == "original-proof" and item.get("relationship") != "other"
+                item.get("type") == "original-proof"
+                and _source_relationship_category(item.get("relationship", "")) != "other"
                 for item in sources
             ):
                 raise ReviewerError("original-proof sources must use relationship other")
-            if not original and not any(item.get("relationship") in substantive for item in sources):
+            if not original and not any(
+                _source_relationship_category(item.get("relationship", ""))
+                in SUBSTANTIVE_SOURCE_RELATIONSHIPS
+                for item in sources
+            ):
                 raise ReviewerError("source-based repairs need a substantive source relationship")
         return sources
     raise ReviewerError(f"unsupported repair field: {field}")
