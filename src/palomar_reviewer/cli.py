@@ -2183,6 +2183,12 @@ SUBSTANTIVE_SOURCE_RELATIONSHIPS = {
 SOURCE_RELATIONSHIP_CATEGORIES = {
     *SUBSTANTIVE_SOURCE_RELATIONSHIPS, "background", "other",
 }
+REGISTERED_SOURCE_ENDORSEMENTS_V2 = {
+    "participated", "endorsed", "no-response", "not-contacted", "declined", "n/a",
+}
+REGISTERED_RELATED_RELATIONSHIPS_V2 = {
+    "builds-on", "adapts", "independent", "supersedes", "other",
+}
 
 
 def _source_relationship_category(value: str) -> str:
@@ -4121,6 +4127,17 @@ def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
     for source in provenance.get("mathematical_sources", []):
         if isinstance(source, dict):
             source.pop("author_contacted", None)
+            relationship = source.get("relationship")
+            if isinstance(relationship, str):
+                source["relationship"] = _source_relationship_category(relationship)
+            if source.get("author_endorsement") not in REGISTERED_SOURCE_ENDORSEMENTS_V2:
+                source.pop("author_endorsement", None)
+    for related in provenance.get("related_formalizations", []):
+        if (
+            isinstance(related, dict)
+            and related.get("relationship") not in REGISTERED_RELATED_RELATIONSHIPS_V2
+        ):
+            related["relationship"] = "other"
     return provenance
 
 
