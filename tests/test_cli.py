@@ -3827,6 +3827,8 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         download_call = next(arguments for arguments in calls if arguments[:2] == ["run", "download"])
         self.assertIn(f"challenge-render-{request_id}", download_call)
         watched.assert_called_once()
+        self.assertEqual(watched.call_args.kwargs["timeout"], 6 * 60 * 60)
+        self.assertEqual(cli.PASS_BUDGET_SECONDS, 6 * 60 * 60)
 
 
 if __name__ == "__main__":
