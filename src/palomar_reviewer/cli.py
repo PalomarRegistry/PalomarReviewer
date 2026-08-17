@@ -2204,6 +2204,12 @@ def _repair_line(value: Any, field: str, maximum: int = 500) -> str:
     return value
 
 
+def _repair_text(value: Any, field: str, maximum: int = 10_000) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        raise ReviewerError(f"repair value for {field} is malformed")
+    return value.strip()
+
+
 def _repair_lines(value: Any, field: str, maximum: int = 100) -> list[str]:
     if not isinstance(value, list) or not 1 <= len(value) <= maximum:
         raise ReviewerError(f"repair value for {field} is malformed")
@@ -2253,7 +2259,7 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
             raise ReviewerError(f"repair value for {field} is malformed")
         allowed = {
             "title", "authors", "id", "type", "location", "relationship", "license",
-            "author_endorsement",
+            "author_endorsement", "note",
         }
         sources: list[dict[str, Any]] = []
         for raw in value:
@@ -2273,6 +2279,8 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
                 )
             elif complete:
                 raise ReviewerError("every repair source needs a relationship")
+            if "note" in raw:
+                item["note"] = _repair_text(raw["note"], "sources.note")
             if "author_endorsement" in raw:
                 item["author_endorsement"] = _repair_line(
                     raw["author_endorsement"], "sources.author_endorsement", 100
@@ -4127,6 +4135,7 @@ def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
     for source in provenance.get("mathematical_sources", []):
         if isinstance(source, dict):
             source.pop("author_contacted", None)
+            source.pop("note", None)
             relationship = source.get("relationship")
             if isinstance(relationship, str):
                 source["relationship"] = _source_relationship_category(relationship)

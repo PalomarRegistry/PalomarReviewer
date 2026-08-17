@@ -6813,6 +6813,7 @@ class EntryProvenanceTests(unittest.TestCase):
                 "title": "An informal account",
                 "authors": [],
                 "relationship": "suggested the key lemma",
+                "note": "The source supplied an idea, not the theorem.",
                 "author_endorsement": "reviewed an early draft",
             }],
             related_formalizations=[{
@@ -6824,6 +6825,7 @@ class EntryProvenanceTests(unittest.TestCase):
         source = result["mathematical_sources"][0]
         self.assertEqual(source["relationship"], "other")
         self.assertNotIn("author_endorsement", source)
+        self.assertNotIn("note", source)
         self.assertEqual(result["related_formalizations"][0]["relationship"], "other")
         self.assertEqual(
             report["provenance"]["mathematical_sources"][0]["relationship"],
@@ -6832,6 +6834,10 @@ class EntryProvenanceTests(unittest.TestCase):
         self.assertEqual(
             report["provenance"]["mathematical_sources"][0]["author_endorsement"],
             "reviewed an early draft",
+        )
+        self.assertEqual(
+            report["provenance"]["mathematical_sources"][0]["note"],
+            "The source supplied an idea, not the theorem.",
         )
         self.assertEqual(
             report["provenance"]["related_formalizations"][0]["relationship"],
@@ -8889,6 +8895,7 @@ class MetadataRepairTests(UsesCapabilities, unittest.TestCase):
                 {
                     "title": "Notes", "type": "private correspondence",
                     "relationship": "suggested the key lemma",
+                    "note": "The source supplied an idea, not the theorem.",
                     "author_endorsement": "reviewed an early draft",
                 },
             ]},
