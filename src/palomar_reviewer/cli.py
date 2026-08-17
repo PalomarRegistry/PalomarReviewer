@@ -69,7 +69,12 @@ REGISTRATION_ATTEMPT_LIMIT = 3
 REGISTRATION_RETRY_BACKOFF_SECONDS = 1800
 REGISTRATION_WAIT_SECONDS = 1800
 REGISTRATION_STALE_SECONDS = 6 * 3600
-PASS_BUDGET_SECONDS = 5400
+# A trusted render runs in its own GitHub-hosted job whose workflow permits the
+# platform maximum of six hours.  The reviewer waits for that child rather than
+# rediscovering it in a later pass, so a shorter command timeout or pass budget
+# here would remain the real rendering ceiling no matter what the child says.
+RENDER_WAIT_SECONDS = 6 * 60 * 60
+PASS_BUDGET_SECONDS = RENDER_WAIT_SECONDS
 # The queue, kept as an index rather than rediscovered from scratch.
 #
 # A pass used to list every directory under `submissions/` and read every record
@@ -1892,7 +1897,7 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
             "--exit-status",
         ],
         check=False,
-        timeout=6000,
+        timeout=RENDER_WAIT_SECONDS,
     )
     if watched.returncode:
         message, deterministic = render_failure_details(
