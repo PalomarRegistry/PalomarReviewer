@@ -16,8 +16,9 @@ jobs:
         with:
           persist-credentials: false
           path: reviewer
-      # PalomarDatabase is private. Public CI checks the schema contract
-      # without granting a cross-repository credential. The full registration
+      # PalomarDatabase is private. Public CI checks the schema contract from
+      # its authoritative public source repository without granting a
+      # cross-repository credential. The full registration
       # integration runs against a committed synthetic database in public
       # PalomarDatabaseTools CI, which needs no credential or private ledger
       # bytes. That is stated
@@ -26,7 +27,7 @@ jobs:
       # "Maintainers run it locally" was the previous answer and it was not
       # true: nothing ran it, and it was red.
       #
-      # A registered record has one current public contract: schema-v2.json.
+      # A registered record has one current public contract: schema-v3.json.
       # `scores-v1.json` is not fetched because it is not published: the
       # database validates `scores/` itself, at registration.
       # The custom domain, not the workers.dev name. That second hostname is
@@ -35,12 +36,12 @@ jobs:
       # path allowlist indefinitely. This is the origin readers use.
       - name: Download the schema a record is built against
         env:
-          PUBLIC_DATA_ORIGIN: https://data.palomar-registry.org
+          PUBLIC_CONTRACT_ORIGIN: https://raw.githubusercontent.com/PalomarRegistry/PalomarDatabaseTools/main
         run: |
           mkdir palomar-schemas
           curl --fail --silent --show-error --retry 3 \
-            "$PUBLIC_DATA_ORIGIN/schema-v2.json" \
-            --output palomar-schemas/schema-v2.json
+            "$PUBLIC_CONTRACT_ORIGIN/schema-v3.json" \
+            --output palomar-schemas/schema-v3.json
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: PalomarRegistry/PalomarPolicy

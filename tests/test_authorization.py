@@ -31,7 +31,7 @@ def current_contract():
     }
     review = {
         "submission_id": SUBMISSION_ID,
-        "decision": "accept",
+        "outcome": "neutral",
         "source": {"repository": "example/project", "commit": "1" * 40},
     }
     digest = authorization.document_digest(review)

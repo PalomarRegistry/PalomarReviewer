@@ -78,7 +78,7 @@ from palomar_reviewer.registration import allocate_identifier, registration_iden
 # PALOMAR_DATABASE_CHECKOUT, which no workflow anywhere set, so it skipped
 # every run and was red for days before anybody looked.
 #
-# So an unavailable capability now has to be somebody's decision.
+# So an unavailable capability now has to be somebody's outcome.
 #
 #   - Available: the tests run.
 #   - Absent, interactively: the tests skip or narrow, and the suite prints at
@@ -252,7 +252,7 @@ class UsesCapabilities:
         """Every capability, or a skip this run will announce.
 
         For a test that is nothing without them. All of them are resolved
-        before any decision to skip, so the summary names everything that was
+        before any outcome to skip, so the summary names everything that was
         missing rather than only the first thing looked for.
         """
         sources = [self.available(capability) for capability in capabilities]
@@ -814,7 +814,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
     def test_the_grant_decides_an_unreadable_setting_whatever_github_calls_it(self):
         # The refusal's wording is not read. Every shape of the same denial has
-        # to reach the same decision, because the one thing this code cannot
+        # to reach the same outcome, because the one thing this code cannot
         # rely on is GitHub keeping a sentence the same.
         for wording in self.ARCHIVE_DENIAL_WORDINGS:
             answer = subprocess.CompletedProcess(["gh", "api"], 1, "", wording)
@@ -1223,10 +1223,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         mechanical = self.mechanical_fixture()
         review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}
         stale = {
-            "schema_version": 1,
+            "schema_version": 2,
             "id": "PALOMAR-2026-08-08-000001",
             "version": 1,
-            "accepted_at": "2026-08-08",
+            "first_registered_on": "2026-08-08",
             "review_sha256": registration_authorization.document_digest(review),
             "source_repository": mechanical["source"]["repository"],
             "source_commit": mechanical["source"]["commit"],
@@ -1321,10 +1321,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         state = {
             "id": "a1b2c3d4e5f6",
             "registration_attempt": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "id": "PALOMAR-2026-08-01-123456",
                 "version": 1,
-                "accepted_at": "2026-08-01",
+                "first_registered_on": "2026-08-01",
                 "registered_at": "2026-08-01T09:00:00Z",
                 "review_sha256": "0" * 64,
                 "source_repository": mechanical["source"]["repository"],
@@ -1333,7 +1333,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             },
         }
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ReviewerError, "different accepted evidence"):
+            with self.assertRaisesRegex(ReviewerError, "different review evidence"):
                 registration_attempt_identity(
                     Path(directory),
                     state=state,
@@ -1463,21 +1463,21 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         }
         jsonschema.validate(mechanical, mechanical_evidence.MECHANICAL_REPORT_SCHEMA)
 
-    def step_result(self, step, scores, verdict="pass"):
+    def step_result(self, step, scores, outcome="neutral"):
         all_scores = {key: None for key in STEP_SCORE_KEYS}
         all_scores.update(scores)
         findings = []
-        if verdict != "pass":
+        if outcome != "neutral":
             findings = [
                 {
-                    "severity": "error" if verdict == "fail" else "warning",
+                    "severity": "error" if outcome == "failure" else "warning",
                     "evidence": f"{step} evidence",
                     "message": f"{step} finding",
                 }
             ]
         return {
             "step": step,
-            "verdict": verdict,
+            "outcome": outcome,
             "summary": f"{step} summary",
             "findings": findings,
             "scores": all_scores,
@@ -1528,11 +1528,11 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         rubric = {
             "schema_version": 10,
             "finding_comment_policy": "all",
-            "minimum_accept_score": 4,
+            "minimum_score": 4,
             "registry_scores": list(scores),
             "mandatory_reject_below_minimum": ["notability"],
             "step_result": {
-                "verdicts": ["pass", "warn", "fail"],
+                "outcomes": ["neutral", "warning", "failure"],
                 "required_fields": list(STEP_SCHEMA["required"]),
             },
             "steps": [
@@ -1583,7 +1583,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             ],
         }
         synthesis = {
-            "decision": "accept",
+            "outcome": "neutral",
             "summary": "synthesis summary",
             "scores": scores,
             "warnings": [],
@@ -1656,7 +1656,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         result["description_coverage"][1]["coverage"] = "missing"
         with self.assertRaisesRegex(ReviewerError, "requires a failed pass"):
             validate_description_coverage(result, step, mechanical)
-        result["verdict"] = "fail"
+        result["outcome"] = "failure"
         validate_description_coverage(result, step, mechanical)
 
         result["description_coverage"].reverse()
@@ -1669,7 +1669,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             {"severity": "warning", "evidence": "Example.result", "message": "Fix result A."},
             {"severity": "warning", "evidence": "Example.result", "message": "Fix result B."},
         ]
-        passes[1]["verdict"] = "warn"
+        passes[1]["outcome"] = "warning"
         synthesis["warnings"] = ["Fix result A."]
         with self.assertRaisesRegex(ReviewerError, "every required pass finding"):
             validate_synthesis_policy(
@@ -1691,7 +1691,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         passes[1]["findings"] = [
             {"severity": "warning", "evidence": "Example.result", "message": "Fix result."},
         ]
-        passes[1]["verdict"] = "warn"
+        passes[1]["outcome"] = "warning"
         passes[1]["internal_notes"] = [
             {"evidence": "Example.result", "message": "Useful private context."}
         ]
@@ -1718,12 +1718,12 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             {"severity": "warning", "evidence": "metadata", "message": "Clarify metadata."}
         ]
         synthesis["warnings"] = ["Clarify metadata."]
-        with self.assertRaisesRegex(ReviewerError, "passing metadata pass"):
+        with self.assertRaisesRegex(ReviewerError, "no-problem metadata check"):
             validate_synthesis_policy(
                 synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
             )
 
-        passes[0]["verdict"] = "fail"
+        passes[0]["outcome"] = "failure"
         with self.assertRaisesRegex(ReviewerError, "requires an error finding"):
             validate_synthesis_policy(
                 synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
@@ -1732,7 +1732,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_synthesis_rejects_duplicate_public_findings(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         for result in passes[:2]:
-            result["verdict"] = "warn"
+            result["outcome"] = "warning"
             result["findings"] = [
                 {"severity": "warning", "evidence": result["step"], "message": "One correction."}
             ]
@@ -1745,16 +1745,16 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_decision_and_requested_changes_are_consistent(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         synthesis["requested_changes"] = ["Unnecessary change."]
-        with self.assertRaisesRegex(ReviewerError, "acceptance cannot request changes"):
+        with self.assertRaisesRegex(ReviewerError, "no-blocking-problem review cannot request changes"):
             validate_synthesis_policy(
                 synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
             )
 
-        passes[0]["verdict"] = "warn"
+        passes[0]["outcome"] = "warning"
         passes[0]["findings"] = [
             {"severity": "warning", "evidence": "metadata", "message": "Clarify metadata."}
         ]
-        synthesis["decision"] = "revise"
+        synthesis["outcome"] = "revision_required"
         synthesis["warnings"] = ["Clarify metadata."]
         synthesis["requested_changes"] = []
         with self.assertRaisesRegex(ReviewerError, "requires at least one requested change"):
@@ -2094,7 +2094,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             previous = [
                 {
                     "step": "metadata",
-                    "verdict": "warn",
+                    "outcome": "warning",
                     "summary": "Material summary",
                     "findings": [
                         {"severity": "warning", "evidence": "metadata", "message": "Public concern"}
@@ -2164,7 +2164,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         )
 
     def example_record(self, **overrides):
-        """One accepted record, built the way `register` builds it."""
+        """One registered record, built the way `register` builds it."""
         mechanical = self.mechanical_fixture()
         arguments = dict(
             state={"id": "a1b2c3d4e5f6", "submitter": "example",
@@ -2175,7 +2175,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "reviewed_at": "2026-08-01T12:34:56Z",
                 "policy_commit": "9" * 40,
                 "reviewer_models": ["codex:test"],
-                "summary": "Editorially accepted example.",
+                "summary": "No problems were identified.",
                 "scores": {
                     "statement_alignment": 4, "definition_fidelity": 4,
                     "notability": 4, "literature": 4, "clarity": 4,
@@ -2189,7 +2189,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 },
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             },
-            accepted_at="2026-08-01",
+            first_registered_on="2026-08-01",
             # A review of the morning, acted on later the same day. The record
             # is dated by the day of this and not by the day of the review.
             registered_at="2026-08-01T17:05:11Z",
@@ -2219,18 +2219,18 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
     def test_registry_record_carries_the_single_schema(self):
         record = self.example_record()
-        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["schema_version"], 3)
         self.assertEqual(record["provenance"]["result_origin"], "original")
         self.assertEqual(record["submission"]["authorization"]["relationship"], "maintainer")
         # The serial follows the last one registered on that date, so this is
         # the shape of the identifier rather than the value: which serial it is
         # depends on what the database under test already holds.
         self.assertRegex(record["id"], r"^PALOMAR-2026-08-01-[0-9]{6}$")
-        self.assertEqual(record["accepted_at"], "2026-08-01")
+        self.assertEqual(record["first_registered_on"], "2026-08-01")
         self.assertEqual(record["source"]["license"]["detected_identifier"], "MIT")
         schema_checkout = self.available("schema")
         if schema_checkout:
-            schema = json.loads((schema_checkout / "schema-v2.json").read_text())
+            schema = json.loads((schema_checkout / "schema-v3.json").read_text())
             jsonschema.validate(
                 record,
                 schema,
@@ -2240,8 +2240,8 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_the_record_is_dated_by_its_registration_and_not_by_its_review(self):
         """Every ordering surface in the database reads `registered_at`.
 
-        The review's verdict is a different moment and can be days earlier:
-        nothing is registered until the submitter consents. The accepted offer
+        The review's outcome is a different moment and can be days earlier:
+        nothing is registered until the submitter consents. The clearance
         normally remains usable for 24 hours, subject to immediate
         reverification after a review-contract or security change, and may
         remain usable longer without a promise. Whenever registration happens,
@@ -2258,7 +2258,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         time the database sees it the registration has already pushed an
         archive tag and dispatched a render."""
         record = self.example_record()
-        self.assertEqual(record["accepted_at"], record["registered_at"][:10])
+        self.assertEqual(record["first_registered_on"], record["registered_at"][:10])
 
         with self.assertRaisesRegex(ReviewerError, "was registered on 2026-08-02"):
             self.example_record(registered_at="2026-08-02T00:30:00Z")
@@ -2270,7 +2270,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         keeps the v2 on its v1's browse page."""
         record = self.example_record(version=2, registered_at="2027-04-01T09:00:00Z")
 
-        self.assertEqual(record["accepted_at"], "2026-08-01")
+        self.assertEqual(record["first_registered_on"], "2026-08-01")
         self.assertEqual(record["registered_at"], "2027-04-01T09:00:00Z")
 
     def test_the_record_carries_the_verdict_and_not_the_scores(self):
@@ -2283,7 +2283,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         """
         record = self.example_record()
         self.assertNotIn("scores", record["review"])
-        self.assertEqual(record["review"]["verdict"], "accept")
+        self.assertEqual(record["review"]["outcome"], "neutral")
         self.assertNotIn("statement_alignment", json.dumps(record))
 
     def test_a_credential_in_a_finding_never_reaches_the_record(self):
@@ -2297,16 +2297,16 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             "reviewed_at": "2026-08-01T12:34:56Z",
             "policy_commit": "9" * 40,
             "reviewer_models": ["codex:test"],
-            "summary": "Editorially accepted example.",
+            "summary": "No problems were identified.",
             "scores": {
                 "statement_alignment": 4, "definition_fidelity": 4,
                 "notability": 4, "literature": 4, "clarity": 4,
             },
             "warnings": [],
-            "passes": [
+            "checks": [
                 {
                     "step": "metadata",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "findings": [
                         {
                             "severity": "info",
@@ -2386,16 +2386,16 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             "reviewed_at": "2026-08-01T12:34:56Z",
             "policy_commit": "9" * 40,
             "reviewer_models": ["codex:test"],
-            "summary": "Editorially accepted example.",
+            "summary": "No problems were identified.",
             "scores": {
                 "statement_alignment": 4, "definition_fidelity": 4,
                 "notability": 4, "literature": 4, "clarity": 4,
             },
             "warnings": ["a concern", "a second concern"],
-            "passes": [
+            "checks": [
                 {
                     "step": "metadata",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "findings": [
                         {"severity": "info", "message": "an observation", "evidence": "e"},
                         {"severity": "warning", "message": "a concern", "evidence": "e"},
@@ -2403,7 +2403,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 },
                 {
                     "step": "literature_notability",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "findings": [
                         {"severity": "error", "message": "a second concern", "evidence": "e"},
                         {"severity": "info", "message": "a second observation", "evidence": "e"},
@@ -2426,7 +2426,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         archived = cli.public_review(review)
         findings = [
             finding["message"]
-            for step in archived["passes"]
+            for step in archived["checks"]
             for finding in step["findings"]
         ]
         self.assertEqual(record["review"]["warnings"], findings)
@@ -2455,7 +2455,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         )
 
     def test_the_scores_are_recorded_beside_the_record(self):
-        """The decision still has to be reconstructable."""
+        """The outcome still has to be reconstructable."""
         review = {
             "reviewed_at": "2026-08-01T12:34:56Z",
             "policy_commit": "9" * 40,
@@ -2474,7 +2474,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(scores["version"], 2)
         self.assertEqual(scores["scores"]["literature"], 3)
         # Bound to the review it explains: without this a later pass could
-        # leave an earlier pass's numbers standing beside a new verdict.
+        # leave an earlier pass's numbers standing beside a new outcome.
         self.assertEqual(scores["reviewed_at"], review["reviewed_at"])
         self.assertEqual(scores["policy_commit"], review["policy_commit"])
         # Only the five the registry records. `provenance` is scored during
@@ -2514,7 +2514,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             self.assertNotIn(invented, written, f"{invented} reached the record")
         schema_checkout = self.available("schema")
         if schema_checkout:
-            schema = json.loads((schema_checkout / "schema-v2.json").read_text())
+            schema = json.loads((schema_checkout / "schema-v3.json").read_text())
             jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
 
     def test_repository_license_is_bound_to_metadata_and_file_bytes(self):
@@ -2597,7 +2597,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "reviewed_at": "2026-08-01T12:34:56Z",
                 "policy_commit": "9" * 40,
                 "reviewer_models": ["codex:test"],
-                "summary": "Accepted.",
+                "summary": "No problems were identified.",
                 "scores": {
                     "statement_alignment": 4,
                     "definition_fidelity": 4,
@@ -2614,7 +2614,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 },
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             },
-            accepted_at="2026-08-01",
+            first_registered_on="2026-08-01",
             registered_at="2026-08-01T17:05:11Z",
             version=1,
             challenge_render={
@@ -2637,7 +2637,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             },
             preservation=self.preservation_fixture(mechanical),
         )
-        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["schema_version"], 3)
         self.assertEqual(record["source"]["project_path"], "examples/comparator")
         self.assertEqual(
             record["formalization"]["lakefile_path"],
@@ -2802,18 +2802,18 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             ]
             passes[0]["codes_checked"] = ["arxiv:math.CO", "msc2020:05C10"]
             review = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "submission_id": "a1b2c3d4e5f6",
                 "source": {
                     "repository": mechanical["source"]["repository"],
                     "commit": mechanical["source"]["commit"],
                 },
                 "mechanical_report": mechanical["workflow_url"],
-                "decision": "accept",
+                "outcome": "neutral",
                 "reviewed_at": "2026-08-01T12:34:56Z",
                 "policy_commit": policy_head,
                 "reviewer_models": ["codex:test"],
-                "summary": "Editorially accepted example.",
+                "summary": "No problems were identified.",
                 "scores": {
                     "statement_alignment": 4,
                     "definition_fidelity": 4,
@@ -2834,10 +2834,15 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 # CI ran it.
                 "warnings": self.synthesis_warnings_for(passes, work / "policy"),
                 "requested_changes": [],
-                "passes": passes,
+                "checks": passes,
             }
             (source / "formalization.yaml").write_text(
-                "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+                "project:\n"
+                "  description: A synthetic formalization used for registration testing.\n"
+                "  license: MIT\n"
+                "classification:\n"
+                "  arxiv: [math.CO]\n"
+                "  msc2020: [05C10]\n"
             )
             (source / "LICENSE").write_text("fixture licence terms\n")
             mechanical["license"]["sha256"] = hashlib.sha256(
@@ -2982,7 +2987,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             (work / "mechanical-report-sha256").write_text(
                 registration_authorization.document_digest(mechanical) + "\n"
             )
-            classification_pass = next(item for item in review["passes"] if item["step"] == "classification")
+            classification_pass = next(item for item in review["checks"] if item["step"] == "classification")
             classification_pass["scores"]["classification"] = 2
             dirty_rubric = json.loads((work / "policy" / "rubric.json").read_text())
             dirty_rubric["minimum_accept_score"] = 1
@@ -3111,9 +3116,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             # The identifier's date, the result date and the registration
             # instant are one fact written three times, and the database
             # refuses a version 1 where they disagree.
-            self.assertEqual(record["id"][len("PALOMAR-"):][:10], record["accepted_at"])
-            self.assertEqual(record["accepted_at"], record["registered_at"][:10])
-            self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(record["id"][len("PALOMAR-"):][:10], record["first_registered_on"])
+            self.assertEqual(record["first_registered_on"], record["registered_at"][:10])
+            self.assertEqual(record["schema_version"], 3)
             self.assertEqual(
                 record["trust"]["challenge_dependencies"],
                 [
@@ -3207,7 +3212,12 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 for dependency in sample_record["formalization"]["project_dependencies"]
             ]
             (update_source / "formalization.yaml").write_text(
-                "project:\n  license: MIT\nclassification:\n  arxiv: [math.CO]\n  msc2020: [05C10]\n"
+                "project:\n"
+                "  description: A synthetic formalization update used for registration testing.\n"
+                "  license: MIT\n"
+                "classification:\n"
+                "  arxiv: [math.CO]\n"
+                "  msc2020: [05C10]\n"
             )
             (update_source / "LICENSE").write_text("fixture licence terms\n")
             update_mechanical["license"]["sha256"] = hashlib.sha256(
@@ -3245,7 +3255,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     "commit": update_mechanical["source"]["commit"],
                 },
                 "mechanical_report": update_mechanical_url,
-                "passes": update_passes,
+                "checks": update_passes,
                 "warnings": self.synthesis_warnings_for(
                     update_passes, update_work / "policy"
                 ),
@@ -3314,7 +3324,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
             # Nothing public may happen for a submission that has not consented:
             # a render dispatch is a public Actions run naming the repository
-            # and commit, which would signal the decision by itself.
+            # and commit, which would signal the outcome by itself.
             unconsented = json.loads((work / "state.json").read_text())
             unconsented["registration_consent"] = False
             (work / "state.json").write_text(json.dumps(unconsented))
@@ -3340,7 +3350,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             update_entry = update_database / "entries" / f"{record['id']}-v2.json"
             update_record = json.loads(update_entry.read_text())
             self.assertEqual(update_record["version"], 2)
-            self.assertEqual(update_record["accepted_at"], record["accepted_at"])
+            self.assertEqual(update_record["first_registered_on"], record["first_registered_on"])
             update_pr = {
                 **pr,
                 "files": [
@@ -3435,6 +3445,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_schema_version_seven_remains_usable_during_rollout(self):
         _, _, rubric = self.review_policy_fixture()
         rubric["schema_version"] = 7
+        rubric["minimum_accept_score"] = rubric.pop("minimum_score")
+        rubric["step_result"]["verdicts"] = ["pass", "warn", "fail"]
+        rubric["step_result"].pop("outcomes")
         rubric["step_result"]["required_fields"] = [
             "step",
             "verdict",
@@ -3450,6 +3463,8 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
         result.pop("codes_checked")
         result.pop("internal_notes")
+        result["verdict"] = "pass"
+        result.pop("outcome")
         result["findings"] = [
             {"severity": "info", "evidence": "metadata", "message": "Legacy observation."}
         ]
@@ -3458,17 +3473,33 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_schema_version_eight_remains_usable_during_rollout(self):
         _, _, rubric = self.review_policy_fixture()
         rubric["schema_version"] = 8
+        rubric["minimum_accept_score"] = rubric.pop("minimum_score")
+        rubric["step_result"]["verdicts"] = ["pass", "warn", "fail"]
+        rubric["step_result"].pop("outcomes")
+        rubric["step_result"]["required_fields"] = [
+            "step", "verdict", "summary", "findings", "scores", "trust_level",
+            "sources_checked", "declarations_checked", "codes_checked", "internal_notes",
+        ]
         statement = next(
             step for step in rubric["steps"] if step["id"] == "statement_alignment"
         )
         validate_rubric(rubric)
 
         result = self.step_result("statement_alignment", {"statement_alignment": 4})
+        result["verdict"] = "pass"
+        result.pop("outcome")
         jsonschema.validate(result, step_schema_for_rubric(statement, 8))
 
     def test_schema_version_nine_remains_usable_during_rollout(self):
         _, _, rubric = self.review_policy_fixture()
         rubric["schema_version"] = 9
+        rubric["minimum_accept_score"] = rubric.pop("minimum_score")
+        rubric["step_result"]["verdicts"] = ["pass", "warn", "fail"]
+        rubric["step_result"].pop("outcomes")
+        rubric["step_result"]["required_fields"] = [
+            "step", "verdict", "summary", "findings", "scores", "trust_level",
+            "sources_checked", "declarations_checked", "codes_checked", "internal_notes",
+        ]
         statement = next(
             step for step in rubric["steps"] if step["id"] == "statement_alignment"
         )
@@ -3481,22 +3512,24 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             "coverage": "direct",
             "reason": "The description names the selected result.",
         }]
+        result["verdict"] = "pass"
+        result.pop("outcome")
         jsonschema.validate(result, step_schema_for_rubric(statement, 9))
 
-    def test_current_rubric_requires_current_verdicts(self):
+    def test_current_rubric_requires_current_outcomes(self):
         _, _, rubric = self.review_policy_fixture()
         validate_rubric(rubric)
-        rubric["step_result"]["verdicts"] = ["pass", "warn", "unknown"]
-        with self.assertRaisesRegex(ReviewerError, "supported pass verdicts"):
+        rubric["step_result"]["outcomes"] = ["neutral", "warning", "unknown"]
+        with self.assertRaisesRegex(ReviewerError, "supported check outcomes"):
             validate_rubric(rubric)
 
     def test_current_engine_schemas_reject_unknown_outcomes(self):
         result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
-        result["verdict"] = "unknown"
+        result["outcome"] = "unknown"
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(result, STEP_SCHEMA)
         synthesis, _passes, _rubric = self.review_policy_fixture()
-        synthesis["decision"] = "unknown"
+        synthesis["outcome"] = "unknown"
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(synthesis, SYNTHESIS_SCHEMA)
 
@@ -3511,7 +3544,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             model_id="command:test",
             passes=passes,
         )
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["schema_version"], 3)
 
     def test_rubric_rejects_unknown_evidence_inputs(self):
         _, _, rubric = self.review_policy_fixture()
@@ -3548,7 +3581,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_acceptance_allows_a_disclosed_nonblocking_warning(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[0]["scores"]["provenance"] = 3
-        passes[0]["verdict"] = "warn"
+        passes[0]["outcome"] = "warning"
         passes[0]["findings"] = [
             {"severity": "warning", "evidence": "metadata", "message": "Clarify provenance."}
         ]
@@ -3561,15 +3594,15 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         )
 
         passes[0]["scores"]["provenance"] = 4
-        passes[0]["verdict"] = "pass"
+        passes[0]["outcome"] = "neutral"
         passes[0]["findings"] = []
         synthesis["warnings"] = []
-        passes[1]["verdict"] = "fail"
+        passes[1]["outcome"] = "failure"
         passes[1]["findings"] = [
             {"severity": "error", "evidence": "statement", "message": "Repair statement."}
         ]
         synthesis["warnings"] = ["Repair statement."]
-        with self.assertRaisesRegex(ReviewerError, "blocking passes"):
+        with self.assertRaisesRegex(ReviewerError, "blocking checks"):
             validate_synthesis_policy(
                 synthesis,
                 passes=passes,
@@ -3580,13 +3613,13 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_low_notability_is_not_revisable(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["notability"] = 3
-        passes[3]["verdict"] = "fail"
+        passes[3]["outcome"] = "failure"
         passes[3]["findings"] = [
             {"severity": "error", "evidence": "result", "message": "Research interest is not established."}
         ]
         synthesis["scores"]["notability"] = 3
         synthesis["warnings"] = ["Research interest is not established."]
-        synthesis["decision"] = "revise"
+        synthesis["outcome"] = "revision_required"
         with self.assertRaisesRegex(ReviewerError, "fundamental editorial failures"):
             validate_synthesis_policy(
                 synthesis,
@@ -3595,7 +3628,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 mechanical={"status": "pass"},
             )
 
-        synthesis["decision"] = "reject"
+        synthesis["outcome"] = "rejected"
         validate_synthesis_policy(
             synthesis,
             passes=passes,
@@ -3609,11 +3642,11 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         passes[3]["findings"] = [
             {"severity": "warning", "evidence": "result", "message": "Research interest is not established."}
         ]
-        passes[3]["verdict"] = "warn"
+        passes[3]["outcome"] = "warning"
         synthesis["scores"]["notability"] = 3
         synthesis["warnings"] = ["Research interest is not established."]
-        synthesis["decision"] = "reject"
-        with self.assertRaisesRegex(ReviewerError, "requires a fail verdict"):
+        synthesis["outcome"] = "rejected"
+        with self.assertRaisesRegex(ReviewerError, "requires a fail outcome"):
             validate_synthesis_policy(
                 synthesis,
                 passes=passes,
@@ -3623,13 +3656,13 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
     def test_correctable_failed_pass_can_be_revised(self):
         synthesis, passes, rubric = self.review_policy_fixture()
-        passes[1]["verdict"] = "fail"
+        passes[1]["outcome"] = "failure"
         passes[1]["scores"]["statement_alignment"] = 3
         passes[1]["findings"] = [
             {"severity": "error", "evidence": "statement", "message": "Repair statement."}
         ]
         synthesis["scores"]["statement_alignment"] = 3
-        synthesis["decision"] = "revise"
+        synthesis["outcome"] = "revision_required"
         synthesis["warnings"] = ["Repair statement."]
         synthesis["requested_changes"] = ["Repair the statement."]
         validate_synthesis_policy(
@@ -3642,12 +3675,12 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
     def test_correctable_low_literature_can_be_revised(self):
         synthesis, passes, rubric = self.review_policy_fixture()
         passes[3]["scores"]["literature"] = 3
-        passes[3]["verdict"] = "fail"
+        passes[3]["outcome"] = "failure"
         passes[3]["findings"] = [
             {"severity": "error", "evidence": "source", "message": "Correct the source account."}
         ]
         synthesis["scores"]["literature"] = 3
-        synthesis["decision"] = "revise"
+        synthesis["outcome"] = "revision_required"
         synthesis["warnings"] = ["Correct the source account."]
         synthesis["requested_changes"] = ["Correct the source account."]
         validate_synthesis_policy(
@@ -3665,8 +3698,8 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             review_schema = {
                 "type": "object",
                 "properties": {
-                    "schema_version": {"const": 2},
-                    "decision": {"enum": ["accept", "revise", "reject"]},
+                    "schema_version": {"const": 3},
+                    "outcome": {"enum": ["neutral", "revision_required", "rejected"]},
                 },
             }
             (work / "policy" / "schemas" / "review.schema.json").write_text(
@@ -3687,12 +3720,12 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             }
             report = {
                 **synthesis,
-                "schema_version": 2,
+                "schema_version": 3,
                 "submission_id": "a1b2c3d4e5f6",
                 "source": mechanical["source"],
                 "mechanical_report": "https://example.test/mechanical",
                 "policy_commit": "2" * 40,
-                "passes": passes,
+                "checks": passes,
             }
             validate_stored_review(
                 report,
@@ -3703,7 +3736,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 policy_commit=report["policy_commit"],
             )
 
-            del report["passes"][0]["scores"]["provenance"]
+            del report["checks"][0]["scores"]["provenance"]
             with self.assertRaises(jsonschema.ValidationError):
                 validate_stored_review(
                     report,
@@ -3722,18 +3755,18 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         }
         report = {
             **synthesis,
-            "schema_version": 2,
+            "schema_version": 3,
             "submission_id": "a1b2c3d4e5f6",
             "source": mechanical["source"],
             "mechanical_report": "https://example.test/mechanical",
             "policy_commit": "2" * 40,
-            "passes": passes,
+            "checks": passes,
         }
         review_schema = {
             "type": "object",
             "properties": {
-                "schema_version": {"const": 2},
-                "decision": {"enum": ["accept", "revise", "reject"]},
+                "schema_version": {"const": 3},
+                "outcome": {"enum": ["neutral", "revision_required", "rejected"]},
             },
         }
         common = {
@@ -3752,8 +3785,8 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             validate_stored_review(old_report, **common)
 
         unknown_report = json.loads(json.dumps(report))
-        unknown_report["decision"] = "unknown"
-        with self.assertRaisesRegex(ReviewerError, "unsupported decision"):
+        unknown_report["outcome"] = "unknown"
+        with self.assertRaisesRegex(ReviewerError, "unsupported outcome"):
             validate_stored_review(unknown_report, **common)
 
         old_rubric = json.loads(json.dumps(rubric))
@@ -3993,9 +4026,9 @@ class PublicationIdentityTests(unittest.TestCase):
             row = {
                 "version": version,
                 "submission_id": record["submission"]["submission_id"],
-                "registered_at": f"{record['accepted_at']}T12:00:00Z",
+                "registered_at": f"{record['first_registered_on']}T12:00:00Z",
                 "title": "Prior result",
-                "status": "accepted",
+                "status": "registered",
                 "path": f"entries/{identifier}-v{version}.json",
                 "abstract": "Prior abstract",
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
@@ -4003,9 +4036,9 @@ class PublicationIdentityTests(unittest.TestCase):
             result = by_result.setdefault(
                 identifier,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "id": identifier,
-                    "accepted_at": record["accepted_at"],
+                    "first_registered_on": record["first_registered_on"],
                     "identity": {
                         "source_repository": record["source"]["repository"],
                         "project_path": record["source"].get("project_path"),
@@ -4019,7 +4052,7 @@ class PublicationIdentityTests(unittest.TestCase):
             result["versions"].append(row)
             submission_id = record["submission"]["submission_id"]
             binding = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "submission_id": submission_id,
                 "id": identifier,
                 "version": version,
@@ -4048,7 +4081,7 @@ class PublicationIdentityTests(unittest.TestCase):
             identity_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "identity": document["identity"],
                         "registration_id": identifier,
                     }
@@ -4059,7 +4092,7 @@ class PublicationIdentityTests(unittest.TestCase):
             path = root / registration_authority.day_path(day)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps({"schema_version": 1, "date": day, "last_serial": last_serial})
+                json.dumps({"schema_version": 2, "date": day, "last_serial": last_serial})
                 + "\n"
             )
         marker = root / ".fixture"
@@ -4086,7 +4119,7 @@ class PublicationIdentityTests(unittest.TestCase):
         return {
             "id": identifier,
             "version": version,
-            "accepted_at": "2026-08-01",
+            "first_registered_on": "2026-08-01",
             "source": {"repository": "example/project", "commit": "1" * 40},
             "formalization": {"comparator_config_path": "comparator.json"},
             "submission": {"submission_id": submission},
@@ -4095,7 +4128,7 @@ class PublicationIdentityTests(unittest.TestCase):
     def registered_on(self, identifier, submission="c3d4e5f6a1b2"):
         """A record whose date agrees with its identifier, as every record's does."""
         record = self.prior(identifier=identifier, submission=submission)
-        record["accepted_at"] = identifier[len("PALOMAR-") :][:10]
+        record["first_registered_on"] = identifier[len("PALOMAR-") :][:10]
         return record
 
     def resolve(
@@ -4128,17 +4161,17 @@ class PublicationIdentityTests(unittest.TestCase):
         )
 
     def test_a_new_submission_gets_the_first_free_serial_for_the_day_it_is_registered(self):
-        identifier, accepted_at, registered_at, version = self.resolve(self.database())
+        identifier, first_registered_on, registered_at, version = self.resolve(self.database())
         self.assertEqual(identifier, "PALOMAR-2026-08-11-000001")
-        self.assertEqual((accepted_at, version), ("2026-08-11", 1))
+        self.assertEqual((first_registered_on, version), ("2026-08-11", 1))
         # The result's date is the day of the instant, from one reading of the
         # clock: two readings a moment apart can straddle midnight.
         self.assertEqual(registered_at, "2026-08-11T09:00:00Z")
-        self.assertEqual(accepted_at, registered_at[:10])
+        self.assertEqual(first_registered_on, registered_at[:10])
 
     def test_a_new_submission_follows_the_last_one_registered_that_day(self):
         earlier_today = self.prior(identifier="PALOMAR-2026-08-11-000042")
-        earlier_today["accepted_at"] = "2026-08-11"
+        earlier_today["first_registered_on"] = "2026-08-11"
         earlier_today["formalization"]["comparator_config_path"] = "earlier.json"
         database = self.database(earlier_today)
         identifier, _, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
@@ -4160,8 +4193,8 @@ class PublicationIdentityTests(unittest.TestCase):
         earlier = self.registered_on("PALOMAR-2026-08-05-000001")
         earlier["formalization"]["comparator_config_path"] = "earlier.json"
         database = self.database(earlier)
-        identifier, accepted_at, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
-        self.assertEqual((identifier, accepted_at), ("PALOMAR-2026-08-11-000001", "2026-08-11"))
+        identifier, first_registered_on, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
+        self.assertEqual((identifier, first_registered_on), ("PALOMAR-2026-08-11-000001", "2026-08-11"))
         self.assertGreater(identifier, "PALOMAR-2026-08-05-000001")
 
     def test_a_second_publication_of_one_submission_needs_an_update(self):
@@ -4177,11 +4210,11 @@ class PublicationIdentityTests(unittest.TestCase):
         identifier, so it would also move the whole result to another day.
         """
         database = self.database(self.prior())
-        identifier, accepted_at, registered_at, version = self.resolve(
+        identifier, first_registered_on, registered_at, version = self.resolve(
             database, submission="b2c3d4e5f6a1", existing_id="PALOMAR-2026-08-01-000012"
         )
         self.assertEqual(
-            (identifier, accepted_at, version), ("PALOMAR-2026-08-01-000012", "2026-08-01", 2)
+            (identifier, first_registered_on, version), ("PALOMAR-2026-08-01-000012", "2026-08-01", 2)
         )
         # The result's date is inherited and the version's instant is not: a v2
         # is a new registration, and every ordering surface has to see it as
@@ -4373,7 +4406,7 @@ class MechanicalReportContractTests(unittest.TestCase):
                 dry_run=True,
             )
             with (
-                mock.patch.object(cli, "delivered_review", return_value={"decision": "accept"}),
+                mock.patch.object(cli, "delivered_review", return_value={"outcome": "neutral"}),
                 mock.patch.object(cli, "served_review", return_value={}),
                 self.assertRaisesRegex(
                     ReviewerError,
@@ -4735,7 +4768,7 @@ class SubmissionListingTests(unittest.TestCase):
                 [record["id"] for record in cli.open_submissions()], list(records)
             )
         (_, value, _), keywords = written[0]
-        # A registration is not the end of a submission: the accepted source is
+        # A registration is not the end of a submission: the registered source is
         # starred afterwards, by a step that may fail and be retried.
         self.assertEqual(value["open"], ["aaaaaaaaaaaa", "cccccccccccc"])
         # Under the sha the index was read at, so an admission the submission
@@ -4788,7 +4821,7 @@ class AutomaticLoopTests(unittest.TestCase):
     def row(self, ident, **fields):
         row = {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
         if row.get("status") == "review-ready":
-            row.setdefault("review_schema_version", 2)
+            row.setdefault("review_schema_version", 3)
         return row
 
     def opts(self, **overrides):
@@ -4810,9 +4843,9 @@ class AutomaticLoopTests(unittest.TestCase):
     def split(self, *rows):
         listing, state = self.records(*rows)
         current_review = {
-            "schema_version": 2,
+            "schema_version": 3,
             "submission_id": "",
-            "decision": "accept",
+            "outcome": "neutral",
         }
 
         def review_for(path):
@@ -4851,7 +4884,7 @@ class AutomaticLoopTests(unittest.TestCase):
         obsolete = {
             "schema_version": 1,
             "submission_id": row["id"],
-            "decision": "accept",
+            "outcome": "neutral",
         }
         with listing, state, mock.patch.object(cli, "state_json", return_value=obsolete):
             to_review, to_register, to_finalize, exhausted, _ = cli.submissions_needing_work()
@@ -5419,7 +5452,7 @@ class DatabaseChangeWaitTests(unittest.TestCase):
             mock.patch.object(cli.time, "sleep", side_effect=slept.append),
         ):
             cli.await_database_checks(7, 40)
-        self.assertTrue(slept, "a validation that has not finished is not a verdict")
+        self.assertTrue(slept, "a validation that has not finished is not a outcome")
 
     def test_a_green_state_with_no_validation_yet_is_still_waited_for(self):
         """The database has no enforced branch protection, so there are no
@@ -5568,7 +5601,7 @@ class DatabaseChangeWaitTests(unittest.TestCase):
             mock.patch.object(cli.time, "sleep", side_effect=slept.append),
         ):
             cli.await_database_checks(7, 40)
-        self.assertTrue(slept, "a superseded green run was read as the verdict")
+        self.assertTrue(slept, "a superseded green run was read as the outcome")
 
         answer, _ = self.gh([self.OPEN_CLEAN], [
             validation_run("e" * 40, "failure", run_number=1, run_attempt=1),
@@ -5576,7 +5609,7 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         ])
         with mock.patch.object(cli, "gh", side_effect=answer):
             view = cli.await_database_checks(7, 0)
-        self.assertEqual(view["validation"], "passed", "a re-run's later attempt is the verdict")
+        self.assertEqual(view["validation"], "passed", "a re-run's later attempt is the outcome")
 
     def test_the_validation_is_asked_for_the_exact_head_commit(self):
         """A validation of some other commit is not a validation of this one."""
@@ -5601,7 +5634,7 @@ class SelfDispatchTests(unittest.TestCase):
     def row(self, ident, **fields):
         row = {"id": ident, "created_at": "2026-08-01T00:00:00Z", **fields}
         if row.get("status") == "review-ready":
-            row.setdefault("review_schema_version", 2)
+            row.setdefault("review_schema_version", 3)
         return row
 
     def opts(self, **overrides):
@@ -5812,7 +5845,7 @@ class SpendPersistenceTests(unittest.TestCase):
             "schema_version": 1,
             "model": usage_accounting.GPT_5_6_SOL_MODEL,
             "measured_at": "2026-08-08T00:00:00Z",
-            "passes": [],
+            "checks": [],
             "usage": {},
             "usd": None,
         }
@@ -5828,7 +5861,7 @@ class SpendPersistenceTests(unittest.TestCase):
             # The pre-launch stored attempts have this v1/null-USD shape.
             "spend": [legacy],
         }
-        review = {"schema_version": 2, "submission_id": "a1b2c3d4e5f6", "decision": "accept"}
+        review = {"schema_version": 3, "submission_id": "a1b2c3d4e5f6", "outcome": "neutral"}
         with (
             mock.patch.object(cli, "put_state"),
             mock.patch.object(cli, "state_json", return_value=None),
@@ -5851,7 +5884,7 @@ class RunReviewAccountingTests(unittest.TestCase):
         }
         usage = {"usage_status": "recorded", "usage_reason": None, "turns": [turn]}
         rubric = {"steps": [{"id": "synthesis"}]}
-        final = {"schema_version": 2, "decision": "accept"}
+        final = {"schema_version": 3, "outcome": "neutral"}
         args = SimpleNamespace(
             submission="a1b2c3d4e5f6",
             work_dir=None,
@@ -6375,9 +6408,9 @@ class DeliveredReviewChainTests(unittest.TestCase):
                  "registration_consent_review_sha256": "0" * 64,
                  "_blob_sha": "blob-1"}
         review = {
-            "schema_version": 2,
+            "schema_version": 3,
             "submission_id": "a1b2c3d4e5f6",
-            "decision": "accept",
+            "outcome": "neutral",
             "summary": "Fine.",
         }
         written = {}
@@ -6395,7 +6428,7 @@ class DeliveredReviewChainTests(unittest.TestCase):
         self.assertEqual(
             updated["review_sha256"], registration_authorization.document_digest(review)
         )
-        self.assertEqual(updated["review_schema_version"], 2)
+        self.assertEqual(updated["review_schema_version"], 3)
         # A second review must not inherit consent given to the first.
         self.assertIs(updated["registration_consent"], False)
         self.assertIsNone(updated["registration_consent_review_sha256"])
@@ -6406,9 +6439,9 @@ class DeliveredReviewChainTests(unittest.TestCase):
     def test_delivery_carries_a_missing_mathlib_cache_to_the_consent_page(self):
         state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": []}
         review = {
-            "schema_version": 2,
+            "schema_version": 3,
             "submission_id": state["id"],
-            "decision": "accept",
+            "outcome": "neutral",
         }
         with (
             mock.patch.object(cli, "put_state"),
@@ -6429,7 +6462,7 @@ class DeliveredReviewChainTests(unittest.TestCase):
 
     def test_the_delivered_bytes_are_what_the_record_cites(self):
         """Delivered digest, consented digest, archived bytes, and record agree."""
-        review = {"submission_id": "a1b2c3d4e5f6", "decision": "accept", "summary": "Fine."}
+        review = {"submission_id": "a1b2c3d4e5f6", "outcome": "neutral", "summary": "Fine."}
         work = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (work / "review.json").write_text(json.dumps(review, indent=2) + "\n")
         state = {
@@ -6499,27 +6532,27 @@ class RegistrationPreflightTests(unittest.TestCase):
             for name in self.BLOCKED_NAMES
         }
 
-    def test_every_non_acceptance_checks_credentials_then_stops(self):
-        """Stale consent must make any non-accept cheap, never public."""
+    def test_every_problem_outcome_checks_credentials_then_stops(self):
+        """Stale consent must make any problem outcome cheap, never public."""
         decisions = (
-            ("revise", {"decision": "revise"}),
-            ("reject", {"decision": "reject"}),
+            ("revision_required", {"outcome": "revision_required"}),
+            ("rejected", {"outcome": "rejected"}),
             ("missing", {}),
-            ("null", {"decision": None}),
+            ("null", {"outcome": None}),
         )
-        for label, decision in decisions:
+        for label, outcome in decisions:
             with (
-                self.subTest(decision=label),
+                self.subTest(outcome=label),
                 tempfile.TemporaryDirectory() as directory,
                 contextlib.ExitStack() as stack,
             ):
                 root = Path(directory)
                 args = self.args(root)
                 review = {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "submission_id": args.submission,
                     "policy_commit": "obsolete-without-needing-to-resolve-it",
-                    **decision,
+                    **outcome,
                 }
                 blocked = self.blocked(stack)
                 authorization = stack.enter_context(
@@ -6532,7 +6565,9 @@ class RegistrationPreflightTests(unittest.TestCase):
                     mock.patch.object(cli, "delivered_review", return_value=review)
                 )
 
-                with self.assertRaisesRegex(ReviewerError, "only an accepted review"):
+                with self.assertRaisesRegex(
+                    ReviewerError, "only a review that identified no blocking problem"
+                ):
                     register(args)
 
                 delivered.assert_called_once_with(args.submission)
@@ -6554,9 +6589,9 @@ class RegistrationPreflightTests(unittest.TestCase):
             root = Path(directory)
             args = self.args(root)
             review = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "submission_id": args.submission,
-                "decision": "reject",
+                "outcome": "rejected",
                 "summary": f"Rejected. The credential was {key}.",
             }
             blocked = self.blocked(stack)
@@ -6721,7 +6756,7 @@ class RegistrationAuthorizationContractTests(unittest.TestCase):
             self.authorize(mechanical, review, state)
 
     def test_a_review_of_another_submission_is_refused(self):
-        """The review is bound to the submission, not merely to a decision."""
+        """The review is bound to the submission, not merely to a outcome."""
         mechanical, review, state = self.parts()
         review["submission_id"] = "f6e5d4c3b2a1"
         with self.assertRaisesRegex(ReviewerError, "review and state disagree"):
@@ -6784,8 +6819,8 @@ class VocabularyTests(unittest.TestCase):
         workflow = (
             Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("$PUBLIC_DATA_ORIGIN/schema-v2.json", workflow)
-        self.assertIn("--output palomar-schemas/schema-v2.json", workflow)
+        self.assertIn("$PUBLIC_CONTRACT_ORIGIN/schema-v3.json", workflow)
+        self.assertIn("--output palomar-schemas/schema-v3.json", workflow)
         self.assertNotIn("schema-v1.json", workflow)
 
 
@@ -7000,9 +7035,9 @@ class DatabaseCheckoutTests(unittest.TestCase):
             result.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "id": identifier,
-                        "accepted_at": "2026-08-08",
+                        "first_registered_on": "2026-08-08",
                         "identity": {
                             "source_repository": "example/project",
                             "project_path": None,
@@ -7014,7 +7049,7 @@ class DatabaseCheckoutTests(unittest.TestCase):
                                 "submission_id": submission_id,
                                 "registered_at": "2026-08-08T12:00:00Z",
                                 "title": f"Result {number + 1}",
-                                "status": "accepted",
+                                "status": "registered",
                                 "path": f"entries/{filename}",
                                 "abstract": "Fixture",
                                 "classification": {"arxiv": [], "msc2020": []},
@@ -7031,7 +7066,7 @@ class DatabaseCheckoutTests(unittest.TestCase):
             submission.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "submission_id": submission_id,
                         "id": identifier,
                         "version": 1,
@@ -7058,7 +7093,7 @@ class DatabaseCheckoutTests(unittest.TestCase):
         day.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "date": "2026-08-08",
                     "last_serial": payload_count,
                 }
@@ -7759,9 +7794,9 @@ class RegistrationProjectionCostTests(unittest.TestCase):
             (results / f"{identifier}.json").write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "id": identifier,
-                        "accepted_at": "2026-08-01",
+                        "first_registered_on": "2026-08-01",
                         "identity": registered_identity,
                         "versions": [
                             {
@@ -7769,7 +7804,7 @@ class RegistrationProjectionCostTests(unittest.TestCase):
                                 "submission_id": "a1b2c3d4e5f6",
                                 "registered_at": "2026-08-01T12:00:00Z",
                                 "title": "Prior",
-                                "status": "accepted",
+                                "status": "registered",
                                 "path": f"entries/{identifier}-v1.json",
                                 "abstract": "Prior abstract",
                                 "classification": {
@@ -7789,7 +7824,7 @@ class RegistrationProjectionCostTests(unittest.TestCase):
             identity_binding.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "identity": registered_identity,
                         "registration_id": identifier,
                     }
@@ -8089,20 +8124,20 @@ class ArchivedReviewTests(unittest.TestCase):
     The numbers decide the outcome and stay in the private record and the
     canonical database. They are not published: the same repository at the same
     commit scored 5 and then 4 for statement alignment across two runs of the
-    same policy, with accept both times.
+    same policy, with no problems identified both times.
     """
 
     def review(self):
         return {
-            "decision": "accept",
-            "summary": "Editorially accepted.",
+            "outcome": "neutral",
+            "summary": "No problems were identified.",
             "warnings": ["a remark the review made"],
             "requested_changes": [],
             "scores": {"statement_alignment": 4, "clarity": 4},
-            "passes": [
+            "checks": [
                 {
                     "step": "metadata",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "scores": {"provenance": 4},
                     "internal_notes": [
                         {"evidence": "metadata", "message": "A private clean check."}
@@ -8118,21 +8153,21 @@ class ArchivedReviewTests(unittest.TestCase):
     def test_no_scores_and_no_severities_survive(self):
         archived = cli.public_review(self.review())
         self.assertNotIn("scores", archived)
-        self.assertNotIn("scores", archived["passes"][0])
-        self.assertNotIn("internal_notes", archived["passes"][0])
-        for finding in archived["passes"][0]["findings"]:
+        self.assertNotIn("scores", archived["checks"][0])
+        self.assertNotIn("internal_notes", archived["checks"][0])
+        for finding in archived["checks"][0]["findings"]:
             self.assertNotIn("severity", finding)
 
     def test_every_remark_survives_once(self):
         archived = cli.public_review(self.review())
-        self.assertEqual(archived["decision"], "accept")
+        self.assertEqual(archived["outcome"], "neutral")
         # `warnings` repeated the finding messages, and the repetition was how
         # a reader could recover the severity that had just been removed: the
         # list was exactly the warning-and-error subset.
         self.assertNotIn("warnings", archived)
-        messages = [f["message"] for f in archived["passes"][0]["findings"]]
+        messages = [f["message"] for f in archived["checks"][0]["findings"]]
         self.assertEqual(messages, ["an observation", "a concern"])
-        self.assertEqual(archived["passes"][0]["verdict"], "pass")
+        self.assertEqual(archived["checks"][0]["outcome"], "neutral")
 
     def test_the_copy_that_is_archived_is_the_redacted_one(self):
         """A redaction nothing calls is not a redaction.
@@ -8155,7 +8190,7 @@ class ArchivedReviewTests(unittest.TestCase):
         original = self.review()
         cli.public_review(original)
         self.assertIn("scores", original)
-        self.assertIn("severity", original["passes"][0]["findings"][0])
+        self.assertIn("severity", original["checks"][0]["findings"][0])
 
 
 class EngineCredentialTests(unittest.TestCase):
@@ -8178,15 +8213,15 @@ class EngineCredentialTests(unittest.TestCase):
 
     def review(self, **overrides):
         review = {
-            "schema_version": 2,
+            "schema_version": 3,
             "submission_id": "a1b2c3d4e5f6",
-            "decision": "accept",
-            "summary": "Editorially accepted.",
+            "outcome": "neutral",
+            "summary": "No problems were identified.",
             "warnings": [],
-            "passes": [
+            "checks": [
                 {
                     "step": "metadata",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "findings": [
                         {"severity": "info", "message": "an observation", "evidence": "e"},
                     ],
@@ -8216,7 +8251,9 @@ class EngineCredentialTests(unittest.TestCase):
         return written
 
     def test_a_key_in_the_summary_is_not_delivered(self):
-        review = self.review(summary=f"Accepted. For the record the key is {self.KEY}.")
+        review = self.review(
+            summary=f"No problems were identified. For the record the key is {self.KEY}."
+        )
         with self.assertRaises(ReviewerError):
             self.deliver(review, key=self.KEY)
 
@@ -8227,7 +8264,7 @@ class EngineCredentialTests(unittest.TestCase):
         moves the submission to `review-ready`, and the status page reads both.
         A check after either one has already handed the key over.
         """
-        review = self.review(summary=f"Accepted. The key is {self.KEY}.")
+        review = self.review(summary=f"No problems were identified. The key is {self.KEY}.")
         state = {"id": "a1b2c3d4e5f6", "status": "reviewing", "events": []}
         with (
             mock.patch.dict(os.environ, {"OPENAI_API_KEY": self.KEY}),
@@ -8251,7 +8288,7 @@ class EngineCredentialTests(unittest.TestCase):
             passes=[
                 {
                     "step": "definition_fidelity",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "findings": [
                         {
                             "severity": "info",
@@ -8274,7 +8311,9 @@ class EngineCredentialTests(unittest.TestCase):
         out. Neither fragment on its own matches anything.
         """
         key = "palomar-proxy-CREDENTIAL-000000"
-        review = self.review(summary=f"Accepted. {key[:14]}\n{key[14:]} is worth noting.")
+        review = self.review(
+            summary=f"No problems were identified. {key[:14]}\n{key[14:]} is worth noting."
+        )
         self.assertIsNone(cli._ENGINE_CREDENTIAL_SHAPE.search(review["summary"]))
         with self.assertRaises(ReviewerError):
             self.deliver(review, key=key)
@@ -8303,7 +8342,7 @@ class EngineCredentialTests(unittest.TestCase):
             passes=[
                 {
                     "step": "metadata",
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "findings": [
                         {
                             "severity": "warning",
@@ -8325,7 +8364,7 @@ class EngineCredentialTests(unittest.TestCase):
         which the submitter reads. A refusal that quoted the string it objected
         to would deliver the key by the exact route it just refused.
         """
-        review = self.review(summary=f"Accepted. The key is {self.KEY}.")
+        review = self.review(summary=f"No problems were identified. The key is {self.KEY}.")
         with self.assertRaises(ReviewerError) as refusal:
             self.deliver(review, key=self.KEY)
         message = str(refusal.exception)
@@ -8367,13 +8406,13 @@ class ServedReviewTests(unittest.TestCase):
     CLOSED = {
         "type": "object",
         "properties": {
-            "passes": {
+            "checks": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "verdict": {"enum": ["pass", "warn", "fail"]},
+                        "outcome": {"enum": ["neutral", "warning", "failure"]},
                         "findings": {
                             "type": "array",
                             "items": {
@@ -8399,7 +8438,7 @@ class ServedReviewTests(unittest.TestCase):
 
     def test_a_policy_carrying_no_schema_stops_the_registration(self):
         """Skipping the check used to look exactly like passing it."""
-        review = {"policy_commit": "a" * 40, "passes": []}
+        review = {"policy_commit": "a" * 40, "checks": []}
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ReviewerError) as caught:
                 cli.served_review(review, self.policy(directory))
@@ -8409,7 +8448,7 @@ class ServedReviewTests(unittest.TestCase):
     def test_a_pass_field_nobody_taught_the_projection_about_fails(self):
         review = {
             "policy_commit": "a" * 40,
-            "passes": [{"verdict": "pass", "confidence": 0.9, "findings": []}],
+            "checks": [{"outcome": "neutral", "confidence": 0.9, "findings": []}],
         }
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(jsonschema.ValidationError):
@@ -8418,8 +8457,8 @@ class ServedReviewTests(unittest.TestCase):
     def test_a_finding_field_nobody_taught_the_projection_about_fails(self):
         review = {
             "policy_commit": "a" * 40,
-            "passes": [
-                {"verdict": "pass", "findings": [{"message": "m", "raw_score": 3}]}
+            "checks": [
+                {"outcome": "neutral", "findings": [{"message": "m", "raw_score": 3}]}
             ],
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -8431,9 +8470,9 @@ class ServedReviewTests(unittest.TestCase):
         review = {
             "policy_commit": "a" * 40,
             "scores": {"clarity": 4},
-            "passes": [
+            "checks": [
                 {
-                    "verdict": "pass",
+                    "outcome": "neutral",
                     "scores": {"provenance": 4},
                     "findings": [{"severity": "info", "message": "an observation"}],
                 }
@@ -8442,8 +8481,8 @@ class ServedReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             served = cli.served_review(review, self.policy(directory, self.CLOSED))
         self.assertNotIn("scores", served)
-        self.assertNotIn("scores", served["passes"][0])
-        self.assertNotIn("severity", served["passes"][0]["findings"][0])
+        self.assertNotIn("scores", served["checks"][0])
+        self.assertNotIn("severity", served["checks"][0]["findings"][0])
 
 
 class PushProofTests(unittest.TestCase):
@@ -8451,7 +8490,7 @@ class PushProofTests(unittest.TestCase):
 
     `push_verified` is a hardcoded literal in the submission server: it records
     that a code path ran. That was adequate while one path could set it. With a
-    second, admitting a method must be a decision taken in the reviewer rather
+    second, admitting a method must be a outcome taken in the reviewer rather
     than a side effect of deploying a server that sets the same boolean.
     """
 

@@ -26,7 +26,7 @@ from typing import Any
 
 from .errors import ReviewerError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_VERSIONS_PER_RESULT = 500
 RESULTS_DIRECTORY = "registrations/results"
 SUBMISSIONS_DIRECTORY = "registrations/submissions"
@@ -345,20 +345,20 @@ def _valid_timestamp(value: object) -> bool:
 
 
 def _validate_result(document: dict[str, Any], identifier: str, where: str) -> None:
-    if set(document) != {"schema_version", "id", "accepted_at", "identity", "versions"}:
+    if set(document) != {"schema_version", "id", "first_registered_on", "identity", "versions"}:
         raise ReviewerError(f"{where}: has an unsupported result projection shape")
-    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+    if type(document.get("schema_version")) is not int or document["schema_version"] != SCHEMA_VERSION:
         raise ReviewerError(f"{where}: unsupported schema_version")
     match = PALOMAR_ID_RE.fullmatch(identifier)
-    accepted_at = document.get("accepted_at")
+    first_registered_on = document.get("first_registered_on")
     if document.get("id") != identifier:
         raise ReviewerError(f"{where}: id disagrees with its path")
-    if match is None or accepted_at != match.group("date"):
-        raise ReviewerError(f"{where}: accepted_at disagrees with id")
+    if match is None or first_registered_on != match.group("date"):
+        raise ReviewerError(f"{where}: first_registered_on disagrees with id")
     try:
-        dt.date.fromisoformat(str(accepted_at))
+        dt.date.fromisoformat(str(first_registered_on))
     except ValueError as error:
-        raise ReviewerError(f"{where}: accepted_at is not a real date") from error
+        raise ReviewerError(f"{where}: first_registered_on is not a real date") from error
     identity = document.get("identity")
     if not isinstance(identity, dict) or set(identity) != {
         "source_repository",
@@ -670,7 +670,7 @@ def registration_identity(
             mechanical,
             git_env=git_env,
         )
-        resolved = (identifier, str(result["accepted_at"]), registered_at, len(versions) + 1)
+        resolved = (identifier, str(result["first_registered_on"]), registered_at, len(versions) + 1)
         if reserved is not None and reserved != resolved:
             raise ReviewerError("saved registration attempt disagrees with the requested update")
         return resolved
@@ -688,24 +688,24 @@ def registration_identity(
     try:
         dt.date.fromisoformat(str(reviewed_at)[:10])
     except ValueError as error:
-        raise ReviewerError("accepted review has no valid review date") from error
+        raise ReviewerError("review has no valid review date") from error
 
     if reserved is not None:
-        identifier, accepted_at, reserved_instant, version = reserved
+        identifier, first_registered_on, reserved_instant, version = reserved
         match = PALOMAR_ID_RE.fullmatch(identifier)
         if (
             match is None
-            or match.group("date") != accepted_at
+            or match.group("date") != first_registered_on
             or not _valid_timestamp(reserved_instant)
-            or reserved_instant[:10] != accepted_at
+            or reserved_instant[:10] != first_registered_on
             or version != 1
         ):
             raise ReviewerError("saved registration attempt has an invalid permanent identity")
-        day = accepted_at
+        day = first_registered_on
         registered_at = reserved_instant
     else:
         day = registered_at[:10]
-        accepted_at = day
+        first_registered_on = day
         identifier = ""
 
     counter = load_day(database, day, git_env=git_env)
@@ -721,7 +721,7 @@ def registration_identity(
         raise ReviewerError(
             f"saved registration attempt {identifier} is already used by another submission"
         )
-    return identifier, accepted_at, registered_at, 1
+    return identifier, first_registered_on, registered_at, 1
 
 
 def projection_changes(
@@ -731,7 +731,7 @@ def projection_changes(
     entry_relative: str,
     git_env: dict[str, str] | None = None,
 ) -> tuple[ProjectionChange, ...]:
-    """Build the exact local projection transition for one accepted record."""
+    """Build the exact local projection transition for one registered record."""
     identifier = record.get("id")
     version = record.get("version")
     submission = record.get("submission")
@@ -788,7 +788,7 @@ def projection_changes(
         result = {
             "schema_version": SCHEMA_VERSION,
             "id": identifier,
-            "accepted_at": record.get("accepted_at"),
+            "first_registered_on": record.get("first_registered_on"),
             "identity": registered_identity,
             "versions": [row],
         }
@@ -801,8 +801,8 @@ def projection_changes(
                 f"{result_relative}: stable identity binding is missing or disagrees"
             )
         _assert_identity_matches(identifier, current, registered_identity)
-        if record.get("accepted_at") != current["accepted_at"]:
-            raise ReviewerError(f"{result_relative}: stable acceptance date changed")
+        if record.get("first_registered_on") != current["first_registered_on"]:
+            raise ReviewerError(f"{result_relative}: stable first registration date changed")
         if version != len(current["versions"]) + 1:
             raise ReviewerError(f"{result_relative}: record is not the next ordered version")
         if len(current["versions"]) >= MAX_VERSIONS_PER_RESULT:

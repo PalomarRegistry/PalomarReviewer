@@ -107,7 +107,7 @@ REPAIR_TERMINAL_STATUSES = frozenset({"merged", "closed", "needs-input", "failed
 # window.
 OPEN_INDEX_REBUILD_SECONDS = 7 * 24 * 3600
 # Statuses the reviewer will never act on again. A registered submission is
-# absent because it is not finished at that point: the accepted source is
+# absent because it is not finished at that point: the registered source is
 # starred afterwards, as a separate step that may fail and be retried.
 #
 # `dispatch-lost` is here because the submission server could not find the
@@ -165,8 +165,9 @@ TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2
 MAX_CONTEXT_BYTES = 300_000
 CURRENT_RUBRIC_VERSION = 10
 SUPPORTED_RUBRIC_VERSIONS = (7, 8, 9, CURRENT_RUBRIC_VERSION)
-REVIEW_SCHEMA_VERSION = 2
-REVIEW_DECISIONS = ("accept", "revise", "reject")
+REVIEW_SCHEMA_VERSION = 3
+REVIEW_OUTCOMES = ("neutral", "revision_required", "rejected")
+LEGACY_CHECK_OUTCOMES = {"pass": "neutral", "warn": "warning", "fail": "failure"}
 
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
 STEP_SCORE_KEYS = (
@@ -198,7 +199,7 @@ STEP_SCHEMA = {
     "additionalProperties": False,
     "required": [
         "step",
-        "verdict",
+        "outcome",
         "summary",
         "findings",
         "scores",
@@ -210,7 +211,7 @@ STEP_SCHEMA = {
     ],
     "properties": {
         "step": {"type": "string"},
-        "verdict": {"enum": ["pass", "warn", "fail"]},
+        "outcome": {"enum": ["neutral", "warning", "failure"]},
         "summary": {"type": "string", "minLength": 1},
         "findings": {
             "type": "array",
@@ -265,9 +266,9 @@ SYNTHESIS_SCORE_KEYS = (
 SYNTHESIS_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "summary", "scores", "warnings", "requested_changes"],
+    "required": ["outcome", "summary", "scores", "warnings", "requested_changes"],
     "properties": {
-        "decision": {"enum": ["accept", "revise", "reject"]},
+        "outcome": {"enum": ["neutral", "revision_required", "rejected"]},
         "summary": {"type": "string", "minLength": 1},
         "scores": {
             "type": "object",
@@ -385,14 +386,14 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     canonical database, in `scores/`, because they do not mean what a reader
     would take them to mean: the same repository at the same commit scored 5
     and then 4 on one dimension across two runs of the same policy, with the
-    same verdict both times. The severity on each finding goes because it ranks
+    same outcome both times. The severity on each finding goes because it ranks
     comments in a way the review did not intend. And the top-level repetition
     of every finding message goes because it is a repetition: with it, a reader
     could recover the severity that had just been removed by comparing the two
     lists, and without it the comments are still all here, once, where they
     were made.
 
-    What survives is the decision, the summary, the requested changes, and
+    What survives is the outcome, the summary, the requested changes, and
     every material finding the review made with the evidence it made it on.
     Private audit notes are removed too: they record checks that did not produce a
     criticism and are neither instructions to the submitter nor part of the
@@ -406,11 +407,11 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     Nor does it by itself keep the severities private. The record is served
     beside this document and carries the review's remarks too, so it has to
     carry a list that no severity can be read out of; `registered_comments`
-    below is the half of this decision that lives there.
+    below is the half of this outcome that lives there.
 
     What removes by name cannot remove a name nobody has thought of, and the
     review contract does grow names: `STEP_SCHEMA` above is closed, so a new
-    `confidence` or `raw_score` inside a pass is a deliberate change to it and
+    `confidence` or `raw_score` inside a check is a deliberate change to it and
     to the rubric that asks for it, made in two repositories, neither of which
     is this function. That is why `served_review` checks the result against
     `public-review.schema.json`, which is closed at every level, and why the
@@ -420,7 +421,7 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
     archived = json.loads(json.dumps(review))
     archived.pop("scores", None)
     archived.pop("warnings", None)
-    for step in archived.get("passes") or []:
+    for step in archived.get("checks") or []:
         if isinstance(step, dict):
             step.pop("scores", None)
             step.pop("internal_notes", None)
@@ -471,23 +472,23 @@ def registered_comments(review: dict[str, Any]) -> list[str]:
     """The remarks a record carries, in the order the review made them.
 
     Not `review["warnings"]`, and this is the other half of `public_review`
-    above. Rubric version 8 defines every finding as an author-facing material
+    above. Rubric version 10 defines every finding as an author-facing material
     criticism and mechanically requires the synthesis list to contain all of
     them. Private audit observations have a different field and are removed
     from the served review, so there is no severity-ranked subset here.
 
-    Every material finding message, once, in pass order, partitions nothing:
+    Every material finding message, once, in check order, partitions nothing:
     it is the same set the archived review already shows. A top-level remark that
     matches no finding is kept as well, because a hand-edited or historical
     review may tie the two lists together not at all, and
     dropping such a remark would lose something the review said rather than
     something it ranked.
 
-    These two functions are one decision written in two places, a long way
+    These two functions are one outcome written in two places, a long way
     apart. Changing either alone puts the severities back.
     """
     comments: list[str] = []
-    for step in review.get("passes") or []:
+    for step in review.get("checks") or []:
         if not isinstance(step, dict):
             continue
         for finding in step.get("findings") or []:
@@ -641,9 +642,10 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
     step_ids = [step.get("id") for step in steps]
     if len(step_ids) != len(set(step_ids)) or not step_ids or step_ids[-1] != "synthesis":
         raise ReviewerError("rubric steps must be unique and end with synthesis")
-    minimum = rubric.get("minimum_accept_score")
+    minimum_key = "minimum_score" if version == CURRENT_RUBRIC_VERSION else "minimum_accept_score"
+    minimum = rubric.get(minimum_key)
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
-        raise ReviewerError("rubric minimum_accept_score must be an integer from 1 to 5")
+        raise ReviewerError(f"rubric {minimum_key} must be an integer from 1 to 5")
     registry_scores = rubric.get("registry_scores")
     if (
         not isinstance(registry_scores, list)
@@ -658,16 +660,37 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
         or len(mandatory_reject) != len(set(mandatory_reject))
     ):
         raise ReviewerError("rubric mandatory_reject_below_minimum must contain unique registry score names")
-    if rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
-        raise ReviewerError("the rubric must declare exactly the supported pass verdicts")
+    step_result = rubric.get("step_result", {})
+    if version == CURRENT_RUBRIC_VERSION:
+        if step_result.get("outcomes") != ["neutral", "warning", "failure"]:
+            raise ReviewerError("the rubric must declare exactly the supported check outcomes")
+    elif step_result.get("verdicts") != ["pass", "warn", "fail"]:
+        raise ReviewerError("the legacy rubric must declare exactly the supported pass verdicts")
     required_fields = rubric.get("step_result", {}).get("required_fields")
-    if version >= 8:
+    if version == CURRENT_RUBRIC_VERSION:
         if required_fields != STEP_SCHEMA["required"]:
             raise ReviewerError("the rubric must declare exactly the current step-result fields")
         if rubric.get("finding_comment_policy") != "all":
             raise ReviewerError(
                 "the current rubric requires every material finding to be shown to the author"
             )
+    elif version >= 8:
+        legacy_required = [
+            "step",
+            "verdict",
+            "summary",
+            "findings",
+            "scores",
+            "trust_level",
+            "sources_checked",
+            "declarations_checked",
+            "codes_checked",
+            "internal_notes",
+        ]
+        if required_fields != legacy_required:
+            raise ReviewerError("the legacy rubric has invalid step-result fields")
+        if rubric.get("finding_comment_policy") != "all":
+            raise ReviewerError("the legacy rubric requires every material finding to be shown to the author")
     else:
         if required_fields != ["step", "verdict", "summary", "findings", "scores"]:
             raise ReviewerError("the legacy rubric has invalid step-result fields")
@@ -748,10 +771,10 @@ def validate_current_review_contract(
     validate_rubric(rubric)
     properties = review_schema.get("properties", {})
     schema_version = properties.get("schema_version", {}).get("const")
-    decisions = properties.get("decision", {}).get("enum")
+    decisions = properties.get("outcome", {}).get("enum")
     if (
         schema_version != REVIEW_SCHEMA_VERSION
-        or decisions != list(REVIEW_DECISIONS)
+        or decisions != list(REVIEW_OUTCOMES)
     ):
         raise ReviewerError(
             "policy commit predates the current review contract; rerun against current policy"
@@ -762,6 +785,10 @@ def step_schema_for_rubric(
     step: dict[str, Any], rubric_version: int = CURRENT_RUBRIC_VERSION
 ) -> dict[str, Any]:
     schema = copy.deepcopy(STEP_SCHEMA)
+    if rubric_version < CURRENT_RUBRIC_VERSION:
+        schema["required"][schema["required"].index("outcome")] = "verdict"
+        schema["properties"]["verdict"] = {"enum": ["pass", "warn", "fail"]}
+        schema["properties"].pop("outcome")
     if rubric_version == 7:
         for key in ("codes_checked", "internal_notes"):
             schema["required"].remove(key)
@@ -803,6 +830,13 @@ def step_schema_for_rubric(
     if rubric_version >= 8:
         schema["properties"]["sources_checked"]["minItems"] = 1
     return schema
+
+
+def check_outcome(result: dict[str, Any]) -> Any:
+    """Return the current check outcome, translating a supported legacy rubric."""
+    if "outcome" in result:
+        return result.get("outcome")
+    return LEGACY_CHECK_OUTCOMES.get(result.get("verdict"))
 
 
 def validate_declaration_coverage(
@@ -857,7 +891,7 @@ def validate_description_coverage(
             "statement_alignment description coverage must exactly match every "
             "Comparator-selected declaration in configuration order"
         )
-    if any(item.get("coverage") == "missing" for item in coverage) and result.get("verdict") != "fail":
+    if any(item.get("coverage") == "missing" for item in coverage) and check_outcome(result) != "failure":
         raise ReviewerError("missing project-description coverage requires a failed pass")
 
 
@@ -871,7 +905,7 @@ def utc_now() -> str:
 
     There was a `utc_today` beside this, and a registration called both. Two
     readings a moment apart can straddle midnight, which is a record whose
-    `registered_at` and `accepted_at` name different days -- the disagreement
+    `registered_at` and `first_registered_on` name different days -- the disagreement
     the database now refuses. One reading, and the date is the day of it.
     """
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1126,7 +1160,7 @@ def is_stale_write(error: Exception) -> bool:
 
 
 def star_registered_sources(args: argparse.Namespace) -> int:
-    """Star every accepted registered source not already recorded as starred.
+    """Star every registered source not already recorded as starred.
 
     The PUT itself is idempotent. State is marked only after a GET verifies the
     star, so an API or state-write failure is safe to retry on the next pass.
@@ -1819,7 +1853,7 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
     if report.get("status") != "pass":
         errors = report.get("errors") or ["unknown renderer failure"]
         raise ReviewerError(
-            "Challenge rendering failed; the acceptance remains valid and registration may be retried: "
+            "Challenge rendering failed; the review outcome is unchanged and registration may be retried: "
             + "; ".join(str(error) for error in errors)
         )
     challenge = mechanical["challenge"]
@@ -1843,7 +1877,7 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
     if report.get("schema_version", 1) != expected_render_version:
         raise ReviewerError("render result has an incompatible schema version")
     if report.get("source") != expected_source:
-        raise ReviewerError("render result does not match the accepted source and Challenge hash")
+        raise ReviewerError("render result does not match the reviewed source and Challenge hash")
     for key in ("verso_commit", "renderer_commit", "landrun_commit"):
         if not isinstance(report.get(key), str) or not re.fullmatch(r"[0-9a-f]{40}", report[key]):
             raise ReviewerError(f"render result has an invalid {key}")
@@ -2915,7 +2949,7 @@ def deliver_review(
 def finished_with(record: dict[str, Any]) -> bool:
     """Whether the reviewer will never act on this submission again.
 
-    A registration is not the end of one. The accepted source is starred
+    A registration is not the end of one. The registered source is starred
     afterwards, by a separate step with its own credential that may fail and be
     retried, so a registered record is finished only once that star is recorded.
 
@@ -3396,7 +3430,7 @@ def render_failure_details(
         )
     return (
         "Challenge rendering did not complete, and no report says why, so this may be "
-        f"transient; the acceptance remains valid and registration may be retried: {url}",
+        f"transient; the review outcome is unchanged and registration may be retried: {url}",
         False,
     )
 
@@ -3667,12 +3701,12 @@ def normalize_final(
         "policy_commit": policy_commit,
         "reviewed_at": utc_now(),
         "reviewer_models": [model_id],
-        "decision": synthesis.get("decision"),
+        "outcome": synthesis.get("outcome"),
         "summary": synthesis.get("summary", ""),
         "scores": {key: synthesis["scores"][key] for key in SYNTHESIS_SCORE_KEYS},
         "warnings": synthesis.get("warnings", []),
         "requested_changes": synthesis.get("requested_changes", []),
-        "passes": passes,
+        "checks": passes,
     }
     return final
 
@@ -3691,8 +3725,8 @@ def validate_stored_review(
     """Bind an operator-inspected dry-run report to the current trusted inputs."""
     if report.get("schema_version") != REVIEW_SCHEMA_VERSION:
         raise ReviewerError("stored review predates the current review contract and must be rerun")
-    if report.get("decision") not in REVIEW_DECISIONS:
-        raise ReviewerError(f"stored review has an unsupported decision: {report.get('decision')!r}")
+    if report.get("outcome") not in REVIEW_OUTCOMES:
+        raise ReviewerError(f"stored review has an unsupported outcome: {report.get('outcome')!r}")
     schema = (
         review_schema
         if review_schema is not None
@@ -3716,7 +3750,7 @@ def validate_stored_review(
 
     steps = {step["id"]: step for step in rubric_data["steps"] if step["id"] != "synthesis"}
     seen: set[str] = set()
-    for result in report["passes"]:
+    for result in report["checks"]:
         step_id = result.get("step")
         if step_id not in steps or step_id in seen:
             raise ReviewerError(f"stored review has an unknown or duplicate pass: {step_id!r}")
@@ -3728,7 +3762,7 @@ def validate_stored_review(
         validate_classification_coverage(result, steps[step_id], mechanical)
         seen.add(step_id)
     synthesis = {
-        "decision": report["decision"],
+        "outcome": report["outcome"],
         "summary": report["summary"],
         "scores": report["scores"],
         "warnings": report["warnings"],
@@ -3736,7 +3770,7 @@ def validate_stored_review(
     }
     validate_synthesis_policy(
         synthesis,
-        passes=report["passes"],
+        passes=report["checks"],
         rubric=rubric_data,
         mechanical=mechanical,
     )
@@ -3794,22 +3828,24 @@ def _validate_legacy_synthesis_policy(
             for step in rubric["steps"]
             if step["id"] != "synthesis" and key in step["score_keys"]
         )
-        if by_step[owner]["verdict"] != "fail":
-            raise ReviewerError(f"a fundamental {key} score below the minimum requires a fail verdict")
+        if check_outcome(by_step[owner]) != "failure":
+            raise ReviewerError(f"a fundamental {key} score below the minimum requires a fail outcome")
         fundamental.append((key, evidence_scores[key]))
-    if fundamental and synthesis["decision"] != "reject":
+    if fundamental and synthesis["outcome"] != "rejected":
         details = ", ".join(f"{key}={score}" for key, score in fundamental)
         raise ReviewerError(
-            f"fundamental editorial failures require reject, not {synthesis['decision']}: {details}"
+            f"fundamental editorial failures require reject, not {synthesis['outcome']}: {details}"
         )
 
-    if synthesis["decision"] != "accept":
+    if synthesis["outcome"] != "neutral":
         return
     if mechanical.get("status") != "pass":
-        raise ReviewerError("an acceptance requires a passing mechanical report")
-    blocking = sorted(result["step"] for result in passes if result["verdict"] == "fail")
+        raise ReviewerError("a no-blocking-problem review requires a passing mechanical report")
+    blocking = sorted(result["step"] for result in passes if check_outcome(result) == "failure")
     if blocking:
-        raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
+        raise ReviewerError(
+            f"a no-blocking-problem review cannot override blocking checks: {', '.join(blocking)}"
+        )
     below_minimum = [
         f"{result['step']}.{key}={score}"
         for result in passes
@@ -3818,7 +3854,8 @@ def _validate_legacy_synthesis_policy(
     ]
     if below_minimum:
         raise ReviewerError(
-            "an acceptance cannot use scores below the rubric minimum: " + ", ".join(below_minimum)
+            "a no-blocking-problem review cannot use scores below the rubric minimum: "
+            + ", ".join(below_minimum)
         )
 
 
@@ -3829,7 +3866,7 @@ def validate_synthesis_policy(
     rubric: dict[str, Any],
     mechanical: dict[str, Any],
 ) -> None:
-    if rubric.get("schema_version") == 7:
+    if rubric.get("schema_version") < CURRENT_RUBRIC_VERSION:
         _validate_legacy_synthesis_policy(
             synthesis,
             passes=passes,
@@ -3866,9 +3903,9 @@ def validate_synthesis_policy(
     if len(normalized_comments) != len(set(normalized_comments)):
         raise ReviewerError("material findings must not be repeated across review passes")
 
-    minimum = rubric.get("minimum_accept_score")
+    minimum = rubric.get("minimum_score")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or not 1 <= minimum <= 5:
-        raise ReviewerError("rubric minimum_accept_score must be an integer from 1 to 5")
+        raise ReviewerError("rubric minimum_score must be an integer from 1 to 5")
     mandatory_reject = rubric.get("mandatory_reject_below_minimum", [])
     if (
         not isinstance(mandatory_reject, list)
@@ -3885,29 +3922,29 @@ def validate_synthesis_policy(
     }
     for result in passes:
         findings = result["findings"]
-        verdict = result["verdict"]
-        if verdict == "pass" and findings:
-            raise ReviewerError(f"a passing {result['step']} pass cannot carry a material finding")
-        if verdict == "warn" and not findings:
-            raise ReviewerError(f"a warning {result['step']} pass requires a material finding")
-        if verdict == "warn" and any(item["severity"] == "error" for item in findings):
-            raise ReviewerError(f"a warning {result['step']} pass cannot carry an error finding")
-        if verdict == "fail" and not any(item["severity"] == "error" for item in findings):
-            raise ReviewerError(f"a failed {result['step']} pass requires an error finding")
+        outcome = check_outcome(result)
+        if outcome == "neutral" and findings:
+            raise ReviewerError(f"a no-problem {result['step']} check cannot carry a material finding")
+        if outcome == "warning" and not findings:
+            raise ReviewerError(f"a warning {result['step']} check requires a material finding")
+        if outcome == "warning" and any(item["severity"] == "error" for item in findings):
+            raise ReviewerError(f"a warning {result['step']} check cannot carry an error finding")
+        if outcome == "failure" and not any(item["severity"] == "error" for item in findings):
+            raise ReviewerError(f"a failed {result['step']} check requires an error finding")
         for key, score in result["scores"].items():
             if score is None or owners.get(key) != result["step"]:
                 continue
-            if verdict == "pass" and score < minimum:
+            if outcome == "neutral" and score < minimum:
                 raise ReviewerError(
-                    f"a passing {result['step']} pass cannot score {key} below the rubric minimum"
+                    f"a no-problem {result['step']} check cannot score {key} below the rubric minimum"
                 )
             if score < minimum and not findings:
                 raise ReviewerError(
                     f"a below-minimum {result['step']}.{key} score requires a material finding"
                 )
-            if score <= 2 and verdict != "fail":
+            if score <= 2 and outcome != "failure":
                 raise ReviewerError(
-                    f"a major {result['step']}.{key} deficiency requires a fail verdict"
+                    f"a major {result['step']}.{key} deficiency requires a fail outcome"
                 )
     fundamental: list[tuple[str, int, str]] = []
     for key in mandatory_reject:
@@ -3917,34 +3954,38 @@ def validate_synthesis_policy(
             step["id"] for step in rubric["steps"] if step["id"] != "synthesis" and key in step["score_keys"]
         )
         provider = by_step[owner]
-        verdict = provider["verdict"]
-        if verdict != "fail":
+        outcome = check_outcome(provider)
+        if outcome != "failure":
             raise ReviewerError(
-                f"a fundamental {key} score below the minimum requires a fail verdict"
+                f"a fundamental {key} score below the minimum requires a fail outcome"
             )
-        fundamental.append((key, evidence_scores[key], verdict))
+        fundamental.append((key, evidence_scores[key], outcome))
     if fundamental:
-        if synthesis["decision"] != "reject":
+        if synthesis["outcome"] != "rejected":
             details = ", ".join(f"{key}={score}" for key, score, _verdict in fundamental)
             raise ReviewerError(
-                f"fundamental editorial failures require reject, not {synthesis['decision']}: {details}"
+                f"fundamental editorial failures require reject, not {synthesis['outcome']}: {details}"
             )
 
-    decision = synthesis["decision"]
-    if decision == "accept" and synthesis["requested_changes"]:
-        raise ReviewerError("an acceptance cannot request changes")
-    if decision == "revise" and not synthesis["requested_changes"]:
-        raise ReviewerError("a revision decision requires at least one requested change")
-    if decision != "accept" and not comments:
-        raise ReviewerError("a non-acceptance requires at least one author-facing material finding")
+    outcome = synthesis["outcome"]
+    if outcome == "neutral" and synthesis["requested_changes"]:
+        raise ReviewerError("a no-blocking-problem review cannot request changes")
+    if outcome == "revision_required" and not synthesis["requested_changes"]:
+        raise ReviewerError("a revision outcome requires at least one requested change")
+    if outcome != "neutral" and not comments:
+        raise ReviewerError(
+            "a review with blocking problems requires at least one author-facing material finding"
+        )
 
-    if decision != "accept":
+    if outcome != "neutral":
         return
     if mechanical.get("status") != "pass":
-        raise ReviewerError("an acceptance requires a passing mechanical report")
-    blocking = sorted(result["step"] for result in passes if result["verdict"] == "fail")
+        raise ReviewerError("a no-blocking-problem review requires a passing mechanical report")
+    blocking = sorted(result["step"] for result in passes if check_outcome(result) == "failure")
     if blocking:
-        raise ReviewerError(f"an acceptance cannot override blocking passes: {', '.join(blocking)}")
+        raise ReviewerError(
+            f"a no-blocking-problem review cannot override blocking checks: {', '.join(blocking)}"
+        )
 
 
 def run_review(args: argparse.Namespace) -> int:
@@ -3983,7 +4024,7 @@ def run_review(args: argparse.Namespace) -> int:
             mechanical_url=mechanical_url,
             policy_commit=policy_commit,
         )
-        # The review goes to the submitter alone. Nothing about the decision is
+        # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
         spend = load_json(spend_path) if spend_path.is_file() else None
@@ -4245,25 +4286,25 @@ def registry_record(
     mechanical: dict[str, Any],
     review: dict[str, Any],
     metadata: dict[str, Any],
-    accepted_at: str,
+    first_registered_on: str,
     registered_at: str,
     version: int,
     challenge_render: dict[str, Any],
     verification_evidence: dict[str, Any],
     preservation: dict[str, Any],
 ) -> dict[str, Any]:
-    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", accepted_at):
-        raise ReviewerError("review has no valid acceptance date")
-    # The database refuses a version 1 whose `accepted_at` is not the day it
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", first_registered_on):
+        raise ReviewerError("review has no valid first registration date")
+    # The database refuses a version 1 whose `first_registered_on` is not the day it
     # was registered, and it is right to: the identifier carries the one and
     # every ordering surface reads the other. Checked here as well, because
     # this is where both are written and a record that fails there has already
     # cost an archive tag and a render run.
     if not TIMESTAMP_RE.fullmatch(registered_at):
         raise ReviewerError("registration has no valid registration instant")
-    if version == 1 and registered_at[:10] != accepted_at:
+    if version == 1 and registered_at[:10] != first_registered_on:
         raise ReviewerError(
-            f"version 1 is dated {accepted_at} but was registered on {registered_at[:10]}"
+            f"version 1 is dated {first_registered_on} but was registered on {registered_at[:10]}"
         )
     title = registry_title(metadata, state.get("title") or state["repository"])
     abstract = metadata_value(metadata, [("project", "description")])
@@ -4326,20 +4367,20 @@ def registry_record(
         mechanical, "lakefile"
     )
     record = {
-        "schema_version": 2,
+        "schema_version": 3,
         "id": permanent_id,
-        "accepted_at": accepted_at,
+        "first_registered_on": first_registered_on,
         # The moment this version's registration happened, which is the moment
         # the submitter's consent was acted on. Every ordering surface reads it
         # and nothing else: `recent.json`, the feeds and the subject pages. It
         # is per version because a v2 is a new registration and is news, where
-        # `accepted_at` would file it among the results registered in the year
-        # of its v1. It is not `review.reviewed_at`, which is when the verdict
+        # `first_registered_on` would file it among the results registered in the year
+        # of its v1. It is not `review.reviewed_at`, which is when the outcome
         # was reached and can be days earlier, because nothing is registered
         # until the submitter has consented to registration.
         "registered_at": registered_at,
         "version": version,
-        "status": "accepted",
+        "status": "registered",
         "title": str(title),
         "abstract": str(abstract),
         "authors": authors_from_metadata(metadata, mechanical),
@@ -4372,7 +4413,7 @@ def registry_record(
         "review": {
             "reviewed_at": review["reviewed_at"],
             "policy_commit": review["policy_commit"],
-            "verdict": "accept",
+            "outcome": "neutral",
             "report": {"sha256": verification_evidence["review_sha256"]},
             "reviewer_models": review["reviewer_models"],
             # Every remark, not the review's own top-level list: that list is
@@ -4428,10 +4469,10 @@ def registry_scores(
     be treated as immutable or cached however firmly the database froze the
     file in git.
 
-    They are still recorded, because the decision has to stay reconstructable,
+    They are still recorded, because the outcome has to stay reconstructable,
     and they are bound to the review they explain by `reviewed_at` and
     `policy_commit` -- without that a later pass could leave an earlier pass's
-    numbers standing beside a new verdict, and the database would see nothing
+    numbers standing beside a new outcome, and the database would see nothing
     wrong. `scores/` is append-only, and the database never stages it.
     """
     return {
@@ -4747,13 +4788,13 @@ def registration_attempt_identity(
     if attempt is not None or dry_run:
         return resolved
 
-    identifier, accepted_at, registered_at, version = resolved
+    identifier, first_registered_on, registered_at, version = resolved
     updated = dict(state)
     updated["registration_attempt"] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "id": identifier,
         "version": version,
-        "accepted_at": accepted_at,
+        "first_registered_on": first_registered_on,
         "registered_at": registered_at,
         "review_sha256": review_sha256,
         "source_repository": source_repository,
@@ -4793,12 +4834,13 @@ def register(args: argparse.Namespace) -> int:
     # engine credential. Checking it is cheap and local, so even a rejection
     # must not become another route by which the credential is exposed.
     refuse_engine_credential(review, context="the review being registered")
-    # A non-acceptance cannot become registrable by doing more work. Refuse it
+    # A review that identified a blocking problem cannot become registrable by
+    # doing more work. Refuse it
     # before cloning policy or source, downloading artifacts, writing a local
     # archive, or reaching any public side effect. This also makes a stale or
     # manually edited consent flag cheap to reject on every unattended pass.
-    if review.get("decision") != "accept":
-        raise ReviewerError("only an accepted review can be registered")
+    if review.get("outcome") != "neutral":
+        raise ReviewerError("only a review that identified no blocking problem can be registered")
     if not args.dry_run:
         recovered_pr = recover_registration_change(args.submission, review)
         if recovered_pr is not None:
@@ -4900,8 +4942,9 @@ def register(args: argparse.Namespace) -> int:
         rubric=committed_rubric,
     )
     # Before anything public happens. Rendering dispatches a public Actions run
-    # named with the repository and commit, which would signal an acceptance
-    # the submitter has not agreed to register, and cannot be taken back.
+    # named with the repository and commit, which would signal that no blocking
+    # problem was identified before the submitter agreed to register, and
+    # cannot be taken back.
     state = registration_authorization.validate_registration(
         args.submission,
         mechanical,
@@ -4942,14 +4985,14 @@ def register(args: argparse.Namespace) -> int:
     # after clone_at returns. Keep the private credential ephemeral and retain
     # the same no-global-config/no-replace hardening used for the clone.
     database_git_env = registry_git_environment(git_env)
-    schema_path = database / "schema-v2.json"
+    schema_path = database / "schema-v3.json"
     if not schema_path.is_file():
-        raise ReviewerError("PalomarDatabase main does not register schema-v2.json")
+        raise ReviewerError("PalomarDatabase main does not register schema-v3.json")
     scores_schema_path = database / "scores-v1.json"
     if not scores_schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
 
-    permanent_id, accepted_at, registered_at, version = registration_attempt_identity(
+    permanent_id, first_registered_on, registered_at, version = registration_attempt_identity(
         database,
         state=state,
         mechanical=mechanical,
@@ -5006,7 +5049,7 @@ def register(args: argparse.Namespace) -> int:
         mechanical=mechanical,
         review=review,
         metadata=metadata,
-        accepted_at=accepted_at,
+        first_registered_on=first_registered_on,
         registered_at=registered_at,
         version=version,
         challenge_render=challenge_render,
@@ -5102,7 +5145,7 @@ def register(args: argparse.Namespace) -> int:
         source_commit=mechanical["source"]["commit"],
         existing_id=mechanical.get("existing_id") or None,
     )
-    if saved_identity != (permanent_id, accepted_at, registered_at, version):
+    if saved_identity != (permanent_id, first_registered_on, registered_at, version):
         raise ReviewerError("saved registration attempt changed before PR checkpointing")
     registration_checkpoint.checkpoint_pr(
         gh,
@@ -5164,7 +5207,7 @@ def finalize(args: argparse.Namespace) -> int:
     if record["submission"]["submission_id"] != args.submission:
         raise ReviewerError("registered record points to a different submission")
     expected = f"entries/{record['id']}-v{record['version']}.json"
-    if entry_path != expected or record["status"] != "accepted":
+    if entry_path != expected or record["status"] != "registered":
         raise ReviewerError("registered record has an inconsistent path or status")
 
     database_url = f"https://github.com/{DATABASE_REPO}/blob/{merge_commit}/{entry_path}"
@@ -5350,11 +5393,11 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
 
 
 def advance_registration(record: dict[str, Any], wait_seconds: float) -> bool:
-    """Merge an accepted registration's database change, then record it.
+    """Merge a registration's database change, then record it.
 
     Returns whether the submission moved. Merging is the registration event and
     no person signs it, so the database's own checks are the whole of what
-    stands between an accepted review and the registry.
+    stands between a registrable review and the registry.
     """
     pr = record["registration_pr"]
     view = await_database_checks(pr, wait_seconds)
@@ -5450,7 +5493,7 @@ def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
         isinstance(review, dict)
         and review.get("schema_version") == REVIEW_SCHEMA_VERSION
         and review.get("submission_id") == record["id"]
-        and review.get("decision") in REVIEW_DECISIONS
+        and review.get("outcome") in REVIEW_OUTCOMES
     )
 
 
@@ -6930,7 +6973,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="deliver the inspected review privately to the submitter",
     )
     run_parser.set_defaults(func=run_review)
-    register_parser = commands.add_parser("register", help="prepare a database PR from an accepted report")
+    register_parser = commands.add_parser(
+        "register", help="prepare a database PR from a review that identified no blocking problem"
+    )
     register_parser.add_argument("--submission", type=str, required=True)
     register_parser.add_argument(
         "--render-result",
@@ -6954,7 +6999,7 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.set_defaults(func=finalize)
     star_parser = commands.add_parser(
         "star-registered",
-        help="star accepted registered source repositories as PalomarArchivist",
+        help="star registered source repositories as PalomarArchivist",
     )
     star_parser.add_argument("--dry-run", action="store_true")
     star_parser.set_defaults(func=star_registered_sources)
