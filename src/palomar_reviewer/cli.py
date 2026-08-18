@@ -158,8 +158,8 @@ PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<se
 # emits and what a record's `registered_at` has to be.
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 MAX_CONTEXT_BYTES = 300_000
-CURRENT_RUBRIC_VERSION = 8
-SUPPORTED_RUBRIC_VERSIONS = (7, CURRENT_RUBRIC_VERSION)
+CURRENT_RUBRIC_VERSION = 9
+SUPPORTED_RUBRIC_VERSIONS = (7, 8, CURRENT_RUBRIC_VERSION)
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_DECISIONS = ("accept", "revise", "reject")
 
@@ -419,6 +419,7 @@ def public_review(review: dict[str, Any]) -> dict[str, Any]:
         if isinstance(step, dict):
             step.pop("scores", None)
             step.pop("internal_notes", None)
+            step.pop("description_coverage", None)
             for finding in step.get("findings") or []:
                 if isinstance(finding, dict):
                     finding.pop("severity", None)
@@ -655,7 +656,7 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
     if rubric.get("step_result", {}).get("verdicts") != ["pass", "warn", "fail"]:
         raise ReviewerError("the rubric must declare exactly the supported pass verdicts")
     required_fields = rubric.get("step_result", {}).get("required_fields")
-    if version == CURRENT_RUBRIC_VERSION:
+    if version >= 8:
         if required_fields != STEP_SCHEMA["required"]:
             raise ReviewerError("the rubric must declare exactly the current step-result fields")
         if rubric.get("finding_comment_policy") != "all":
@@ -687,10 +688,22 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
         for step in steps
         if step.get("requires_classification_coverage") is True
     }
-    expected_classification_coverage = {"classification"} if version == CURRENT_RUBRIC_VERSION else set()
+    expected_classification_coverage = {"classification"} if version >= 8 else set()
     if classification_coverage != expected_classification_coverage:
         raise ReviewerError(
             "the rubric must require complete classification-code coverage"
+        )
+    description_coverage = {
+        step.get("id")
+        for step in steps
+        if step.get("requires_description_coverage") is True
+    }
+    expected_description_coverage = (
+        {"statement_alignment"} if version == CURRENT_RUBRIC_VERSION else set()
+    )
+    if description_coverage != expected_description_coverage:
+        raise ReviewerError(
+            "the rubric must require project-description coverage in statement alignment"
         )
     allowed_step_scores = set(STEP_SCORE_KEYS)
     owned: list[str] = []
@@ -705,7 +718,7 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
             raise ReviewerError(f"rubric step {step.get('id')!r} has an unknown evidence input")
         if step.get("id") == "synthesis":
             continue
-        if version == CURRENT_RUBRIC_VERSION and "policy:prompts/materiality.md" not in inputs:
+        if version >= 8 and "policy:prompts/materiality.md" not in inputs:
             raise ReviewerError(
                 f"rubric step {step.get('id')!r} is missing the binding materiality policy"
             )
@@ -766,9 +779,25 @@ def step_schema_for_rubric(
         schema["properties"]["declarations_checked"]["minItems"] = 1
         if rubric_version == 7:
             schema["properties"]["findings"].pop("minItems", None)
-    if rubric_version == CURRENT_RUBRIC_VERSION and step.get("requires_classification_coverage"):
+    if step.get("requires_description_coverage"):
+        schema["required"].append("description_coverage")
+        schema["properties"]["description_coverage"] = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["declaration", "coverage", "reason"],
+                "properties": {
+                    "declaration": {"type": "string", "minLength": 1},
+                    "coverage": {"enum": ["direct", "collective", "missing"]},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+            },
+        }
+    if rubric_version >= 8 and step.get("requires_classification_coverage"):
         schema["properties"]["codes_checked"]["minItems"] = 1
-    if rubric_version == CURRENT_RUBRIC_VERSION:
+    if rubric_version >= 8:
         schema["properties"]["sources_checked"]["minItems"] = 1
     return schema
 
@@ -807,6 +836,26 @@ def validate_classification_coverage(
             "classification code coverage must exactly match every submitted arXiv and "
             "MSC2020 code, in metadata order"
         )
+
+
+def validate_description_coverage(
+    result: dict[str, Any], step: dict[str, Any], mechanical: dict[str, Any]
+) -> None:
+    if not step.get("requires_description_coverage"):
+        return
+    expected = [
+        *mechanical["comparator"].get("theorem_names", []),
+        *mechanical["comparator"].get("definition_names", []),
+    ]
+    coverage = result.get("description_coverage")
+    actual = [item.get("declaration") for item in coverage] if isinstance(coverage, list) else []
+    if actual != expected:
+        raise ReviewerError(
+            "statement_alignment description coverage must exactly match every "
+            "Comparator-selected declaration in configuration order"
+        )
+    if any(item.get("coverage") == "missing" for item in coverage) and result.get("verdict") != "fail":
+        raise ReviewerError("missing project-description coverage requires a failed pass")
 
 
 def utc_now() -> str:
@@ -2182,6 +2231,10 @@ REPAIR_FIELDS_V2 = {
     "automation.methods": "methods",
     "repository.substantive_formalization": "substantive-repository",
 }
+REPAIR_FIELDS_V3 = {
+    **REPAIR_FIELDS_V2,
+    "project.description": "prose",
+}
 SUBSTANTIVE_SOURCE_RELATIONSHIPS = {
     "formalizes", "adapts", "independently-proves",
 }
@@ -2221,10 +2274,18 @@ def _repair_lines(value: Any, field: str, maximum: int = 100) -> list[str]:
     return [_repair_line(item, field) for item in value]
 
 
-def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
-    kind = REPAIR_FIELDS_V2.get(field)
+def _normalized_repair_value(
+    field: str,
+    value: Any,
+    *,
+    complete: bool,
+    fields: dict[str, str] = REPAIR_FIELDS_V3,
+) -> Any:
+    kind = fields.get(field)
     if kind == "text":
         return _repair_line(value, field)
+    if kind == "prose":
+        return _repair_text(value, field)
     if kind in {"list", "people"}:
         items = _repair_lines(value, field)
         if complete and field == "classification.arxiv" and len(items) > 2:
@@ -2315,20 +2376,24 @@ def _normalized_repair_value(field: str, value: Any, *, complete: bool) -> Any:
     raise ReviewerError(f"unsupported repair field: {field}")
 
 
-def _bounded_repair_draft(value: Any) -> dict[str, Any]:
+def _bounded_repair_draft(
+    value: Any, fields: dict[str, str] = REPAIR_FIELDS_V3
+) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"values", "origins"}:
         raise ReviewerError("formalization repair draft is malformed")
     values, origins = value.get("values"), value.get("origins")
     if not isinstance(values, dict) or not isinstance(origins, dict):
         raise ReviewerError("formalization repair draft is malformed")
-    if len(values) > len(REPAIR_FIELDS_V2) or set(origins) - set(values):
+    if len(values) > len(fields) or set(origins) - set(values):
         raise ReviewerError("formalization repair draft has inconsistent fields")
     result_values: dict[str, Any] = {}
     result_origins: dict[str, str] = {}
     for field, item in values.items():
-        if field not in REPAIR_FIELDS_V2:
+        if field not in fields:
             raise ReviewerError("formalization repair draft names an unsupported field")
-        result_values[field] = _normalized_repair_value(field, item, complete=False)
+        result_values[field] = _normalized_repair_value(
+            field, item, complete=False, fields=fields
+        )
     for field, origin in origins.items():
         result_origins[field] = _repair_line(origin, f"draft origin {field}", 400)
     return {"values": result_values, "origins": result_origins}
@@ -2414,9 +2479,10 @@ def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, An
         result["phase"] = phase
     draft = report.get("formalization_repair_draft")
     if draft is not None:
-        if profile_version != 2:
-            raise ReviewerError("formalization repair draft requires profile version 2")
-        result["repair_draft"] = _bounded_repair_draft(draft)
+        if profile_version not in {2, 3}:
+            raise ReviewerError("formalization repair draft requires profile version 2 or 3")
+        fields = REPAIR_FIELDS_V3 if profile_version == 3 else REPAIR_FIELDS_V2
+        result["repair_draft"] = _bounded_repair_draft(draft, fields)
     return result
 
 
@@ -3988,6 +4054,7 @@ def run_review(args: argparse.Namespace) -> int:
             if result["step"] != step["id"]:
                 raise ReviewerError(f"engine returned step {result['step']!r}, expected {step['id']!r}")
             validate_declaration_coverage(result, step, mechanical)
+            validate_description_coverage(result, step, mechanical)
             validate_classification_coverage(result, step, mechanical)
             passes.append(result)
             write_json(work / "passes" / f"{step['id']}.json", result)
@@ -4183,19 +4250,10 @@ def registry_record(
             f"version 1 is dated {accepted_at} but was registered on {registered_at[:10]}"
         )
     title = registry_title(metadata, state.get("title") or state["repository"])
-    abstract = (
-        metadata_value(
-            metadata,
-            [
-                ("project", "short_description"),
-                ("project", "description"),
-                ("result", "statement"),
-                ("project", "name"),
-                ("result", "name"),
-            ],
-        )
-        or title
-    )
+    abstract = metadata_value(metadata, [("project", "description")])
+    if not isinstance(abstract, str) or not abstract.strip():
+        raise ReviewerError("formalization.yaml has no nonempty project.description")
+    abstract = abstract.strip()
     license_record = validated_repository_license(mechanical, metadata)
     challenge = mechanical["challenge"]
     dependencies = []
@@ -5552,7 +5610,7 @@ def _record_repair(repair: dict[str, Any], status: str, explanation: str, **fiel
 
 def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
     schema_version = repair.get("schema_version")
-    if schema_version not in {1, 2} or repair.get("submission_id") != state.get("id"):
+    if schema_version not in {1, 2, 3} or repair.get("submission_id") != state.get("id"):
         raise ReviewerError("repair request does not match its submission")
     if repair.get("revision") != (state.get("repair") or {}).get("revision"):
         raise ReviewerError("repair request revision does not match the submission")
@@ -5583,7 +5641,11 @@ def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
     if Path(path).name != "formalization.yaml":
         raise ReviewerError("repair target must be named formalization.yaml")
     edits = repair.get("edits")
-    allowed = REPAIR_FIELDS_V2 if schema_version == 2 else REPAIR_FIELDS_V1
+    allowed = (
+        REPAIR_FIELDS_V3 if schema_version == 3
+        else REPAIR_FIELDS_V2 if schema_version == 2
+        else REPAIR_FIELDS_V1
+    )
     if not isinstance(edits, list) or not edits or len(edits) > len(allowed):
         raise ReviewerError("repair request has no bounded edit list")
     fields = [item.get("field") for item in edits if isinstance(item, dict)]
@@ -5591,7 +5653,9 @@ def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
         raise ReviewerError("repair request contains an unsupported or duplicate field")
     for edit in edits:
         field = edit["field"]
-        _normalized_repair_value(field, edit.get("value"), complete=True)
+        _normalized_repair_value(
+            field, edit.get("value"), complete=True, fields=allowed
+        )
 
 
 def _refuse_yaml_aliases(value: Any, seen: set[int] | None = None) -> None:
@@ -5608,7 +5672,7 @@ def _refuse_yaml_aliases(value: Any, seen: set[int] | None = None) -> None:
 
 
 REPAIR_CHILD_ORDER = {
-    "project": ["name", "authors", "license", "responsible_maintainers"],
+    "project": ["name", "description", "authors", "license", "responsible_maintainers"],
     "classification": ["arxiv", "msc2020"],
     "automation": ["methods"],
     "review": ["status"],
@@ -6444,19 +6508,19 @@ def upgrade_repair_failures(args: argparse.Namespace) -> int:
             validated = validated_failure_report(report, fresh)
             diagnostics = validated["diagnostics"]
             if (
-                validated.get("profile_version") != 2
+                validated.get("profile_version") != 3
                 or "repair_draft" not in validated
                 or not diagnostics
                 or any(item.get("owner") != "submitter" for item in diagnostics)
             ):
-                raise ReviewerError("current preflight did not produce guided profile-v2 metadata")
+                raise ReviewerError("current preflight did not produce guided profile-v3 metadata")
             old_failure = fresh["failure"]
             failure = {
                 "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
                 "mode": old_failure.get("mode", "preflight"),
                 "phase": old_failure.get("phase", "preparation"),
                 "run": old_failure.get("run"),
-                "profile_version": 2,
+                "profile_version": 3,
                 "diagnostics": diagnostics,
                 "repair_draft": validated["repair_draft"],
             }

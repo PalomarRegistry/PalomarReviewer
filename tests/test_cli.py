@@ -49,6 +49,7 @@ from palomar_reviewer.cli import (
     step_schema_for_rubric,
     validate_classification_coverage,
     validate_declaration_coverage,
+    validate_description_coverage,
     validate_render_result,
     validate_rubric,
     validate_stored_review,
@@ -1483,6 +1484,13 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             "sources_checked": ["fixture"],
             "declarations_checked": ["Example.result"],
             "codes_checked": ["arxiv:math.CO"] if step == "classification" else [],
+            **({
+                "description_coverage": [{
+                    "declaration": "Example.result",
+                    "coverage": "direct",
+                    "reason": "The description names the selected result.",
+                }]
+            } if step == "statement_alignment" else {}),
             "internal_notes": [
                 {"evidence": f"{step} evidence", "message": f"{step} clean audit"}
             ],
@@ -1524,7 +1532,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             self.step_result("classification", {"classification": 4}),
         ]
         rubric = {
-            "schema_version": 8,
+            "schema_version": 9,
             "finding_comment_policy": "all",
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
@@ -1543,6 +1551,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 {
                     "id": "statement_alignment",
                     "requires_declaration_coverage": True,
+                    "requires_description_coverage": True,
                     "required": True,
                     "score_keys": ["statement_alignment"],
                     "inputs": ["policy:prompts/materiality.md"],
@@ -1602,6 +1611,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         mechanical["comparator"]["theorem_names"] = ["Example.first", "Example.second"]
         mechanical["comparator"]["definition_names"] = ["Example.input"]
         result = self.step_result("statement_alignment", {"statement_alignment": 4})
+        result.pop("description_coverage")
         result["declarations_checked"] = ["Example.first", "Example.second", "Example.input"]
         jsonschema.validate(result, step_schema_for_rubric(step))
         validate_declaration_coverage(result, step, mechanical)
@@ -1625,6 +1635,41 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         result["codes_checked"].reverse()
         with self.assertRaisesRegex(ReviewerError, "exactly match every submitted"):
             validate_classification_coverage(result, step, mechanical)
+
+    def test_statement_alignment_audits_description_against_every_comparator_result(self):
+        step = {
+            "id": "statement_alignment",
+            "score_keys": ["statement_alignment"],
+            "requires_description_coverage": True,
+        }
+        mechanical = self.mechanical_fixture()
+        mechanical["comparator"]["theorem_names"] = ["Example.first"]
+        mechanical["comparator"]["definition_names"] = ["Example.input"]
+        result = self.step_result("statement_alignment", {"statement_alignment": 4})
+        result["description_coverage"] = [
+            {
+                "declaration": "Example.first",
+                "coverage": "direct",
+                "reason": "The description states the first result.",
+            },
+            {
+                "declaration": "Example.input",
+                "coverage": "collective",
+                "reason": "The description identifies the family containing this definition.",
+            },
+        ]
+        jsonschema.validate(result, step_schema_for_rubric(step))
+        validate_description_coverage(result, step, mechanical)
+
+        result["description_coverage"][1]["coverage"] = "missing"
+        with self.assertRaisesRegex(ReviewerError, "requires a failed pass"):
+            validate_description_coverage(result, step, mechanical)
+        result["verdict"] = "fail"
+        validate_description_coverage(result, step, mechanical)
+
+        result["description_coverage"].reverse()
+        with self.assertRaisesRegex(ReviewerError, "exactly match every"):
+            validate_description_coverage(result, step, mechanical)
 
     def test_synthesis_cannot_drop_material_findings(self):
         synthesis, passes, rubric = self.review_policy_fixture()
@@ -2146,7 +2191,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "warnings": [],
             },
             metadata={
-                "project": {"license": "MIT"},
+                "project": {
+                    "license": "MIT",
+                    "description": "A formalization of the selected example result.",
+                },
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             },
             accepted_at="2026-08-01",
@@ -2292,7 +2340,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         """
         record = self.example_record(
             metadata={
-                "project": {"license": "MIT", "short_description": "A " + "sk-" + "q4Wm" * 8},
+                "project": {"license": "MIT", "description": "A " + "sk-" + "q4Wm" * 8},
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             }
         )
@@ -2315,15 +2363,24 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         named = self.example_record(
             review=review,
             metadata={
-                "project": {"license": "MIT", "name": "Submitter's project name"},
+                "project": {
+                    "license": "MIT",
+                    "name": "Submitter's project name",
+                    "description": "Submitter's account of the selected result.",
+                },
                 "classification": classification,
             },
         )
-        unnamed = self.example_record(review=review)
-
-        self.assertEqual(named["abstract"], "Submitter's project name")
-        self.assertEqual(unnamed["abstract"], "example/project")
-        self.assertNotIn(review["summary"], json.dumps([named, unnamed]))
+        self.assertEqual(named["abstract"], "Submitter's account of the selected result.")
+        with self.assertRaisesRegex(ReviewerError, "project.description"):
+            self.example_record(
+                review=review,
+                metadata={
+                    "project": {"license": "MIT", "name": "Only a project name"},
+                    "classification": classification,
+                },
+            )
+        self.assertNotIn(review["summary"], json.dumps(named))
 
     def review_with_ranked_findings(self):
         """A review whose top-level list is the warning-and-error findings.
@@ -2449,7 +2506,11 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         into a permanent public record by naming it something new.
         """
         metadata = {
-            "project": {"license": "MIT", "funding": "ARC DP123456"},
+            "project": {
+                "license": "MIT",
+                "description": "A formalization of the selected example result.",
+                "funding": "ARC DP123456",
+            },
             "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             "lab_notebook": {"tried": ["induction", "a walk"], "cost_aud": 412.5},
             "result": {"mood": "relieved"},
@@ -2531,7 +2592,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "warnings": [],
             },
             metadata={
-                "project": {"license": "MIT"},
+                "project": {
+                    "license": "MIT",
+                    "description": "A formalization of the selected example result.",
+                },
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
             },
             accepted_at="2026-08-01",
@@ -3365,6 +3429,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         next(step for step in rubric["steps"] if step["id"] == "classification").pop(
             "requires_classification_coverage"
         )
+        next(step for step in rubric["steps"] if step["id"] == "statement_alignment").pop(
+            "requires_description_coverage"
+        )
         validate_rubric(rubric)
 
         result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
@@ -3374,6 +3441,19 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             {"severity": "info", "evidence": "metadata", "message": "Legacy observation."}
         ]
         jsonschema.validate(result, step_schema_for_rubric(rubric["steps"][0], 7))
+
+    def test_schema_version_eight_remains_usable_during_rollout(self):
+        _, _, rubric = self.review_policy_fixture()
+        rubric["schema_version"] = 8
+        statement = next(
+            step for step in rubric["steps"] if step["id"] == "statement_alignment"
+        )
+        statement.pop("requires_description_coverage")
+        validate_rubric(rubric)
+
+        result = self.step_result("statement_alignment", {"statement_alignment": 4})
+        result.pop("description_coverage")
+        jsonschema.validate(result, step_schema_for_rubric(statement, 8))
 
     def test_current_rubric_requires_current_verdicts(self):
         _, _, rubric = self.review_policy_fixture()
@@ -8725,6 +8805,23 @@ class FailureDiagnosticTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "unsupported field"):
             cli.validated_failure_report(report, self.state())
 
+    def test_profile_three_repair_draft_accepts_the_public_description(self):
+        report = self.report(self.diagnostic())
+        report["formalization_profile_version"] = 3
+        report["formalization_repair_draft"] = {
+            "values": {"project.description": "A concise public abstract."},
+            "origins": {"project.description": "project.short_description"},
+        }
+        result = cli.validated_failure_report(report, self.state())
+        self.assertEqual(
+            result["repair_draft"]["values"]["project.description"],
+            "A concise public abstract.",
+        )
+
+        report["formalization_profile_version"] = 2
+        with self.assertRaisesRegex(ReviewerError, "unsupported field"):
+            cli.validated_failure_report(report, self.state())
+
     def test_legacy_failure_report_without_phase_remains_valid(self):
         report = self.report(self.diagnostic())
         del report["phase"]
@@ -9519,6 +9616,33 @@ notes: keep this
         self.assertEqual(repaired["project"]["authors"], ["Ada Lovelace"])
         self.assertEqual(repaired["sources"][0]["relationship"], "formalizes")
 
+    def test_profile_three_updates_the_public_description_in_canonical_order(self):
+        source = """project:
+  name: Example
+  authors: [Example Author]
+  license: MIT
+"""
+        edits = [{
+            "field": "project.description",
+            "value": "A result about the Comparator-selected configuration.\nIt states the main bound.",
+        }]
+        repair = self.repair()
+        repair["schema_version"] = 3
+        repair["edits"] = edits
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        cli._validate_repair(repair, state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            path.write_text(source, encoding="utf-8")
+            cli._apply_repair(path, edits)
+            repaired = path.read_text(encoding="utf-8")
+        self.assertLess(repaired.index("  name:"), repaired.index("  description:"))
+        self.assertLess(repaired.index("  description:"), repaired.index("  authors:"))
+        self.assertIn("It states the main bound.", repaired)
+
     def test_profile_two_rejects_incomplete_or_inconsistent_sources(self):
         repair = self.repair()
         repair["schema_version"] = 2
@@ -9606,7 +9730,7 @@ class RepairFailureMigrationTests(unittest.TestCase):
             "schema_version": 1, "status": "fail", "stage": "preflight",
             "submission": {"submission_id": "a1b2c3d4e5f6"},
             "source": {"repository": "owner/project", "commit": "a" * 40},
-            "diagnostics_schema_version": 1, "formalization_profile_version": 2,
+            "diagnostics_schema_version": 1, "formalization_profile_version": 3,
             "diagnostics": [diagnostic],
             "formalization_repair_draft": {
                 "values": {"project.name": "Legacy name"},
@@ -9632,6 +9756,6 @@ class RepairFailureMigrationTests(unittest.TestCase):
         self.assertEqual(updated["id"], state["id"])
         self.assertEqual(updated["status"], "changes-required")
         self.assertEqual(updated["preflight_run"], state["preflight_run"])
-        self.assertEqual(updated["failure"]["profile_version"], 2)
+        self.assertEqual(updated["failure"]["profile_version"], 3)
         self.assertEqual(updated["failure"]["run"], state["failure"]["run"])
         self.assertNotIn("_blob_sha", updated)
