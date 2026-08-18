@@ -37,6 +37,7 @@ from palomar_reviewer.cli import (
     has_proof_account,
     load_formalization_metadata,
     preserve_sources,
+    qualified_challenge_reasons,
     register,
     registration_attempt_identity,
     registration_entry_path,
@@ -2538,8 +2539,32 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "disagrees"):
             validated_repository_license(mechanical, metadata)
 
+    def test_qualified_challenge_reasons_name_the_imported_roots(self):
+        self.assertEqual(
+            qualified_challenge_reasons(
+                {
+                    "trust_level": "qualified",
+                    "dependencies": [
+                        {"repository": "leanprover-community/mathlib4"},
+                        {"repository": "TauCetiProject/TauCeti"},
+                        {"repository": "leanprover/cslib"},
+                    ],
+                }
+            ),
+            ["Challenge imports CSLib", "Challenge imports Tau Ceti"],
+        )
+        self.assertEqual(
+            qualified_challenge_reasons(
+                {
+                    "trust_level": "high",
+                    "dependencies": [{"repository": "leanprover/cslib"}],
+                }
+            ),
+            [],
+        )
+
     def test_registry_record_preserves_qualified_allowlisted_provenance(self):
-        # `TauCetiProject/TauCeti` is the allowlist's one qualified-trust root
+        # `TauCetiProject/TauCeti` is a qualified-trust root
         # (`FormalFrontier/TauCeti` is its former name), and `registry_record`
         # names Tau Ceti in the reason it writes for `qualified`. Not a fixture name.
         mechanical = self.nested_mechanical_fixture()

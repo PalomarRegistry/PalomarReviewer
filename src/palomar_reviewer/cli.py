@@ -128,6 +128,11 @@ FINISHED_STATUSES = frozenset(
         "dispatch-lost",
     }
 )
+
+QUALIFIED_CHALLENGE_REPOSITORY_LABELS = {
+    "taucetiproject/tauceti": "Tau Ceti",
+    "leanprover/cslib": "CSLib",
+}
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
 DATABASE_VALIDATE_WORKFLOW = "validate.yml"
@@ -4220,6 +4225,19 @@ def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
     return provenance
 
 
+def qualified_challenge_reasons(challenge: dict[str, Any]) -> list[str]:
+    if challenge.get("trust_level") != "qualified":
+        return []
+    labels = {
+        QUALIFIED_CHALLENGE_REPOSITORY_LABELS.get(
+            str(dependency.get("repository", "")).lower()
+        )
+        for dependency in challenge.get("dependencies", [])
+        if isinstance(dependency, dict)
+    }
+    return [f"Challenge imports {label}" for label in sorted(labels - {None})]
+
+
 def registry_record(
     *,
     state: dict[str, Any],
@@ -4266,9 +4284,7 @@ def registry_record(
                     "revision": item["revision"],
                 }
             )
-    reasons = []
-    if challenge["trust_level"] == "qualified":
-        reasons.append("Challenge imports Tau Ceti")
+    reasons = qualified_challenge_reasons(challenge)
     database_challenge_dependencies = []
     for item in challenge["dependencies"]:
         database_dependency = {
