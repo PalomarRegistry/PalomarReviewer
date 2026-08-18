@@ -87,7 +87,7 @@ exact deterministic repair branch removed on a best-effort basis.
 
 `upgrade-repair-failures` reruns current preflight for settled profile-1
 `formalization.missing_sections` failures and replaces only their failure
-guidance with profile-2 diagnostics and safe draft values. The submission id,
+guidance with profile-3 diagnostics and safe draft values. The submission id,
 status, original run link, and history are retained, and a migration event is
 appended. Pass `--submission ID` for one record or omit it for all eligible
 records; as with every State mutation, the operator must explicitly set
