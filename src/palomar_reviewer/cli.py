@@ -158,8 +158,8 @@ PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<se
 # emits and what a record's `registered_at` has to be.
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 MAX_CONTEXT_BYTES = 300_000
-CURRENT_RUBRIC_VERSION = 9
-SUPPORTED_RUBRIC_VERSIONS = (7, 8, CURRENT_RUBRIC_VERSION)
+CURRENT_RUBRIC_VERSION = 10
+SUPPORTED_RUBRIC_VERSIONS = (7, 8, 9, CURRENT_RUBRIC_VERSION)
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_DECISIONS = ("accept", "revise", "reject")
 
@@ -698,9 +698,7 @@ def validate_rubric(rubric: dict[str, Any]) -> None:
         for step in steps
         if step.get("requires_description_coverage") is True
     }
-    expected_description_coverage = (
-        {"statement_alignment"} if version == CURRENT_RUBRIC_VERSION else set()
-    )
+    expected_description_coverage = {"statement_alignment"} if version == 9 else set()
     if description_coverage != expected_description_coverage:
         raise ReviewerError(
             "the rubric must require project-description coverage in statement alignment"

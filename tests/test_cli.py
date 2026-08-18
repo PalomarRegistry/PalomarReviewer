@@ -1484,13 +1484,6 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             "sources_checked": ["fixture"],
             "declarations_checked": ["Example.result"],
             "codes_checked": ["arxiv:math.CO"] if step == "classification" else [],
-            **({
-                "description_coverage": [{
-                    "declaration": "Example.result",
-                    "coverage": "direct",
-                    "reason": "The description names the selected result.",
-                }]
-            } if step == "statement_alignment" else {}),
             "internal_notes": [
                 {"evidence": f"{step} evidence", "message": f"{step} clean audit"}
             ],
@@ -1532,7 +1525,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             self.step_result("classification", {"classification": 4}),
         ]
         rubric = {
-            "schema_version": 9,
+            "schema_version": 10,
             "finding_comment_policy": "all",
             "minimum_accept_score": 4,
             "registry_scores": list(scores),
@@ -1551,7 +1544,6 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 {
                     "id": "statement_alignment",
                     "requires_declaration_coverage": True,
-                    "requires_description_coverage": True,
                     "required": True,
                     "score_keys": ["statement_alignment"],
                     "inputs": ["policy:prompts/materiality.md"],
@@ -1611,7 +1603,6 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         mechanical["comparator"]["theorem_names"] = ["Example.first", "Example.second"]
         mechanical["comparator"]["definition_names"] = ["Example.input"]
         result = self.step_result("statement_alignment", {"statement_alignment": 4})
-        result.pop("description_coverage")
         result["declarations_checked"] = ["Example.first", "Example.second", "Example.input"]
         jsonschema.validate(result, step_schema_for_rubric(step))
         validate_declaration_coverage(result, step, mechanical)
@@ -3429,9 +3420,6 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         next(step for step in rubric["steps"] if step["id"] == "classification").pop(
             "requires_classification_coverage"
         )
-        next(step for step in rubric["steps"] if step["id"] == "statement_alignment").pop(
-            "requires_description_coverage"
-        )
         validate_rubric(rubric)
 
         result = self.step_result("metadata", {"clarity": 4, "provenance": 4})
@@ -3448,12 +3436,27 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         statement = next(
             step for step in rubric["steps"] if step["id"] == "statement_alignment"
         )
-        statement.pop("requires_description_coverage")
         validate_rubric(rubric)
 
         result = self.step_result("statement_alignment", {"statement_alignment": 4})
-        result.pop("description_coverage")
         jsonschema.validate(result, step_schema_for_rubric(statement, 8))
+
+    def test_schema_version_nine_remains_usable_during_rollout(self):
+        _, _, rubric = self.review_policy_fixture()
+        rubric["schema_version"] = 9
+        statement = next(
+            step for step in rubric["steps"] if step["id"] == "statement_alignment"
+        )
+        statement["requires_description_coverage"] = True
+        validate_rubric(rubric)
+
+        result = self.step_result("statement_alignment", {"statement_alignment": 4})
+        result["description_coverage"] = [{
+            "declaration": "Example.result",
+            "coverage": "direct",
+            "reason": "The description names the selected result.",
+        }]
+        jsonschema.validate(result, step_schema_for_rubric(statement, 9))
 
     def test_current_rubric_requires_current_verdicts(self):
         _, _, rubric = self.review_policy_fixture()
