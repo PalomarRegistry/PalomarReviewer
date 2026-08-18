@@ -6940,6 +6940,10 @@ class EntryProvenanceTests(unittest.TestCase):
             {
                 "title": "A source",
                 "authors": [],
+                "contributors": [
+                    {"name": "Wilhelm Magnus", "role": "problem-proposer"},
+                    {"name": "Evgenii Khukhro", "role": "editor"},
+                ],
                 "relationship": "other",
                 "author_contacted": "yes",
                 "author_endorsement": "endorsed",
@@ -6950,6 +6954,13 @@ class EntryProvenanceTests(unittest.TestCase):
         self.assertEqual(
             result["mathematical_sources"][0]["author_endorsement"],
             "endorsed",
+        )
+        self.assertEqual(
+            result["mathematical_sources"][0]["contributors"],
+            [
+                {"name": "Wilhelm Magnus", "role": "problem-proposer"},
+                {"name": "Evgenii Khukhro", "role": "editor"},
+            ],
         )
 
     def test_free_text_is_canonicalized_only_at_the_public_entry_boundary(self):
@@ -9709,6 +9720,50 @@ notes: keep this
         self.assertLess(repaired.index("  name:"), repaired.index("  description:"))
         self.assertLess(repaired.index("  description:"), repaired.index("  authors:"))
         self.assertIn("It states the main bound.", repaired)
+
+    def test_profile_four_writes_structured_source_contributors(self):
+        source = """project:
+  name: Example
+sources:
+  - title: Old source
+    relationship: formalizes
+"""
+        edits = [{
+            "field": "sources",
+            "value": [{
+                "title": "Kourovka Notebook",
+                "authors": ["Solution Author"],
+                "contributors": [
+                    {"name": "Wilhelm Magnus", "role": "problem-proposer"},
+                    {"name": "Evgenii Khukhro", "role": "editor"},
+                ],
+                "relationship": "formalizes",
+            }],
+        }]
+        repair = self.repair()
+        repair["schema_version"] = 4
+        repair["edits"] = edits
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        cli._validate_repair(repair, state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formalization.yaml"
+            path.write_text(source, encoding="utf-8")
+            cli._apply_repair(path, edits)
+            repaired = yaml.safe_load(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            repaired["sources"][0]["contributors"],
+            [
+                {"name": "Wilhelm Magnus", "role": "problem-proposer"},
+                {"name": "Evgenii Khukhro", "role": "editor"},
+            ],
+        )
+
+        repair["schema_version"] = 3
+        with self.assertRaisesRegex(ReviewerError, "malformed"):
+            cli._validate_repair(repair, state)
 
     def test_profile_two_rejects_incomplete_or_inconsistent_sources(self):
         repair = self.repair()

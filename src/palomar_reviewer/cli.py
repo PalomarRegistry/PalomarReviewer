@@ -2272,6 +2272,7 @@ REPAIR_FIELDS_V3 = {
     **REPAIR_FIELDS_V2,
     "project.description": "prose",
 }
+REPAIR_FIELDS_V4 = dict(REPAIR_FIELDS_V3)
 SUBSTANTIVE_SOURCE_RELATIONSHIPS = {
     "formalizes", "adapts", "independently-proves",
 }
@@ -2316,7 +2317,7 @@ def _normalized_repair_value(
     value: Any,
     *,
     complete: bool,
-    fields: dict[str, str] = REPAIR_FIELDS_V3,
+    fields: dict[str, str] = REPAIR_FIELDS_V4,
 ) -> Any:
     kind = fields.get(field)
     if kind == "text":
@@ -2364,6 +2365,8 @@ def _normalized_repair_value(
             "title", "authors", "id", "type", "location", "relationship", "license",
             "author_endorsement", "note",
         }
+        if fields is REPAIR_FIELDS_V4:
+            allowed.add("contributors")
         sources: list[dict[str, Any]] = []
         for raw in value:
             if not isinstance(raw, dict) or set(raw) - allowed:
@@ -2371,6 +2374,24 @@ def _normalized_repair_value(
             item: dict[str, Any] = {"title": _repair_line(raw.get("title"), "sources.title")}
             if "authors" in raw:
                 item["authors"] = _repair_lines(raw["authors"], "sources.authors")
+            if "contributors" in raw:
+                contributors = raw["contributors"]
+                if not isinstance(contributors, list):
+                    raise ReviewerError("repair value for sources.contributors is malformed")
+                item["contributors"] = []
+                for contributor in contributors:
+                    if not isinstance(contributor, dict) or set(contributor) != {"name", "role"}:
+                        raise ReviewerError(
+                            "repair value for sources.contributors is malformed"
+                        )
+                    item["contributors"].append({
+                        "name": _repair_line(
+                            contributor.get("name"), "sources.contributors.name"
+                        ),
+                        "role": _repair_line(
+                            contributor.get("role"), "sources.contributors.role", 200
+                        ),
+                    })
             for name, maximum in (("id", 2_048), ("location", 1_000), ("license", 500)):
                 if name in raw:
                     item[name] = _repair_line(raw[name], f"sources.{name}", maximum)
@@ -2414,7 +2435,7 @@ def _normalized_repair_value(
 
 
 def _bounded_repair_draft(
-    value: Any, fields: dict[str, str] = REPAIR_FIELDS_V3
+    value: Any, fields: dict[str, str] = REPAIR_FIELDS_V4
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"values", "origins"}:
         raise ReviewerError("formalization repair draft is malformed")
@@ -2516,9 +2537,15 @@ def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, An
         result["phase"] = phase
     draft = report.get("formalization_repair_draft")
     if draft is not None:
-        if profile_version not in {2, 3}:
-            raise ReviewerError("formalization repair draft requires profile version 2 or 3")
-        fields = REPAIR_FIELDS_V3 if profile_version == 3 else REPAIR_FIELDS_V2
+        if profile_version not in {2, 3, 4}:
+            raise ReviewerError(
+                "formalization repair draft requires profile version 2, 3, or 4"
+            )
+        fields = (
+            REPAIR_FIELDS_V4 if profile_version == 4
+            else REPAIR_FIELDS_V3 if profile_version == 3
+            else REPAIR_FIELDS_V2
+        )
         result["repair_draft"] = _bounded_repair_draft(draft, fields)
     return result
 
@@ -5667,7 +5694,7 @@ def _record_repair(repair: dict[str, Any], status: str, explanation: str, **fiel
 
 def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
     schema_version = repair.get("schema_version")
-    if schema_version not in {1, 2, 3} or repair.get("submission_id") != state.get("id"):
+    if schema_version not in {1, 2, 3, 4} or repair.get("submission_id") != state.get("id"):
         raise ReviewerError("repair request does not match its submission")
     if repair.get("revision") != (state.get("repair") or {}).get("revision"):
         raise ReviewerError("repair request revision does not match the submission")
@@ -5699,7 +5726,8 @@ def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
         raise ReviewerError("repair target must be named formalization.yaml")
     edits = repair.get("edits")
     allowed = (
-        REPAIR_FIELDS_V3 if schema_version == 3
+        REPAIR_FIELDS_V4 if schema_version == 4
+        else REPAIR_FIELDS_V3 if schema_version == 3
         else REPAIR_FIELDS_V2 if schema_version == 2
         else REPAIR_FIELDS_V1
     )
