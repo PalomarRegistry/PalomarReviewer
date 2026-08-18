@@ -39,9 +39,9 @@ def commit(root: Path) -> None:
 
 def result_document(*, versions: int = 1) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "id": FIRST,
-        "accepted_at": "2026-08-09",
+        "first_registered_on": "2026-08-09",
         "identity": {
             "source_repository": "example/project",
             "project_path": None,
@@ -53,7 +53,7 @@ def result_document(*, versions: int = 1) -> dict:
                 "submission_id": f"{version:012d}",
                 "registered_at": f"2026-08-{min(9 + version - 1, 31):02d}T12:00:00Z",
                 "title": f"Version {version}",
-                "status": "accepted",
+                "status": "registered",
                 "path": f"entries/{FIRST}-v{version}.json",
                 "abstract": f"Abstract {version}",
                 "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
@@ -66,7 +66,7 @@ def result_document(*, versions: int = 1) -> dict:
 def identity_document(identifier: str = FIRST) -> dict:
     identity = result_document()["identity"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "identity": identity,
         "registration_id": identifier,
     }
@@ -80,11 +80,11 @@ def write_identity(root: Path, identifier: str = FIRST) -> None:
 def record(*, identifier: str = FIRST, version: int = 1, submission: str = "a1b2c3d4e5f6") -> dict:
     return {
         "id": identifier,
-        "accepted_at": identifier[len("PALOMAR-") :][:10],
+        "first_registered_on": identifier[len("PALOMAR-") :][:10],
         "registered_at": "2026-08-09T12:00:00Z",
         "version": version,
         "title": "A result",
-        "status": "accepted",
+        "status": "registered",
         "abstract": "An abstract",
         "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
         "source": {"repository": "example/project", "commit": "1" * 40},
@@ -124,7 +124,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             "submission": (
                 registration.submission_path("a1b2c3d4e5f6"),
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "submission_id": "a1b2c3d4e5f6",
                     "id": FIRST,
                     "version": 1,
@@ -133,7 +133,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             ),
             "day": (
                 registration.day_path("2026-08-09"),
-                {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+                {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
             ),
             "identity": (
                 registration.identity_path(result_document()["identity"]),
@@ -165,7 +165,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             "submission": (
                 registration.submission_path("a1b2c3d4e5f6"),
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "submission_id": "a1b2c3d4e5f6",
                     "id": FIRST,
                     "version": 1,
@@ -174,7 +174,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             ),
             "day": (
                 registration.day_path("2026-08-09"),
-                {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+                {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
             ),
             "identity": (
                 registration.identity_path(result_document()["identity"]),
@@ -203,7 +203,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         write_json(
             repo,
             relative,
-            {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
         )
         commit(repo)
         (repo / relative).unlink()
@@ -213,7 +213,7 @@ class RegistrationProjectionTests(unittest.TestCase):
     def test_a_sparse_projection_is_read_from_head_without_materializing_it(self):
         repo = self.repo()
         relative = registration.day_path("2026-08-09")
-        document = {"schema_version": 1, "date": "2026-08-09", "last_serial": 1}
+        document = {"schema_version": 2, "date": "2026-08-09", "last_serial": 1}
         write_json(repo, relative, document)
         commit(repo)
         subprocess.run(
@@ -234,7 +234,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         write_json(
             repo,
             relative,
-            {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
         )
         commit(repo)
         subprocess.run(
@@ -257,7 +257,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         write_json(
             repo,
             relative,
-            {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
         )
         with self.assertRaisesRegex(ReviewerError, "not authority from the checked-out commit"):
             registration.load_day(repo, "2026-08-09")
@@ -314,7 +314,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             repo,
             registration.submission_path("a1b2c3d4e5f6"),
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
                 "id": FIRST,
                 "version": 1,
@@ -359,7 +359,7 @@ class RegistrationProjectionTests(unittest.TestCase):
             repo,
             relative,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "submission_id": "a1b2c3d4e5f6",
                 "id": FIRST,
                 "version": 2,
@@ -375,7 +375,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         write_json(
             repo,
             registration.day_path("2026-08-09"),
-            {"schema_version": 1, "date": "2026-08-09", "last_serial": 0},
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 0},
         )
         commit(repo)
         with self.assertRaisesRegex(ReviewerError, "malformed day counter"):
@@ -419,7 +419,7 @@ class RegistrationProjectionTests(unittest.TestCase):
                     "submission_id": "a1b2c3d4e5f6",
                     "registered_at": "2026-08-09T12:00:00Z",
                     "title": "A result",
-                    "status": "accepted",
+                    "status": "registered",
                     "path": f"entries/{FIRST}-v1.json",
                     "abstract": "An abstract",
                     "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
@@ -479,7 +479,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         write_json(
             repo,
             registration.day_path("2026-08-09"),
-            {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
         )
         commit(repo)
         with self.assertRaisesRegex(ReviewerError, "not the next contiguous allocation"):
@@ -494,7 +494,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         write_json(
             repo,
             registration.day_path("2026-08-09"),
-            {"schema_version": 1, "date": "2026-08-09", "last_serial": 1},
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
         )
         commit(repo)
         identifier = "PALOMAR-2026-08-09-000002"

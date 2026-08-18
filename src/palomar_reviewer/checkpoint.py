@@ -34,7 +34,7 @@ def saved_identity(
         "schema_version",
         "id",
         "version",
-        "accepted_at",
+        "first_registered_on",
         "registered_at",
         "review_sha256",
         "source_repository",
@@ -45,7 +45,7 @@ def saved_identity(
         not isinstance(attempt, dict)
         or bool(set(attempt) - keys)
         or type(attempt.get("schema_version")) is not int
-        or attempt["schema_version"] != 1
+        or attempt["schema_version"] != 2
     ):
         raise ReviewerError("saved registration attempt is malformed")
     bindings = {
@@ -55,10 +55,10 @@ def saved_identity(
         "existing_id": existing_id,
     }
     if any(attempt.get(field) != value for field, value in bindings.items()):
-        raise ReviewerError("saved registration attempt belongs to different accepted evidence")
+        raise ReviewerError("saved registration attempt belongs to different review evidence")
 
     identifier = attempt.get("id")
-    accepted_at = attempt.get("accepted_at")
+    first_registered_on = attempt.get("first_registered_on")
     registered_at = attempt.get("registered_at")
     version = attempt.get("version")
     match = (
@@ -68,8 +68,8 @@ def saved_identity(
     )
     if (
         match is None
-        or not isinstance(accepted_at, str)
-        or match.group("date") != accepted_at
+        or not isinstance(first_registered_on, str)
+        or match.group("date") != first_registered_on
         or not isinstance(registered_at, str)
         or TIMESTAMP_RE.fullmatch(registered_at) is None
         or type(version) is not int
@@ -78,7 +78,7 @@ def saved_identity(
         or (existing_id is not None and (identifier != existing_id or version < 2))
     ):
         raise ReviewerError("saved registration attempt has an invalid permanent identity")
-    return identifier, accepted_at, registered_at, version
+    return identifier, first_registered_on, registered_at, version
 
 
 def branch(submission_id: str, version: int) -> str:
@@ -127,7 +127,7 @@ def validate_pr(
 
 def entry_path(identity: tuple[str, str, str, int]) -> str:
     """Return the immutable entry path named by a saved identity."""
-    identifier, _accepted_at, _registered_at, version = identity
+    identifier, _first_registered_on, _registered_at, version = identity
     return f"entries/{identifier}-v{version}.json"
 
 
@@ -140,7 +140,7 @@ def validate_record(
     identity: tuple[str, str, str, int],
 ) -> dict[str, Any]:
     """Bind the branch record to the saved identity, review, source, and State."""
-    identifier, accepted_at, registered_at, version = identity
+    identifier, first_registered_on, registered_at, version = identity
     source = record.get("source") if isinstance(record, dict) else None
     submission = record.get("submission") if isinstance(record, dict) else None
     recorded_review = record.get("review") if isinstance(record, dict) else None
@@ -149,19 +149,19 @@ def validate_record(
     if (
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
-        or record["schema_version"] != 2
+        or record["schema_version"] != 3
         or record.get("id") != identifier
         or record.get("version") != version
-        or record.get("accepted_at") != accepted_at
+        or record.get("first_registered_on") != first_registered_on
         or record.get("registered_at") != registered_at
-        or record.get("status") != "accepted"
+        or record.get("status") != "registered"
         or not isinstance(source, dict)
         or source.get("repository") != state.get("repository")
         or source.get("commit") != state.get("commit")
         or not isinstance(submission, dict)
         or submission.get("submission_id") != submission_id
         or not isinstance(recorded_review, dict)
-        or recorded_review.get("verdict") != "accept"
+        or recorded_review.get("outcome") != "neutral"
         or recorded_review.get("reviewed_at") != review.get("reviewed_at")
         or recorded_review.get("policy_commit") != review.get("policy_commit")
         or recorded_review.get("reviewer_models") != review.get("reviewer_models")
@@ -190,7 +190,7 @@ def pr_body(
 ) -> str:
     """Build the current registration PR description from its immutable record."""
     lines = [
-        f"Registers accepted submission `{submission_id}`.",
+        f"Registers submission `{submission_id}`.",
         "",
         f"- Source: `{record['source']['repository']}@{record['source']['commit']}`",
         f"- Mechanical run: {record['verification']['workflow_url']}",

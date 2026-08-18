@@ -28,9 +28,9 @@ class RegistrationCheckpointRecoveryTests(unittest.TestCase):
 
     def fixtures(self):
         review = {
-            "schema_version": 2,
+            "schema_version": 3,
             "submission_id": self.submission_id,
-            "decision": "accept",
+            "outcome": "neutral",
             "source": {"repository": "example/project", "commit": "1" * 40},
             "reviewed_at": "2026-08-09T11:00:00Z",
             "policy_commit": "2" * 40,
@@ -50,10 +50,10 @@ class RegistrationCheckpointRecoveryTests(unittest.TestCase):
             "review_sha256": digest,
             "registration_consent_review_sha256": digest,
             "registration_attempt": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "id": self.identifier,
                 "version": 1,
-                "accepted_at": "2026-08-09",
+                "first_registered_on": "2026-08-09",
                 "registered_at": self.registered_at,
                 "review_sha256": digest,
                 "source_repository": "example/project",
@@ -63,12 +63,12 @@ class RegistrationCheckpointRecoveryTests(unittest.TestCase):
             "_blob_sha": "state-blob",
         }
         record = {
-            "schema_version": 2,
+            "schema_version": 3,
             "id": self.identifier,
             "version": 1,
-            "accepted_at": "2026-08-09",
+            "first_registered_on": "2026-08-09",
             "registered_at": self.registered_at,
-            "status": "accepted",
+            "status": "registered",
             "title": "A result",
             "source": {"repository": "example/project", "commit": "1" * 40},
             "submission": {"submission_id": self.submission_id},
@@ -78,7 +78,7 @@ class RegistrationCheckpointRecoveryTests(unittest.TestCase):
                 )
             },
             "review": {
-                "verdict": "accept",
+                "outcome": "neutral",
                 "reviewed_at": review["reviewed_at"],
                 "policy_commit": review["policy_commit"],
                 "reviewer_models": review["reviewer_models"],

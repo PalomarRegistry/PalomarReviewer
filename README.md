@@ -12,11 +12,11 @@ JSON-producing command, validates the final report, and then:
 
 - delivers the review privately to the submitter, and to nobody else;
 - once, and only once, the submitter chooses to register, prepares and opens the
-  append-only database pull request for an accepted entry;
+  append-only database pull request for a registrable entry;
 - verifies the merged record and records the registration against the private
   submission record.
 
-The review is never posted in public. A decision the submitter does not register
+The review is never posted in public. A review the submitter does not register
 leaves no public trace of itself, which is the whole reason the intake is
 private. What is public from the moment of submission is the mechanical
 verification: the repository, the commit, and the GitHub Actions run that
@@ -94,11 +94,11 @@ records; as with every State mutation, the operator must explicitly set
 `PALOMAR_ALLOW_STATE_WRITES=1`.
 
 `palomar_reviewer.authorization` is the pure registration-authorization
-contract. It owns the accepted push-proof methods, binds the private State
+contract. It owns the permitted push-proof methods, binds the private State
 record to the report and review, requires the positive one-time consent state,
 and checks that the delivered, consented-to, and registering review have one
 canonical digest. New work applies the complete contract after the
-credential-output backstop, accepted-decision check, and stored
+credential-output backstop, no-blocking-problem outcome check, and stored
 report/run/policy bindings and before source preservation, render, or database
 work. Recovery of an already-created branch applies the narrower current
 State/review/source standing first, then validates the reserved public record
@@ -238,7 +238,7 @@ the real public schema and validators without any private ledger bytes.
 ## Running a review by hand
 
 These are the steps the pipeline performs. Run them yourself to reproduce a
-decision, or to recover a run that failed partway. Submissions are named by the
+review outcome, or to recover a run that failed partway. Submissions are named by the
 twelve-character id the submission server allocated.
 
 Preview the queue without changing anything:
@@ -272,14 +272,14 @@ may continue over the queue it derived after a refused cache write, because the
 concurrent live index remains intact for its next pass. A pass that cannot
 enumerate its work fails; it never reports having found nothing.
 
-The current rubric contract is schema version 8. The reviewer temporarily also
-accepts version 7 so existing reviews and the separately deployed policy can
-roll forward safely; new policy work targets version 8. It
-rejects an internally inconsistent positive review: synthesis must reproduce
-the evidence-pass scores exactly, acceptance
-cannot override a failed pass, clean passes must meet the rubric minimum, and
-mandatory floors cannot be softened. Non-blocking warnings on other dimensions
-may accompany acceptance. These structural checks are the whole
+The current rubric contract is schema version 10. The reviewer temporarily also
+accepts versions 7, 8, and 9 so existing reviews and the separately deployed
+policy can roll forward safely; new policy work targets version 10. It rejects
+an internally inconsistent no-blocking-problem review: synthesis must reproduce
+the evidence-check scores exactly, the final outcome cannot override a failed
+check, clean checks must meet the rubric minimum, and mandatory floors cannot
+be softened. Non-blocking warnings on other dimensions may accompany a review
+that identifies no blocking problem. These structural checks are the whole
 enforcement: whether the cited evidence genuinely supports the model's
 substantive judgments is not separately confirmed. The private State workflow
 uploads the complete packet as operator evidence with a requested 90-day
@@ -376,14 +376,14 @@ summary when the evidence is sufficient.
 ## Registration
 
 Nothing is registered until the submitter asks for it on their status page. When
-they have, and the review was an acceptance:
+they have, and the review identified no blocking problem:
 
 ```bash
 palomar-review register --submission a1b2c3d4e5f6
 ```
 
-`register` first reads the private delivered review and refuses anything but an
-acceptance, before it clones a policy or source, downloads an artifact, or
+`register` first reads the private delivered review and refuses a review that
+identified a blocking problem, before it clones a policy or source, downloads an artifact, or
 writes a workspace. A real retry with a saved registration identity first
 rechecks the current private consent and exact delivered-review/source binding,
 then looks for that identity's deterministic Database branch and same-repository
@@ -396,8 +396,8 @@ that it was, to name no previous registration, to carry the submitter's
 consent, and for the digest delivered, the digest consented to, and the review
 about to be archived to be the same bytes. Only then does it dispatch the
 pinned Challenge renderer, which is a public Actions run naming the repository
-and commit and would otherwise signal an acceptance the submitter never agreed
-to register.
+and commit and would otherwise signal a registrable review the submitter never
+agreed to register.
 
 The submission server records the proof method and its GitHub repository and
 principal observations. The reviewer requires schema version 1, validates the
@@ -405,20 +405,20 @@ method's claimed binding, and binds the proof to the reviewed commit and
 principal. It does not independently ask GitHub to resolve the stored
 `repository_id` back to the submitted repository.
 
-An acceptance normally remains an offer to register for 24 hours after the
+An eligible review normally remains an offer to register for 24 hours after the
 review is delivered. A review-contract or security change may require immediate
 reverification instead; this exception avoids retaining obsolete validators as
 compatibility code. After 24 hours Palomar may expire the offer and require
 reverification before making a new one. The offer may remain usable longer,
 but there is no promise that it will.
 
-It then checks that the render matches the accepted source, Challenge hash,
-workflow run and renderer commit, revalidates every stored evidence pass and the
-score-to-decision policy, binds registered metadata to the mechanically recorded
+It then checks that the render matches the reviewed source, Challenge hash,
+workflow run and renderer commit, revalidates every stored evidence check and the
+score-to-outcome policy, binds registered metadata to the mechanically recorded
 `formalization.yaml` digest, and preserves the submitted repository, every Git
 dependency, and any separately recorded substantive formalization. Repositories
 in the same GitHub fork network share one native fork in `PalomarArchive`; each
-accepted commit receives a record-specific
+registered commit receives a record-specific
 `refs/tags/palomar/PALOMAR-…-vN/<sha>` ref. If any source, fork, commit, or ref
 cannot be created and read back exactly, registration stops before a database
 branch is published. GitHub creates forks asynchronously, so the reviewer waits
@@ -454,7 +454,7 @@ authority and payload blobs remain promised. New files are normalized to mode
 `100644`, enumerated rather than
 added by directory, force-added by their explicit paths so an ignore rule
 cannot omit one, and compared with the staged Git tree before the commit is
-accepted.
+used.
 
 The proposed commit is validated with the real `tools/validate.py --since` the
 exact Database `main` commit it extends, so the validator hashes the new
@@ -534,14 +534,14 @@ time. The account makes native forks, adds
 new preservation refs, and stars the original top-level source after its
 registration completes. `palomar-review star-registered` is idempotent: it
 verifies each star before recording it in private state, and an interrupted or
-failed pass is retried without affecting the accepted record. Dependencies and
+failed pass is retried without affecting the registered record. Dependencies and
 archive forks are not starred. GitHub redacts a
 ruleset's bypass-actor list after that demotion; the reviewer verifies every
 remaining ruleset field on later registrations, while creation verifies the
 complete rule, including its empty bypass list, before dropping administrator
 access.
 
-A renderer or infrastructure failure does not undo acceptance. Before making
+A renderer or infrastructure failure does not change the review outcome. Before making
 any public archive changes, `register` reserves the permanent ID and version in
 the private submission state. A retry reuses that identity and verifies or
 finishes the same archive refs instead of allocating an orphaned second ID.
@@ -650,7 +650,7 @@ owns rubric prompts and orchestration and checks every returned pass with the
 credential-output backstop before that pass can enter another prompt or leave
 the review workspace.
 
-An acceptance-capable literature pass must be able to verify important sources
+An outcome-permitting literature check must be able to verify important sources
 and search for obvious prior formalizations. Only the configured Claude
 literature pass currently has explicit web research tools. This runner never
 enables Codex web search and ignores user configuration that could enable it.
@@ -778,4 +778,4 @@ tools and a custom command is arbitrary code inside the namespace, so these
 controls reduce accidental instruction following rather than preventing it;
 what the broker adds is that succeeding at it wins nothing that outlives the
 pass. While the private packet remains available, it lets an operator audit the
-decision.
+review outcome.
