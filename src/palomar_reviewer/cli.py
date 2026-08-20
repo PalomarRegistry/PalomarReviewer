@@ -4818,21 +4818,6 @@ def registration_attempt_identity(
         source_commit=source_commit,
         existing_id=existing_id,
     )
-    # A reservation another result has since overtaken is worse than no
-    # reservation: it cannot be registered, and holding it makes every retry
-    # fail on the serial instead of on whatever stopped the first attempt. Give
-    # it up and reserve the serial that is next now, dated now, exactly as a
-    # first attempt would.
-    if reserved is not None and registration_authority.reservation_superseded(
-        database, reserved, existing_id=existing_id, git_env=git_env
-    ):
-        print(
-            f"registration attempt {reserved[0]} was overtaken by another result; "
-            "reserving the next serial instead"
-        )
-        reserved = None
-        attempt = None
-
     resolved = registration_authority.registration_identity(
         database,
         submission_id=state["id"],
