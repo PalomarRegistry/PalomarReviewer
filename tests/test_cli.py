@@ -9984,12 +9984,17 @@ class PublicIdentityUseTests(unittest.TestCase):
         return {"id": "a1b2c3d4e5f6", "_blob_sha": "abc", **fields}
 
     def test_the_first_public_use_is_written_down(self):
+        registrable = self.state(
+            status="review-ready",
+            registration_consent=True,
+            registration_attempt={"id": "PALOMAR-2026-08-20-000004"},
+        )
         with (
-            mock.patch.object(cli, "submission_state", return_value=self.state()),
+            mock.patch.object(cli, "submission_state", return_value=registrable),
             mock.patch.object(cli, "put_state") as put_state,
         ):
             updated = cli._record_public_identity_use(
-                self.state(), "PALOMAR-2026-08-20-000004", 1
+                registrable, "PALOMAR-2026-08-20-000004", 1
             )
         self.assertEqual(updated["public_identity_use"]["id"], "PALOMAR-2026-08-20-000004")
         self.assertEqual(updated["public_identity_use"]["version"], 1)
@@ -10009,10 +10014,52 @@ class PublicIdentityUseTests(unittest.TestCase):
         self.assertEqual(updated["public_identity_use"], used)
         put_state.assert_not_called()
 
+    def test_a_second_identifier_is_refused_rather_than_recorded(self):
+        """Allocating another does not unmake the tags naming the first."""
+        used = {"id": "PALOMAR-2026-08-20-000004", "version": 1, "at": "2026-08-20T05:00:00Z"}
+        recorded = self.state(public_identity_use=used)
+        with (
+            mock.patch.object(cli, "submission_state", return_value=recorded),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            with self.assertRaises(cli.DeterministicRegistrationError) as caught:
+                cli._record_public_identity_use(recorded, "PALOMAR-2026-08-21-000009", 1)
+        self.assertIn("PALOMAR-2026-08-20-000004", str(caught.exception))
+        put_state.assert_not_called()
+
+    def test_a_record_that_stopped_being_registrable_during_the_render_is_refused(self):
+        for changed in (
+            {"status": "withdrawn"},
+            {"registration_consent": False},
+            {"registration_attempt": {"id": "PALOMAR-2026-08-20-000009"}},
+        ):
+            with self.subTest(changed=sorted(changed)):
+                fields = {
+                    "status": "review-ready",
+                    "registration_consent": True,
+                    "registration_attempt": {"id": "PALOMAR-2026-08-20-000004"},
+                    **changed,
+                }
+                current = self.state(**fields)
+                with (
+                    mock.patch.object(cli, "submission_state", return_value=current),
+                    mock.patch.object(cli, "put_state") as put_state,
+                ):
+                    with self.assertRaisesRegex(ReviewerError, "no longer registrable"):
+                        cli._record_public_identity_use(
+                            self.state(), "PALOMAR-2026-08-20-000004", 1
+                        )
+                put_state.assert_not_called()
+
     def test_the_record_is_read_again_rather_than_trusted_from_this_pass(self):
         """Reserving the identity already wrote to this record, so the sha this
         pass is holding is one write out of date."""
-        fresh = self.state(_blob_sha="def")
+        fresh = self.state(
+            _blob_sha="def",
+            status="review-ready",
+            registration_consent=True,
+            registration_attempt={"id": "PALOMAR-2026-08-20-000004"},
+        )
         with (
             mock.patch.object(cli, "submission_state", return_value=fresh),
             mock.patch.object(cli, "put_state") as put_state,
@@ -10027,11 +10074,9 @@ class IrreversibleStepOrderTests(unittest.TestCase):
     """Where the one step that cannot be undone sits in `register`.
 
     Preservation writes tags into public archive forks whose rulesets forbid
-    deleting them, naming an identifier the registry may later give to another
-    result. Read as an order rather than as behaviour because the alternative
-    is a test that stands up a database, a render dispatch and an archive; what
-    matters is only that nothing which can still refuse the registration runs
-    after it.
+    deleting them. Read as an order rather than as behaviour because the
+    alternative is a test that stands up a database, a render dispatch and an
+    archive to prove where one call sits.
     """
 
     def call_lines(self, name):
@@ -10050,7 +10095,11 @@ class IrreversibleStepOrderTests(unittest.TestCase):
             and getattr(node.func, "id", getattr(node.func, "attr", None)) == name
         ]
 
-    def test_nothing_that_can_still_refuse_the_registration_runs_after_preserving(self):
+    def test_the_gates_that_used_to_run_after_preserving_now_run_before_it(self):
+        """Not every refusal: building the evidence, the record, the projections
+        and the database commit all still follow, and can still leave a tag
+        behind. What they can no longer do is leave one under an identifier the
+        registry hands to somebody else, which the spend marker forbids."""
         preserving = self.call_lines("preserve_sources")
         self.assertEqual(len(preserving), 1)
         for earlier in (

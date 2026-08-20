@@ -4767,6 +4767,28 @@ def validate_sparse_database(
     )
 
 
+def _refuse_second_identity(
+    spent: dict[str, Any], reserved: tuple[str, str, str, int] | None, submission_id: str
+) -> None:
+    """Refuse to register under a second identifier once one has been spent.
+
+    The tags naming the first are not undone by allocating another, and a
+    submission whose archive names one identifier and whose record names a
+    second
+    leaves the archive asserting a result that does not exist. There is no safe
+    automatic answer once this happens, so it stops here and says which
+    identifier is already public.
+    """
+    identifier = spent.get("id")
+    if reserved is not None and reserved[0] == identifier and reserved[3] == spent.get("version"):
+        return
+    raise DeterministicRegistrationError(
+        f"{submission_id} already has archive tags naming {identifier}; "
+        "registering it under a different identifier would leave those tags naming "
+        "a result that does not exist. An operator has to reconcile the two."
+    )
+
+
 def _record_public_identity_use(
     state: dict[str, Any], permanent_id: str, version: int
 ) -> dict[str, Any]:
@@ -4788,10 +4810,28 @@ def _record_public_identity_use(
     # reserving the identity already wrote to this record, so the sha in hand is
     # one write out of date and the conditional write would be refused.
     current = submission_state(state["id"]) or state
-    if isinstance(current.get("public_identity_use"), dict) and current[
-        "public_identity_use"
-    ].get("id") == permanent_id:
+    existing = current.get("public_identity_use")
+    if isinstance(existing, dict):
+        _refuse_second_identity(
+            existing, (permanent_id, "", "", version), current.get("id", state["id"])
+        )
         return current
+    # A render can take hours, and the record this pass authorized at the start
+    # of them may have been withdrawn, re-reviewed, or had its consent taken
+    # back since. Nothing downstream reads that, because everything downstream
+    # assumed this check happened before the identifier was reserved. It is the
+    # last moment at which reading it still prevents something, so read it.
+    saved = (current.get("registration_attempt") or {}).get("id")
+    if (
+        current.get("status") not in {"review-ready", "registration-paused"}
+        or current.get("registration_consent") is not True
+        or (saved is not None and saved != permanent_id)
+    ):
+        raise ReviewerError(
+            f"{state['id']} is no longer registrable under {permanent_id}: its record now "
+            f"reads {current.get('status')!r} with consent {current.get('registration_consent')!r} "
+            f"and reservation {saved!r}"
+        )
     updated = dict(current)
     updated["public_identity_use"] = {
         "id": permanent_id,
@@ -4950,10 +4990,19 @@ def registration_attempt_identity(
     # why preservation now runs last and says so when it does. With a public use
     # recorded, the dead reservation is kept and the failure is left visible: a
     # second identifier would not unmake the archive tags naming the first.
+    # A delivered review clears the reservation, so the reservation cannot be
+    # what remembers that an identifier was spent: a re-review would forget it
+    # and the next pass would allocate a second one, which is the failure the
+    # marker exists to prevent. The marker outlives the reservation and is
+    # checked against whatever identity this pass is about to use.
+    spent = state.get("public_identity_use")
+    if isinstance(spent, dict) and not dry_run:
+        _refuse_second_identity(spent, reserved, state["id"])
+
     if (
         reserved is not None
         and not dry_run
-        and state.get("public_identity_use") is None
+        and spent is None
         and registration_authority.reservation_superseded(
             database, reserved, existing_id=existing_id, git_env=git_env
         )
