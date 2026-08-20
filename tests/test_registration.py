@@ -525,3 +525,38 @@ class RegistrationProjectionTests(unittest.TestCase):
                     "comparator": {"path": "comparator.json"},
                 },
             )
+
+    def reserved(self, identifier: str = FIRST) -> tuple[str, str, str, int]:
+        return (identifier, identifier[8:18], f"{identifier[8:18]}T12:00:00Z", 1)
+
+    def test_a_reservation_another_result_overtook_is_superseded(self):
+        repo = self.repo()
+        write_json(
+            repo,
+            registration.day_path("2026-08-09"),
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 1},
+        )
+        commit(repo)
+        self.assertTrue(
+            registration.reservation_superseded(repo, self.reserved(), existing_id=None)
+        )
+
+    def test_a_reservation_that_is_still_next_is_not_superseded(self):
+        repo = self.repo()
+        self.assertFalse(
+            registration.reservation_superseded(repo, self.reserved(), existing_id=None)
+        )
+
+    def test_an_update_reservation_is_never_superseded(self):
+        repo = self.repo()
+        write_json(
+            repo,
+            registration.day_path("2026-08-09"),
+            {"schema_version": 2, "date": "2026-08-09", "last_serial": 9},
+        )
+        commit(repo)
+        self.assertFalse(
+            registration.reservation_superseded(
+                repo, (FIRST, "2026-08-09", "2026-08-09T12:00:00Z", 2), existing_id=FIRST
+            )
+        )

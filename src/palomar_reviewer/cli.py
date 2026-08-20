@@ -4767,6 +4767,27 @@ def validate_sparse_database(
     )
 
 
+def _validate_registered_document(
+    document: dict[str, Any], schema: dict[str, Any], *, what: str
+) -> None:
+    """Check one document the registration is about to write into the database.
+
+    A schema failure here is not an outage. The document was built from evidence
+    that is already fixed, so the next attempt builds the same document and the
+    schema rejects it again. Registration must stop and say what is wrong rather
+    than retry, both to spare the attempts and because the identity reserved for
+    this registration stops being allocatable as soon as another one takes it.
+    """
+    try:
+        jsonschema.validate(document, schema, format_checker=jsonschema.FormatChecker())
+    except jsonschema.ValidationError as error:
+        location = "/".join(str(part) for part in error.absolute_path)
+        where = f" at {location}" if location else ""
+        raise DeterministicRegistrationError(
+            f"the {what} does not satisfy the registry schema{where}: {error.message}"
+        ) from error
+
+
 def registration_attempt_identity(
     database: Path,
     *,
@@ -4797,6 +4818,20 @@ def registration_attempt_identity(
         source_commit=source_commit,
         existing_id=existing_id,
     )
+    # A reservation another result has since overtaken is worse than no
+    # reservation: it cannot be registered, and holding it makes every retry
+    # fail on the serial instead of on whatever stopped the first attempt. Give
+    # it up and reserve the serial that is next now, dated now, exactly as a
+    # first attempt would.
+    if reserved is not None and registration_authority.reservation_superseded(
+        database, reserved, existing_id=existing_id, git_env=git_env
+    ):
+        print(
+            f"registration attempt {reserved[0]} was overtaken by another result; "
+            "reserving the next serial instead"
+        )
+        reserved = None
+        attempt = None
 
     resolved = registration_authority.registration_identity(
         database,
@@ -5095,11 +5130,14 @@ def register(args: argparse.Namespace) -> int:
     )
     _registration_projection_statuses(projections)
     schema = load_json(schema_path)
-    jsonschema.validate(record, schema, format_checker=jsonschema.FormatChecker())
-    jsonschema.validate(
-        scores_document,
-        load_json(scores_schema_path),
-        format_checker=jsonschema.FormatChecker(),
+    # The record is a function of the review and the mechanical report, both of
+    # which are fixed by now, so a record the registry schema rejects will be
+    # rejected identically by every retry. Saying so is what stops the schedule
+    # from spending attempts on it, and what stops those attempts from outliving
+    # the reserved serial while another submission takes it.
+    _validate_registered_document(record, schema, what="registered record")
+    _validate_registered_document(
+        scores_document, load_json(scores_schema_path), what="registry scores"
     )
     destination = database / "entries" / filename
     artifact_destination = database / artifact_path
