@@ -9975,3 +9975,149 @@ class RegisteredDocumentSchemaTests(unittest.TestCase):
         cli._validate_registered_document(
             {"classification": {"arxiv": ["math.PR"]}}, self.schema, what="registered record"
         )
+
+
+class PublicIdentityUseTests(unittest.TestCase):
+    """The record of an identifier having been spent outside the registry."""
+
+    def state(self, **fields):
+        return {"id": "a1b2c3d4e5f6", "_blob_sha": "abc", **fields}
+
+    def test_the_first_public_use_is_written_down(self):
+        registrable = self.state(
+            status="review-ready",
+            registration_consent=True,
+            registration_attempt={"id": "PALOMAR-2026-08-20-000004"},
+        )
+        with (
+            mock.patch.object(cli, "submission_state", return_value=registrable),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            updated = cli._record_public_identity_use(
+                registrable, "PALOMAR-2026-08-20-000004", 1
+            )
+        self.assertEqual(updated["public_identity_use"]["id"], "PALOMAR-2026-08-20-000004")
+        self.assertEqual(updated["public_identity_use"]["version"], 1)
+        path, written = put_state.call_args.args[:2]
+        self.assertEqual(path, "submissions/a1b2c3d4e5f6/state.json")
+        self.assertIn("public_identity_use", written)
+
+    def test_recording_the_same_use_again_writes_nothing(self):
+        """A retry that re-preserves the same identifier has not spent a second one."""
+        used = {"id": "PALOMAR-2026-08-20-000004", "version": 1, "at": "2026-08-20T05:00:00Z"}
+        recorded = self.state(public_identity_use=used)
+        with (
+            mock.patch.object(cli, "submission_state", return_value=recorded),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            updated = cli._record_public_identity_use(recorded, used["id"], 1)
+        self.assertEqual(updated["public_identity_use"], used)
+        put_state.assert_not_called()
+
+    def test_a_second_identifier_is_refused_rather_than_recorded(self):
+        """Allocating another does not unmake the tags naming the first."""
+        used = {"id": "PALOMAR-2026-08-20-000004", "version": 1, "at": "2026-08-20T05:00:00Z"}
+        recorded = self.state(public_identity_use=used)
+        with (
+            mock.patch.object(cli, "submission_state", return_value=recorded),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            with self.assertRaises(cli.DeterministicRegistrationError) as caught:
+                cli._record_public_identity_use(recorded, "PALOMAR-2026-08-21-000009", 1)
+        self.assertIn("PALOMAR-2026-08-20-000004", str(caught.exception))
+        put_state.assert_not_called()
+
+    def test_a_record_that_stopped_being_registrable_during_the_render_is_refused(self):
+        for changed in (
+            {"status": "withdrawn"},
+            {"registration_consent": False},
+            {"registration_attempt": {"id": "PALOMAR-2026-08-20-000009"}},
+        ):
+            with self.subTest(changed=sorted(changed)):
+                fields = {
+                    "status": "review-ready",
+                    "registration_consent": True,
+                    "registration_attempt": {"id": "PALOMAR-2026-08-20-000004"},
+                    **changed,
+                }
+                current = self.state(**fields)
+                with (
+                    mock.patch.object(cli, "submission_state", return_value=current),
+                    mock.patch.object(cli, "put_state") as put_state,
+                ):
+                    with self.assertRaisesRegex(ReviewerError, "no longer registrable"):
+                        cli._record_public_identity_use(
+                            self.state(), "PALOMAR-2026-08-20-000004", 1
+                        )
+                put_state.assert_not_called()
+
+    def test_the_record_is_read_again_rather_than_trusted_from_this_pass(self):
+        """Reserving the identity already wrote to this record, so the sha this
+        pass is holding is one write out of date."""
+        fresh = self.state(
+            _blob_sha="def",
+            status="review-ready",
+            registration_consent=True,
+            registration_attempt={"id": "PALOMAR-2026-08-20-000004"},
+        )
+        with (
+            mock.patch.object(cli, "submission_state", return_value=fresh),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            cli._record_public_identity_use(
+                self.state(_blob_sha="stale"), "PALOMAR-2026-08-20-000004", 1
+            )
+        self.assertEqual(put_state.call_args.kwargs["blob_sha"], "def")
+
+
+class IrreversibleStepOrderTests(unittest.TestCase):
+    """Where the one step that cannot be undone sits in `register`.
+
+    Preservation writes tags into public archive forks whose rulesets forbid
+    deleting them. Read as an order rather than as behaviour because the
+    alternative is a test that stands up a database, a render dispatch and an
+    archive to prove where one call sits.
+    """
+
+    def call_lines(self, name):
+        import ast
+
+        tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+        register = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "register"
+        )
+        return [
+            node.lineno
+            for node in ast.walk(register)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None)) == name
+        ]
+
+    def test_the_gates_that_used_to_run_after_preserving_now_run_before_it(self):
+        """Not every refusal: building the evidence, the record, the projections
+        and the database commit all still follow, and can still leave a tag
+        behind. What they can no longer do is leave one under an identifier the
+        registry hands to somebody else, which the spend marker forbids."""
+        preserving = self.call_lines("preserve_sources")
+        self.assertEqual(len(preserving), 1)
+        for earlier in (
+            "_refuse_unregistrable_metadata",
+            "request_render",
+            "validate_render_result",
+        ):
+            with self.subTest(step=earlier):
+                lines = self.call_lines(earlier)
+                self.assertTrue(lines, f"{earlier} is no longer called by register")
+                self.assertLess(max(lines), preserving[0])
+
+    def test_the_identifier_is_recorded_as_spent_before_it_is_spent(self):
+        """The write and the tags cannot be made atomic, so the order has to be
+        the one that is safe to be interrupted in: a recorded identifier no tag
+        names costs a repair, an unrecorded one a tag does name costs the
+        belief that it is free."""
+        recording = self.call_lines("_record_public_identity_use")
+        self.assertEqual(len(recording), 1)
+        self.assertLess(recording[0], self.call_lines("preserve_sources")[0])
+

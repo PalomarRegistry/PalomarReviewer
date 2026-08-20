@@ -4767,6 +4767,86 @@ def validate_sparse_database(
     )
 
 
+def _refuse_second_identity(
+    spent: dict[str, Any], reserved: tuple[str, str, str, int] | None, submission_id: str
+) -> None:
+    """Refuse to register under a second identifier once one has been spent.
+
+    The tags naming the first are not undone by allocating another, and a
+    submission whose archive names one identifier and whose record names a
+    second
+    leaves the archive asserting a result that does not exist. There is no safe
+    automatic answer once this happens, so it stops here and says which
+    identifier is already public.
+    """
+    identifier = spent.get("id")
+    if reserved is not None and reserved[0] == identifier and reserved[3] == spent.get("version"):
+        return
+    raise DeterministicRegistrationError(
+        f"{submission_id} already has archive tags naming {identifier}; "
+        "registering it under a different identifier would leave those tags naming "
+        "a result that does not exist. An operator has to reconcile the two."
+    )
+
+
+def _record_public_identity_use(
+    state: dict[str, Any], permanent_id: str, version: int
+) -> dict[str, Any]:
+    """Record that this identifier is about to name something outside the registry.
+
+    A preservation tag cannot be deleted, so from the moment one exists the
+    identifier has been spent whether or not the registration completes. Writing
+    that down is what lets a later pass tell two failures apart: one that may
+    still be given a different identifier, and one that may not without leaving a
+    public ref naming a result that will never exist.
+
+    Written before the tags rather than after them, because the two cannot be
+    made atomic and only one order is safe to be interrupted in. Recording an
+    identifier that no tag ended up naming costs an operator one repair. Failing
+    to record one that a tag does name costs a later pass the belief that the
+    identifier is free, which is the whole failure this exists to prevent.
+    """
+    # Read again rather than writing against the sha this pass started with:
+    # reserving the identity already wrote to this record, so the sha in hand is
+    # one write out of date and the conditional write would be refused.
+    current = submission_state(state["id"]) or state
+    existing = current.get("public_identity_use")
+    if isinstance(existing, dict):
+        _refuse_second_identity(
+            existing, (permanent_id, "", "", version), current.get("id", state["id"])
+        )
+        return current
+    # A render can take hours, and the record this pass authorized at the start
+    # of them may have been withdrawn, re-reviewed, or had its consent taken
+    # back since. Nothing downstream reads that, because everything downstream
+    # assumed this check happened before the identifier was reserved. It is the
+    # last moment at which reading it still prevents something, so read it.
+    saved = (current.get("registration_attempt") or {}).get("id")
+    if (
+        current.get("status") not in {"review-ready", "registration-paused"}
+        or current.get("registration_consent") is not True
+        or (saved is not None and saved != permanent_id)
+    ):
+        raise ReviewerError(
+            f"{state['id']} is no longer registrable under {permanent_id}: its record now "
+            f"reads {current.get('status')!r} with consent {current.get('registration_consent')!r} "
+            f"and reservation {saved!r}"
+        )
+    updated = dict(current)
+    updated["public_identity_use"] = {
+        "id": permanent_id,
+        "version": version,
+        "at": utc_now(),
+    }
+    put_state(
+        f"submissions/{state['id']}/state.json",
+        updated,
+        f"Record public use of {permanent_id} by {state['id']}",
+        blob_sha=current.get("_blob_sha"),
+    )
+    return updated
+
+
 # The blocks of a record that describe work this registration has not done yet:
 # where the sources were archived, what the Challenge rendered to, and what the
 # evidence tree holds. They are stood in for while the rest is checked, so a
@@ -4903,6 +4983,37 @@ def registration_attempt_identity(
         source_commit=source_commit,
         existing_id=existing_id,
     )
+    # A reservation another result has overtaken can never be registered: every
+    # later attempt fails on the serial rather than on whatever stopped the
+    # first one, and the submission dead-ends needing an operator. Giving it up
+    # is safe exactly when the identifier has not been used publicly, which is
+    # why preservation now runs last and says so when it does. With a public use
+    # recorded, the dead reservation is kept and the failure is left visible: a
+    # second identifier would not unmake the archive tags naming the first.
+    # A delivered review clears the reservation, so the reservation cannot be
+    # what remembers that an identifier was spent: a re-review would forget it
+    # and the next pass would allocate a second one, which is the failure the
+    # marker exists to prevent. The marker outlives the reservation and is
+    # checked against whatever identity this pass is about to use.
+    spent = state.get("public_identity_use")
+    if isinstance(spent, dict) and not dry_run:
+        _refuse_second_identity(spent, reserved, state["id"])
+
+    if (
+        reserved is not None
+        and not dry_run
+        and spent is None
+        and registration_authority.reservation_superseded(
+            database, reserved, existing_id=existing_id, git_env=git_env
+        )
+    ):
+        print(
+            f"reservation {reserved[0]} was overtaken by another result and was never "
+            "used publicly; reserving the serial that is next instead"
+        )
+        reserved = None
+        attempt = None
+
     resolved = registration_authority.registration_identity(
         database,
         submission_id=state["id"],
@@ -5150,13 +5261,6 @@ def register(args: argparse.Namespace) -> int:
         registered_at=registered_at,
         version=version,
     )
-    preservation = preserve_sources(
-        work,
-        mechanical,
-        permanent_id=permanent_id,
-        version=version,
-        dry_run=args.dry_run,
-    )
     if args.render_result:
         render_candidate = Path(args.render_result).expanduser().resolve()
     elif (work / "render-result").is_dir():
@@ -5187,6 +5291,26 @@ def register(args: argparse.Namespace) -> int:
         "landrun_commit": render_report["landrun_commit"],
         "rendered_at": render_report["rendered_at"],
     }
+    # The last irreversible step, and deliberately the last thing before the
+    # evidence that needs its receipt. Preservation writes tags naming the
+    # reserved identifier into public archive forks whose rulesets forbid
+    # deleting them, so everything that can still refuse this registration --
+    # the metadata gate above, the render dispatch, the render bundle -- has
+    # already run by the time it does.
+    #
+    # What that buys is not only fewer stray tags. A registration that fails
+    # before this point has written nothing public under its identifier, so the
+    # identifier is still nobody's, and a later pass may give the reservation up
+    # for one that is current instead of dying on it.
+    if not args.dry_run:
+        state = _record_public_identity_use(state, permanent_id, version)
+    preservation = preserve_sources(
+        work,
+        mechanical,
+        permanent_id=permanent_id,
+        version=version,
+        dry_run=args.dry_run,
+    )
     evidence_bundle, verification_evidence = build_verification_evidence(work)
     if verification_evidence["source_archive_sha256"] != preservation["receipt_sha256"]:
         raise ReviewerError("source archive receipt changed while building verification evidence")
