@@ -9881,3 +9881,30 @@ class RepairFailureMigrationTests(unittest.TestCase):
         self.assertEqual(updated["failure"]["profile_version"], 3)
         self.assertEqual(updated["failure"]["run"], state["failure"]["run"])
         self.assertNotIn("_blob_sha", updated)
+
+
+class RegisteredDocumentSchemaTests(unittest.TestCase):
+    schema = {
+        "type": "object",
+        "properties": {
+            "classification": {
+                "type": "object",
+                "properties": {
+                    "arxiv": {"type": "array", "maxItems": 2},
+                },
+            },
+        },
+    }
+
+    def test_a_schema_failure_is_deterministic_and_names_where_it_failed(self):
+        document = {"classification": {"arxiv": ["math.PR", "cs.DS", "math.CO"]}}
+        with self.assertRaises(cli.DeterministicRegistrationError) as caught:
+            cli._validate_registered_document(document, self.schema, what="registered record")
+        message = str(caught.exception)
+        self.assertIn("registered record", message)
+        self.assertIn("classification/arxiv", message)
+
+    def test_a_conforming_document_passes(self):
+        cli._validate_registered_document(
+            {"classification": {"arxiv": ["math.PR"]}}, self.schema, what="registered record"
+        )
