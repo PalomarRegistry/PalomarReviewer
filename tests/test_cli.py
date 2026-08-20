@@ -10063,8 +10063,12 @@ class IrreversibleStepOrderTests(unittest.TestCase):
                 self.assertTrue(lines, f"{earlier} is no longer called by register")
                 self.assertLess(max(lines), preserving[0])
 
-    def test_the_public_use_of_an_identifier_is_recorded_where_it_happens(self):
+    def test_the_identifier_is_recorded_as_spent_before_it_is_spent(self):
+        """The write and the tags cannot be made atomic, so the order has to be
+        the one that is safe to be interrupted in: a recorded identifier no tag
+        names costs a repair, an unrecorded one a tag does name costs the
+        belief that it is free."""
         recording = self.call_lines("_record_public_identity_use")
         self.assertEqual(len(recording), 1)
-        self.assertGreater(recording[0], self.call_lines("preserve_sources")[0])
+        self.assertLess(recording[0], self.call_lines("preserve_sources")[0])
 

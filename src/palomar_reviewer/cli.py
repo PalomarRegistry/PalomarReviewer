@@ -4770,13 +4770,19 @@ def validate_sparse_database(
 def _record_public_identity_use(
     state: dict[str, Any], permanent_id: str, version: int
 ) -> dict[str, Any]:
-    """Record that this identifier now names something outside the registry.
+    """Record that this identifier is about to name something outside the registry.
 
     A preservation tag cannot be deleted, so from the moment one exists the
-    identifier has been spent whether or not the registration completes.
-    Writing that down is what lets a later pass tell two failures apart: one
-    that may still be given a different identifier, and one that may not without
-    leaving a public ref naming a result that will never exist.
+    identifier has been spent whether or not the registration completes. Writing
+    that down is what lets a later pass tell two failures apart: one that may
+    still be given a different identifier, and one that may not without leaving a
+    public ref naming a result that will never exist.
+
+    Written before the tags rather than after them, because the two cannot be
+    made atomic and only one order is safe to be interrupted in. Recording an
+    identifier that no tag ended up naming costs an operator one repair. Failing
+    to record one that a tag does name costs a later pass the belief that the
+    identifier is free, which is the whole failure this exists to prevent.
     """
     # Read again rather than writing against the sha this pass started with:
     # reserving the identity already wrote to this record, so the sha in hand is
@@ -5247,6 +5253,8 @@ def register(args: argparse.Namespace) -> int:
     # before this point has written nothing public under its identifier, so the
     # identifier is still nobody's, and a later pass may give the reservation up
     # for one that is current instead of dying on it.
+    if not args.dry_run:
+        state = _record_public_identity_use(state, permanent_id, version)
     preservation = preserve_sources(
         work,
         mechanical,
@@ -5254,8 +5262,6 @@ def register(args: argparse.Namespace) -> int:
         version=version,
         dry_run=args.dry_run,
     )
-    if not args.dry_run:
-        state = _record_public_identity_use(state, permanent_id, version)
     evidence_bundle, verification_evidence = build_verification_evidence(work)
     if verification_evidence["source_archive_sha256"] != preservation["receipt_sha256"]:
         raise ReviewerError("source archive receipt changed while building verification evidence")
