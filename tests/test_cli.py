@@ -9975,3 +9975,96 @@ class RegisteredDocumentSchemaTests(unittest.TestCase):
         cli._validate_registered_document(
             {"classification": {"arxiv": ["math.PR"]}}, self.schema, what="registered record"
         )
+
+
+class PublicIdentityUseTests(unittest.TestCase):
+    """The record of an identifier having been spent outside the registry."""
+
+    def state(self, **fields):
+        return {"id": "a1b2c3d4e5f6", "_blob_sha": "abc", **fields}
+
+    def test_the_first_public_use_is_written_down(self):
+        with (
+            mock.patch.object(cli, "submission_state", return_value=self.state()),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            updated = cli._record_public_identity_use(
+                self.state(), "PALOMAR-2026-08-20-000004", 1
+            )
+        self.assertEqual(updated["public_identity_use"]["id"], "PALOMAR-2026-08-20-000004")
+        self.assertEqual(updated["public_identity_use"]["version"], 1)
+        path, written = put_state.call_args.args[:2]
+        self.assertEqual(path, "submissions/a1b2c3d4e5f6/state.json")
+        self.assertIn("public_identity_use", written)
+
+    def test_recording_the_same_use_again_writes_nothing(self):
+        """A retry that re-preserves the same identifier has not spent a second one."""
+        used = {"id": "PALOMAR-2026-08-20-000004", "version": 1, "at": "2026-08-20T05:00:00Z"}
+        recorded = self.state(public_identity_use=used)
+        with (
+            mock.patch.object(cli, "submission_state", return_value=recorded),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            updated = cli._record_public_identity_use(recorded, used["id"], 1)
+        self.assertEqual(updated["public_identity_use"], used)
+        put_state.assert_not_called()
+
+    def test_the_record_is_read_again_rather_than_trusted_from_this_pass(self):
+        """Reserving the identity already wrote to this record, so the sha this
+        pass is holding is one write out of date."""
+        fresh = self.state(_blob_sha="def")
+        with (
+            mock.patch.object(cli, "submission_state", return_value=fresh),
+            mock.patch.object(cli, "put_state") as put_state,
+        ):
+            cli._record_public_identity_use(
+                self.state(_blob_sha="stale"), "PALOMAR-2026-08-20-000004", 1
+            )
+        self.assertEqual(put_state.call_args.kwargs["blob_sha"], "def")
+
+
+class IrreversibleStepOrderTests(unittest.TestCase):
+    """Where the one step that cannot be undone sits in `register`.
+
+    Preservation writes tags into public archive forks whose rulesets forbid
+    deleting them, naming an identifier the registry may later give to another
+    result. Read as an order rather than as behaviour because the alternative
+    is a test that stands up a database, a render dispatch and an archive; what
+    matters is only that nothing which can still refuse the registration runs
+    after it.
+    """
+
+    def call_lines(self, name):
+        import ast
+
+        tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+        register = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "register"
+        )
+        return [
+            node.lineno
+            for node in ast.walk(register)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None)) == name
+        ]
+
+    def test_nothing_that_can_still_refuse_the_registration_runs_after_preserving(self):
+        preserving = self.call_lines("preserve_sources")
+        self.assertEqual(len(preserving), 1)
+        for earlier in (
+            "_refuse_unregistrable_metadata",
+            "request_render",
+            "validate_render_result",
+        ):
+            with self.subTest(step=earlier):
+                lines = self.call_lines(earlier)
+                self.assertTrue(lines, f"{earlier} is no longer called by register")
+                self.assertLess(max(lines), preserving[0])
+
+    def test_the_public_use_of_an_identifier_is_recorded_where_it_happens(self):
+        recording = self.call_lines("_record_public_identity_use")
+        self.assertEqual(len(recording), 1)
+        self.assertGreater(recording[0], self.call_lines("preserve_sources")[0])
+
