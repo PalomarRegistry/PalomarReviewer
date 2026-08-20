@@ -2217,6 +2217,73 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         arguments.update(overrides)
         return registry_record(**arguments)
 
+    def metadata_gate_arguments(self, **overrides):
+        """The inputs `register` has in hand before it preserves anything."""
+        mechanical = self.mechanical_fixture()
+        arguments = dict(
+            state={"id": "a1b2c3d4e5f6", "submitter": "example",
+                   "repository": "example/project", "commit": "1" * 40},
+            permanent_id="PALOMAR-2026-08-01-000012",
+            mechanical=mechanical,
+            review={
+                "reviewed_at": "2026-08-01T12:34:56Z",
+                "policy_commit": "9" * 40,
+                "reviewer_models": ["codex:test"],
+                "summary": "No problems were identified.",
+                "scores": {
+                    "statement_alignment": 4, "definition_fidelity": 4,
+                    "notability": 4, "literature": 4, "clarity": 4,
+                },
+                "warnings": [],
+            },
+            metadata={
+                "project": {
+                    "license": "MIT",
+                    "description": "A formalization of the selected example result.",
+                },
+                "classification": {"arxiv": ["math.CO"], "msc2020": ["05C10"]},
+            },
+            first_registered_on="2026-08-01",
+            registered_at="2026-08-01T17:05:11Z",
+            version=1,
+        )
+        arguments.update(overrides)
+        return arguments
+
+    # A schema that objects to one thing the submitter chose and one thing this
+    # registration has not done yet.
+    GATE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "classification": {
+                "type": "object",
+                "properties": {"arxiv": {"type": "array", "maxItems": 2}},
+            },
+            "preservation": {
+                "type": "object",
+                "properties": {"repositories": {"type": "array", "minItems": 1}},
+            },
+        },
+    }
+
+    def test_metadata_the_registry_would_refuse_is_refused_before_preserving(self):
+        arguments = self.metadata_gate_arguments()
+        codes = ["math.CO", "cs.LO", "math.PR"]
+        arguments["metadata"]["classification"]["arxiv"] = codes
+        arguments["mechanical"]["classification"]["arxiv"] = [
+            {"code": code, "name": code} for code in codes
+        ]
+        with self.assertRaises(cli.DeterministicRegistrationError) as caught:
+            cli._refuse_unregistrable_metadata(self.GATE_SCHEMA, **arguments)
+        self.assertIn("classification/arxiv", str(caught.exception))
+
+    def test_the_blocks_this_registration_has_not_built_yet_are_not_blamed(self):
+        """The stand-in preservation block violates the schema on purpose: the
+        submitter did not choose it and cannot fix it."""
+        cli._refuse_unregistrable_metadata(
+            self.GATE_SCHEMA, **self.metadata_gate_arguments()
+        )
+
     def test_registry_record_carries_the_single_schema(self):
         record = self.example_record()
         self.assertEqual(record["schema_version"], 3)
