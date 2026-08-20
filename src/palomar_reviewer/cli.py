@@ -4767,6 +4767,91 @@ def validate_sparse_database(
     )
 
 
+# The blocks of a record that describe work this registration has not done yet:
+# where the sources were archived, what the Challenge rendered to, and what the
+# evidence tree holds. They are stood in for while the rest is checked, so a
+# failure in one of them is not the submission's failure and is not reported.
+DEFERRED_RECORD_BLOCKS = frozenset({"preservation", "challenge_render", "verification"})
+
+
+def _refuse_unregistrable_metadata(
+    schema: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    permanent_id: str,
+    mechanical: dict[str, Any],
+    review: dict[str, Any],
+    metadata: dict[str, Any],
+    first_registered_on: str,
+    registered_at: str,
+    version: int,
+) -> None:
+    """Refuse metadata the registry schema will refuse, before preserving anything.
+
+    The record cannot be built in full yet: three of its blocks describe an
+    archive, a render and an evidence tree that do not exist until later. They
+    are filled with documents of the right shape and left out of the reckoning,
+    so what is checked here is exactly what the submitter controls -- the
+    classification, the abstract, the provenance, the authorship.
+
+    Failing here costs nothing but a queue slot. Failing after preservation
+    costs a permanent tag in a public archive, naming an identifier this
+    registration may never be allowed to use.
+    """
+    placeholder_sha256 = "0" * 64
+    candidate = registry_record(
+        state=state,
+        permanent_id=permanent_id,
+        mechanical=mechanical,
+        review=review,
+        metadata=metadata,
+        first_registered_on=first_registered_on,
+        registered_at=registered_at,
+        version=version,
+        challenge_render={
+            "format": "verso-html",
+            "artifact_path": f"renders/{permanent_id}-v{version}/{placeholder_sha256}/",
+            "entrypoint": "Challenge/index.html",
+            "artifact_tree_sha256": placeholder_sha256,
+            "verso_commit": "0" * 40,
+            "renderer_commit": "0" * 40,
+            "landrun_commit": "0" * 40,
+            "rendered_at": registered_at,
+        },
+        verification_evidence={
+            "evidence_path": f"evidence/{permanent_id}-v{version}/{placeholder_sha256}/",
+            "evidence_tree_sha256": placeholder_sha256,
+            "mechanical_report_sha256": placeholder_sha256,
+            # The record's review block is checked, so this stands in only for
+            # the digest, which the schema reads as a shape rather than a value.
+            "review_sha256": placeholder_sha256,
+            "workflow_commit": "0" * 40,
+            "workflow_run_attempt": 1,
+        },
+        preservation={
+            "schema_version": 1,
+            "archived_at": registered_at,
+            "receipt_sha256": placeholder_sha256,
+            "repositories": [],
+        },
+    )
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.FormatChecker()
+    )
+    blamed = [
+        error
+        for error in validator.iter_errors(candidate)
+        if not (error.absolute_path and error.absolute_path[0] in DEFERRED_RECORD_BLOCKS)
+    ]
+    if blamed:
+        error = jsonschema.exceptions.best_match(iter(blamed))
+        location = "/".join(str(part) for part in error.absolute_path)
+        where = f" at {location}" if location else ""
+        raise DeterministicRegistrationError(
+            f"the submitted metadata does not satisfy the registry schema{where}: {error.message}"
+        )
+
+
 def _validate_registered_document(
     document: dict[str, Any], schema: dict[str, Any], *, what: str
 ) -> None:
@@ -5046,6 +5131,24 @@ def register(args: argparse.Namespace) -> int:
         review=review,
         dry_run=args.dry_run,
         git_env=database_git_env,
+    )
+    # Everything the registry schema checks about the submission itself is
+    # already decided here, and the next line is the first thing that cannot be
+    # undone: preservation writes tags naming this identifier into public
+    # archive forks whose rulesets forbid deleting them. A record that the
+    # schema refuses used to be discovered after that, and after a render run,
+    # which is why an identifier that was never registered can still be found
+    # in the archive.
+    _refuse_unregistrable_metadata(
+        load_json(schema_path),
+        state=state,
+        permanent_id=permanent_id,
+        mechanical=mechanical,
+        review=review,
+        metadata=metadata,
+        first_registered_on=first_registered_on,
+        registered_at=registered_at,
+        version=version,
     )
     preservation = preserve_sources(
         work,
