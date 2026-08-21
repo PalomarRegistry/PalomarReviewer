@@ -22,6 +22,10 @@ private. What is public from the moment of submission is the mechanical
 verification: the repository, the commit, and the GitHub Actions run that
 checked them, because that run is a public workflow with public logs.
 
+Publication-safe evaluations of the reviewer live under [`docs/audits`](docs/audits/README.md).
+The reports publish aggregate behavior and anonymized adjudication, never the
+private review packets or linkage to withdrawn submissions.
+
 The reviewer takes the mechanical report from the verification run the
 submission server recorded for that submission, matched by run id and by exact
 run name. The submission id appears in a public run title, so anyone able to
