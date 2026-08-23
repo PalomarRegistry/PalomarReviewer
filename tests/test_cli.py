@@ -1782,15 +1782,15 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 synthesis, passes=passes, rubric=rubric, mechanical={"status": "pass"}
             )
 
-    def test_authors(self):
+    def test_authors_canonicalize_contact_identifiers(self):
         data = {
             "project": {
                 "authors": [
-                    "Ada",
+                    {"name": "Ada", "orcid": "0000-0002-0201-310X"},
                     {
                         "name": "Emmy",
-                        "github": "@emmy",
-                        "orcid": "https://orcid.org/0000-0002-0201-310X",
+                        "github": " @emmy ",
+                        "orcid": "https://orcid.org/0000-0000-0000-000X/",
                     },
                 ]
             }
@@ -1798,14 +1798,30 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(
             authors_from_metadata(data, "fallback"),
             [
-                {"name": "Ada"},
+                {"name": "Ada", "orcid": "0000-0002-0201-310X"},
                 {
                     "name": "Emmy",
                     "github": "emmy",
-                    "orcid": "0000-0002-0201-310X",
+                    "orcid": "0000-0000-0000-000X",
                 },
             ],
         )
+
+    def test_authors_reject_malformed_contact_identifiers(self):
+        cases = (
+            ({"github": "https://github.com/emmy"}, "GitHub login"),
+            ({"github": 7}, "GitHub login must be a string"),
+            ({"orcid": "https://example.com/0000-0002-0201-310X"}, "ORCID"),
+            ({"orcid": 7}, "ORCID must be a string"),
+        )
+        for contact, message in cases:
+            with self.subTest(contact=contact), self.assertRaisesRegex(
+                cli.DeterministicRegistrationError, message
+            ):
+                authors_from_metadata(
+                    {"project": {"authors": [{"name": "Emmy", **contact}]}},
+                    "fallback",
+                )
 
     def test_formalization_metadata_rejects_ambiguous_yaml(self):
         with tempfile.TemporaryDirectory() as directory:
