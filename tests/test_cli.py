@@ -5288,6 +5288,10 @@ class AutomaticLoopTests(unittest.TestCase):
             "events": [],
             "_blob_sha": "state-sha",
             "registration_attempts": 3,
+            "registration_attempt": {
+                "id": "PALOMAR-2026-08-08-000001",
+                "version": 1,
+            },
             "registration_error": "old failure",
             "registration_failure": {"detail": "old failure"},
         }
@@ -5312,6 +5316,7 @@ class AutomaticLoopTests(unittest.TestCase):
         updated = write.call_args_list[1].args[1]
         self.assertEqual(updated["status"], "review-ready")
         self.assertEqual(updated["registration_attempts"], 0)
+        self.assertIsNone(updated["registration_attempt"])
         self.assertIsNone(updated["registration_failure"])
         self.assertIsNone(updated["registration_error"])
 
