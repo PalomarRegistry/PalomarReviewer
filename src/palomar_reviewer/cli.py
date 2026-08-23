@@ -168,6 +168,13 @@ PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<se
 # The shape the database's schema gives an instant, which is what `utc_now`
 # emits and what a record's `registered_at` has to be.
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+ORCID_URL_RE = re.compile(
+    r"https://orcid\.org/(?P<identifier>[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9X]{4})/?\Z"
+)
+ORCID_RE = re.compile(r"[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9X]{4}\Z")
+GITHUB_LOGIN_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z"
+)
 MAX_CONTEXT_BYTES = 300_000
 CURRENT_RUBRIC_VERSION = 10
 SUPPORTED_RUBRIC_VERSIONS = (7, 8, 9, CURRENT_RUBRIC_VERSION)
@@ -4740,10 +4747,35 @@ def authors_from_metadata(
                 item = {"name": str(name)}
                 github = author.get("github")
                 orcid = author.get("orcid")
-                if github:
-                    item["github"] = str(github).removeprefix("@")
-                if orcid:
-                    item["orcid"] = str(orcid)
+                if github is not None:
+                    if not isinstance(github, str):
+                        raise DeterministicRegistrationError(
+                            "an author GitHub login must be a string"
+                        )
+                    login = github.strip().removeprefix("@")
+                    if GITHUB_LOGIN_RE.fullmatch(login) is None:
+                        raise DeterministicRegistrationError(
+                            f"author GitHub login {github!r} is malformed"
+                        )
+                    item["github"] = login
+                if orcid is not None:
+                    if not isinstance(orcid, str):
+                        raise DeterministicRegistrationError(
+                            "an author ORCID must be a string"
+                        )
+                    identifier = orcid.strip()
+                    url_match = ORCID_URL_RE.fullmatch(identifier)
+                    identifier = (
+                        url_match.group("identifier")
+                        if url_match is not None
+                        else identifier
+                    )
+                    if ORCID_RE.fullmatch(identifier) is None:
+                        raise DeterministicRegistrationError(
+                            f"author ORCID {orcid!r} must be a bare ORCID or an "
+                            "https://orcid.org URL"
+                        )
+                    item["orcid"] = identifier
                 result.append(item)
     if not result:
         raise ReviewerError(
