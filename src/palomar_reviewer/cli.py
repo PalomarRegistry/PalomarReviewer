@@ -7397,6 +7397,7 @@ def retry_registration(args: argparse.Namespace) -> int:
         "review-ready",
         "Registration was queued again by an operator",
         registration_attempts=0,
+        registration_attempt=None,
         registration_started_at=None,
         registration_retry_after=None,
         registration_error=None,
