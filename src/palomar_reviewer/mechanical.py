@@ -206,7 +206,9 @@ MECHANICAL_REPORT_SCHEMA = {
         "lean_toolchain": {"type": "string", "pattern": r"^leanprover/lean4:"},
         "comparator": {
             "type": "object",
-            "required": ["path", "theorem_names", "definition_names", "permitted_axioms"],
+            "required": [
+                "path", "sha256", "theorem_names", "definition_names", "permitted_axioms"
+            ],
             "properties": {
                 "theorem_names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                 "definition_names": {"type": "array", "items": {"type": "string"}},

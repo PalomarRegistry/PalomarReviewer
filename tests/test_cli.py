@@ -3895,6 +3895,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "renderer_commit": "3" * 40,
                 "landrun_commit": "4" * 40,
                 "rendered_at": "2026-07-31T00:00:00Z",
+                "workflow_url": (
+                    "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+                ),
             }
             (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
             mechanical = {
@@ -3924,6 +3927,19 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             validated, validated_bundle = validate_render_result(result, mechanical)
             self.assertEqual(validated["artifact_tree_sha256"], tree_hash)
             self.assertEqual(validated_bundle, bundle)
+
+            report["rendered_at"] = "not-a-timestamp"
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "valid rendered_at"):
+                validate_render_result(result, mechanical)
+            report["rendered_at"] = "2026-07-31T00:00:00Z"
+            report["workflow_url"] = "https://example.test/actions/runs/123"
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "workflow URL"):
+                validate_render_result(result, mechanical)
+            report["workflow_url"] = (
+                "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+            )
 
             nested = self.nested_mechanical_fixture()
             nested["challenge"]["sha256"] = source["challenge_sha256"]
@@ -4037,6 +4053,176 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         watched.assert_called_once()
         self.assertEqual(watched.call_args.kwargs["timeout"], 6 * 60 * 60)
         self.assertEqual(cli.PASS_BUDGET_SECONDS, 6 * 60 * 60)
+
+
+    def test_missing_publication_anchor_is_a_submitter_renderability_failure(self):
+        request_id = "a" * 32
+        run_url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+        renderer_commit = "b" * 40
+        mechanical = self.nested_mechanical_fixture()
+        diagnostic = {
+            "code": "challenge.declaration_not_rendered",
+            "stage": "sanitize",
+            "owner": "submitter",
+            "summary": "Verso output does not contain a compared declaration.",
+            "explanation": "Example.generated has no compiler-backed publication anchor.",
+            "next_action": "Give the declaration an explicit source-level name and resubmit.",
+            "retryable": False,
+            "repairable": False,
+            "field": "comparator.declarations",
+        }
+
+        def fake_gh(arguments, **_kwargs):
+            if arguments[:2] == ["run", "list"]:
+                return json.dumps([{
+                    "databaseId": 123,
+                    "displayTitle": (
+                        f"Render {mechanical['source']['repository']}@"
+                        f"{mechanical['source']['commit']} [{request_id}]"
+                    ),
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "url": run_url,
+                    "headSha": renderer_commit,
+                }])
+            if arguments[:2] == ["run", "download"]:
+                destination = Path(arguments[arguments.index("--dir") + 1]) / "result"
+                destination.mkdir(parents=True)
+                (destination / "report.json").write_text(json.dumps({
+                    "schema_version": 2,
+                    "status": "error",
+                    "source": cli.expected_render_source(mechanical),
+                    "renderer_commit": renderer_commit,
+                    "workflow_url": run_url,
+                    "diagnostics_schema_version": 1,
+                    "diagnostics": [diagnostic],
+                    "errors": [diagnostic["summary"]],
+                }))
+            return ""
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("palomar_reviewer.cli.uuid.uuid4", return_value=SimpleNamespace(hex=request_id)),
+            mock.patch("palomar_reviewer.cli.gh", side_effect=fake_gh),
+            mock.patch(
+                "palomar_reviewer.cli.run",
+                return_value=subprocess.CompletedProcess(["gh"], 1, "", "failed"),
+            ),
+        ):
+            with self.assertRaises(cli.SubmitterRenderabilityError) as raised:
+                request_render(Path(directory), mechanical)
+        self.assertEqual(raised.exception.run_id, 123)
+        self.assertEqual(raised.exception.diagnostics, [diagnostic])
+
+    def test_renderability_receipt_binds_source_comparator_and_renderer(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {
+            "artifact_tree_sha256": "1" * 64,
+            "verso_commit": "2" * 40,
+            "renderer_commit": "3" * 40,
+            "landrun_commit": "4" * 40,
+            "rendered_at": "2026-08-23T00:00:00Z",
+            "workflow_url": (
+                "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+            ),
+        }
+        receipt = cli.renderability_receipt(report, mechanical)
+        self.assertEqual(cli.validate_renderability_receipt(receipt, mechanical), receipt)
+        changed = json.loads(json.dumps(mechanical))
+        changed["comparator"]["definition_names"] = ["Audit.Task.extra"]
+        with self.assertRaisesRegex(ReviewerError, "does not match"):
+            cli.validate_renderability_receipt(receipt, changed)
+
+    def test_invalid_renderability_receipt_is_rejected_before_review_write(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {
+            "artifact_tree_sha256": "1" * 64,
+            "verso_commit": "2" * 40,
+            "renderer_commit": "3" * 40,
+            "landrun_commit": "4" * 40,
+            "rendered_at": "2026-08-23T00:00:00Z",
+            "workflow_url": (
+                "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+            ),
+        }
+        receipt = cli.renderability_receipt(report, mechanical)
+        receipt["artifact_tree_sha256"] = "bad"
+        with mock.patch.object(cli, "put_state") as write:
+            with self.assertRaisesRegex(ReviewerError, "invalid artifact_tree_sha256"):
+                cli.deliver_review(
+                    {"id": "a" * 12, "status": "reviewing", "events": []},
+                    {"schema_version": 3, "outcome": "neutral"},
+                    mechanical=mechanical,
+                    renderability=receipt,
+                )
+        write.assert_not_called()
+
+    def test_successful_renderability_check_is_reused_from_the_workspace(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {"status": "pass", "artifact_tree_sha256": "1" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            result = Path(directory) / "download" / "result"
+            bundle = result / "bundle"
+            bundle.mkdir(parents=True)
+            (result / "challenge-render.json").write_text("{}")
+            (bundle / "marker").write_text("rendered")
+
+            def validate(path, _mechanical):
+                root = path / "result" if (path / "result").is_dir() else path
+                return report, root / "bundle"
+
+            with (
+                mock.patch.object(cli, "request_render", return_value=result.parent) as request,
+                mock.patch.object(cli, "validate_render_result", side_effect=validate),
+            ):
+                first = cli.ensure_challenge_renderable(work, mechanical)
+                second = cli.ensure_challenge_renderable(work, mechanical)
+        request.assert_called_once()
+        self.assertEqual(first[0], report)
+        self.assertEqual(second[0], report)
+
+    def test_dry_run_never_replaces_an_invalid_cached_render(self):
+        mechanical = self.nested_mechanical_fixture()
+        args = SimpleNamespace(render_result=None, dry_run=True)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "render-result").mkdir()
+            with (
+                mock.patch.object(
+                    cli, "validate_render_result", side_effect=ReviewerError("invalid cache")
+                ),
+                mock.patch.object(cli, "ensure_challenge_renderable") as ensure,
+            ):
+                with self.assertRaisesRegex(ReviewerError, "invalid cache"):
+                    cli.registration_render_result(args, work, mechanical, None)
+        ensure.assert_not_called()
+
+    def test_registration_reclassifies_only_a_prior_success_contradiction(self):
+        mechanical = self.nested_mechanical_fixture()
+        args = SimpleNamespace(render_result=None, dry_run=False)
+        error = cli.SubmitterRenderabilityError(
+            "missing anchor",
+            diagnostics=[{
+                "code": "challenge.declaration_not_rendered",
+                "stage": "sanitize",
+                "owner": "submitter",
+                "summary": "missing anchor",
+                "explanation": "missing anchor",
+                "next_action": "name it",
+                "retryable": False,
+                "repairable": False,
+            }],
+            run_id=123,
+            run_url="https://example.test/render/123",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with mock.patch.object(cli, "ensure_challenge_renderable", side_effect=error):
+                with self.assertRaises(cli.SubmitterRenderabilityError):
+                    cli.registration_render_result(args, work, mechanical, None)
+                with self.assertRaises(cli.DeterministicRegistrationError):
+                    cli.registration_render_result(args, work, mechanical, {"schema_version": 1})
 
 
 if __name__ == "__main__":
@@ -4440,6 +4626,7 @@ class MechanicalReportContractTests(unittest.TestCase):
             ("challenge", "path"),
             ("solution", "path"),
             ("comparator", "path"),
+            ("comparator", "sha256"),
             ("formalization", "path"),
             ("lakefile",),
             ("lakefile", "path"),
@@ -5003,6 +5190,29 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(first["review_attempts"], 1)
         self.assertEqual(second["review_attempts"], 2)
 
+    def test_renderability_attempt_is_counted_without_spending_a_review_attempt(self):
+        with mock.patch.object(cli, "put_state"):
+            updated = cli.begin_renderability_check({
+                "id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": []
+            })
+        self.assertEqual(updated["renderability_attempts"], 1)
+        self.assertNotIn("review_attempts", updated)
+
+    def test_chained_state_transitions_use_the_sha_written_by_the_first(self):
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "status": "awaiting-review",
+            "events": [],
+            "_blob_sha": "old-sha",
+        }
+        with mock.patch.object(cli, "put_state", side_effect=["gate-sha", "review-sha"]) as write:
+            checked = cli.begin_renderability_check(state)
+            reviewing = cli.begin_review(checked)
+        self.assertEqual(write.call_args_list[0].kwargs["blob_sha"], "old-sha")
+        self.assertEqual(write.call_args_list[1].kwargs["blob_sha"], "gate-sha")
+        self.assertEqual(reviewing["_blob_sha"], "review-sha")
+        self.assertEqual(reviewing["renderability_attempts"], 0)
+
     def test_a_registration_attempt_is_counted_before_work_starts(self):
         with mock.patch.object(cli, "put_state"):
             first = cli.begin_registration({
@@ -5026,6 +5236,31 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(updated["status"], "registration-paused")
         self.assertEqual(updated["registration_failure"]["category"], "deterministic")
         self.assertIsNone(updated["registration_retry_after"])
+
+    def test_renderability_failure_uses_submitter_facing_verification_contract(self):
+        diagnostic = {
+            "code": "challenge.declaration_not_rendered",
+            "stage": "sanitize",
+            "owner": "submitter",
+            "summary": "missing declaration anchor",
+            "explanation": "Example.generated has no publication anchor",
+            "next_action": "Name the declaration and submit a new commit.",
+            "retryable": False,
+            "repairable": False,
+        }
+        error = cli.SubmitterRenderabilityError(
+            "missing declaration anchor",
+            diagnostics=[diagnostic],
+            run_id=123,
+            run_url="https://example.test/render/123",
+        )
+        with mock.patch.object(cli, "put_state"):
+            updated = cli.record_renderability_failure(
+                {"id": "a" * 12, "status": "reviewing", "events": []}, error
+            )
+        self.assertEqual(updated["status"], "verification-failed")
+        self.assertEqual(updated["failure"]["phase"], "verification")
+        self.assertEqual(updated["failure"]["diagnostics"], [diagnostic])
 
     def test_transient_registration_failure_backs_off_then_pauses_at_the_limit(self):
         with mock.patch.object(cli, "put_state"):
@@ -5129,6 +5364,8 @@ class AutomaticLoopTests(unittest.TestCase):
         seen = []
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
             mock.patch.object(
@@ -5156,6 +5393,8 @@ class AutomaticLoopTests(unittest.TestCase):
 
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
             mock.patch.object(cli, "advance_state", side_effect=lambda s, *a, **k: s),
@@ -5333,6 +5572,11 @@ class AutomaticLoopTests(unittest.TestCase):
                         mock.patch.object(cli, "_write_open_index"),
                         mock.patch.object(cli, "submission_state", side_effect=read),
                         mock.patch.object(cli.time, "monotonic", lambda at=clock: at[0]),
+                        mock.patch.object(cli, "REVIEW_RESERVE_SECONDS", 0),
+                        mock.patch.object(
+                            cli, "begin_renderability_check", side_effect=lambda r: r
+                        ),
+                        mock.patch.object(cli, "ensure_review_renderable"),
                         mock.patch.object(cli, "begin_review") as began,
                         mock.patch.object(cli, "run_review"),
                         mock.patch.object(cli, "record_review_duration"),
@@ -5386,6 +5630,85 @@ class AutomaticLoopTests(unittest.TestCase):
         registered.assert_called_once()
         self.assertTrue(recorded.call_args.kwargs["deterministic"])
         again.assert_called_once_with(0, 5)
+
+    def test_a_submitter_renderability_failure_stops_before_review_retry(self):
+        row = self.row("aaaaaaaaaaaa", status="awaiting-review")
+        listing, state = self.records(row)
+        error = cli.SubmitterRenderabilityError(
+            "missing declaration anchor",
+            diagnostics=[{
+                "code": "challenge.declaration_not_rendered",
+                "stage": "sanitize",
+                "owner": "submitter",
+                "summary": "missing declaration anchor",
+                "explanation": "Example.generated has no publication anchor",
+                "next_action": "Name the declaration and submit a new commit.",
+                "retryable": False,
+                "repairable": False,
+            }],
+            run_id=123,
+            run_url="https://example.test/render/123",
+        )
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable", side_effect=error),
+            mock.patch.object(cli, "begin_review") as began,
+            mock.patch.object(cli, "run_review") as reviewed,
+            mock.patch.object(
+                cli,
+                "record_renderability_failure",
+                return_value={**row, "status": "verification-failed"},
+            ) as recorded,
+            mock.patch.object(cli, "advance_state") as retry,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 0)
+        recorded.assert_called_once()
+        began.assert_not_called()
+        reviewed.assert_not_called()
+        retry.assert_not_called()
+
+    def test_a_transient_render_failure_does_not_spend_a_review_attempt(self):
+        row = self.row("aaaaaaaaaaaa", status="awaiting-review")
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(
+                cli, "ensure_review_renderable", side_effect=ReviewerError("renderer unavailable")
+            ),
+            mock.patch.object(cli, "begin_review") as began,
+            mock.patch.object(cli, "run_review") as reviewed,
+            mock.patch.object(cli, "advance_state", return_value=row) as retry,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        began.assert_not_called()
+        reviewed.assert_not_called()
+        self.assertEqual(retry.call_args.args[1], "awaiting-review")
+
+    def test_repeated_render_infrastructure_failure_becomes_terminal(self):
+        row = self.row(
+            "aaaaaaaaaaaa",
+            status="awaiting-review",
+            renderability_attempts=cli.RENDERABILITY_ATTEMPT_LIMIT,
+        )
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(
+                cli, "ensure_review_renderable", side_effect=ReviewerError("renderer unavailable")
+            ),
+            mock.patch.object(cli, "begin_review") as began,
+            mock.patch.object(cli, "advance_state", return_value=row) as recorded,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        began.assert_not_called()
+        self.assertEqual(recorded.call_args.args[1], "verification-error")
+        self.assertIsNone(recorded.call_args.kwargs["review_retry_after"])
 
     def test_a_failure_after_the_database_pr_exists_stays_on_finalization_recovery(self):
         before = self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True)
@@ -5721,6 +6044,8 @@ class SelfDispatchTests(unittest.TestCase):
         listing, state = self.records(*rows)
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
             mock.patch.object(cli, "advance_state", side_effect=lambda st, *a, **k: st),
@@ -5813,6 +6138,8 @@ class SelfDispatchTests(unittest.TestCase):
         listing, state = self.records(*rows)
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
             mock.patch.object(cli, "advance_state",
@@ -5939,6 +6266,50 @@ class SpendPersistenceTests(unittest.TestCase):
 
 
 class RunReviewAccountingTests(unittest.TestCase):
+    def test_publication_gate_runs_before_any_model_review(self):
+        args = SimpleNamespace(
+            submission="a1b2c3d4e5f6",
+            work_dir=None,
+            apply=False,
+            policy_ref=None,
+            engine="codex",
+            model="gpt-5.6-sol",
+            command=None,
+            reasoning_effort="high",
+        )
+        error = cli.SubmitterRenderabilityError(
+            "missing declaration anchor",
+            diagnostics=[{
+                "code": "challenge.declaration_not_rendered",
+                "stage": "sanitize",
+                "owner": "submitter",
+                "summary": "missing declaration anchor",
+                "explanation": "Example.generated has no publication anchor",
+                "next_action": "Name the declaration and submit a new commit.",
+                "retryable": False,
+                "repairable": False,
+            }],
+            run_id=123,
+            run_url="https://example.test/render/123",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / args.submission
+            work.mkdir()
+            args.work_dir = directory
+            with (
+                mock.patch.object(cli, "queue", return_value=[]),
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    return_value=(work, {"id": args.submission}, {"status": "pass"}, "a" * 40),
+                ),
+                mock.patch.object(cli, "ensure_challenge_renderable", side_effect=error),
+                mock.patch.object(engine_execution, "execute") as execute_engine,
+            ):
+                with self.assertRaises(cli.SubmitterRenderabilityError):
+                    cli.run_review(args)
+            execute_engine.assert_not_called()
+
     def test_a_completed_review_records_and_prints_the_measured_spend(self):
         """Exercise the paid-run tail through the pure accounting call seam."""
         measured_at = "2026-08-08T01:02:03Z"
@@ -5980,6 +6351,7 @@ class RunReviewAccountingTests(unittest.TestCase):
                         "a" * 40,
                     ),
                 ),
+                mock.patch.object(cli, "ensure_challenge_renderable"),
                 mock.patch.object(cli, "load_json", side_effect=[rubric, {}]),
                 mock.patch.object(cli, "validate_current_review_contract"),
                 mock.patch.object(cli, "render_prompt", return_value="review prompt"),
@@ -6057,6 +6429,7 @@ class RunReviewAccountingTests(unittest.TestCase):
                         "a" * 40,
                     ),
                 ),
+                mock.patch.object(cli, "ensure_challenge_renderable"),
                 mock.patch.object(
                     cli,
                     "load_json",

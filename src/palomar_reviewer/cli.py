@@ -35,7 +35,11 @@ from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
 from . import registration as registration_authority
 from . import usage as usage_accounting
-from .errors import DeterministicRegistrationError, ReviewerError
+from .errors import (
+    DeterministicRegistrationError,
+    ReviewerError,
+    SubmitterRenderabilityError,
+)
 
 STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
@@ -75,6 +79,7 @@ REGISTRATION_STALE_SECONDS = 6 * 3600
 # here would remain the real rendering ceiling no matter what the child says.
 RENDER_WAIT_SECONDS = 6 * 60 * 60
 PASS_BUDGET_SECONDS = RENDER_WAIT_SECONDS
+REVIEW_RESERVE_SECONDS = 90 * 60
 # The queue, kept as an index rather than rediscovered from scratch.
 #
 # A pass used to list every directory under `submissions/` and read every record
@@ -1841,6 +1846,100 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
     }
 
 
+def expected_render_source(mechanical: dict[str, Any]) -> dict[str, Any]:
+    challenge = mechanical["challenge"]
+    return {
+        "repository": mechanical["source"]["repository"],
+        "repository_url": mechanical["source"]["repository_url"],
+        "commit": mechanical["source"]["commit"],
+        "challenge_sha256": challenge["sha256"],
+        "project_path": mechanical["source"].get("project_path", ""),
+        "challenge_path": mechanical["challenge"]["path"],
+        "solution_path": mechanical["solution"]["path"],
+        "comparator_config_path": mechanical["comparator"]["path"],
+        "lakefile_path": mechanical["lakefile"]["path"],
+        "lean_toolchain_path": mechanical["lean_toolchain_path"],
+    }
+
+
+def renderability_receipt(
+    report: dict[str, Any], mechanical: dict[str, Any]
+) -> dict[str, Any]:
+    """Build the durable fact that this immutable comparison rendered once."""
+    declarations = [
+        *mechanical["comparator"]["theorem_names"],
+        *mechanical["comparator"].get("definition_names", []),
+    ]
+    declaration_digest = hashlib.sha256(
+        json.dumps(declarations, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "source_repository": mechanical["source"]["repository"],
+        "source_commit": mechanical["source"]["commit"],
+        "challenge_source_sha256": mechanical["challenge"]["sha256"],
+        "comparator_config_sha256": mechanical["comparator"]["sha256"],
+        "declarations_sha256": declaration_digest,
+        "artifact_tree_sha256": report["artifact_tree_sha256"],
+        "verso_commit": report["verso_commit"],
+        "renderer_commit": report["renderer_commit"],
+        "landrun_commit": report["landrun_commit"],
+        "rendered_at": report["rendered_at"],
+        "workflow_url": report["workflow_url"],
+    }
+
+
+def validate_renderability_receipt(
+    value: Any, mechanical: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Validate an optional pre-review receipt against the reviewed inputs."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ReviewerError("saved renderability receipt must be an object")
+    expected = {
+        "schema_version", "source_repository", "source_commit", "challenge_source_sha256",
+        "comparator_config_sha256", "declarations_sha256", "artifact_tree_sha256",
+        "verso_commit", "renderer_commit", "landrun_commit", "rendered_at",
+        "workflow_url",
+    }
+    if set(value) != expected or value.get("schema_version") != 1:
+        raise ReviewerError("saved renderability receipt has an unsupported shape")
+    expected_receipt = renderability_receipt(
+        {
+            "artifact_tree_sha256": value.get("artifact_tree_sha256"),
+            "verso_commit": value.get("verso_commit"),
+            "renderer_commit": value.get("renderer_commit"),
+            "landrun_commit": value.get("landrun_commit"),
+            "rendered_at": value.get("rendered_at"),
+            "workflow_url": value.get("workflow_url"),
+        },
+        mechanical,
+    )
+    for field in (
+        "challenge_source_sha256", "comparator_config_sha256", "declarations_sha256",
+        "artifact_tree_sha256",
+    ):
+        if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
+            raise ReviewerError(f"saved renderability receipt has an invalid {field}")
+    for field in ("source_commit", "verso_commit", "renderer_commit", "landrun_commit"):
+        if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{40}", value[field]):
+            raise ReviewerError(f"saved renderability receipt has an invalid {field}")
+    if not isinstance(value.get("rendered_at"), str) or not TIMESTAMP_RE.fullmatch(
+        value["rendered_at"]
+    ):
+        raise ReviewerError("saved renderability receipt has an invalid rendered_at")
+    if not isinstance(value.get("workflow_url"), str) or not re.fullmatch(
+        rf"https://github\.com/{re.escape(mechanical_evidence.SUBMISSION_REPO)}"
+        r"/actions/runs/[1-9][0-9]*",
+        value["workflow_url"],
+    ):
+        raise ReviewerError("saved renderability receipt has an invalid workflow_url")
+    if value != expected_receipt:
+        raise ReviewerError("saved renderability receipt does not match the reviewed comparison")
+    return value
+
+
 def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[dict[str, Any], Path]:
     if not (result / "challenge-render.json").is_file() and (result / "result").is_dir():
         result = result / "result"
@@ -1856,24 +1955,8 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
             "Challenge rendering failed; the review outcome is unchanged and registration may be retried: "
             + "; ".join(str(error) for error in errors)
         )
-    challenge = mechanical["challenge"]
-    expected_source = {
-        "repository": mechanical["source"]["repository"],
-        "repository_url": mechanical["source"]["repository_url"],
-        "commit": mechanical["source"]["commit"],
-        "challenge_sha256": challenge["sha256"],
-    }
+    expected_source = expected_render_source(mechanical)
     expected_render_version = 2
-    expected_source.update(
-        {
-            "project_path": mechanical["source"].get("project_path", ""),
-            "challenge_path": mechanical["challenge"]["path"],
-            "solution_path": mechanical["solution"]["path"],
-            "comparator_config_path": mechanical["comparator"]["path"],
-            "lakefile_path": mechanical["lakefile"]["path"],
-            "lean_toolchain_path": mechanical["lean_toolchain_path"],
-        }
-    )
     if report.get("schema_version", 1) != expected_render_version:
         raise ReviewerError("render result has an incompatible schema version")
     if report.get("source") != expected_source:
@@ -1899,12 +1982,21 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
     if not (bundle / report["entrypoint"]).is_file():
         raise ReviewerError("render result entrypoint is missing")
     rendered_at = report.get("rendered_at")
-    if not isinstance(rendered_at, str):
-        raise ReviewerError("render result has no rendered_at timestamp")
+    if not isinstance(rendered_at, str) or not TIMESTAMP_RE.fullmatch(rendered_at):
+        raise ReviewerError("render result has no valid rendered_at timestamp")
+    workflow_url = report.get("workflow_url")
+    if not isinstance(workflow_url, str) or not re.fullmatch(
+        rf"https://github\.com/{re.escape(mechanical_evidence.SUBMISSION_REPO)}"
+        r"/actions/runs/[1-9][0-9]*",
+        workflow_url,
+    ):
+        raise ReviewerError("render result has no valid PalomarSubmission workflow URL")
     return report, bundle
 
 
-def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
+def request_render(
+    work: Path, mechanical: dict[str, Any], *, wait_seconds: int = RENDER_WAIT_SECONDS
+) -> Path:
     request_id = uuid.uuid4().hex
     challenge = mechanical["challenge"]
     dispatch = [
@@ -1983,12 +2075,59 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
             "--exit-status",
         ],
         check=False,
-        timeout=RENDER_WAIT_SECONDS,
+        timeout=wait_seconds,
     )
     if watched.returncode:
-        message, deterministic = render_failure_details(
-            work, run_id, request_id, run_data["url"]
-        )
+        failure_report = render_failure_report(work, run_id, request_id)
+        reported_errors = failure_report.get("errors") if failure_report is not None else None
+        problems = reported_errors if isinstance(reported_errors, list) else []
+        if problems:
+            message = (
+                "Challenge rendering failed, and will fail the same way until it is fixed: "
+                + "; ".join(str(problem) for problem in problems)
+                + f" ({run_data['url']})"
+            )
+            deterministic = True
+        else:
+            message = (
+                "Challenge rendering did not complete, and no report says why, so this may be "
+                "transient; the review outcome is unchanged and registration may be retried: "
+                f"{run_data['url']}"
+            )
+            deterministic = False
+        if failure_report is not None:
+            raw_diagnostics = failure_report.get("diagnostics")
+            trusted_binding = (
+                failure_report.get("schema_version") == 2
+                and failure_report.get("source") == expected_render_source(mechanical)
+                and failure_report.get("renderer_commit") == run_data.get("headSha")
+                and failure_report.get("workflow_url") == run_data.get("url")
+                and failure_report.get("diagnostics_schema_version") == DIAGNOSTICS_SCHEMA_VERSION
+            )
+            if (
+                trusted_binding
+                and isinstance(raw_diagnostics, list)
+                and 1 <= len(raw_diagnostics) <= MAX_FAILURE_DIAGNOSTICS
+            ):
+                try:
+                    diagnostics = [_bounded_diagnostic(item) for item in raw_diagnostics]
+                except ReviewerError:
+                    diagnostics = []
+                submitter_diagnostics = [
+                    item for item in diagnostics if item["owner"] == "submitter"
+                ]
+                if submitter_diagnostics:
+                    message = (
+                        "Challenge rendering found repository changes that are required: "
+                        + "; ".join(item["summary"] for item in submitter_diagnostics)
+                        + f" ({run_data['url']})"
+                    )
+                    raise SubmitterRenderabilityError(
+                        message,
+                        diagnostics=submitter_diagnostics,
+                        run_id=int(run_id),
+                        run_url=str(run_data["url"]),
+                    )
         error_type = DeterministicRegistrationError if deterministic else ReviewerError
         raise error_type(message)
     download = work / "render-download"
@@ -2020,6 +2159,67 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
     if report.get("workflow_url") != run_data.get("url"):
         raise ReviewerError("downloaded render result does not match its workflow run")
     return download
+
+
+def ensure_challenge_renderable(
+    work: Path,
+    mechanical: dict[str, Any],
+    *,
+    wait_seconds: int = RENDER_WAIT_SECONDS,
+) -> tuple[dict[str, Any], Path]:
+    """Require render anchors before review and retain the validated bundle."""
+    cached = work / "render-result"
+    if cached.is_dir() and not cached.is_symlink():
+        try:
+            return validate_render_result(cached, mechanical)
+        except ReviewerError:
+            shutil.rmtree(cached)
+    elif cached.exists() or cached.is_symlink():
+        cached.unlink()
+    candidate = request_render(work, mechanical, wait_seconds=wait_seconds)
+    report, bundle = validate_render_result(candidate, mechanical)
+    temporary = work / "render-result.tmp"
+    if temporary.exists() or temporary.is_symlink():
+        if temporary.is_dir() and not temporary.is_symlink():
+            shutil.rmtree(temporary)
+        else:
+            temporary.unlink()
+    shutil.copytree(bundle.parent, temporary)
+    os.replace(temporary, cached)
+    cached_report, cached_bundle = validate_render_result(cached, mechanical)
+    if cached_report != report:
+        raise ReviewerError("cached render receipt changed while it was copied")
+    return cached_report, cached_bundle
+
+
+def registration_render_result(
+    args: argparse.Namespace,
+    work: Path,
+    mechanical: dict[str, Any],
+    prior_renderability: dict[str, Any] | None,
+) -> tuple[dict[str, Any], Path]:
+    """Select registration render evidence without violating dry-run purity."""
+    if args.render_result:
+        candidate = Path(args.render_result).expanduser().resolve()
+        return validate_render_result(candidate, mechanical)
+    if args.dry_run:
+        cached = work / "render-result"
+        if not cached.is_dir() or cached.is_symlink():
+            raise ReviewerError(
+                "dry-run registration does not dispatch workflows; pass --render-result or "
+                f"reuse {cached}"
+            )
+        return validate_render_result(cached, mechanical)
+    try:
+        return ensure_challenge_renderable(work, mechanical)
+    except SubmitterRenderabilityError as error:
+        if prior_renderability is None:
+            raise
+        raise DeterministicRegistrationError(
+            "Palomar previously verified every compared declaration anchor, but the "
+            "current trusted renderer no longer reproduces that result; do not change "
+            "the submitted repository"
+        ) from error
 
 
 def download_mechanical_artifact(
@@ -2802,12 +3002,14 @@ def advance_state(
         *state.get("events", []),
         {"at": utc_now(), "status": status, "note": note},
     ]
-    put_state(
+    written_sha = put_state(
         f"submissions/{state['id']}/state.json",
         updated,
         f"{note} ({state['id']})",
         blob_sha=state.get("_blob_sha"),
     )
+    if isinstance(written_sha, str) and written_sha:
+        updated["_blob_sha"] = written_sha
     return updated
 
 
@@ -2815,6 +3017,19 @@ def advance_state(
 # when they start, not when they fail, so a runner that dies without recording
 # anything is counted too.
 REVIEW_ATTEMPT_LIMIT = 3
+RENDERABILITY_ATTEMPT_LIMIT = 3
+
+
+def begin_renderability_check(state: dict[str, Any]) -> dict[str, Any]:
+    """Durably count the pre-review gate without spending a model attempt."""
+    return advance_state(
+        state,
+        "awaiting-review",
+        "Palomar is checking that the Challenge can be rendered",
+        renderability_attempts=int(state.get("renderability_attempts") or 0) + 1,
+        renderability_started_at=utc_now(),
+        renderability_error=None,
+    )
 
 
 def begin_review(state: dict[str, Any]) -> dict[str, Any]:
@@ -2830,6 +3045,8 @@ def begin_review(state: dict[str, Any]) -> dict[str, Any]:
         "The automated review is running",
         review_started_at=utc_now(),
         review_attempts=int(state.get("review_attempts") or 0) + 1,
+        renderability_attempts=0,
+        renderability_error=None,
     )
 
 
@@ -2845,6 +3062,35 @@ def abandon_review(state: dict[str, Any], reason: str) -> dict[str, Any]:
         "review-failed",
         "The automated review could not be completed",
         review_error=reason[:500],
+    )
+
+
+def record_renderability_failure(
+    state: dict[str, Any], error: SubmitterRenderabilityError
+) -> dict[str, Any]:
+    """Settle a source-owned renderability failure before editorial review."""
+    if not 1 <= len(error.diagnostics) <= MAX_FAILURE_DIAGNOSTICS:
+        raise ReviewerError("renderability failure has an invalid diagnostics count")
+    failure = {
+        "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+        "mode": "full",
+        "phase": "verification",
+        "run": {"id": error.run_id, "url": error.run_url},
+        "profile_version": None,
+        "diagnostics": [_bounded_diagnostic(item) for item in error.diagnostics],
+    }
+    return advance_state(
+        state,
+        "verification-failed",
+        "Challenge rendering found repository changes that are required",
+        failure=failure,
+        review_error=None,
+        review_retry_after=None,
+        registration_error=None,
+        registration_failure=None,
+        registration_retry_after=None,
+        registration_consent=False,
+        registration_consent_review_sha256=None,
     )
 
 
@@ -2931,6 +3177,7 @@ def deliver_review(
     spend: dict[str, Any] | None = None,
     *,
     mechanical: dict[str, Any] | None = None,
+    renderability: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Hand the review to the submitter privately, and to nobody else.
 
@@ -2940,6 +3187,11 @@ def deliver_review(
     earlier one.
     """
     refuse_engine_credential(review, context="the review being delivered")
+    validated_renderability = None
+    if renderability is not None:
+        if mechanical is None:
+            raise ReviewerError("renderability receipt requires mechanical evidence")
+        validated_renderability = validate_renderability_receipt(renderability, mechanical)
     existing = state_json(f"submissions/{state['id']}/review.json")
     put_state(
         f"submissions/{state['id']}/review.json",
@@ -2959,17 +3211,22 @@ def deliver_review(
         if isinstance(cache, dict) and cache.get("required") is True
         else None
     )
+    fields: dict[str, Any] = {
+        "review_sha256": registration_authorization.document_digest(review),
+        "review_schema_version": review["schema_version"],
+        "registration_consent": False,
+        "registration_consent_review_sha256": None,
+        "registration_attempt": None,
+        "mathlib_cache_available": cache_available,
+        "spend": [*previous, spend] if spend else previous,
+    }
+    if validated_renderability is not None:
+        fields["renderability"] = validated_renderability
     return advance_state(
         state,
         "review-ready",
         "The editorial review is ready for you",
-        review_sha256=registration_authorization.document_digest(review),
-        review_schema_version=review["schema_version"],
-        registration_consent=False,
-        registration_consent_review_sha256=None,
-        registration_attempt=None,
-        mathlib_cache_available=cache_available,
-        spend=[*previous, spend] if spend else previous,
+        **fields,
     )
 
 
@@ -3423,17 +3680,8 @@ def push_registration_branch(database: Path, branch: str) -> None:
     run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
 
 
-def render_failure_details(
-    work: Path, run_id: str, request_id: str, url: str
-) -> tuple[str, bool]:
-    """Say what a failed render run actually failed at.
-
-    Every failed render used to be reported as infrastructure whose retry might
-    work. The first real registration failed on a TypeError in the renderer,
-    which was reported that way and would have failed identically forever. The
-    run uploads its report whatever the outcome, and a report carrying errors
-    is this pipeline's own fault, not a passing condition.
-    """
+def render_failure_report(work: Path, run_id: str, request_id: str) -> dict[str, Any] | None:
+    """Download the trusted renderer's bounded failure report, if it has one."""
     report = work / "render-failure"
     if report.exists():
         shutil.rmtree(report)
@@ -3445,9 +3693,26 @@ def render_failure_details(
             "--name", f"challenge-render-{request_id}", "--dir", str(report),
         ])
         found = next(report.rglob("report.json"), None)
-        problems = json.loads(found.read_text())["errors"] if found else []
+        value = json.loads(found.read_text()) if found else None
+        return value if isinstance(value, dict) else None
     except Exception:  # noqa: BLE001 - the diagnosis must not replace the failure
-        problems = []
+        return None
+
+
+def render_failure_details(
+    work: Path, run_id: str, request_id: str, url: str
+) -> tuple[str, bool]:
+    """Say what a failed render run actually failed at.
+
+    Every failed render used to be reported as infrastructure whose retry might
+    work. The first real registration failed on a TypeError in the renderer,
+    which was reported that way and would have failed identically forever. The
+    run uploads its report whatever the outcome, and a report carrying errors
+    is this pipeline's own fault, not a passing condition.
+    """
+    report = render_failure_report(work, run_id, request_id)
+    reported_errors = report.get("errors") if report is not None else None
+    problems = reported_errors if isinstance(reported_errors, list) else []
     if problems:
         return (
             "Challenge rendering failed, and will fail the same way until it is fixed: "
@@ -4051,11 +4316,19 @@ def run_review(args: argparse.Namespace) -> int:
             mechanical_url=mechanical_url,
             policy_commit=policy_commit,
         )
+        render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
+        receipt = renderability_receipt(render_report, mechanical)
         # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
         spend = load_json(spend_path) if spend_path.is_file() else None
-        state = deliver_review(state, stored, spend, mechanical=mechanical)
+        state = deliver_review(
+            state,
+            stored,
+            spend,
+            mechanical=mechanical,
+            renderability=receipt,
+        )
         write_json(work / "state.json", state)
         (work / "review-sha256").write_text(
             registration_authorization.document_digest(stored) + "\n"
@@ -4072,6 +4345,11 @@ def run_review(args: argparse.Namespace) -> int:
         root=root,
         policy_ref=args.policy_ref,
     )
+    # Rendering is an eligibility condition, not a post-consent registration
+    # side effect. Run the exact trusted rendering path before spending any
+    # model review; anonymous compiler-generated declarations selected by the
+    # Comparator are rejected here with a submitter-facing diagnostic.
+    ensure_challenge_renderable(work, mechanical)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
     validate_current_review_contract(rubric, review_schema)
@@ -4160,6 +4438,19 @@ def run_review(args: argparse.Namespace) -> int:
     print(json.dumps(final, indent=2))
     print("\nDry run: GitHub was not changed. Inspect review.json, then re-run with --apply.")
     return 0
+
+
+def ensure_review_renderable(
+    record: dict[str, Any], args: argparse.Namespace, *, wait_seconds: int = RENDER_WAIT_SECONDS
+) -> None:
+    """Run the renderability gate before a review attempt is durably counted."""
+    root = Path(args.work_dir).expanduser().resolve()
+    work, _state, mechanical, _policy_commit = prepare_workspace(
+        record["id"],
+        root=root,
+        policy_ref=args.policy_ref,
+    )
+    ensure_challenge_renderable(work, mechanical, wait_seconds=wait_seconds)
 
 
 def metadata_value(data: dict[str, Any], paths: list[tuple[str, ...]]) -> Any:
@@ -5073,10 +5364,9 @@ def register(args: argparse.Namespace) -> int:
         review_schema=committed_review_schema,
         rubric=committed_rubric,
     )
-    # Before anything public happens. Rendering dispatches a public Actions run
-    # named with the repository and commit, which would signal that no blocking
-    # problem was identified before the submitter agreed to register, and
-    # cannot be taken back.
+    # Before any registration-time public action. A cache miss may dispatch a
+    # public render run, and archive/database writes follow it; consent is
+    # revalidated before either can happen.
     state = registration_authorization.validate_registration(
         args.submission,
         mechanical,
@@ -5084,6 +5374,12 @@ def register(args: argparse.Namespace) -> int:
         submission_state(args.submission),
         state_repository=STATE_REPO,
     )
+    try:
+        prior_renderability = validate_renderability_receipt(
+            state.get("renderability"), mechanical
+        )
+    except ReviewerError as error:
+        raise DeterministicRegistrationError(str(error)) from error
     source = work / "source"
     formalization_path = mechanical_evidence.source_path(
         source,
@@ -5103,6 +5399,13 @@ def register(args: argparse.Namespace) -> int:
     source_commit = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
     if source_commit != mechanical["source"]["commit"]:
         raise ReviewerError("review workspace source no longer matches the mechanical report")
+    # Renderability is settled before an identifier is reserved or source
+    # preservation begins. New reviews already cached this exact check; this
+    # remains the fail-closed boundary for older reviews and for a lost
+    # workspace cache.
+    render_report, render_bundle = registration_render_result(
+        args, work, mechanical, prior_renderability
+    )
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     checked_out = clone_at(
@@ -5157,22 +5460,12 @@ def register(args: argparse.Namespace) -> int:
         version=version,
         dry_run=args.dry_run,
     )
-    if args.render_result:
-        render_candidate = Path(args.render_result).expanduser().resolve()
-    elif (work / "render-result").is_dir():
-        render_candidate = work / "render-result"
-    elif args.dry_run:
-        raise ReviewerError(
-            "dry-run registration does not dispatch workflows; pass --render-result or reuse "
-            f"{work / 'render-result'}"
-        )
-    else:
-        render_candidate = request_render(work, mechanical)
-    render_report, render_bundle = validate_render_result(render_candidate, mechanical)
     cached_render = work / "render-result"
     if render_bundle.parent != cached_render:
-        if cached_render.exists():
+        if cached_render.is_dir() and not cached_render.is_symlink():
             shutil.rmtree(cached_render)
+        elif cached_render.exists() or cached_render.is_symlink():
+            cached_render.unlink()
         shutil.copytree(render_bundle.parent, cached_render)
         render_bundle = cached_render / "bundle"
     tree_hash = render_report["artifact_tree_sha256"]
@@ -6817,14 +7110,30 @@ def auto(args: argparse.Namespace) -> int:
             print("::endgroup::", flush=True)
 
     for record in to_review[: args.max_reviews]:
-        if pass_remaining() <= 0:
+        if pass_remaining() <= REVIEW_RESERVE_SECONDS:
             # Starting a review here would run past the job's own timeout and
             # be killed part-way, which costs the attempt and tells nobody why.
             print(f"pass budget spent; leaving {record['id']} for a later pass")
             unattempted.append(record)
             continue
         print(f"::group::Review {record['id']}", flush=True)
+        gate_complete = False
         try:
+            record = begin_renderability_check(record)
+            render_wait = max(1, int(pass_remaining() - REVIEW_RESERVE_SECONDS))
+            ensure_review_renderable(record, args, wait_seconds=render_wait)
+            gate_complete = True
+            if pass_remaining() <= 0:
+                record = advance_state(
+                    record,
+                    "awaiting-review",
+                    "The Challenge renderability check passed; review will start next pass",
+                    renderability_attempts=0,
+                    renderability_error=None,
+                )
+                advanced += 1
+                unattempted.append(record)
+                continue
             started = time.monotonic()
             begin_review(record)
             for apply_step in (False, True):
@@ -6835,18 +7144,55 @@ def auto(args: argparse.Namespace) -> int:
                 run_review(step)
             record_review_duration(time.monotonic() - started)
             advanced += 1
+        except SubmitterRenderabilityError as error:
+            print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if fresh is not None and fresh.get("status") in {"awaiting-review", "reviewing"}:
+                record_renderability_failure(fresh, error)
+                advanced += 1
+            elif fresh is None:
+                failures += 1
+                print(
+                    f"error: submission state disappeared while settling {record['id']}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"::warning::{record['id']} became {fresh.get('status')}; "
+                    "leaving its newer state unchanged",
+                    file=sys.stderr,
+                )
         except Exception as error:  # one bad submission must not stall the queue
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
             if fresh is not None:
-                advance_state(
-                    fresh,
-                    "awaiting-review",
-                    "The automated review did not complete; it will be tried again",
-                    review_error=str(error)[:500],
-                    review_retry_after=utc_after(REVIEW_RETRY_BACKOFF_SECONDS),
-                )
+                if gate_complete:
+                    advance_state(
+                        fresh,
+                        "awaiting-review",
+                        "The automated review did not complete; it will be tried again",
+                        review_error=str(error)[:500],
+                        review_retry_after=utc_after(REVIEW_RETRY_BACKOFF_SECONDS),
+                    )
+                else:
+                    attempts = int(fresh.get("renderability_attempts") or 0)
+                    exhausted_gate = attempts >= RENDERABILITY_ATTEMPT_LIMIT
+                    advance_state(
+                        fresh,
+                        "verification-error" if exhausted_gate else "awaiting-review",
+                        (
+                            "Palomar could not complete the Challenge renderability check"
+                            if exhausted_gate
+                            else "The Challenge renderability check will be tried again"
+                        ),
+                        renderability_error=str(error)[:500],
+                        review_retry_after=(
+                            None
+                            if exhausted_gate
+                            else utc_after(REVIEW_RETRY_BACKOFF_SECONDS)
+                        ),
+                    )
         finally:
             print("::endgroup::", flush=True)
 
@@ -6879,6 +7225,17 @@ def auto(args: argparse.Namespace) -> int:
             fresh = submission_state(record["id"])
             if fresh is not None and fresh.get("registration_pr"):
                 advance_registration(fresh, min(pass_remaining(), REGISTRATION_WAIT_SECONDS))
+        except SubmitterRenderabilityError as error:
+            print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if (
+                fresh is not None
+                and fresh.get("status") == "review-ready"
+                and fresh.get("registration_consent") is True
+                and not fresh.get("registration_pr")
+            ):
+                record_renderability_failure(fresh, error)
+                advanced += 1
         except Exception as error:
             failures += 1
             print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
