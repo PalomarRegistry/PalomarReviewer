@@ -37,6 +37,7 @@ from . import registration as registration_authority
 from . import usage as usage_accounting
 from .errors import (
     DeterministicRegistrationError,
+    RegistrationDeferred,
     ReviewerError,
     SubmitterRenderabilityError,
 )
@@ -1653,7 +1654,7 @@ def _ensure_archive_ref(source_repository: str, commit: str, fork_repository: st
     )
 
 
-def preserve_sources(
+def prepare_preservation(
     work: Path,
     mechanical: dict[str, Any],
     *,
@@ -1661,17 +1662,20 @@ def preserve_sources(
     version: int,
     dry_run: bool,
 ) -> dict[str, Any]:
-    """Create permanent archive refs and write their deterministic receipt."""
+    """Prepare the exact receipt and archive destinations without writing identity refs."""
     sources = preservation_sources(mechanical)
+
     def ref_for(commit: str) -> str:
         return f"refs/tags/palomar/{permanent_id}-v{version}/{commit}"
-    rows: list[dict[str, str]] = []
+
+    planned: list[dict[str, str]] = []
     if dry_run:
         for repository, commit in sources:
             root = repository
-            rows.append(
+            planned.append(
                 {
                     "source_repository": repository,
+                    "canonical_repository": repository,
                     "commit": commit,
                     "fork_repository": f"{ARCHIVE_OWNER}/{archive_repository_name(root)}",
                     "ref": ref_for(commit),
@@ -1703,7 +1707,7 @@ def preserve_sources(
             roots.setdefault(key, root)
             groups.setdefault(key, []).append((repository, commit, canonical_repository))
 
-        def preserve_group(key: str) -> list[dict[str, str]]:
+        def prepare_group(key: str) -> list[dict[str, str]]:
             items = sorted(groups[key], key=lambda item: (item[0].casefold(), item[1]))
             # Repository endpoints redirect after a transfer or rename. GitHub
             # follows that redirect for reads, but does not follow a POST to
@@ -1723,10 +1727,10 @@ def preserve_sources(
             result = []
             for repository, commit, canonical_repository in items:
                 ref = ref_for(commit)
-                _ensure_archive_ref(canonical_repository, commit, fork, ref)
                 result.append(
                     {
                         "source_repository": repository,
+                        "canonical_repository": canonical_repository,
                         "commit": commit,
                         "fork_repository": fork,
                         "ref": ref,
@@ -1735,10 +1739,15 @@ def preserve_sources(
             return result
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(preserve_group, key) for key in sorted(groups)]
+            futures = [executor.submit(prepare_group, key) for key in sorted(groups)]
             for future in futures:
-                rows.extend(future.result())
+                planned.extend(future.result())
 
+    planned.sort(key=lambda item: (item["source_repository"].casefold(), item["commit"]))
+    rows = [
+        {key: value for key, value in item.items() if key != "canonical_repository"}
+        for item in planned
+    ]
     rows.sort(key=lambda item: (item["source_repository"].casefold(), item["commit"]))
     archived_at = utc_now()
     receipt = {
@@ -1751,12 +1760,54 @@ def preserve_sources(
     }
     receipt_path = work / "source-archive.json"
     write_json(receipt_path, receipt)
-    return {
+    preservation = {
         "archive_owner": ARCHIVE_OWNER,
         "archived_at": archived_at,
         "receipt_sha256": sha256_file(receipt_path),
         "repositories": rows,
     }
+    return {"preservation": preservation, "planned": planned}
+
+
+def publish_preservation(plan: dict[str, Any]) -> None:
+    """Create and verify only the identifier-bearing refs in a prepared plan."""
+    planned = plan.get("planned")
+    if not isinstance(planned, list) or not planned:
+        raise ReviewerError("source preservation plan is empty or malformed")
+
+    def publish(item: dict[str, str]) -> None:
+        _ensure_archive_ref(
+            item["canonical_repository"],
+            item["commit"],
+            item["fork_repository"],
+            item["ref"],
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(publish, item) for item in planned]
+        for future in futures:
+            future.result()
+
+
+def preserve_sources(
+    work: Path,
+    mechanical: dict[str, Any],
+    *,
+    permanent_id: str,
+    version: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Compatibility wrapper for callers that prepare and publish in one step."""
+    plan = prepare_preservation(
+        work,
+        mechanical,
+        permanent_id=permanent_id,
+        version=version,
+        dry_run=dry_run,
+    )
+    if not dry_run:
+        publish_preservation(plan)
+    return plan["preservation"]
 
 
 def render_bundle_manifest(bundle: Path) -> tuple[list[dict[str, Any]], str]:
@@ -3013,6 +3064,192 @@ def advance_state(
     return updated
 
 
+def _attempt_identity(attempt: dict[str, Any]) -> dict[str, Any]:
+    return registration_checkpoint.identity_document(attempt)
+
+
+def _write_lock(path: str, lock: dict[str, Any], message: str) -> dict[str, Any]:
+    written = put_state(path, lock, message, blob_sha=lock.get("_blob_sha"))
+    updated = {key: value for key, value in lock.items() if key != "_blob_sha"}
+    if written:
+        updated["_blob_sha"] = written
+    return updated
+
+
+def _empty_lock(scope: dict[str, str], *, blob_sha: str | None = None) -> dict[str, Any]:
+    lock: dict[str, Any] = {
+        "schema_version": 1,
+        "scope": scope,
+        "holder": None,
+        "updated_at": utc_now(),
+    }
+    if blob_sha:
+        lock["_blob_sha"] = blob_sha
+    return lock
+
+
+def _acquire_registration_lock(
+    *,
+    state: dict[str, Any],
+    identity: dict[str, Any],
+    database_base: str,
+) -> tuple[str, dict[str, Any]]:
+    """Acquire or recover the exact allocation lock before saving an attempt."""
+    scope = registration_checkpoint.lock_scope(identity)
+    path = registration_checkpoint.lock_path(scope)
+    current = state_json(path)
+    acquired_at = utc_now()
+    if current is not None:
+        registration_checkpoint.validate_lock(current, path=path)
+        holder = current.get("holder")
+        if isinstance(holder, dict):
+            if (
+                holder.get("submission_id") == state["id"]
+                and holder.get("identity") == identity
+            ):
+                if holder.get("status") == "releasing":
+                    raise RegistrationDeferred(
+                        f"registration allocation {scope['kind']} {scope['value']} is releasing"
+                    )
+                return path, current
+            raise RegistrationDeferred(
+                f"registration allocation {scope['kind']} {scope['value']} is held by "
+                f"{holder.get('submission_id', 'another submission')}"
+            )
+    else:
+        current = _empty_lock(scope)
+    lock = registration_checkpoint.lock_document(
+        identity=identity,
+        submission_id=state["id"],
+        database_base=database_base,
+        acquired_at=acquired_at,
+        status="acquiring",
+        updated_at=acquired_at,
+    )
+    lock["_blob_sha"] = current.get("_blob_sha")
+    try:
+        acquired = _write_lock(
+            path,
+            lock,
+            f"Acquire registration allocation for {state['id']}",
+        )
+    except ReviewerError:
+        raced = state_json(path)
+        if raced is None:
+            raise
+        registration_checkpoint.validate_lock(raced, path=path)
+        holder = raced.get("holder")
+        if isinstance(holder, dict) and holder.get("submission_id") != state["id"]:
+            raise RegistrationDeferred(
+                f"registration allocation {scope['kind']} {scope['value']} was acquired by "
+                f"{holder.get('submission_id', 'another submission')}"
+            ) from None
+        raise
+    return path, acquired
+
+
+def _hold_registration_lock(path: str, lock: dict[str, Any]) -> dict[str, Any]:
+    registration_checkpoint.validate_lock(lock, path=path)
+    holder = dict(lock.get("holder") or {})
+    if holder.get("status") == "held":
+        return lock
+    if holder.get("status") != "acquiring":
+        raise ReviewerError("registration allocation cannot become held from its current state")
+    holder["status"] = "held"
+    updated = {**lock, "holder": holder, "updated_at": utc_now()}
+    return _write_lock(path, updated, f"Hold registration allocation for {holder['submission_id']}")
+
+
+def _release_unpublished_attempt(
+    state: dict[str, Any], identity: dict[str, Any]
+) -> dict[str, Any]:
+    """Clear a schema-3 attempt only after making publication impossible."""
+    attempt = state.get("registration_attempt")
+    if (
+        not isinstance(attempt, dict)
+        or attempt.get("schema_version") != 3
+        or _attempt_identity(attempt) != identity
+        or registration_checkpoint.matching_public_use(state, identity) is not None
+    ):
+        raise ReviewerError("registration attempt is not explicitly safe to release")
+    path = registration_checkpoint.lock_path(registration_checkpoint.lock_scope(identity))
+    lock = state_json(path)
+    if lock is None:
+        raise ReviewerError("unpublished registration attempt has no allocation lock")
+    registration_checkpoint.validate_lock(lock, path=path)
+    holder = dict(lock.get("holder") or {})
+    if holder.get("submission_id") != state["id"] or holder.get("identity") != identity:
+        raise ReviewerError("registration allocation belongs to another attempt")
+    holder["status"] = "releasing"
+    lock = _write_lock(
+        path,
+        {**lock, "holder": holder, "updated_at": utc_now()},
+        f"Release registration allocation for {state['id']}",
+    )
+    updated = dict(state)
+    updated["registration_attempt"] = None
+    written = put_state(
+        f"submissions/{state['id']}/state.json",
+        updated,
+        f"Release unpublished registration identity for {state['id']}",
+        blob_sha=state.get("_blob_sha"),
+    )
+    if written:
+        updated["_blob_sha"] = written
+    _write_lock(
+        path,
+        _empty_lock(lock["scope"], blob_sha=lock.get("_blob_sha")),
+        f"Clear registration allocation for {state['id']}",
+    )
+    return updated
+
+
+def _release_registration_lock(state: dict[str, Any], identity: dict[str, Any]) -> None:
+    """Release an allocation only after State durably records registration."""
+    path = registration_checkpoint.lock_path(registration_checkpoint.lock_scope(identity))
+    lock = state_json(path)
+    if lock is None:
+        raise ReviewerError("registered identity has no allocation lock to release")
+    registration_checkpoint.validate_lock(lock, path=path)
+    holder = dict(lock.get("holder") or {})
+    if holder.get("submission_id") != state["id"] or holder.get("identity") != identity:
+        raise ReviewerError("registered identity does not own its allocation lock")
+    if holder.get("status") != "releasing":
+        if holder.get("status") != "held":
+            raise ReviewerError("registered allocation is not held or releasing")
+        holder["status"] = "releasing"
+        lock = _write_lock(
+            path,
+            {**lock, "holder": holder, "updated_at": utc_now()},
+            f"Release registered allocation for {state['id']}",
+        )
+    _write_lock(
+        path,
+        _empty_lock(lock["scope"], blob_sha=lock.get("_blob_sha")),
+        f"Clear registered allocation for {state['id']}",
+    )
+
+
+def _registration_owns_lock(state: dict[str, Any]) -> bool:
+    """Whether queued work is recovering the allocation that blocks its peers."""
+    attempt = state.get("registration_attempt")
+    if not isinstance(attempt, dict):
+        return False
+    identity = _attempt_identity(attempt)
+    path = registration_checkpoint.lock_path(registration_checkpoint.lock_scope(identity))
+    lock = state_json(path)
+    if lock is None:
+        return False
+    registration_checkpoint.validate_lock(lock, path=path)
+    holder = lock.get("holder")
+    return bool(
+        isinstance(holder, dict)
+        and holder.get("submission_id") == state.get("id")
+        and holder.get("identity") == identity
+        and holder.get("status") in {"acquiring", "held"}
+    )
+
+
 # A review that keeps failing must stop being retried. Attempts are counted
 # when they start, not when they fail, so a runner that dies without recording
 # anything is counted too.
@@ -3192,6 +3429,19 @@ def deliver_review(
         if mechanical is None:
             raise ReviewerError("renderability receipt requires mechanical evidence")
         validated_renderability = validate_renderability_receipt(renderability, mechanical)
+    attempt = state.get("registration_attempt")
+    if isinstance(attempt, dict):
+        identity = _attempt_identity(attempt)
+        if (
+            attempt.get("schema_version") == 3
+            and registration_checkpoint.matching_public_use(state, identity) is None
+        ):
+            state = _release_unpublished_attempt(state, identity)
+        else:
+            raise ReviewerError(
+                "the prior review has a retained registration identity; reconcile it "
+                "before delivering a replacement review"
+            )
     existing = state_json(f"submissions/{state['id']}/review.json")
     put_state(
         f"submissions/{state['id']}/review.json",
@@ -5194,6 +5444,31 @@ def registration_attempt_identity(
         source_commit=source_commit,
         existing_id=existing_id,
     )
+    if reserved is not None and registration_authority.reservation_superseded(
+        database,
+        reserved,
+        existing_id=existing_id,
+        git_env=git_env,
+    ):
+        identity = _attempt_identity(attempt)
+        if (
+            isinstance(attempt, dict)
+            and attempt.get("schema_version") == 3
+            and registration_checkpoint.matching_public_use(state, identity) is None
+        ):
+            if dry_run:
+                raise RegistrationDeferred(
+                    f"saved registration attempt {reserved[0]} must be released before retry"
+                )
+            state = _release_unpublished_attempt(state, identity)
+            attempt = None
+            reserved = None
+        else:
+            raise DeterministicRegistrationError(
+                f"saved registration attempt {reserved[0]} is no longer allocatable; "
+                "its publication history requires operator reconciliation"
+            )
+
     resolved = registration_authority.registration_identity(
         database,
         submission_id=state["id"],
@@ -5208,13 +5483,8 @@ def registration_attempt_identity(
         reserved=reserved,
         git_env=git_env,
     )
-    if attempt is not None or dry_run:
-        return resolved
-
     identifier, first_registered_on, registered_at, version = resolved
-    updated = dict(state)
-    updated["registration_attempt"] = {
-        "schema_version": 2,
+    identity = {
         "id": identifier,
         "version": version,
         "first_registered_on": first_registered_on,
@@ -5224,13 +5494,148 @@ def registration_attempt_identity(
         "source_commit": source_commit,
         "existing_id": existing_id,
     }
-    put_state(
+    registration_checkpoint.refuse_unresolved_public_identity(state, identity)
+    if dry_run:
+        return resolved
+
+    database_base = run(["git", "rev-parse", "HEAD"], cwd=database).stdout.strip()
+    lock_path, lock = _acquire_registration_lock(
+        state=state,
+        identity=identity,
+        database_base=database_base,
+    )
+    if attempt is None:
+        updated = dict(state)
+        updated["registration_attempt"] = {"schema_version": 3, **identity}
+        written = put_state(
+            f"submissions/{state['id']}/state.json",
+            updated,
+            f"Reserve registration identity for {state['id']}",
+            blob_sha=state.get("_blob_sha"),
+        )
+        if written:
+            state = {**updated, "_blob_sha": written}
+    _hold_registration_lock(lock_path, lock)
+    return resolved
+
+
+def _held_registration_lock(state: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+    path = registration_checkpoint.lock_path(registration_checkpoint.lock_scope(identity))
+    lock = state_json(path)
+    if lock is None:
+        raise ReviewerError("registration identity has no allocation lock")
+    registration_checkpoint.validate_lock(lock, path=path)
+    holder = lock.get("holder")
+    if (
+        not isinstance(holder, dict)
+        or holder.get("submission_id") != state["id"]
+        or holder.get("identity") != identity
+        or holder.get("status") != "held"
+    ):
+        raise ReviewerError("registration identity does not hold its allocation lock")
+    return lock
+
+
+def _write_public_identity_uses(
+    state: dict[str, Any], rows: list[dict[str, Any]], message: str
+) -> dict[str, Any]:
+    updated = {**state, "public_identity_uses": rows}
+    written = put_state(
         f"submissions/{state['id']}/state.json",
         updated,
-        f"Reserve registration identity for {state['id']}",
+        message,
         blob_sha=state.get("_blob_sha"),
     )
-    return resolved
+    if written:
+        updated["_blob_sha"] = written
+    return updated
+
+
+def _record_public_identity_start(
+    *,
+    submission_id: str,
+    review: dict[str, Any],
+    mechanical: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Durably record the identity immediately before its first public use."""
+    fresh = registration_authorization.validate_registration_checkpoint(
+        submission_id,
+        review,
+        submission_state(submission_id),
+        state_repository=STATE_REPO,
+    )
+    saved = registration_checkpoint.saved_identity(
+        fresh,
+        review_sha256=identity["review_sha256"],
+        source_repository=mechanical["source"]["repository"],
+        source_commit=mechanical["source"]["commit"],
+        existing_id=mechanical.get("existing_id") or None,
+    )
+    if saved != (
+        identity["id"], identity["first_registered_on"],
+        identity["registered_at"], identity["version"],
+    ):
+        raise ReviewerError("saved registration attempt changed before publication")
+    registration_checkpoint.refuse_unresolved_public_identity(fresh, identity)
+    _held_registration_lock(fresh, identity)
+    rows = registration_checkpoint.public_identity_uses(fresh)
+    existing = registration_checkpoint.matching_public_use(fresh, identity)
+    if existing is not None:
+        if existing["identity"] != identity:
+            raise ReviewerError("public identity record changed before publication")
+        if existing["phase"] not in {"publication-started", "published"}:
+            raise ReviewerError("public identity is not in a publishable phase")
+        return fresh
+    now = utc_now()
+    return _write_public_identity_uses(
+        fresh,
+        [
+            *rows,
+            {
+                "schema_version": 1,
+                "identity": identity,
+                "phase": "publication-started",
+                "basis": "prospective",
+                "recorded_at": now,
+                "updated_at": now,
+            },
+        ],
+        f"Record public registration identity for {submission_id}",
+    )
+
+
+def _record_public_identity_published(
+    *,
+    submission_id: str,
+    identity: dict[str, Any],
+    preservation: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the exact verified archive receipt to the durable identity record."""
+    fresh = submission_state(submission_id)
+    if fresh is None:
+        raise ReviewerError(f"submission {submission_id} disappeared during publication")
+    _held_registration_lock(fresh, identity)
+    rows = registration_checkpoint.public_identity_uses(fresh)
+    existing = registration_checkpoint.matching_public_use(fresh, identity)
+    if existing is None or existing["identity"] != identity:
+        raise ReviewerError("public identity was not recorded before archive publication")
+    archive = {
+        "receipt_sha256": preservation["receipt_sha256"],
+        "repositories": preservation["repositories"],
+    }
+    if existing["phase"] == "published":
+        if existing.get("archive") != archive:
+            raise ReviewerError("published identity is bound to different archive evidence")
+        return fresh
+    if existing["phase"] != "publication-started":
+        raise ReviewerError("public identity is not awaiting archive publication")
+    replacement = {**existing, "phase": "published", "archive": archive, "updated_at": utc_now()}
+    return _write_public_identity_uses(
+        fresh,
+        [replacement if row is existing else row for row in rows],
+        f"Record published registration identity for {submission_id}",
+    )
 
 
 def delivered_review(submission_id: str) -> dict[str, Any]:
@@ -5435,6 +5840,11 @@ def register(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         git_env=database_git_env,
     )
+    if getattr(args, "count_attempt", False) and not args.dry_run:
+        fresh_for_attempt = submission_state(args.submission)
+        if fresh_for_attempt is None:
+            raise ReviewerError(f"submission {args.submission} disappeared after allocation")
+        state = begin_registration(fresh_for_attempt)
     # Everything the registry schema checks about the submission itself is
     # already decided here, and the next line is the first thing that cannot be
     # undone: preservation writes tags naming this identifier into public
@@ -5453,13 +5863,14 @@ def register(args: argparse.Namespace) -> int:
         registered_at=registered_at,
         version=version,
     )
-    preservation = preserve_sources(
+    preservation_plan = prepare_preservation(
         work,
         mechanical,
         permanent_id=permanent_id,
         version=version,
         dry_run=args.dry_run,
     )
+    preservation = preservation_plan["preservation"]
     cached_render = work / "render-result"
     if render_bundle.parent != cached_render:
         if cached_render.is_dir() and not cached_render.is_symlink():
@@ -5562,6 +5973,31 @@ def register(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"Prepared {destination}; dry run, branch was not pushed.")
         return 0
+    identity = {
+        "id": permanent_id,
+        "version": version,
+        "first_registered_on": first_registered_on,
+        "registered_at": registered_at,
+        "review_sha256": registration_authorization.document_digest(review),
+        "source_repository": mechanical["source"]["repository"],
+        "source_commit": mechanical["source"]["commit"],
+        "existing_id": mechanical.get("existing_id") or None,
+    }
+    # The local database change has passed its complete validator. Record the
+    # identity while it is still private, then make exactly the refs described
+    # by that durable record public and bind their verified receipt to it.
+    _record_public_identity_start(
+        submission_id=args.submission,
+        review=review,
+        mechanical=mechanical,
+        identity=identity,
+    )
+    publish_preservation(preservation_plan)
+    _record_public_identity_published(
+        submission_id=args.submission,
+        identity=identity,
+        preservation=preservation,
+    )
     push_registration_branch(database, branch)
     open_pr = registration_checkpoint.open_pr(gh, DATABASE_REPO, branch)
     if open_pr is not None:
@@ -5667,13 +6103,33 @@ def finalize(args: argparse.Namespace) -> int:
     state = submission_state(args.submission)
     if state is None:
         raise ReviewerError(f"submission {args.submission} has no record in {STATE_REPO}")
-    advance_state(
+    attempt = state.get("registration_attempt")
+    if not isinstance(attempt, dict):
+        raise ReviewerError("registered submission has no saved registration identity")
+    identity = _attempt_identity(attempt)
+    if (identity["id"], identity["version"]) != (record["id"], record["version"]):
+        raise ReviewerError("merged database record disagrees with the saved identity")
+    _held_registration_lock(state, identity)
+    rows = registration_checkpoint.public_identity_uses(state)
+    public_use = registration_checkpoint.matching_public_use(state, identity)
+    if public_use is None or public_use["identity"] != identity:
+        raise ReviewerError("merged database record has no matching public identity evidence")
+    if public_use["phase"] not in {"published", "registered"}:
+        raise ReviewerError("public identity evidence was not published before registration")
+    registered_use = {
+        **public_use,
+        "phase": "registered",
+        "updated_at": utc_now(),
+    }
+    updated = advance_state(
         state,
         "registered",
         f"Registered as {record['id']} version {record['version']}",
         registered_entry=f"{record['id']}-v{record['version']}",
         registered_url=website_url,
+        public_identity_uses=[registered_use if row is public_use else row for row in rows],
     )
+    _release_registration_lock(updated, identity)
     print("Recorded the registration against the private submission record.")
     return 0
 
@@ -7085,6 +7541,12 @@ def auto(args: argparse.Namespace) -> int:
     pass_remaining = lambda: max(0.0, deadline - time.monotonic())  # noqa: E731
 
     to_review, to_register, to_finalize, exhausted, cooling = submissions_needing_work()
+    if len(to_register) > 1:
+        # A process may die while its allocation remains durable. Let that
+        # submission finish before an earlier queue entry repeatedly discovers
+        # the lock and consumes the one registration slot for every pass.
+        ownership = {record["id"]: _registration_owns_lock(record) for record in to_register}
+        to_register.sort(key=lambda record: not ownership[record["id"]])
     if cooling:
         print(f"{len(cooling)} review(s) waiting out a retry backoff: "
               f"{', '.join(record['id'] for record in cooling)}")
@@ -7108,6 +7570,17 @@ def auto(args: argparse.Namespace) -> int:
             print(f"error: abandoning review of {record['id']} failed: {error}", file=sys.stderr)
         finally:
             print("::endgroup::", flush=True)
+
+    for record in to_finalize:
+        # Settle already-public work before reserving another allocation. This
+        # keeps a completed registration from holding a day/result lock while
+        # a new registration waits behind it.
+        try:
+            if advance_registration(record, 0):
+                advanced += 1
+        except Exception as error:
+            failures += 1
+            print(f"error: finalizing {record['id']} failed: {error}", file=sys.stderr)
 
     for record in to_review[: args.max_reviews]:
         if pass_remaining() <= REVIEW_RESERVE_SECONDS:
@@ -7209,12 +7682,12 @@ def auto(args: argparse.Namespace) -> int:
             continue
         print(f"::group::Register {record['id']}", flush=True)
         try:
-            begin_registration(record)
             register(argparse.Namespace(
                 submission=record["id"],
                 work_dir=args.work_dir,
                 render_result=None,
                 dry_run=False,
+                count_attempt=True,
             ))
             # The change the registration just opened is the only thing between
             # the submitter and a registered record, and until now the only
@@ -7225,6 +7698,9 @@ def auto(args: argparse.Namespace) -> int:
             fresh = submission_state(record["id"])
             if fresh is not None and fresh.get("registration_pr"):
                 advance_registration(fresh, min(pass_remaining(), REGISTRATION_WAIT_SECONDS))
+        except RegistrationDeferred as error:
+            print(f"registration deferred for {record['id']}: {error}")
+            unattempted.append(record)
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
@@ -7259,16 +7735,6 @@ def auto(args: argparse.Namespace) -> int:
     if unattempted:
         print(f"{len(unattempted)} item(s) left for a later pass: "
               f"{', '.join(record['id'] for record in unattempted)}")
-
-    for record in to_finalize:
-        # Recovery only: a registration whose job died between opening the
-        # change and merging it. A pass that made one does not reach this arm.
-        try:
-            if advance_registration(record, 0):
-                advanced += 1
-        except Exception as error:
-            failures += 1
-            print(f"error: finalizing {record['id']} failed: {error}", file=sys.stderr)
 
     # Only work this pass never attempted earns another pass, which is exactly
     # what `unattempted` holds: what the review cap, the one-registration rule
@@ -7362,6 +7828,135 @@ def list_queue(_: argparse.Namespace) -> int:
     return 0
 
 
+def list_registration_locks(args: argparse.Namespace) -> int:
+    """Show allocation locks without exposing unrelated submission state."""
+    listing = gh(
+        [
+            "api",
+            f"repos/{STATE_REPO}/contents/index/registration-locks",
+            "--jq",
+            ".[] | .path",
+        ]
+    )
+    locks: list[dict[str, Any]] = []
+    for path in sorted(line.strip() for line in listing.splitlines() if line.strip()):
+        if not re.fullmatch(
+            r"index/registration-locks/(?:day-[0-9]{4}-[0-9]{2}-[0-9]{2}|"
+            r"result-PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})\.json",
+            path,
+        ):
+            raise ReviewerError(f"unexpected registration lock path: {path}")
+        lock = state_json(path)
+        if lock is None:
+            raise ReviewerError(f"registration lock disappeared while listing: {path}")
+        registration_checkpoint.validate_lock(lock, path=path)
+        locks.append({"path": path, **{key: value for key, value in lock.items() if key != "_blob_sha"}})
+    if args.json:
+        print(json.dumps(locks, indent=2))
+        return 0
+    active = [lock for lock in locks if lock.get("holder") is not None]
+    if not active:
+        print("No registration allocations are held.")
+        return 0
+    for lock in active:
+        holder = lock["holder"]
+        identity = holder["identity"]
+        print(
+            f"{lock['scope']['kind']}:{lock['scope']['value']}\t"
+            f"{holder['status']}\t{holder['submission_id']}\t"
+            f"{identity['id']}-v{identity['version']}"
+        )
+    return 0
+
+
+def resolve_registration_identity(args: argparse.Namespace) -> int:
+    """Authorize replacement only after independently proving a historic collision."""
+    submission_id = str(args.submission)
+    identifier = str(args.identity)
+    if getattr(args, "authorize_replacement", False) is not True:
+        raise ReviewerError("replacement authorization was not explicitly confirmed")
+    if not SUBMISSION_ID_RE.fullmatch(submission_id):
+        raise ReviewerError("submission id is malformed")
+    identity_match = registration_authority.PALOMAR_ID_RE.fullmatch(identifier)
+    if identity_match is None:
+        raise ReviewerError("Palomar identity is malformed")
+    now = utc_now()
+    if identity_match.group("date") >= now[:10]:
+        raise ReviewerError("only a historical identity collision can authorize replacement")
+    state = submission_state(submission_id)
+    if state is None or state.get("status") != "registration-paused":
+        raise ReviewerError("identity reconciliation requires a paused registration")
+    rows = registration_checkpoint.public_identity_uses(state)
+    matches = [row for row in rows if row["identity"].get("id") == identifier]
+    if len(matches) != 1:
+        raise ReviewerError("paused submission has no unique matching public identity record")
+    conflict = matches[0]
+    if conflict.get("phase") != "conflicted" or conflict.get("resolution") is not None:
+        raise ReviewerError("public identity is not an unresolved collision")
+    identity = conflict["identity"]
+    entry_path = f"entries/{identifier}-v{identity['version']}.json"
+    registered = json.loads(
+        gh(
+            [
+                "api",
+                "-H",
+                "Accept: application/vnd.github.raw+json",
+                f"repos/{DATABASE_REPO}/contents/{entry_path}?ref=main",
+            ]
+        )
+    )
+    registered_submission = (registered.get("submission") or {}).get("submission_id")
+    if (
+        registered.get("id") != identifier
+        or registered.get("version") != identity["version"]
+        or registered_submission == submission_id
+        or not isinstance(registered_submission, str)
+    ):
+        raise ReviewerError("Database does not prove this identity was assigned elsewhere")
+    archive = conflict.get("archive")
+    repositories = archive.get("repositories") if isinstance(archive, dict) else None
+    if not isinstance(repositories, list) or not repositories:
+        raise ReviewerError("collision has no audited archive evidence")
+    for repository in repositories:
+        fork = repository.get("fork_repository") if isinstance(repository, dict) else None
+        ref = repository.get("ref") if isinstance(repository, dict) else None
+        commit = repository.get("commit") if isinstance(repository, dict) else None
+        if not all(isinstance(value, str) for value in (fork, ref, commit)):
+            raise ReviewerError("collision archive evidence is malformed")
+        view = json.loads(gh(["api", _archive_ref_endpoint(fork, ref)]))
+        if view.get("object", {}).get("sha") != commit:
+            raise ReviewerError(f"archive evidence no longer matches {fork}:{ref}")
+    resolved = {
+        **conflict,
+        "resolution": {
+            "schema_version": 1,
+            "action": "authorize-replacement",
+            "reason": "identifier-assigned-to-another-submission",
+            "resolved_at": now,
+        },
+        "updated_at": now,
+    }
+    attempt = state.get("registration_attempt")
+    if isinstance(attempt, dict) and _attempt_identity(attempt) != identity:
+        raise ReviewerError("active registration attempt disagrees with the collision")
+    updated = advance_state(
+        state,
+        "registration-paused",
+        f"Operator reconciled collided identity {identifier}",
+        public_identity_uses=[resolved if row is conflict else row for row in rows],
+        registration_attempt=None,
+    )
+    path = registration_checkpoint.lock_path(registration_checkpoint.lock_scope(identity))
+    lock = state_json(path)
+    if lock is not None and lock.get("holder") is not None:
+        _release_registration_lock(updated, identity)
+    print(
+        f"authorized a replacement identity for {submission_id}; "
+        "run retry-registration when the submission is ready"
+    )
+    return 0
+
+
 def retry_registration(args: argparse.Namespace) -> int:
     """Requeue a paused registration after an operator has addressed its cause."""
     submission_id = str(args.submission)
@@ -7375,6 +7970,29 @@ def retry_registration(args: argparse.Namespace) -> int:
         state,
         state_repository=STATE_REPO,
     )
+    attempt = checked.get("registration_attempt")
+    release_identity: dict[str, Any] | None = None
+    if isinstance(attempt, dict):
+        identity = _attempt_identity(attempt)
+        registration_checkpoint.refuse_unresolved_public_identity(checked, identity)
+        public_use = registration_checkpoint.matching_public_use(checked, identity)
+        if attempt.get("schema_version") == 3 and public_use is None:
+            release_identity = identity
+        elif public_use is not None and registration_checkpoint.replacement_is_authorized(public_use):
+            raise ReviewerError(
+                "the reconciled identity is still saved as the active attempt; "
+                "complete reconciliation before retrying"
+            )
+    else:
+        unresolved = [
+            row
+            for row in registration_checkpoint.public_identity_uses(checked)
+            if not registration_checkpoint.replacement_is_authorized(row)
+        ]
+        if unresolved:
+            raise ReviewerError(
+                "the submission has unresolved public identity evidence and cannot be retried"
+            )
 
     # Queue first: if the following conditional state update races, the record
     # remains safely paused. The reverse order could leave eligible work absent
@@ -7392,12 +8010,16 @@ def retry_registration(args: argparse.Namespace) -> int:
             blob_sha=index.get("_blob_sha"),
         )
 
+    if release_identity is not None:
+        checked = _release_unpublished_attempt(checked, release_identity)
+        attempt = None
+
     advance_state(
         checked,
         "review-ready",
         "Registration was queued again by an operator",
         registration_attempts=0,
-        registration_attempt=None,
+        registration_attempt=attempt,
         registration_started_at=None,
         registration_retry_after=None,
         registration_error=None,
@@ -7501,6 +8123,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry_parser.add_argument("--submission", type=str, required=True)
     retry_parser.set_defaults(func=retry_registration)
+    locks_parser = commands.add_parser(
+        "registration-locks",
+        help="list durable registration allocation locks",
+    )
+    locks_parser.add_argument("--json", action="store_true")
+    locks_parser.set_defaults(func=list_registration_locks)
+    resolve_identity_parser = commands.add_parser(
+        "resolve-registration-identity",
+        help="authorize a replacement for one independently verified identity collision",
+    )
+    resolve_identity_parser.add_argument("--submission", type=str, required=True)
+    resolve_identity_parser.add_argument("--identity", type=str, required=True)
+    resolve_identity_parser.add_argument(
+        "--authorize-replacement",
+        action="store_true",
+        required=True,
+        help="confirm that the audited collision may receive a new identifier",
+    )
+    resolve_identity_parser.set_defaults(func=resolve_registration_identity)
     finalize_parser = commands.add_parser(
         "finalize",
         help="verify a merged database PR and close out the private submission record",

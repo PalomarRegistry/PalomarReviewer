@@ -353,5 +353,59 @@ class RegistrationCheckpointRecoveryTests(unittest.TestCase):
                     )
 
 
+class RegistrationIdentityContractTests(unittest.TestCase):
+    def identity(self, identifier="PALOMAR-2026-08-23-000001"):
+        return {
+            "id": identifier,
+            "version": 1,
+            "first_registered_on": identifier[8:18],
+            "registered_at": f"{identifier[8:18]}T12:00:00Z",
+            "review_sha256": "1" * 64,
+            "source_repository": "example/project",
+            "source_commit": "2" * 40,
+            "existing_id": None,
+        }
+
+    def test_a_day_lock_carries_the_complete_identity_binding(self):
+        identity = self.identity()
+        lock = checkpoint.lock_document(
+            identity=identity,
+            submission_id="a1b2c3d4e5f6",
+            database_base="3" * 40,
+            acquired_at="2026-08-23T12:00:01Z",
+            status="held",
+            updated_at="2026-08-23T12:00:02Z",
+        )
+        path = "index/registration-locks/day-2026-08-23.json"
+        self.assertIs(checkpoint.validate_lock(lock, path=path), lock)
+        self.assertEqual(lock["holder"]["identity"], identity)
+
+    def test_a_different_public_identity_requires_explicit_collision_resolution(self):
+        old_identity = self.identity("PALOMAR-2026-08-23-000001")
+        new_identity = self.identity("PALOMAR-2026-08-24-000001")
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "public_identity_uses": [
+                {
+                    "schema_version": 1,
+                    "identity": old_identity,
+                    "phase": "conflicted",
+                    "basis": "archive-audit",
+                    "recorded_at": "2026-08-23T12:00:00Z",
+                    "updated_at": "2026-08-23T12:00:00Z",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ReviewerError, "explicit operator reconciliation"):
+            checkpoint.refuse_unresolved_public_identity(state, new_identity)
+        state["public_identity_uses"][0]["resolution"] = {
+            "schema_version": 1,
+            "action": "authorize-replacement",
+            "reason": "identifier-assigned-to-another-submission",
+            "resolved_at": "2026-08-23T12:01:00Z",
+        }
+        checkpoint.refuse_unresolved_public_identity(state, new_identity)
+
+
 if __name__ == "__main__":
     unittest.main()

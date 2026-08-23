@@ -724,6 +724,47 @@ def registration_identity(
     return identifier, first_registered_on, registered_at, 1
 
 
+def reservation_superseded(
+    database: Path,
+    reserved: tuple[str, str, str, int],
+    *,
+    existing_id: object,
+    git_env: dict[str, str] | None = None,
+) -> bool:
+    """Whether a saved first-version reservation can never become a registration.
+
+    A reserved serial is usable only while it is still the next one for its day.
+    A registration that failed and was retried after another result registered in
+    the meantime holds an identifier that will never be allocatable again.
+
+    Only a serial at or behind the counter has been overtaken. One ahead of it
+    means the day projection has gone backwards, which is not a stale
+    reservation but a registry that disagrees with itself, so it is raised
+    rather than quietly resolved by allocating something else.
+
+    An update to an existing result is never superseded: its identifier comes
+    from the result it updates rather than from a day counter, so no other
+    registration can take it.
+    """
+    if existing_id:
+        return False
+    identifier, first_registered_on, _reserved_instant, version = reserved
+    if version != 1:
+        return False
+    match = PALOMAR_ID_RE.fullmatch(identifier)
+    if match is None:
+        return False
+    counter = load_day(database, first_registered_on, git_env=git_env)
+    last_serial = int(counter["last_serial"]) if counter is not None else 0
+    serial = int(match.group("serial"))
+    if serial > last_serial + 1:
+        raise ReviewerError(
+            f"saved registration attempt {identifier} is ahead of the last serial "
+            f"recorded for {first_registered_on}"
+        )
+    return serial <= last_serial
+
+
 def projection_changes(
     database: Path,
     *,
