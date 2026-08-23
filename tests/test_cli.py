@@ -1783,10 +1783,28 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             )
 
     def test_authors(self):
-        data = {"project": {"authors": ["Ada", {"name": "Emmy", "github": "@emmy"}]}}
+        data = {
+            "project": {
+                "authors": [
+                    "Ada",
+                    {
+                        "name": "Emmy",
+                        "github": "@emmy",
+                        "orcid": "https://orcid.org/0000-0002-0201-310X",
+                    },
+                ]
+            }
+        }
         self.assertEqual(
             authors_from_metadata(data, "fallback"),
-            [{"name": "Ada"}, {"name": "Emmy", "github": "emmy"}],
+            [
+                {"name": "Ada"},
+                {
+                    "name": "Emmy",
+                    "github": "emmy",
+                    "orcid": "0000-0002-0201-310X",
+                },
+            ],
         )
 
     def test_formalization_metadata_rejects_ambiguous_yaml(self):

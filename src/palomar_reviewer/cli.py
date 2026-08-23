@@ -168,6 +168,9 @@ PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<se
 # The shape the database's schema gives an instant, which is what `utc_now`
 # emits and what a record's `registered_at` has to be.
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+ORCID_URL_RE = re.compile(
+    r"https://orcid\.org/(?P<identifier>[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9X]{4})/?\Z"
+)
 MAX_CONTEXT_BYTES = 300_000
 CURRENT_RUBRIC_VERSION = 10
 SUPPORTED_RUBRIC_VERSIONS = (7, 8, 9, CURRENT_RUBRIC_VERSION)
@@ -4743,7 +4746,13 @@ def authors_from_metadata(
                 if github:
                     item["github"] = str(github).removeprefix("@")
                 if orcid:
-                    item["orcid"] = str(orcid)
+                    identifier = str(orcid).strip()
+                    url_match = ORCID_URL_RE.fullmatch(identifier)
+                    item["orcid"] = (
+                        url_match.group("identifier")
+                        if url_match is not None
+                        else identifier
+                    )
                 result.append(item)
     if not result:
         raise ReviewerError(
