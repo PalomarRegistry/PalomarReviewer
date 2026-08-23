@@ -1876,8 +1876,8 @@ def renderability_receipt(
         "schema_version": 1,
         "source_repository": mechanical["source"]["repository"],
         "source_commit": mechanical["source"]["commit"],
-        "challenge_sha256": mechanical["challenge"]["sha256"],
-        "comparator_sha256": mechanical["comparator"]["sha256"],
+        "challenge_source_sha256": mechanical["challenge"]["sha256"],
+        "comparator_config_sha256": mechanical["comparator"]["sha256"],
         "declarations_sha256": declaration_digest,
         "artifact_tree_sha256": report["artifact_tree_sha256"],
         "verso_commit": report["verso_commit"],
@@ -1897,8 +1897,8 @@ def validate_renderability_receipt(
     if not isinstance(value, dict):
         raise ReviewerError("saved renderability receipt must be an object")
     expected = {
-        "schema_version", "source_repository", "source_commit", "challenge_sha256",
-        "comparator_sha256", "declarations_sha256", "artifact_tree_sha256",
+        "schema_version", "source_repository", "source_commit", "challenge_source_sha256",
+        "comparator_config_sha256", "declarations_sha256", "artifact_tree_sha256",
         "verso_commit", "renderer_commit", "landrun_commit", "rendered_at",
         "workflow_url",
     }
@@ -1916,7 +1916,7 @@ def validate_renderability_receipt(
         mechanical,
     )
     for field in (
-        "challenge_sha256", "comparator_sha256", "declarations_sha256",
+        "challenge_source_sha256", "comparator_config_sha256", "declarations_sha256",
         "artifact_tree_sha256",
     ):
         if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
@@ -1981,8 +1981,15 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
     if not (bundle / report["entrypoint"]).is_file():
         raise ReviewerError("render result entrypoint is missing")
     rendered_at = report.get("rendered_at")
-    if not isinstance(rendered_at, str):
-        raise ReviewerError("render result has no rendered_at timestamp")
+    if not isinstance(rendered_at, str) or not TIMESTAMP_RE.fullmatch(rendered_at):
+        raise ReviewerError("render result has no valid rendered_at timestamp")
+    workflow_url = report.get("workflow_url")
+    if not isinstance(workflow_url, str) or not re.fullmatch(
+        rf"https://github\.com/{re.escape(mechanical_evidence.SUBMISSION_REPO)}"
+        r"/actions/runs/[1-9][0-9]*",
+        workflow_url,
+    ):
+        raise ReviewerError("render result has no valid PalomarSubmission workflow URL")
     return report, bundle
 
 
@@ -2101,8 +2108,13 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
                     diagnostics = []
                 submitter_diagnostics = [
                     item for item in diagnostics if item["owner"] == "submitter"
-                ]
+                ][:MAX_FAILURE_DIAGNOSTICS]
                 if submitter_diagnostics:
+                    message = (
+                        "Challenge rendering found repository changes that are required: "
+                        + "; ".join(item["summary"] for item in submitter_diagnostics)
+                        + f" ({run_data['url']})"
+                    )
                     raise SubmitterRenderabilityError(
                         message,
                         diagnostics=submitter_diagnostics,
@@ -2148,10 +2160,22 @@ def ensure_challenge_renderable(
     """Require render anchors before review and retain the validated bundle."""
     cached = work / "render-result"
     if cached.is_dir():
-        return validate_render_result(cached, mechanical)
+        try:
+            return validate_render_result(cached, mechanical)
+        except ReviewerError:
+            shutil.rmtree(cached)
+    elif cached.exists() or cached.is_symlink():
+        cached.unlink()
     candidate = request_render(work, mechanical)
     report, bundle = validate_render_result(candidate, mechanical)
-    shutil.copytree(bundle.parent, cached)
+    temporary = work / "render-result.tmp"
+    if temporary.exists() or temporary.is_symlink():
+        if temporary.is_dir() and not temporary.is_symlink():
+            shutil.rmtree(temporary)
+        else:
+            temporary.unlink()
+    shutil.copytree(bundle.parent, temporary)
+    os.replace(temporary, cached)
     cached_report, cached_bundle = validate_render_result(cached, mechanical)
     if cached_report != report:
         raise ReviewerError("cached render receipt changed while it was copied")
@@ -2951,6 +2975,19 @@ def advance_state(
 # when they start, not when they fail, so a runner that dies without recording
 # anything is counted too.
 REVIEW_ATTEMPT_LIMIT = 3
+RENDERABILITY_ATTEMPT_LIMIT = 3
+
+
+def begin_renderability_check(state: dict[str, Any]) -> dict[str, Any]:
+    """Durably count the pre-review gate without spending a model attempt."""
+    return advance_state(
+        state,
+        "awaiting-review",
+        "Palomar is checking that the Challenge can be rendered",
+        renderability_attempts=int(state.get("renderability_attempts") or 0) + 1,
+        renderability_started_at=utc_now(),
+        renderability_error=None,
+    )
 
 
 def begin_review(state: dict[str, Any]) -> dict[str, Any]:
@@ -2988,6 +3025,8 @@ def record_renderability_failure(
     state: dict[str, Any], error: SubmitterRenderabilityError
 ) -> dict[str, Any]:
     """Settle a source-owned renderability failure before editorial review."""
+    if not 1 <= len(error.diagnostics) <= MAX_FAILURE_DIAGNOSTICS:
+        raise ReviewerError("renderability failure has an invalid diagnostics count")
     failure = {
         "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "mode": "full",
@@ -3102,6 +3141,11 @@ def deliver_review(
     earlier one.
     """
     refuse_engine_credential(review, context="the review being delivered")
+    validated_renderability = None
+    if renderability is not None:
+        if mechanical is None:
+            raise ReviewerError("renderability receipt requires mechanical evidence")
+        validated_renderability = validate_renderability_receipt(renderability, mechanical)
     existing = state_json(f"submissions/{state['id']}/review.json")
     put_state(
         f"submissions/{state['id']}/review.json",
@@ -3130,10 +3174,8 @@ def deliver_review(
         "mathlib_cache_available": cache_available,
         "spend": [*previous, spend] if spend else previous,
     }
-    if renderability is not None:
-        if mechanical is None:
-            raise ReviewerError("renderability receipt requires mechanical evidence")
-        fields["renderability"] = validate_renderability_receipt(renderability, mechanical)
+    if validated_renderability is not None:
+        fields["renderability"] = validated_renderability
     return advance_state(
         state,
         "review-ready",
@@ -4219,8 +4261,6 @@ def run_review(args: argparse.Namespace) -> int:
             root=root,
             policy_ref=stored["policy_commit"],
         )
-        render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
-        receipt = renderability_receipt(render_report, mechanical)
         mechanical_url = (work / "mechanical-report-url").read_text().strip()
         validate_stored_review(
             stored,
@@ -4230,6 +4270,8 @@ def run_review(args: argparse.Namespace) -> int:
             mechanical_url=mechanical_url,
             policy_commit=policy_commit,
         )
+        render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
+        receipt = renderability_receipt(render_report, mechanical)
         # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
@@ -5324,7 +5366,7 @@ def register(args: argparse.Namespace) -> int:
         except SubmitterRenderabilityError as error:
             if prior_renderability is None:
                 raise
-            raise ReviewerError(
+            raise DeterministicRegistrationError(
                 "Palomar previously verified every compared declaration anchor, but the "
                 "current trusted renderer no longer reproduces that result; do not change "
                 "the submitted repository"
@@ -7038,8 +7080,11 @@ def auto(args: argparse.Namespace) -> int:
             unattempted.append(record)
             continue
         print(f"::group::Review {record['id']}", flush=True)
+        gate_complete = False
         try:
+            record = begin_renderability_check(record)
             ensure_review_renderable(record, args)
+            gate_complete = True
             started = time.monotonic()
             begin_review(record)
             for apply_step in (False, True):
@@ -7061,13 +7106,32 @@ def auto(args: argparse.Namespace) -> int:
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
             if fresh is not None:
-                advance_state(
-                    fresh,
-                    "awaiting-review",
-                    "The automated review did not complete; it will be tried again",
-                    review_error=str(error)[:500],
-                    review_retry_after=utc_after(REVIEW_RETRY_BACKOFF_SECONDS),
-                )
+                if gate_complete:
+                    advance_state(
+                        fresh,
+                        "awaiting-review",
+                        "The automated review did not complete; it will be tried again",
+                        review_error=str(error)[:500],
+                        review_retry_after=utc_after(REVIEW_RETRY_BACKOFF_SECONDS),
+                    )
+                else:
+                    attempts = int(fresh.get("renderability_attempts") or 0)
+                    exhausted_gate = attempts >= RENDERABILITY_ATTEMPT_LIMIT
+                    advance_state(
+                        fresh,
+                        "verification-error" if exhausted_gate else "awaiting-review",
+                        (
+                            "Palomar could not complete the Challenge renderability check"
+                            if exhausted_gate
+                            else "The Challenge renderability check will be tried again"
+                        ),
+                        renderability_error=str(error)[:500],
+                        review_retry_after=(
+                            None
+                            if exhausted_gate
+                            else utc_after(REVIEW_RETRY_BACKOFF_SECONDS)
+                        ),
+                    )
         finally:
             print("::endgroup::", flush=True)
 

@@ -3895,6 +3895,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "renderer_commit": "3" * 40,
                 "landrun_commit": "4" * 40,
                 "rendered_at": "2026-07-31T00:00:00Z",
+                "workflow_url": (
+                    "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+                ),
             }
             (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
             mechanical = {
@@ -3924,6 +3927,19 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             validated, validated_bundle = validate_render_result(result, mechanical)
             self.assertEqual(validated["artifact_tree_sha256"], tree_hash)
             self.assertEqual(validated_bundle, bundle)
+
+            report["rendered_at"] = "not-a-timestamp"
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "valid rendered_at"):
+                validate_render_result(result, mechanical)
+            report["rendered_at"] = "2026-07-31T00:00:00Z"
+            report["workflow_url"] = "https://example.test/actions/runs/123"
+            (result / "challenge-render.json").write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "workflow URL"):
+                validate_render_result(result, mechanical)
+            report["workflow_url"] = (
+                "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+            )
 
             nested = self.nested_mechanical_fixture()
             nested["challenge"]["sha256"] = source["challenge_sha256"]
@@ -4116,6 +4132,30 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         changed["comparator"]["definition_names"] = ["Audit.Task.extra"]
         with self.assertRaisesRegex(ReviewerError, "does not match"):
             cli.validate_renderability_receipt(receipt, changed)
+
+    def test_invalid_renderability_receipt_is_rejected_before_review_write(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {
+            "artifact_tree_sha256": "1" * 64,
+            "verso_commit": "2" * 40,
+            "renderer_commit": "3" * 40,
+            "landrun_commit": "4" * 40,
+            "rendered_at": "2026-08-23T00:00:00Z",
+            "workflow_url": (
+                "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+            ),
+        }
+        receipt = cli.renderability_receipt(report, mechanical)
+        receipt["artifact_tree_sha256"] = "bad"
+        with mock.patch.object(cli, "put_state") as write:
+            with self.assertRaisesRegex(ReviewerError, "invalid artifact_tree_sha256"):
+                cli.deliver_review(
+                    {"id": "a" * 12, "status": "reviewing", "events": []},
+                    {"schema_version": 3, "outcome": "neutral"},
+                    mechanical=mechanical,
+                    renderability=receipt,
+                )
+        write.assert_not_called()
 
     def test_successful_renderability_check_is_reused_from_the_workspace(self):
         mechanical = self.nested_mechanical_fixture()
@@ -5107,6 +5147,14 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(first["review_attempts"], 1)
         self.assertEqual(second["review_attempts"], 2)
 
+    def test_renderability_attempt_is_counted_without_spending_a_review_attempt(self):
+        with mock.patch.object(cli, "put_state"):
+            updated = cli.begin_renderability_check({
+                "id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": []
+            })
+        self.assertEqual(updated["renderability_attempts"], 1)
+        self.assertNotIn("review_attempts", updated)
+
     def test_a_registration_attempt_is_counted_before_work_starts(self):
         with mock.patch.object(cli, "put_state"):
             first = cli.begin_registration({
@@ -5258,6 +5306,7 @@ class AutomaticLoopTests(unittest.TestCase):
         seen = []
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
             mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
@@ -5286,6 +5335,7 @@ class AutomaticLoopTests(unittest.TestCase):
 
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
             mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
@@ -5464,6 +5514,9 @@ class AutomaticLoopTests(unittest.TestCase):
                         mock.patch.object(cli, "_write_open_index"),
                         mock.patch.object(cli, "submission_state", side_effect=read),
                         mock.patch.object(cli.time, "monotonic", lambda at=clock: at[0]),
+                        mock.patch.object(
+                            cli, "begin_renderability_check", side_effect=lambda r: r
+                        ),
                         mock.patch.object(cli, "ensure_review_renderable"),
                         mock.patch.object(cli, "begin_review") as began,
                         mock.patch.object(cli, "run_review"),
@@ -5540,6 +5593,7 @@ class AutomaticLoopTests(unittest.TestCase):
         with (
             listing,
             state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
             mock.patch.object(cli, "ensure_review_renderable", side_effect=error),
             mock.patch.object(cli, "begin_review") as began,
             mock.patch.object(cli, "run_review") as reviewed,
@@ -5562,6 +5616,7 @@ class AutomaticLoopTests(unittest.TestCase):
         with (
             listing,
             state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
             mock.patch.object(
                 cli, "ensure_review_renderable", side_effect=ReviewerError("renderer unavailable")
             ),
@@ -5573,6 +5628,28 @@ class AutomaticLoopTests(unittest.TestCase):
         began.assert_not_called()
         reviewed.assert_not_called()
         self.assertEqual(retry.call_args.args[1], "awaiting-review")
+
+    def test_repeated_render_infrastructure_failure_becomes_terminal(self):
+        row = self.row(
+            "aaaaaaaaaaaa",
+            status="awaiting-review",
+            renderability_attempts=cli.RENDERABILITY_ATTEMPT_LIMIT,
+        )
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(
+                cli, "ensure_review_renderable", side_effect=ReviewerError("renderer unavailable")
+            ),
+            mock.patch.object(cli, "begin_review") as began,
+            mock.patch.object(cli, "advance_state", return_value=row) as recorded,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        began.assert_not_called()
+        self.assertEqual(recorded.call_args.args[1], "verification-error")
+        self.assertIsNone(recorded.call_args.kwargs["review_retry_after"])
 
     def test_a_failure_after_the_database_pr_exists_stays_on_finalization_recovery(self):
         before = self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True)
@@ -5908,6 +5985,7 @@ class SelfDispatchTests(unittest.TestCase):
         listing, state = self.records(*rows)
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
             mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
@@ -6001,6 +6079,7 @@ class SelfDispatchTests(unittest.TestCase):
         listing, state = self.records(*rows)
         with (
             listing, state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
             mock.patch.object(cli, "ensure_review_renderable"),
             mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
             mock.patch.object(cli, "record_review_duration"),
