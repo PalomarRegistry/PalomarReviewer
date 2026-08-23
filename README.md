@@ -553,10 +553,13 @@ access.
 
 A renderer or infrastructure failure does not change a delivered review's outcome.
 Renderability is checked before model review and again, when necessary, before
-registration reserves the permanent ID and version in private state. A retry
-reuses an identity only after one has actually been reserved and verifies or
-finishes the same archive refs instead of allocating an orphaned second ID.
-The automatic loop records each registration attempt before starting it. A
+registration reserves the permanent ID and version in private state. Allocation
+is serialized by a durable State lock: first versions lock their registration
+day, and updates lock their existing result. The complete identity/evidence
+binding is copied into both the lock and a schema-3 attempt before the lock is
+marked held. A retry recovers those transitions instead of allocating an
+orphaned second ID. Lock contention is a deferral, not a failed attempt, and the
+automatic loop counts an attempt only after allocation succeeds. A
 legacy reviewed submission whose render has a submitter-owned missing-anchor
 diagnostic moves to `verification-failed` without reserving an ID. Other render
 failures with a concrete report pause the registration immediately;
@@ -566,7 +569,15 @@ consented submission behind it. After correcting the cause, an operator uses
 the State workflow's `retry_registration` input, or runs
 `palomar-review retry-registration --submission ID` with explicit State-write
 authority. That command revalidates the repository, commit, write proof,
-delivered review, and existing consent before restoring the queue entry.
+delivered review, and existing consent before restoring the queue entry. It
+releases only a schema-3 reservation that has no durable public-use record;
+legacy or already-public attempts retain their exact identity. Operators can
+inspect active allocations with `palomar-review registration-locks` (or
+`--json`). A collided immutable identity remains quarantined until
+`palomar-review resolve-registration-identity --submission ID --identity
+PALOMAR-ID --authorize-replacement` independently verifies both the Database
+assignment and every audited archive ref. Resolution authorizes a later retry;
+it does not itself enqueue one.
 Full verification also records whether Mathlib's trusted cache client could
 supply the pinned dependency closure. Review delivery copies that typed result
 to private State, so the consent page can warn about a missing cache before the
@@ -584,9 +595,17 @@ creation time retains honest stale-change diagnostics, and a retry of an
 already-recorded checkpoint is idempotent. A new attempt uses an ordinary
 branch push and never force-replaces remote work; a branch that appears after
 preflight is recovered on the next pass.
-If another same-day registration merges first, the contiguous day counter
-invalidates the saved serial and the attempt needs operator coordination; it
-is never silently reallocated under a second identity.
+Before an identity appears publicly, registration builds the archive receipt,
+record, render bundle, evidence bundle, projections, and committed Database
+change and runs the Database validator locally. State then records
+`publication-started`; only after that write do immutable archive refs become
+visible, and their exact verified receipt is immediately recorded as
+`published`. Finalization advances that row to `registered` before releasing
+the allocation. An interrupted pass can therefore distinguish an unused
+reservation from an identity that must never be replaced automatically. If a
+legacy or public reservation has been overtaken by the day counter, it remains
+paused for operator reconciliation; only an unpublished schema-3 reservation
+can be safely released and reallocated.
 Rerun `register`, or pass a previously downloaded trusted result with
 `--render-result PATH`.
 

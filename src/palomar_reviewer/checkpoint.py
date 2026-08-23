@@ -45,7 +45,7 @@ def saved_identity(
         not isinstance(attempt, dict)
         or bool(set(attempt) - keys)
         or type(attempt.get("schema_version")) is not int
-        or attempt["schema_version"] != 2
+        or attempt["schema_version"] not in {2, 3}
     ):
         raise ReviewerError("saved registration attempt is malformed")
     bindings = {
@@ -79,6 +79,155 @@ def saved_identity(
     ):
         raise ReviewerError("saved registration attempt has an invalid permanent identity")
     return identifier, first_registered_on, registered_at, version
+
+
+IDENTITY_FIELDS = (
+    "id", "version", "first_registered_on", "registered_at", "review_sha256",
+    "source_repository", "source_commit", "existing_id",
+)
+PUBLIC_IDENTITY_PHASES = {
+    "publication-started", "published", "registered", "conflicted", "released-unused"
+}
+LOCK_STATUSES = {"acquiring", "held", "releasing"}
+
+
+def identity_document(attempt: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact identity/evidence binding shared by attempts and locks."""
+    if not isinstance(attempt, dict) or any(field not in attempt for field in IDENTITY_FIELDS):
+        raise ReviewerError("registration attempt has no complete identity binding")
+    return {field: attempt[field] for field in IDENTITY_FIELDS}
+
+
+def identity_key(identity: dict[str, Any]) -> tuple[object, object]:
+    return identity.get("id"), identity.get("version")
+
+
+def public_identity_uses(state: dict[str, Any]) -> list[dict[str, Any]]:
+    value = state.get("public_identity_uses")
+    if value is None:
+        return []
+    if not isinstance(value, list) or not 1 <= len(value) <= 20:
+        raise ReviewerError("saved public identity uses are malformed")
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[object, object]] = set()
+    for row in value:
+        identity = row.get("identity") if isinstance(row, dict) else None
+        if (
+            not isinstance(row, dict)
+            or row.get("schema_version") != 1
+            or row.get("phase") not in PUBLIC_IDENTITY_PHASES
+            or row.get("basis") not in {"prospective", "archive-audit"}
+            or not isinstance(identity, dict)
+            or set(identity) != set(IDENTITY_FIELDS)
+        ):
+            raise ReviewerError("saved public identity uses are malformed")
+        key = identity_key(identity)
+        if key in seen:
+            raise ReviewerError("saved public identity uses repeat an identity")
+        seen.add(key)
+        rows.append(row)
+    return rows
+
+
+def matching_public_use(
+    state: dict[str, Any], identity: dict[str, Any]
+) -> dict[str, Any] | None:
+    key = identity_key(identity)
+    return next(
+        (row for row in public_identity_uses(state) if identity_key(row["identity"]) == key),
+        None,
+    )
+
+
+def replacement_is_authorized(row: dict[str, Any]) -> bool:
+    resolution = row.get("resolution")
+    return bool(
+        row.get("phase") == "conflicted"
+        and isinstance(resolution, dict)
+        and resolution.get("schema_version") == 1
+        and resolution.get("action") == "authorize-replacement"
+        and resolution.get("reason") == "identifier-assigned-to-another-submission"
+    )
+
+
+def refuse_unresolved_public_identity(state: dict[str, Any], identity: dict[str, Any]) -> None:
+    """Forbid a second public identity unless every older collision was resolved."""
+    key = identity_key(identity)
+    for row in public_identity_uses(state):
+        if identity_key(row["identity"]) == key:
+            if row["identity"] != identity:
+                raise ReviewerError("saved public identity use disagrees with its attempt binding")
+            continue
+        if not replacement_is_authorized(row):
+            raise ReviewerError(
+                f"{state.get('id')} already exposed {row['identity'].get('id')}; "
+                "a different identity requires explicit operator reconciliation"
+            )
+
+
+def lock_scope(identity: dict[str, Any]) -> dict[str, str]:
+    existing_id = identity.get("existing_id")
+    if existing_id is None:
+        return {"kind": "day", "value": str(identity["first_registered_on"])}
+    return {"kind": "result", "value": str(existing_id)}
+
+
+def lock_path(scope: dict[str, str]) -> str:
+    kind, value = scope.get("kind"), scope.get("value")
+    if kind == "day" and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", str(value)):
+        return f"index/registration-locks/day-{value}.json"
+    if kind == "result" and registration_authority.PALOMAR_ID_RE.fullmatch(str(value)):
+        return f"index/registration-locks/result-{value}.json"
+    raise ReviewerError("registration lock scope is malformed")
+
+
+def validate_lock(value: Any, *, path: str | None = None) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ReviewerError("registration lock is malformed")
+    scope = value.get("scope")
+    expected_path = lock_path(scope) if isinstance(scope, dict) else None
+    if path is not None and expected_path != path:
+        raise ReviewerError("registration lock path disagrees with its scope")
+    holder = value.get("holder")
+    if holder is not None:
+        identity = holder.get("identity") if isinstance(holder, dict) else None
+        if (
+            not isinstance(holder, dict)
+            or holder.get("status") not in LOCK_STATUSES
+            or not isinstance(holder.get("submission_id"), str)
+            or not isinstance(holder.get("database_base"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", holder["database_base"]) is None
+            or not isinstance(identity, dict)
+            or set(identity) != set(IDENTITY_FIELDS)
+            or lock_scope(identity) != scope
+        ):
+            raise ReviewerError("registration lock holder is malformed")
+    return value
+
+
+def lock_document(
+    *,
+    identity: dict[str, Any],
+    submission_id: str,
+    database_base: str,
+    acquired_at: str,
+    status: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    if status not in LOCK_STATUSES:
+        raise ReviewerError("registration lock status is malformed")
+    return {
+        "schema_version": 1,
+        "scope": lock_scope(identity),
+        "holder": {
+            "submission_id": submission_id,
+            "identity": identity,
+            "database_base": database_base,
+            "acquired_at": acquired_at,
+            "status": status,
+        },
+        "updated_at": updated_at,
+    }
 
 
 def branch(submission_id: str, version: int) -> str:

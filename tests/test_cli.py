@@ -1174,6 +1174,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             )
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
+                mock.patch.object(cli, "state_json", return_value=None),
                 mock.patch.object(cli, "put_state") as write,
             ):
                 identity = registration_attempt_identity(
@@ -1188,7 +1189,13 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 identity,
                 ("PALOMAR-2026-08-11-000001", "2026-08-11", "2026-08-11T09:30:00Z", 1),
             )
-            saved = write.call_args.args[1]
+            saved_call = next(
+                call
+                for call in write.call_args_list
+                if call.args[0] == "submissions/a1b2c3d4e5f6/state.json"
+            )
+            saved = saved_call.args[1]
+            self.assertEqual(saved["registration_attempt"]["schema_version"], 3)
             self.assertEqual(saved["registration_attempt"]["id"], identity[0])
             # The instant is reserved with the identity, because it is what a
             # retry has to reuse and what the record is dated by.
@@ -1199,13 +1206,17 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 saved["registration_attempt"]["review_sha256"],
                 registration_authorization.document_digest(review),
             )
-            self.assertEqual(write.call_args.kwargs["blob_sha"], "state-blob")
+            self.assertEqual(saved_call.kwargs["blob_sha"], "state-blob")
 
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:31:00Z"),
                 mock.patch.object(
                     registration_authority, "allocate_identifier"
                 ) as allocate_again,
+                mock.patch.object(
+                    cli, "_acquire_registration_lock", return_value=("lock.json", {})
+                ),
+                mock.patch.object(cli, "_hold_registration_lock"),
                 mock.patch.object(cli, "put_state") as write_again,
             ):
                 retried = registration_attempt_identity(
@@ -1282,6 +1293,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             )
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-11T23:59:00Z"),
+                mock.patch.object(cli, "state_json", return_value=None),
                 mock.patch.object(cli, "put_state") as write,
             ):
                 reserved = registration_attempt_identity(
@@ -1295,10 +1307,18 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 reserved,
                 ("PALOMAR-2026-08-11-000001", "2026-08-11", "2026-08-11T23:59:00Z", 1),
             )
-            attempt = write.call_args.args[1]["registration_attempt"]
+            attempt = next(
+                call.args[1]["registration_attempt"]
+                for call in write.call_args_list
+                if call.args[0] == "submissions/a1b2c3d4e5f6/state.json"
+            )
 
             with (
                 mock.patch.object(cli, "utc_now", return_value="2026-08-12T00:01:00Z") as tomorrow,
+                mock.patch.object(
+                    cli, "_acquire_registration_lock", return_value=("lock.json", {})
+                ),
+                mock.patch.object(cli, "_hold_registration_lock"),
                 mock.patch.object(cli, "put_state") as write_again,
             ):
                 retried = registration_attempt_identity(
@@ -4229,6 +4249,169 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class RegistrationPublicationTests(unittest.TestCase):
+    def identity(self):
+        return {
+            "id": "PALOMAR-2026-08-23-000001",
+            "version": 1,
+            "first_registered_on": "2026-08-23",
+            "registered_at": "2026-08-23T12:00:00Z",
+            "review_sha256": registration_authorization.document_digest(self.review()),
+            "source_repository": "example/project",
+            "source_commit": "2" * 40,
+            "existing_id": None,
+        }
+
+    def review(self):
+        return {
+            "submission_id": "a1b2c3d4e5f6",
+            "source": {"repository": "example/project", "commit": "2" * 40},
+        }
+
+    def state(self):
+        identity = self.identity()
+        return {
+            "id": "a1b2c3d4e5f6",
+            "_blob_sha": "state-before",
+            "registration_attempt": {"schema_version": 3, **identity},
+        }
+
+    def lock(self):
+        return registration_checkpoint.lock_document(
+            identity=self.identity(),
+            submission_id="a1b2c3d4e5f6",
+            database_base="3" * 40,
+            acquired_at="2026-08-23T12:00:00Z",
+            status="held",
+            updated_at="2026-08-23T12:00:00Z",
+        )
+
+    def test_publication_is_recorded_before_and_after_archive_visibility(self):
+        state = self.state()
+        review = self.review()
+        mechanical = {"source": {"repository": "example/project", "commit": "2" * 40}}
+        with (
+            mock.patch.object(
+                cli.registration_authorization,
+                "validate_registration_checkpoint",
+                return_value=state,
+            ),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "state_json", return_value=self.lock()),
+            mock.patch.object(cli, "utc_now", return_value="2026-08-23T12:01:00Z"),
+            mock.patch.object(cli, "put_state", return_value="state-started"),
+        ):
+            started = cli._record_public_identity_start(
+                submission_id=state["id"],
+                review=review,
+                mechanical=mechanical,
+                identity=self.identity(),
+            )
+        row = started["public_identity_uses"][0]
+        self.assertEqual(row["phase"], "publication-started")
+        self.assertNotIn("archive", row)
+
+        preservation = {
+            "receipt_sha256": "4" * 64,
+            "repositories": [
+                {
+                    "source_repository": "example/project",
+                    "commit": "2" * 40,
+                    "fork_repository": "PalomarArchive/example-project",
+                    "ref": "refs/tags/palomar/PALOMAR-2026-08-23-000001-v1/" + "2" * 40,
+                }
+            ],
+        }
+        with (
+            mock.patch.object(cli, "submission_state", return_value=started),
+            mock.patch.object(cli, "state_json", return_value=self.lock()),
+            mock.patch.object(cli, "utc_now", return_value="2026-08-23T12:02:00Z"),
+            mock.patch.object(cli, "put_state", return_value="state-published"),
+        ):
+            published = cli._record_public_identity_published(
+                submission_id=state["id"],
+                identity=self.identity(),
+                preservation=preservation,
+            )
+        row = published["public_identity_uses"][0]
+        self.assertEqual(row["phase"], "published")
+        self.assertEqual(row["archive"]["receipt_sha256"], "4" * 64)
+
+    def test_a_lock_held_by_another_submission_defers_without_writing(self):
+        lock = self.lock()
+        lock["holder"]["submission_id"] = "b2c3d4e5f6a1"
+        with (
+            mock.patch.object(cli, "state_json", return_value=lock),
+            mock.patch.object(cli, "put_state") as write,
+            self.assertRaisesRegex(cli.RegistrationDeferred, "held by b2c3d4e5f6a1"),
+        ):
+            cli._acquire_registration_lock(
+                state=self.state(),
+                identity=self.identity(),
+                database_base="3" * 40,
+            )
+        write.assert_not_called()
+
+    def test_operator_replacement_requires_database_and_live_archive_proof(self):
+        state = self.state()
+        identity = self.identity()
+        repository = {
+            "source_repository": "example/project",
+            "commit": identity["source_commit"],
+            "fork_repository": "PalomarArchive/example-project",
+            "ref": "refs/tags/palomar/PALOMAR-2026-08-23-000001-v1/" + "2" * 40,
+        }
+        state.update(
+            {
+                "status": "registration-paused",
+                "public_identity_uses": [
+                    {
+                        "schema_version": 1,
+                        "identity": identity,
+                        "phase": "conflicted",
+                        "basis": "archive-audit",
+                        "recorded_at": "2026-08-23T12:00:00Z",
+                        "updated_at": "2026-08-23T12:00:00Z",
+                        "archive": {"receipt_sha256": None, "repositories": [repository]},
+                    }
+                ],
+            }
+        )
+
+        def github(arguments):
+            endpoint = arguments[-1]
+            if "PalomarDatabase/contents/entries/" in endpoint:
+                return json.dumps(
+                    {
+                        "id": identity["id"],
+                        "version": 1,
+                        "submission": {"submission_id": "b2c3d4e5f6a1"},
+                    }
+                )
+            return json.dumps({"object": {"sha": identity["source_commit"]}})
+
+        with (
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(cli, "gh", side_effect=github),
+            mock.patch.object(cli, "state_json", return_value=None),
+            mock.patch.object(cli, "utc_now", return_value="2026-08-24T12:03:00Z"),
+            mock.patch.object(cli, "advance_state", return_value=state) as advance,
+        ):
+            self.assertEqual(
+                cli.resolve_registration_identity(
+                    SimpleNamespace(
+                        submission=state["id"],
+                        identity=identity["id"],
+                        authorize_replacement=True,
+                    )
+                ),
+                0,
+            )
+        resolved = advance.call_args.kwargs["public_identity_uses"][0]
+        self.assertEqual(resolved["resolution"]["action"], "authorize-replacement")
+        self.assertIsNone(advance.call_args.kwargs["registration_attempt"])
+
+
 class IdentifierAllocationTests(unittest.TestCase):
     """Identifiers sort in registration order, with no ordinal to disagree."""
 
@@ -4429,6 +4612,36 @@ class PublicationIdentityTests(unittest.TestCase):
         database = self.database(earlier_today)
         identifier, _, _, _ = self.resolve(database, submission="b2c3d4e5f6a1")
         self.assertEqual(identifier, "PALOMAR-2026-08-11-000043")
+
+    def test_a_reserved_serial_is_superseded_only_after_the_day_counter_passes_it(self):
+        earlier_today = self.prior(identifier="PALOMAR-2026-08-11-000042")
+        earlier_today["first_registered_on"] = "2026-08-11"
+        earlier_today["formalization"]["comparator_config_path"] = "earlier.json"
+        database = self.database(earlier_today)
+        self.assertTrue(
+            registration_authority.reservation_superseded(
+                database,
+                (
+                    "PALOMAR-2026-08-11-000042",
+                    "2026-08-11",
+                    "2026-08-11T13:00:00Z",
+                    1,
+                ),
+                existing_id=None,
+            )
+        )
+        self.assertFalse(
+            registration_authority.reservation_superseded(
+                database,
+                (
+                    "PALOMAR-2026-08-11-000043",
+                    "2026-08-11",
+                    "2026-08-11T13:00:00Z",
+                    1,
+                ),
+                existing_id=None,
+            )
+        )
 
     def test_holding_consent_back_does_not_buy_an_earlier_identifier(self):
         """The date is when the result entered the registry, not when it was reviewed.
@@ -5280,7 +5493,7 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertIsNotNone(retrying["registration_retry_after"])
         self.assertEqual(paused["status"], "registration-paused")
 
-    def test_operator_retry_requeues_before_unpausing_and_clears_attempt_state(self):
+    def test_operator_retry_requeues_before_unpausing_and_retains_legacy_attempt(self):
         submission_id = "a1b2c3d4e5f6"
         state = {
             "id": submission_id,
@@ -5289,8 +5502,15 @@ class AutomaticLoopTests(unittest.TestCase):
             "_blob_sha": "state-sha",
             "registration_attempts": 3,
             "registration_attempt": {
+                "schema_version": 2,
                 "id": "PALOMAR-2026-08-08-000001",
                 "version": 1,
+                "first_registered_on": "2026-08-08",
+                "registered_at": "2026-08-08T12:00:00Z",
+                "review_sha256": "1" * 64,
+                "source_repository": "example/project",
+                "source_commit": "2" * 40,
+                "existing_id": None,
             },
             "registration_error": "old failure",
             "registration_failure": {"detail": "old failure"},
@@ -5316,7 +5536,7 @@ class AutomaticLoopTests(unittest.TestCase):
         updated = write.call_args_list[1].args[1]
         self.assertEqual(updated["status"], "review-ready")
         self.assertEqual(updated["registration_attempts"], 0)
-        self.assertIsNone(updated["registration_attempt"])
+        self.assertEqual(updated["registration_attempt"], state["registration_attempt"])
         self.assertIsNone(updated["registration_failure"])
         self.assertIsNone(updated["registration_error"])
 
@@ -5605,6 +5825,48 @@ class AutomaticLoopTests(unittest.TestCase):
         ):
             cli.auto(self.opts())
         self.assertEqual(registered.call_count, 1)
+
+    def test_lock_contention_defers_without_counting_or_recording_a_failure(self):
+        row = self.row(
+            "aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+            registration_attempts=1,
+        )
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(
+                cli, "register", side_effect=cli.RegistrationDeferred("day is held")
+            ),
+            mock.patch.object(cli, "begin_registration") as began,
+            mock.patch.object(cli, "record_registration_failure") as failed,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 0)
+        began.assert_not_called()
+        failed.assert_not_called()
+        self.assertEqual(row["registration_attempts"], 1)
+
+    def test_a_queued_lock_owner_is_prioritized_over_an_unallocated_peer(self):
+        first = self.row(
+            "aaaaaaaaaaaa", status="review-ready", registration_consent=True,
+        )
+        owner = self.row(
+            "bbbbbbbbbbbb",
+            status="review-ready",
+            registration_consent=True,
+            registration_attempt={"schema_version": 3},
+        )
+        listing, state = self.records(first, owner)
+        with (
+            listing,
+            state,
+            mock.patch.object(
+                cli, "_registration_owns_lock", side_effect=lambda row: row is owner
+            ),
+            mock.patch.object(cli, "register", return_value=0) as registered,
+        ):
+            cli.auto(self.opts())
+        self.assertEqual(registered.call_args.args[0].submission, owner["id"])
 
     def test_a_registration_in_backoff_does_not_block_the_next_one(self):
         cooling = self.row(
@@ -7258,7 +7520,23 @@ class VocabularyTests(unittest.TestCase):
                 set(re.findall(r"\b\w*[Pp]ublish\w*|\b\w*[Pp]ublicat\w*", source))
             ):
                 stray.append(f"{path.relative_to(package)}:{word}")
-        self.assertEqual(stray, [], f"production package still says {', '.join(stray)}")
+        identity_contract_terms = {
+            "checkpoint.py:publication",
+            "checkpoint.py:published",
+            "cli.py:_record_public_identity_published",
+            "cli.py:_release_unpublished_attempt",
+            "cli.py:publication",
+            "cli.py:publish",
+            "cli.py:publish_preservation",
+            "cli.py:publishable",
+            "cli.py:published",
+            "cli.py:unpublished",
+        }
+        self.assertEqual(
+            set(stray),
+            identity_contract_terms,
+            f"production package has unexpected publication vocabulary: {', '.join(stray)}",
+        )
 
     def test_public_ci_fetches_only_the_current_record_schema(self):
         workflow = (
