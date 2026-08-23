@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "snapshot_end": "2026-08-20",
+  "prepared_at": "2026-08-21",
+  "corpus": {
+    "retained_review_artifacts": 141,
+    "distinct_raw_model_attempts": 71,
+    "complete_valid_reviews": 67,
+    "valid_reviews_per_raw_attempt": 0.9437,
+    "reviewer_workflow_runs": {
+      "total": 233,
+      "success": 172,
+      "failure": 34,
+      "cancelled": 27
+    },
+    "literature_passes": {
+      "total": 67,
+      "qualified_trust": 67,
+      "dns_retrieval_failure": 40,
+      "no_external_attempt_recorded": 27,
+      "score_four": 56
+    }
+  },
+  "blind_replay": {
+    "case_count": 5,
+    "real_maintainer_authorized": true,
+    "technical_tests_and_probes_excluded": true,
+    "blind_outputs_sealed_before_comparison": true,
+    "routed_through_deployed_broker": false,
+    "production": {
+      "model": "gpt-5.6-sol",
+      "adverse_outcomes": 2,
+      "non_adverse_outcomes": 3
+    },
+    "terra": {
+      "model": "gpt-5.6-terra",
+      "outcome_agreement_with_production": 2,
+      "adverse_outcomes": 1,
+      "non_adverse_outcomes": 4
+    },
+    "luna": {
+      "model": "gpt-5.6-luna",
+      "outcome_agreement_with_production": 3,
+      "adverse_outcomes": 0,
+      "non_adverse_outcomes": 5
+    },
+    "ground_truth_caveat": "Production outcomes were independently adjudicated and were not treated as ground truth."
+  },
+  "recommendation": {
+    "primary_reviewer": "gpt-5.6-sol",
+    "replace_with_terra_or_luna": false,
+    "next_evaluation": "Use a lower-tier model to adversarially verify each proposed material finding, with human escalation for contradicted or unresolved findings."
+  },
+  "privacy": {
+    "case_aliases_only": true,
+    "entry_identifiers_included": false,
+    "withdrawn_entry_linkage_included": false,
+    "raw_evidence_included": false
+  }
+}
