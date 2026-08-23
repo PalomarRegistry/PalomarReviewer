@@ -79,6 +79,7 @@ REGISTRATION_STALE_SECONDS = 6 * 3600
 # here would remain the real rendering ceiling no matter what the child says.
 RENDER_WAIT_SECONDS = 6 * 60 * 60
 PASS_BUDGET_SECONDS = RENDER_WAIT_SECONDS
+REVIEW_RESERVE_SECONDS = 90 * 60
 # The queue, kept as an index rather than rediscovered from scratch.
 #
 # A pass used to list every directory under `submissions/` and read every record
@@ -1993,7 +1994,9 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
     return report, bundle
 
 
-def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
+def request_render(
+    work: Path, mechanical: dict[str, Any], *, wait_seconds: int = RENDER_WAIT_SECONDS
+) -> Path:
     request_id = uuid.uuid4().hex
     challenge = mechanical["challenge"]
     dispatch = [
@@ -2072,7 +2075,7 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
             "--exit-status",
         ],
         check=False,
-        timeout=RENDER_WAIT_SECONDS,
+        timeout=wait_seconds,
     )
     if watched.returncode:
         failure_report = render_failure_report(work, run_id, request_id)
@@ -2159,7 +2162,10 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
 
 
 def ensure_challenge_renderable(
-    work: Path, mechanical: dict[str, Any]
+    work: Path,
+    mechanical: dict[str, Any],
+    *,
+    wait_seconds: int = RENDER_WAIT_SECONDS,
 ) -> tuple[dict[str, Any], Path]:
     """Require render anchors before review and retain the validated bundle."""
     cached = work / "render-result"
@@ -2170,7 +2176,7 @@ def ensure_challenge_renderable(
             shutil.rmtree(cached)
     elif cached.exists() or cached.is_symlink():
         cached.unlink()
-    candidate = request_render(work, mechanical)
+    candidate = request_render(work, mechanical, wait_seconds=wait_seconds)
     report, bundle = validate_render_result(candidate, mechanical)
     temporary = work / "render-result.tmp"
     if temporary.exists() or temporary.is_symlink():
@@ -4434,7 +4440,9 @@ def run_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def ensure_review_renderable(record: dict[str, Any], args: argparse.Namespace) -> None:
+def ensure_review_renderable(
+    record: dict[str, Any], args: argparse.Namespace, *, wait_seconds: int = RENDER_WAIT_SECONDS
+) -> None:
     """Run the renderability gate before a review attempt is durably counted."""
     root = Path(args.work_dir).expanduser().resolve()
     work, _state, mechanical, _policy_commit = prepare_workspace(
@@ -4442,7 +4450,7 @@ def ensure_review_renderable(record: dict[str, Any], args: argparse.Namespace) -
         root=root,
         policy_ref=args.policy_ref,
     )
-    ensure_challenge_renderable(work, mechanical)
+    ensure_challenge_renderable(work, mechanical, wait_seconds=wait_seconds)
 
 
 def metadata_value(data: dict[str, Any], paths: list[tuple[str, ...]]) -> Any:
@@ -5454,8 +5462,10 @@ def register(args: argparse.Namespace) -> int:
     )
     cached_render = work / "render-result"
     if render_bundle.parent != cached_render:
-        if cached_render.exists():
+        if cached_render.is_dir() and not cached_render.is_symlink():
             shutil.rmtree(cached_render)
+        elif cached_render.exists() or cached_render.is_symlink():
+            cached_render.unlink()
         shutil.copytree(render_bundle.parent, cached_render)
         render_bundle = cached_render / "bundle"
     tree_hash = render_report["artifact_tree_sha256"]
@@ -7100,7 +7110,7 @@ def auto(args: argparse.Namespace) -> int:
             print("::endgroup::", flush=True)
 
     for record in to_review[: args.max_reviews]:
-        if pass_remaining() <= 0:
+        if pass_remaining() <= REVIEW_RESERVE_SECONDS:
             # Starting a review here would run past the job's own timeout and
             # be killed part-way, which costs the attempt and tells nobody why.
             print(f"pass budget spent; leaving {record['id']} for a later pass")
@@ -7110,7 +7120,8 @@ def auto(args: argparse.Namespace) -> int:
         gate_complete = False
         try:
             record = begin_renderability_check(record)
-            ensure_review_renderable(record, args)
+            render_wait = max(1, int(pass_remaining() - REVIEW_RESERVE_SECONDS))
+            ensure_review_renderable(record, args, wait_seconds=render_wait)
             gate_complete = True
             if pass_remaining() <= 0:
                 record = advance_state(
@@ -7136,9 +7147,21 @@ def auto(args: argparse.Namespace) -> int:
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
-            if fresh is not None and fresh.get("status") == "awaiting-review":
+            if fresh is not None and fresh.get("status") in {"awaiting-review", "reviewing"}:
                 record_renderability_failure(fresh, error)
                 advanced += 1
+            elif fresh is None:
+                failures += 1
+                print(
+                    f"error: submission state disappeared while settling {record['id']}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"::warning::{record['id']} became {fresh.get('status')}; "
+                    "leaving its newer state unchanged",
+                    file=sys.stderr,
+                )
         except Exception as error:  # one bad submission must not stall the queue
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)

@@ -4626,6 +4626,7 @@ class MechanicalReportContractTests(unittest.TestCase):
             ("challenge", "path"),
             ("solution", "path"),
             ("comparator", "path"),
+            ("comparator", "sha256"),
             ("formalization", "path"),
             ("lakefile",),
             ("lakefile", "path"),
@@ -5571,6 +5572,7 @@ class AutomaticLoopTests(unittest.TestCase):
                         mock.patch.object(cli, "_write_open_index"),
                         mock.patch.object(cli, "submission_state", side_effect=read),
                         mock.patch.object(cli.time, "monotonic", lambda at=clock: at[0]),
+                        mock.patch.object(cli, "REVIEW_RESERVE_SECONDS", 0),
                         mock.patch.object(
                             cli, "begin_renderability_check", side_effect=lambda r: r
                         ),
