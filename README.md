@@ -388,16 +388,26 @@ writes a workspace. A real retry with a saved registration identity first
 rechecks the current private consent and exact delivered-review/source binding,
 then looks for that identity's deterministic Database branch and same-repository
 open PR. An existing change is recovered at that boundary instead of rebuilding
-the workspace or repeating archive and render side effects. It then checks the
+the workspace or repeating archive side effects. It then checks the
 exact reviewed policy and evidence when no recoverable change exists. No
 submission is grandfathered past authorization: every registration requires
 the private record to describe how push access was proved and not merely assert
 that it was, to name no previous registration, to carry the submitter's
 consent, and for the digest delivered, the digest consented to, and the review
-about to be archived to be the same bytes. Only then does it dispatch the
-pinned Challenge renderer, which is a public Actions run naming the repository
-and commit and would otherwise signal a registrable review the submitter never
-agreed to register.
+about to be archived to be the same bytes.
+
+Before any model review, the reviewer dispatches the pinned Challenge renderer
+for the exact mechanically accepted source. Every Comparator-selected
+declaration must have a compiler-backed Verso anchor. A missing anchor becomes
+a structured, submitter-owned verification failure with instructions to name
+the declaration and submit a new commit; no model review is spent. A successful
+bundle is content-addressed, revalidated, and cached in the review workspace.
+Review delivery records a bounded receipt tied to the source commit, Challenge,
+Comparator declarations, renderer, Verso, and artifact tree. Registration
+reuses the bundle when available, or repeats the same fail-closed check before
+reserving an identifier when the workspace did not survive. If a later
+renderer contradicts a stored successful receipt, that is a Palomar failure,
+not a new repository eligibility decision.
 
 The submission server records the proof method and its GitHub repository and
 principal observations. The reviewer requires schema version 1, validates the
@@ -541,12 +551,15 @@ remaining ruleset field on later registrations, while creation verifies the
 complete rule, including its empty bypass list, before dropping administrator
 access.
 
-A renderer or infrastructure failure does not change the review outcome. Before making
-any public archive changes, `register` reserves the permanent ID and version in
-the private submission state. A retry reuses that identity and verifies or
+A renderer or infrastructure failure does not change a delivered review's outcome.
+Renderability is checked before model review and again, when necessary, before
+registration reserves the permanent ID and version in private state. A retry
+reuses an identity only after one has actually been reserved and verifies or
 finishes the same archive refs instead of allocating an orphaned second ID.
 The automatic loop records each registration attempt before starting it. A
-render run with a concrete failure report pauses the registration immediately;
+legacy reviewed submission whose render has a submitter-owned missing-anchor
+diagnostic moves to `verification-failed` without reserving an ID. Other render
+failures with a concrete report pause the registration immediately;
 an unexplained operational failure waits 30 minutes and pauses after three
 attempts. Paused work leaves the automatic queue, so it cannot keep the next
 consented submission behind it. After correcting the cause, an operator uses
