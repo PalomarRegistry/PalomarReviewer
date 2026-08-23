@@ -2101,14 +2101,18 @@ def request_render(work: Path, mechanical: dict[str, Any]) -> Path:
                 and failure_report.get("workflow_url") == run_data.get("url")
                 and failure_report.get("diagnostics_schema_version") == DIAGNOSTICS_SCHEMA_VERSION
             )
-            if trusted_binding and isinstance(raw_diagnostics, list):
+            if (
+                trusted_binding
+                and isinstance(raw_diagnostics, list)
+                and 1 <= len(raw_diagnostics) <= MAX_FAILURE_DIAGNOSTICS
+            ):
                 try:
                     diagnostics = [_bounded_diagnostic(item) for item in raw_diagnostics]
                 except ReviewerError:
                     diagnostics = []
                 submitter_diagnostics = [
                     item for item in diagnostics if item["owner"] == "submitter"
-                ][:MAX_FAILURE_DIAGNOSTICS]
+                ]
                 if submitter_diagnostics:
                     message = (
                         "Challenge rendering found repository changes that are required: "
@@ -2159,7 +2163,7 @@ def ensure_challenge_renderable(
 ) -> tuple[dict[str, Any], Path]:
     """Require render anchors before review and retain the validated bundle."""
     cached = work / "render-result"
-    if cached.is_dir():
+    if cached.is_dir() and not cached.is_symlink():
         try:
             return validate_render_result(cached, mechanical)
         except ReviewerError:
@@ -2180,6 +2184,36 @@ def ensure_challenge_renderable(
     if cached_report != report:
         raise ReviewerError("cached render receipt changed while it was copied")
     return cached_report, cached_bundle
+
+
+def registration_render_result(
+    args: argparse.Namespace,
+    work: Path,
+    mechanical: dict[str, Any],
+    prior_renderability: dict[str, Any] | None,
+) -> tuple[dict[str, Any], Path]:
+    """Select registration render evidence without violating dry-run purity."""
+    if args.render_result:
+        candidate = Path(args.render_result).expanduser().resolve()
+        return validate_render_result(candidate, mechanical)
+    if args.dry_run:
+        cached = work / "render-result"
+        if not cached.is_dir() or cached.is_symlink():
+            raise ReviewerError(
+                "dry-run registration does not dispatch workflows; pass --render-result or "
+                f"reuse {cached}"
+            )
+        return validate_render_result(cached, mechanical)
+    try:
+        return ensure_challenge_renderable(work, mechanical)
+    except SubmitterRenderabilityError as error:
+        if prior_renderability is None:
+            raise
+        raise DeterministicRegistrationError(
+            "Palomar previously verified every compared declaration anchor, but the "
+            "current trusted renderer no longer reproduces that result; do not change "
+            "the submitted repository"
+        ) from error
 
 
 def download_mechanical_artifact(
@@ -2962,12 +2996,14 @@ def advance_state(
         *state.get("events", []),
         {"at": utc_now(), "status": status, "note": note},
     ]
-    put_state(
+    written_sha = put_state(
         f"submissions/{state['id']}/state.json",
         updated,
         f"{note} ({state['id']})",
         blob_sha=state.get("_blob_sha"),
     )
+    if isinstance(written_sha, str) and written_sha:
+        updated["_blob_sha"] = written_sha
     return updated
 
 
@@ -3003,6 +3039,8 @@ def begin_review(state: dict[str, Any]) -> dict[str, Any]:
         "The automated review is running",
         review_started_at=utc_now(),
         review_attempts=int(state.get("review_attempts") or 0) + 1,
+        renderability_attempts=0,
+        renderability_error=None,
     )
 
 
@@ -3045,6 +3083,8 @@ def record_renderability_failure(
         registration_error=None,
         registration_failure=None,
         registration_retry_after=None,
+        registration_consent=False,
+        registration_consent_review_sha256=None,
     )
 
 
@@ -5326,9 +5366,12 @@ def register(args: argparse.Namespace) -> int:
         submission_state(args.submission),
         state_repository=STATE_REPO,
     )
-    prior_renderability = validate_renderability_receipt(
-        state.get("renderability"), mechanical
-    )
+    try:
+        prior_renderability = validate_renderability_receipt(
+            state.get("renderability"), mechanical
+        )
+    except ReviewerError as error:
+        raise DeterministicRegistrationError(str(error)) from error
     source = work / "source"
     formalization_path = mechanical_evidence.source_path(
         source,
@@ -5352,25 +5395,9 @@ def register(args: argparse.Namespace) -> int:
     # preservation begins. New reviews already cached this exact check; this
     # remains the fail-closed boundary for older reviews and for a lost
     # workspace cache.
-    if args.render_result:
-        render_candidate = Path(args.render_result).expanduser().resolve()
-        render_report, render_bundle = validate_render_result(render_candidate, mechanical)
-    elif args.dry_run and not (work / "render-result").is_dir():
-        raise ReviewerError(
-            "dry-run registration does not dispatch workflows; pass --render-result or reuse "
-            f"{work / 'render-result'}"
-        )
-    else:
-        try:
-            render_report, render_bundle = ensure_challenge_renderable(work, mechanical)
-        except SubmitterRenderabilityError as error:
-            if prior_renderability is None:
-                raise
-            raise DeterministicRegistrationError(
-                "Palomar previously verified every compared declaration anchor, but the "
-                "current trusted renderer no longer reproduces that result; do not change "
-                "the submitted repository"
-            ) from error
+    render_report, render_bundle = registration_render_result(
+        args, work, mechanical, prior_renderability
+    )
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     checked_out = clone_at(
@@ -7085,6 +7112,17 @@ def auto(args: argparse.Namespace) -> int:
             record = begin_renderability_check(record)
             ensure_review_renderable(record, args)
             gate_complete = True
+            if pass_remaining() <= 0:
+                record = advance_state(
+                    record,
+                    "awaiting-review",
+                    "The Challenge renderability check passed; review will start next pass",
+                    renderability_attempts=0,
+                    renderability_error=None,
+                )
+                advanced += 1
+                unattempted.append(record)
+                continue
             started = time.monotonic()
             begin_review(record)
             for apply_step in (False, True):
@@ -7098,7 +7136,7 @@ def auto(args: argparse.Namespace) -> int:
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
-            if fresh is not None:
+            if fresh is not None and fresh.get("status") == "awaiting-review":
                 record_renderability_failure(fresh, error)
                 advanced += 1
         except Exception as error:  # one bad submission must not stall the queue
@@ -7167,7 +7205,12 @@ def auto(args: argparse.Namespace) -> int:
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
-            if fresh is not None and not fresh.get("registration_pr"):
+            if (
+                fresh is not None
+                and fresh.get("status") == "review-ready"
+                and fresh.get("registration_consent") is True
+                and not fresh.get("registration_pr")
+            ):
                 record_renderability_failure(fresh, error)
                 advanced += 1
         except Exception as error:

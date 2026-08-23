@@ -388,7 +388,7 @@ writes a workspace. A real retry with a saved registration identity first
 rechecks the current private consent and exact delivered-review/source binding,
 then looks for that identity's deterministic Database branch and same-repository
 open PR. An existing change is recovered at that boundary instead of rebuilding
-the workspace or repeating archive side effects. It then checks the
+the workspace or repeating archive and render side effects. It then checks the
 exact reviewed policy and evidence when no recoverable change exists. No
 submission is grandfathered past authorization: every registration requires
 the private record to describe how push access was proved and not merely assert

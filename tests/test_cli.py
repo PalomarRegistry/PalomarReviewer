@@ -4182,6 +4182,48 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(first[0], report)
         self.assertEqual(second[0], report)
 
+    def test_dry_run_never_replaces_an_invalid_cached_render(self):
+        mechanical = self.nested_mechanical_fixture()
+        args = SimpleNamespace(render_result=None, dry_run=True)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "render-result").mkdir()
+            with (
+                mock.patch.object(
+                    cli, "validate_render_result", side_effect=ReviewerError("invalid cache")
+                ),
+                mock.patch.object(cli, "ensure_challenge_renderable") as ensure,
+            ):
+                with self.assertRaisesRegex(ReviewerError, "invalid cache"):
+                    cli.registration_render_result(args, work, mechanical, None)
+        ensure.assert_not_called()
+
+    def test_registration_reclassifies_only_a_prior_success_contradiction(self):
+        mechanical = self.nested_mechanical_fixture()
+        args = SimpleNamespace(render_result=None, dry_run=False)
+        error = cli.SubmitterRenderabilityError(
+            "missing anchor",
+            diagnostics=[{
+                "code": "challenge.declaration_not_rendered",
+                "stage": "sanitize",
+                "owner": "submitter",
+                "summary": "missing anchor",
+                "explanation": "missing anchor",
+                "next_action": "name it",
+                "retryable": False,
+                "repairable": False,
+            }],
+            run_id=123,
+            run_url="https://example.test/render/123",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with mock.patch.object(cli, "ensure_challenge_renderable", side_effect=error):
+                with self.assertRaises(cli.SubmitterRenderabilityError):
+                    cli.registration_render_result(args, work, mechanical, None)
+                with self.assertRaises(cli.DeterministicRegistrationError):
+                    cli.registration_render_result(args, work, mechanical, {"schema_version": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -5154,6 +5196,21 @@ class AutomaticLoopTests(unittest.TestCase):
             })
         self.assertEqual(updated["renderability_attempts"], 1)
         self.assertNotIn("review_attempts", updated)
+
+    def test_chained_state_transitions_use_the_sha_written_by_the_first(self):
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "status": "awaiting-review",
+            "events": [],
+            "_blob_sha": "old-sha",
+        }
+        with mock.patch.object(cli, "put_state", side_effect=["gate-sha", "review-sha"]) as write:
+            checked = cli.begin_renderability_check(state)
+            reviewing = cli.begin_review(checked)
+        self.assertEqual(write.call_args_list[0].kwargs["blob_sha"], "old-sha")
+        self.assertEqual(write.call_args_list[1].kwargs["blob_sha"], "gate-sha")
+        self.assertEqual(reviewing["_blob_sha"], "review-sha")
+        self.assertEqual(reviewing["renderability_attempts"], 0)
 
     def test_a_registration_attempt_is_counted_before_work_starts(self):
         with mock.patch.object(cli, "put_state"):
