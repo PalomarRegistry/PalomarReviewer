@@ -3263,6 +3263,13 @@ def _registration_owns_lock(state: dict[str, Any]) -> bool:
 REVIEW_ATTEMPT_LIMIT = 3
 RENDERABILITY_ATTEMPT_LIMIT = 3
 
+# The only two statuses a review pass may settle from. A pass selects its work
+# once and then runs for minutes, so the record can move underneath it: the
+# submitter withdraws, or an operator intervenes. Anything else on the re-read
+# is somebody else's newer decision, and writing a retry over it would reopen a
+# submission that has already stopped.
+REVIEWABLE_STATUSES = frozenset({"awaiting-review", "reviewing"})
+
 
 def begin_renderability_check(state: dict[str, Any]) -> dict[str, Any]:
     """Durably count the pre-review gate without spending a model attempt."""
@@ -7652,7 +7659,7 @@ def auto(args: argparse.Namespace) -> int:
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
-            if fresh is not None and fresh.get("status") in {"awaiting-review", "reviewing"}:
+            if fresh is not None and fresh.get("status") in REVIEWABLE_STATUSES:
                 record_renderability_failure(fresh, error)
                 advanced += 1
             elif fresh is None:
@@ -7671,7 +7678,17 @@ def auto(args: argparse.Namespace) -> int:
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
-            if fresh is not None:
+            if fresh is not None and fresh.get("status") not in REVIEWABLE_STATUSES:
+                # The record moved while this pass was running. Its queue entry
+                # drains on the next pass, which is what withdrawal relies on;
+                # re-arming it here would hand the submitter back a submission
+                # they have already withdrawn, as waiting for review.
+                print(
+                    f"::warning::{record['id']} became {fresh.get('status')}; "
+                    "leaving its newer state unchanged",
+                    file=sys.stderr,
+                )
+            elif fresh is not None:
                 if gate_complete:
                     advance_state(
                         fresh,

@@ -5662,6 +5662,51 @@ class AutomaticLoopTests(unittest.TestCase):
             self.assertEqual(cli.auto(self.opts()), 1)
         self.assertIn("bbbbbbbbbbbb", attempted)
 
+    def moving(self, live, later):
+        """A record that changes underneath the pass that selected it."""
+        current = {"row": live}
+
+        def read(_identifier):
+            return current["row"]
+
+        def explode(_namespace):
+            current["row"] = later
+            raise ReviewerError("state changed under the pass")
+
+        return read, explode
+
+    def test_a_withdrawal_during_a_pass_is_not_reopened_by_its_retry(self):
+        live = self.row("aaaaaaaaaaaa", status="awaiting-review")
+        read, explode = self.moving(live, dict(live, status="withdrawn"))
+        with (
+            mock.patch.object(cli, "open_index", return_value={"open": [live["id"]]}),
+            mock.patch.object(cli, "submission_state", side_effect=read),
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable"),
+            mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "advance_state") as advanced,
+            mock.patch.object(cli, "run_review", side_effect=explode),
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        advanced.assert_not_called()
+
+    def test_a_failed_review_of_a_live_submission_is_still_retried(self):
+        live = self.row("aaaaaaaaaaaa", status="awaiting-review")
+        read, explode = self.moving(live, live)
+        with (
+            mock.patch.object(cli, "open_index", return_value={"open": [live["id"]]}),
+            mock.patch.object(cli, "submission_state", side_effect=read),
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable"),
+            mock.patch.object(cli, "begin_review", side_effect=lambda r: r),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "advance_state") as advanced,
+            mock.patch.object(cli, "run_review", side_effect=explode),
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        self.assertEqual(advanced.call_args.args[1], "awaiting-review")
+
     def test_a_database_change_that_is_not_green_is_not_merged(self):
         """The database's own checks are what stand between a review and the registry."""
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
