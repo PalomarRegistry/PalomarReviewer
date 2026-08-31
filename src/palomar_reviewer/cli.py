@@ -2291,7 +2291,13 @@ def download_mechanical_artifact(
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
-    artifact = "preflight-report" if mode == "preflight" else "mechanical-report"
+    artifact = {
+        "preflight": "preflight-report",
+        "correction": "correction-report",
+        "full": "mechanical-report",
+    }.get(mode)
+    if artifact is None:
+        raise ReviewerError(f"mechanical artifact mode {mode!r} is not recognized")
     proc = run(
         [
             "gh",
@@ -2363,11 +2369,13 @@ def normalized_submission_run(
     # `submission.yml` declares `run-name`, so a run's `name` is that run name
     # and not the workflow's own `name:`. Both fields therefore read "Verify
     # submission <id>" here, and the workflow's identity comes from the path.
-    if mode not in {"preflight", "full"}:
+    if mode not in {"preflight", "full", "correction"}:
         raise ReviewerError(f"submission run mode {mode!r} is not recognized")
     title = (
         f"Preflight submission {submission_id}"
         if mode == "preflight"
+        else f"Validate registry correction {submission_id}"
+        if mode == "correction"
         else f"Verify submission {submission_id}"
     )
     # Not folded into the exact comparisons below, which are equality: `True`
@@ -2451,7 +2459,9 @@ def trusted_submission_run(
     run_field = "preflight_run" if mode == "preflight" else "run"
     recorded = (state.get(run_field) or {}).get("id")
     if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 1:
-        kind = "verification" if mode == "full" else "preflight"
+        kind = {
+            "full": "verification", "preflight": "preflight", "correction": "correction"
+        }.get(mode, mode)
         raise ReviewerError(f"the submission server recorded no {kind} run for {submission_id}")
     proc = run(
         [
@@ -2495,10 +2505,18 @@ def mechanical_report(
     state: dict[str, Any], download_root: Path
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     submission_id = state["id"]
-    run_data = trusted_verification_run(state)
-    report_path = download_mechanical_artifact(
-        run_data["databaseId"], submission_id, download_root
-    )
+    if state.get("registry_correction"):
+        run_data = trusted_submission_run(state, mode="correction")
+        report_path = download_mechanical_artifact(
+            run_data["databaseId"], submission_id, download_root, mode="correction"
+        )
+    else:
+        # Preserve the ordinary call boundary; tests and operator tooling mock
+        # this wrapper to audit full-verification ancestry and artifact trust.
+        run_data = trusted_verification_run(state)
+        report_path = download_mechanical_artifact(
+            run_data["databaseId"], submission_id, download_root
+        )
     try:
         report = load_json(report_path)
     except (OSError, json.JSONDecodeError) as error:
@@ -4004,6 +4022,24 @@ def resolve_remote_commit(repository: str, revision: str) -> str:
     return output
 
 
+def apply_registry_correction_metadata(mechanical: dict[str, Any]) -> bool:
+    """Expose corrected effective metadata to every automated review boundary."""
+    correction = mechanical.get("submission", {}).get("registry_correction")
+    if not isinstance(correction, dict):
+        return False
+    effective = correction["metadata"]
+    mechanical["effective_registry_metadata"] = effective
+    mechanical["classification"] = {
+        key: [{"code": code, "name": code} for code in effective["classification"][key]]
+        for key in ("arxiv", "msc2020")
+    }
+    for key in (
+        "responsible_maintainers", "mathematical_sources", "related_formalizations"
+    ):
+        mechanical["provenance"][key] = effective["provenance"][key]
+    return True
+
+
 def prepare_workspace(
     submission_id: str,
     *,
@@ -4022,6 +4058,7 @@ def prepare_workspace(
     work.mkdir(parents=True, exist_ok=True)
     download_root = work / "mechanical-download"
     mechanical, report_url, run_data = mechanical_report(state, download_root)
+    apply_registry_correction_metadata(mechanical)
     source_info = mechanical["source"]
     if mechanical["submission"]["submission_id"] != submission_id:
         raise ReviewerError("mechanical report names a different submission")
@@ -4115,6 +4152,7 @@ def submission_evidence(state: dict[str, Any]) -> dict[str, Any]:
         "authorization": state.get("authorization"),
         "existing_id": state.get("existing_id"),
         "notes_for_the_reviewer": state.get("context"),
+        "registry_correction": state.get("registry_correction"),
     }
 
 
@@ -4209,8 +4247,24 @@ def render_prompt(
             "lakefile",
             "lean_toolchain",
         }:
-            evidence_path = mechanical_evidence.relative_path(mechanical, name)
-            content = context_file(source, evidence_path)
+            if name == "formalization_metadata" and mechanical.get(
+                "effective_registry_metadata"
+            ):
+                content = json.dumps(
+                    {
+                        "effective_registry_metadata": mechanical[
+                            "effective_registry_metadata"
+                        ],
+                        "registry_correction": mechanical["submission"][
+                            "registry_correction"
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            else:
+                evidence_path = mechanical_evidence.relative_path(mechanical, name)
+                content = context_file(source, evidence_path)
         else:
             raise ReviewerError(f"rubric evidence input {name!r} has no renderer")
         envelope = {
@@ -4572,6 +4626,11 @@ def run_review(args: argparse.Namespace) -> int:
             root=root,
             policy_ref=stored["policy_commit"],
         )
+        correction_review = bool(state.get("registry_correction"))
+        receipt = None
+        if not correction_review:
+            render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
+            receipt = renderability_receipt(render_report, mechanical)
         mechanical_url = (work / "mechanical-report-url").read_text().strip()
         validate_stored_review(
             stored,
@@ -5156,6 +5215,98 @@ def registry_record(
     return record
 
 
+def registry_correction_record(
+    *,
+    state: dict[str, Any],
+    mechanical: dict[str, Any],
+    review: dict[str, Any],
+    baseline: dict[str, Any],
+    baseline_path: str,
+    baseline_sha256: str,
+    registered_at: str,
+    version: int,
+    correction_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Append one metadata-only version while inheriting all mechanical proof."""
+    correction = mechanical["submission"]["registry_correction"]
+    based_on = correction["based_on"]
+    if (
+        baseline.get("id") != based_on.get("id")
+        or baseline.get("version") != based_on.get("version")
+        or baseline_path != correction["baseline"]["path"]
+        or baseline_sha256 != correction["baseline"]["sha256"]
+        or type(version) is not int
+        or version <= baseline["version"]
+    ):
+        raise ReviewerError("registry correction baseline is stale or does not match its bytes")
+    if baseline.get("source") != {
+        **baseline.get("source", {}),
+        "repository": mechanical["source"]["repository"],
+        "commit": mechanical["source"]["commit"],
+    }:
+        raise ReviewerError("registry correction would move the source repository or commit")
+    requested = mechanical["submission"].get("requested_paths", {})
+    project_prefix = f"{requested.get('project_path')}/" if requested.get("project_path") else ""
+    if (
+        (baseline["source"].get("project_path") or "") != (requested.get("project_path") or "")
+        or baseline["formalization"]["comparator_config_path"]
+        != (requested.get("comparator_config_path") or f"{project_prefix}comparator.json")
+        or baseline["formalization"]["formalization_metadata_path"]
+        != (requested.get("formalization_metadata_path") or f"{project_prefix}formalization.yaml")
+    ):
+        raise ReviewerError("registry correction would move a protected source path")
+
+    record = copy.deepcopy(baseline)
+    effective = copy.deepcopy(correction["metadata"])
+    receipts = orcid_receipts(mechanical)
+    checked_people(effective["authors"], receipts)
+    checked_people(effective["provenance"]["responsible_maintainers"], receipts)
+    for source in effective["provenance"]["mathematical_sources"]:
+        checked_people(source.get("authors", []), receipts)
+    record.update(
+        {
+            "schema_version": 4,
+            "registered_at": registered_at,
+            "version": version,
+            "title": effective["title"],
+            "abstract": effective["abstract"],
+            "authors": effective["authors"],
+            "classification": effective["classification"],
+            "review": {
+                "reviewed_at": review["reviewed_at"],
+                "policy_commit": review["policy_commit"],
+                "outcome": "neutral",
+                "report": {"sha256": correction_evidence["review_sha256"]},
+                "reviewer_models": review["reviewer_models"],
+                "warnings": registered_comments(review),
+            },
+            "submission": {
+                "submission_id": state["id"],
+                "authorization": {"relationship": "palomar-maintainer"},
+            },
+            "registry_correction": {
+                "kind": "registry-metadata-correction",
+                "generated_by": "Palomar / Registry correction",
+                "based_on": {
+                    "version": baseline["version"],
+                    "path": baseline_path,
+                    "sha256": baseline_sha256,
+                },
+                "explanation": correction["explanation"],
+                "changed_fields": correction["changed_fields"],
+                "evidence_path": correction_evidence["evidence_path"],
+                "evidence_tree_sha256": correction_evidence["evidence_tree_sha256"],
+            },
+        }
+    )
+    for key in (
+        "responsible_maintainers", "mathematical_sources", "related_formalizations"
+    ):
+        record["provenance"][key] = effective["provenance"][key]
+    refuse_engine_credential(record["review"], context="the correction review being registered")
+    return record
+
+
 def registry_scores(
     *,
     permanent_id: str,
@@ -5300,7 +5451,7 @@ def stage_registration_change(
     *,
     entry: Path,
     scores: Path,
-    render_bundle: Path,
+    render_bundle: Path | None,
     evidence_bundle: Path,
     projections: tuple[registration_authority.ProjectionChange, ...],
 ) -> tuple[str, ...]:
@@ -5320,7 +5471,8 @@ def stage_registration_change(
             raise ReviewerError(f"{relative}: {label} must be an ordinary file")
         path.chmod(0o644)
         additions.append(relative)
-    additions.extend(_registration_bundle_files(database, render_bundle, "render bundle"))
+    if render_bundle is not None:
+        additions.extend(_registration_bundle_files(database, render_bundle, "render bundle"))
     additions.extend(_registration_bundle_files(database, evidence_bundle, "evidence bundle"))
     additions = sorted(additions)
     for change in projections:
@@ -5828,6 +5980,7 @@ def register(args: argparse.Namespace) -> int:
     )
     state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")
+    apply_registry_correction_metadata(mechanical)
     if state.get("id") != args.submission:
         raise ReviewerError("workspace state does not match the requested submission")
     mechanical_evidence.validate_report_schema(mechanical)
@@ -6065,9 +6218,12 @@ def register(args: argparse.Namespace) -> int:
         scores_document, load_json(scores_schema_path), what="registry scores"
     )
     destination = database / "entries" / filename
-    artifact_destination = database / artifact_path
-    artifact_destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(render_bundle, artifact_destination)
+    artifact_destination = None
+    if artifact_path is not None:
+        assert render_bundle is not None
+        artifact_destination = database / artifact_path
+        artifact_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(render_bundle, artifact_destination)
     evidence_destination = database / evidence_path
     evidence_destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(evidence_bundle, evidence_destination)
@@ -6145,7 +6301,11 @@ def register(args: argparse.Namespace) -> int:
             branch,
             submission_id=args.submission,
             record=record,
-            render_workflow_url=render_report["workflow_url"],
+            render_workflow_url=(
+                mechanical_url
+                if render_report is None
+                else render_report["workflow_url"]
+            ),
         )
     fresh = registration_authorization.validate_registration_checkpoint(
         args.submission,

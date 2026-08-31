@@ -27,6 +27,8 @@ from typing import Any
 from .errors import ReviewerError
 
 SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3})
 MAX_VERSIONS_PER_RESULT = 500
 RESULTS_DIRECTORY = "registrations/results"
 SUBMISSIONS_DIRECTORY = "registrations/submissions"
@@ -41,6 +43,10 @@ TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
 )
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+TAKEDOWN_KEYS = frozenset({
+    "id", "version", "taken_down_at", "authorized_by_login",
+    "authorization_issue", "reason",
+})
 
 
 class _InvalidJSON(ValueError):
@@ -347,7 +353,10 @@ def _valid_timestamp(value: object) -> bool:
 def _validate_result(document: dict[str, Any], identifier: str, where: str) -> None:
     if set(document) != {"schema_version", "id", "first_registered_on", "identity", "versions"}:
         raise ReviewerError(f"{where}: has an unsupported result projection shape")
-    if type(document.get("schema_version")) is not int or document["schema_version"] != SCHEMA_VERSION:
+    if (
+        type(document.get("schema_version")) is not int
+        or document["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise ReviewerError(f"{where}: unsupported schema_version")
     match = PALOMAR_ID_RE.fullmatch(identifier)
     first_registered_on = document.get("first_registered_on")
@@ -395,11 +404,31 @@ def _validate_result(document: dict[str, Any], identifier: str, where: str) -> N
         "classification",
     }
     submissions: set[str] = set()
+    has_correction = any(
+        isinstance(row, dict) and "registry_correction" in row for row in versions
+    )
+    expected_schema = RESULT_SCHEMA_VERSION if has_correction else SCHEMA_VERSION
+    if document["schema_version"] != expected_schema:
+        raise ReviewerError(f"{where}: schema_version disagrees with its version rows")
     for expected_version, row in enumerate(versions, 1):
-        if not isinstance(row, dict) or set(row) != keys:
+        row_keys = set(row) if isinstance(row, dict) else set()
+        if not isinstance(row, dict) or frozenset(row_keys) not in {
+            frozenset(keys), frozenset({*keys, "registry_correction"})
+        }:
             raise ReviewerError(
                 f"{where}: version {expected_version} has an unsupported shape"
             )
+        correction = row.get("registry_correction")
+        if correction is not None and (
+            not isinstance(correction, dict)
+            or set(correction) != {"generated_by", "explanation", "changed_fields"}
+            or correction.get("generated_by") != "Palomar / Registry correction"
+            or not isinstance(correction.get("explanation"), str)
+            or not correction["explanation"]
+            or not isinstance(correction.get("changed_fields"), list)
+            or not correction["changed_fields"]
+        ):
+            raise ReviewerError(f"{where}: version {expected_version} has malformed correction data")
         submission_id = row.get("submission_id")
         if (
             type(row.get("version")) is not int
@@ -466,7 +495,7 @@ def load_identity(
     if (
         set(document) != {"schema_version", "identity", "registration_id"}
         or type(document.get("schema_version")) is not int
-        or document["schema_version"] != SCHEMA_VERSION
+        or document["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
         or document.get("identity") != identity
         or not isinstance(identifier, str)
         or PALOMAR_ID_RE.fullmatch(identifier) is None
@@ -490,7 +519,7 @@ def load_submission(
     identifier, version = document.get("id"), document.get("version")
     if (
         type(document.get("schema_version")) is not int
-        or document["schema_version"] != SCHEMA_VERSION
+        or document["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
         or document.get("submission_id") != submission_id
         or not isinstance(identifier, str)
         or PALOMAR_ID_RE.fullmatch(identifier) is None
@@ -500,6 +529,40 @@ def load_submission(
     ):
         raise ReviewerError(f"{relative}: has a malformed submission binding")
     return document
+
+
+def active_version(
+    database: Path,
+    identifier: str,
+    versions: list[dict[str, Any]],
+    *,
+    git_env: dict[str, str] | None = None,
+) -> int:
+    """Return the highest version not removed by the committed takedown authority."""
+    manifest = _load_projection(database, "takedowns.json", git_env=git_env)
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schema_version", "takedowns"}
+        or manifest.get("schema_version") != 1
+        or not isinstance(manifest.get("takedowns"), list)
+    ):
+        raise ReviewerError("takedowns.json: cannot establish the active correction baseline")
+    inactive: set[int] = set()
+    for row in manifest["takedowns"]:
+        if (
+            not isinstance(row, dict)
+            or set(row) != TAKEDOWN_KEYS
+            or not isinstance(row.get("id"), str)
+            or type(row.get("version")) is not int
+            or row["version"] < 1
+        ):
+            raise ReviewerError("takedowns.json: cannot establish the active correction baseline")
+        if row["id"] == identifier:
+            inactive.add(row["version"])
+    active = [row["version"] for row in versions if row["version"] not in inactive]
+    if not active:
+        raise ReviewerError("registry correction target has no active version")
+    return max(active)
 
 
 def load_day(
@@ -522,7 +585,7 @@ def load_day(
     if (
         set(document) != {"schema_version", "date", "last_serial"}
         or type(document.get("schema_version")) is not int
-        or document["schema_version"] != SCHEMA_VERSION
+        or document["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
         or document.get("date") != day
         or type(last_serial) is not int
         or not 1 <= last_serial <= 999_999
@@ -813,6 +876,13 @@ def projection_changes(
         "abstract": record.get("abstract"),
         "classification": copy.deepcopy(record.get("classification")),
     }
+    correction = record.get("registry_correction")
+    if isinstance(correction, dict):
+        row["registry_correction"] = {
+            "generated_by": correction.get("generated_by"),
+            "explanation": correction.get("explanation"),
+            "changed_fields": copy.deepcopy(correction.get("changed_fields")),
+        }
     result_relative = result_path(identifier)
     current = load_result(database, identifier, git_env=git_env)
     identity_binding = load_identity(
@@ -850,7 +920,15 @@ def projection_changes(
             raise ReviewerError(
                 f"{identifier} has reached the {MAX_VERSIONS_PER_RESULT}-version limit"
             )
-        result = {**current, "versions": [*current["versions"], row]}
+        appended = [*current["versions"], row]
+        result = {
+            **current,
+            "schema_version": (
+                RESULT_SCHEMA_VERSION if any("registry_correction" in item for item in appended)
+                else SCHEMA_VERSION
+            ),
+            "versions": appended,
+        }
         result_status = "M"
     _validate_result(result, identifier, result_relative)
 

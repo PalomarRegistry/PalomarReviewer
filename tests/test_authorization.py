@@ -77,6 +77,33 @@ class RegistrationAuthorizationOrderTests(unittest.TestCase):
         mechanical, review, state = current_contract()
         self.assertIs(validate(mechanical, review, state), state)
 
+    def test_a_registry_correction_uses_technical_membership_without_repo_write_access(self):
+        mechanical, review, state = current_contract()
+        relationship = {"relationship": "palomar-maintainer"}
+        correction = {
+            "kind": "palomar-maintainer",
+            "based_on": {"id": "PALOMAR-2026-08-31-000001", "version": 1},
+        }
+        mechanical["submission"].update(
+            authorization=relationship,
+            registry_correction=correction,
+        )
+        state.update(
+            authorization=relationship,
+            registry_correction=correction,
+            registry_correction_authorized=True,
+            push_verified=False,
+            push_proof=push_proof(
+                method="technical-team-correction",
+                binding="active-technical-team-membership",
+            ),
+        )
+        self.assertIs(validate(mechanical, review, state), state)
+
+        state["registry_correction_authorized"] = False
+        with self.assertRaisesRegex(ReviewerError, "not authorized at intake"):
+            validate(mechanical, review, state)
+
     def test_a_technical_team_test_cannot_be_registered_even_with_forged_consent(self):
         mechanical, review, state = current_contract()
         mechanical["submission"]["authorization"] = {"relationship": "technical-test"}

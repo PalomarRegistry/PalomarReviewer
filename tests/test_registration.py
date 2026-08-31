@@ -118,6 +118,25 @@ class RegistrationProjectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ReviewerError, "is not valid strict JSON"):
                     registration.load_day(repo, "2026-08-09")
 
+    def test_correction_baseline_is_the_highest_version_not_taken_down(self):
+        repo = self.repo()
+        write_json(repo, "takedowns.json", {
+            "schema_version": 1,
+            "takedowns": [{
+                "id": FIRST,
+                "version": 3,
+                "taken_down_at": "2026-08-12T12:00:00Z",
+                "authorized_by_login": "avigad",
+                "authorization_issue": 1,
+                "reason": "Temporarily removed.",
+            }],
+        })
+        commit(repo)
+        self.assertEqual(
+            registration.active_version(repo, FIRST, result_document(versions=3)["versions"]),
+            2,
+        )
+
     def test_every_existing_authority_path_requires_exact_git_mode_100644(self):
         documents = {
             "result": (registration.result_path(FIRST), result_document()),

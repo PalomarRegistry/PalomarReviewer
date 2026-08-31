@@ -316,13 +316,66 @@ MECHANICAL_REPORT_SCHEMA = {
     },
 }
 
+CORRECTION_REPORT_SCHEMA = {
+    "type": "object",
+    "required": [
+        "schema_version", "status", "stage", "phase", "submission", "source",
+        "existing_id", "formalization", "classification", "provenance",
+        "orcid_validation", "license", "lean_toolchain", "comparator", "lakefile",
+        "checked_at", "workflow_url",
+    ],
+    "properties": {
+        "schema_version": {"const": 2},
+        "status": {"const": "pass"},
+        "stage": {"const": "correction-validation"},
+        "phase": {"const": "complete"},
+        "existing_id": {
+            "type": "string",
+            "pattern": r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$",
+        },
+        "submission": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "submission_id", "authorization", "requested_paths", "registry_correction"
+            ],
+            "properties": {
+                "submission_id": {"type": "string", "pattern": "^[0-9a-z]{12}$"},
+                "authorization": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["relationship"],
+                    "properties": {"relationship": {"const": "palomar-maintainer"}},
+                },
+                "requested_paths": MECHANICAL_REPORT_SCHEMA["properties"]["submission"][
+                    "properties"
+                ]["requested_paths"],
+                "registry_correction": {"type": "object"},
+            },
+        },
+        "source": MECHANICAL_REPORT_SCHEMA["properties"]["source"],
+        "formalization": MECHANICAL_REPORT_SCHEMA["properties"]["formalization"],
+        "classification": {"type": "object"},
+        "provenance": MECHANICAL_REPORT_SCHEMA["properties"]["provenance"],
+        "orcid_validation": MECHANICAL_REPORT_SCHEMA["properties"]["orcid_validation"],
+        "license": MECHANICAL_REPORT_SCHEMA["properties"]["license"],
+        "lean_toolchain": MECHANICAL_REPORT_SCHEMA["properties"]["lean_toolchain"],
+        "comparator": MECHANICAL_REPORT_SCHEMA["properties"]["comparator"],
+        "lakefile": MECHANICAL_REPORT_SCHEMA["properties"]["lakefile"],
+        "checked_at": MECHANICAL_REPORT_SCHEMA["properties"]["checked_at"],
+        "workflow_url": MECHANICAL_REPORT_SCHEMA["properties"]["workflow_url"],
+    },
+}
+
 
 def validate_report_schema(report: dict[str, Any]) -> None:
     """Reject a malformed current report before any path is dereferenced."""
     try:
         jsonschema.validate(
             report,
-            MECHANICAL_REPORT_SCHEMA,
+            CORRECTION_REPORT_SCHEMA
+            if report.get("schema_version") == 2
+            else MECHANICAL_REPORT_SCHEMA,
             format_checker=jsonschema.FormatChecker(),
         )
     except jsonschema.ValidationError as error:
@@ -413,6 +466,40 @@ def validate_report_contract(
             f"mechanical verification did not pass ({report.get('status')}): {problems}"
         )
     validate_report_schema(report)
+    if report.get("schema_version") == 2:
+        source = report["source"]
+        if report["submission"]["submission_id"] != state.get("id"):
+            raise ReviewerError("correction report names a different submission")
+        if report["submission"].get("registry_correction") != state.get(
+            "registry_correction"
+        ):
+            raise ReviewerError("correction report does not bind the intake correction")
+        if report.get("existing_id") != state.get("existing_id"):
+            raise ReviewerError("correction report names a different registry entry")
+        if report.get("workflow_url") != run_data.get("url"):
+            raise ReviewerError("correction report does not name its trusted workflow run")
+        if source["repository_url"] != f"https://github.com/{source['repository']}":
+            raise ReviewerError("correction report source repository URL is inconsistent")
+        if source["tree_url"] != source_tree_url(source):
+            raise ReviewerError("correction report source tree URL is inconsistent")
+        if (
+            source["repository"].lower() != str(state.get("repository", "")).lower()
+            or source["commit"] != state.get("commit")
+        ):
+            raise ReviewerError("correction report source does not match the submission")
+        requested = state.get("requested_paths") or {}
+        reported = report["submission"].get("requested_paths") or {}
+        for key in (
+            "project_path", "comparator_config_path", "formalization_metadata_path"
+        ):
+            if (reported.get(key, "") or "") != (requested.get(key, "") or ""):
+                raise ReviewerError(f"correction report was asked for a different {key}")
+        head_sha = run_data.get("headSha")
+        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise ReviewerError("trusted correction run has no full workflow commit")
+        if run_data.get("event") != "workflow_dispatch":
+            raise ReviewerError("correction validation was not workflow-dispatched")
+        return head_sha
     required_paths = (
         (report.get("challenge", {}), "path", "challenge.path"),
         (report.get("solution", {}), "path", "solution.path"),
