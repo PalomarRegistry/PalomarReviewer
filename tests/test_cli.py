@@ -2226,17 +2226,29 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     **context,
                 )
 
-    def test_registry_title_prefers_human_text(self):
-        metadata = {"result": {"name": "machine_readable_name"}}
+    def test_registry_title_prefers_the_required_project_name_to_the_repository(self):
+        metadata = {"project": {"name": "A human-readable result"}}
         self.assertEqual(
-            registry_title(metadata, "A human-readable result"),
+            registry_title(metadata, "example/source-repository"),
             "A human-readable result",
         )
-        metadata["result"]["title"] = "Explicit metadata title"
+
+    def test_registry_title_keeps_explicit_title_and_legacy_fallbacks(self):
+        metadata = {
+            "project": {
+                "name": "Project name",
+                "title": "Explicit metadata title",
+            }
+        }
         self.assertEqual(
-            registry_title(metadata, "A human-readable result"),
+            registry_title(metadata, "example/source-repository"),
             "Explicit metadata title",
         )
+        self.assertEqual(
+            registry_title({"result": {"name": "Legacy result name"}}, "example/source"),
+            "Legacy result name",
+        )
+        self.assertEqual(registry_title({}, "example/source"), "example/source")
 
     def example_record(self, **overrides):
         """One registered record, built the way `register` builds it."""
@@ -9937,6 +9949,15 @@ class MetadataRepairTests(UsesCapabilities, unittest.TestCase):
         wrong_path["source"]["formalization_path"] = "metadata.yaml"
         with self.assertRaisesRegex(ReviewerError, "named formalization.yaml"):
             cli._validate_repair(wrong_path, state)
+
+    def test_project_name_repair_matches_the_public_title_limit(self):
+        state = {
+            "id": "a1b2c3d4e5f6", "repository": "owner/project", "commit": "1" * 40,
+            "repair": {"revision": "a" * 16, "status": "queued"},
+        }
+        cli._validate_repair(self.repair("x" * 300), state)
+        with self.assertRaisesRegex(ReviewerError, "value.*malformed"):
+            cli._validate_repair(self.repair("x" * 301), state)
 
     def test_descriptive_metadata_repairs_accept_bounded_free_text(self):
         state = {
