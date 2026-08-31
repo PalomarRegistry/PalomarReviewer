@@ -2580,7 +2580,7 @@ def _normalized_repair_value(
 ) -> Any:
     kind = fields.get(field)
     if kind == "text":
-        return _repair_line(value, field)
+        return _repair_line(value, field, 300 if field == "project.name" else 500)
     if kind == "prose":
         return _repair_text(value, field)
     if kind in {"list", "people"}:
@@ -4874,17 +4874,17 @@ def registry_title(metadata: dict[str, Any], fallback_title: str) -> str:
     )
     if explicit:
         return str(explicit)
-    submitted = fallback_title.strip()
-    if submitted:
-        return submitted
-    fallback = metadata_value(
+    project_name = metadata_value(
         metadata,
         [
             ("project", "name"),
             ("result", "name"),
         ],
     )
-    return str(fallback or "Untitled Palomar submission")
+    if project_name:
+        return str(project_name)
+    submitted = fallback_title.strip()
+    return submitted or "Untitled Palomar submission"
 
 
 def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any]) -> dict[str, list[str]]:
