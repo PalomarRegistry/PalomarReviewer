@@ -169,9 +169,10 @@ PALOMAR_ID_RE = re.compile(r"PALOMAR-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?P<se
 # emits and what a record's `registered_at` has to be.
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 ORCID_URL_RE = re.compile(
-    r"https://orcid\.org/(?P<identifier>[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9X]{4})/?\Z"
+    r"https://orcid\.org/(?P<identifier>"
+    r"[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X])/?\Z"
 )
-ORCID_RE = re.compile(r"[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9X]{4}\Z")
+ORCID_RE = re.compile(r"[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]\Z")
 GITHUB_LOGIN_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z"
 )
@@ -4744,6 +4745,7 @@ def authors_from_metadata(
         raw = mechanical.get("provenance", {}).get("responsible_maintainers")
     if not isinstance(raw, list):
         raw = []
+    receipts = orcid_receipts(mechanical)
     result = []
     for author in raw:
         if isinstance(author, str):
@@ -4783,6 +4785,9 @@ def authors_from_metadata(
                             "https://orcid.org URL"
                         )
                     item["orcid"] = identifier
+                    item["orcid_record_checked_at"] = required_orcid_receipt(
+                        identifier, receipts
+                    )
                 result.append(item)
     if not result:
         raise ReviewerError(
@@ -4790,6 +4795,73 @@ def authors_from_metadata(
             "responsible maintainers; a record cannot be registered without one"
         )
     return result
+
+
+def orcid_receipts(mechanical: dict[str, Any]) -> dict[str, str]:
+    """Return the exact current-record checks carried by trusted evidence."""
+    validation = mechanical.get("orcid_validation")
+    if validation is None:
+        return {}
+    if (
+        not isinstance(validation, dict)
+        or set(validation) != {"schema_version", "checked_at", "registry", "records"}
+        or validation.get("schema_version") != 1
+        or validation.get("registry") != "https://orcid.org"
+        or not isinstance(validation.get("checked_at"), str)
+        or not TIMESTAMP_RE.fullmatch(validation["checked_at"])
+        or not isinstance(validation.get("records"), list)
+    ):
+        raise ReviewerError("mechanical report has malformed ORCID validation evidence")
+    checked_at = validation["checked_at"]
+    receipts: dict[str, str] = {}
+    for record in validation["records"]:
+        if not isinstance(record, dict) or set(record) != {"orcid", "record_url"}:
+            raise ReviewerError("mechanical report has malformed ORCID validation evidence")
+        identifier = record.get("orcid")
+        if (
+            not isinstance(identifier, str)
+            or not valid_orcid_checksum(identifier)
+            or record.get("record_url") != f"https://orcid.org/{identifier}"
+            or identifier in receipts
+        ):
+            raise ReviewerError("mechanical report has malformed ORCID validation evidence")
+        receipts[identifier] = checked_at
+    return receipts
+
+
+def valid_orcid_checksum(identifier: str) -> bool:
+    """Validate a canonical ORCID iD's ISO 7064 check digit."""
+    if ORCID_RE.fullmatch(identifier) is None:
+        return False
+    total = 0
+    for character in identifier.replace("-", "")[:-1]:
+        total = (total + int(character)) * 2
+    result = (12 - total % 11) % 11
+    expected = "X" if result == 10 else str(result)
+    return identifier[-1] == expected
+
+
+def required_orcid_receipt(identifier: str, receipts: dict[str, str]) -> str:
+    checked_at = receipts.get(identifier)
+    if checked_at is None:
+        raise ReviewerError(
+            f"formalization.yaml ORCID iD {identifier} has no current-record check "
+            "in the mechanical report"
+        )
+    return checked_at
+
+
+def checked_people(people: Any, receipts: dict[str, str]) -> None:
+    """Attach the receipt to every declared ORCID in one copied people list."""
+    if not isinstance(people, list):
+        return
+    for person in people:
+        if isinstance(person, dict) and person.get("orcid"):
+            identifier = str(person["orcid"])
+            person["orcid"] = identifier
+            person["orcid_record_checked_at"] = required_orcid_receipt(
+                identifier, receipts
+            )
 
 
 def registry_title(metadata: dict[str, Any], fallback_title: str) -> str:
@@ -4844,6 +4916,8 @@ def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
     that declared nothing into a record asserting defaults.
     """
     provenance = copy.deepcopy(mechanical["provenance"])
+    receipts = orcid_receipts(mechanical)
+    checked_people(provenance.get("responsible_maintainers"), receipts)
     declared = provenance.pop("declared", None)
     if declared is not None:
         missing = sorted(field for field, said in declared.items() if not said)
@@ -4857,6 +4931,7 @@ def entry_provenance(mechanical: dict[str, Any]) -> dict[str, Any]:
             raise ReviewerError(f"cannot register a submission whose {field} is unspecified")
     for source in provenance.get("mathematical_sources", []):
         if isinstance(source, dict):
+            checked_people(source.get("authors"), receipts)
             source.pop("author_contacted", None)
             source.pop("note", None)
             relationship = source.get("relationship")
@@ -5045,6 +5120,25 @@ def registry_record(
             "authorization": copy.deepcopy(mechanical["submission"]["authorization"]),
         },
     }
+    receipts = orcid_receipts(mechanical)
+    registered_orcids = {
+        person["orcid"]
+        for people in [
+            record["authors"],
+            record["provenance"]["responsible_maintainers"],
+            *[
+                source.get("authors", [])
+                for source in record["provenance"]["mathematical_sources"]
+                if isinstance(source, dict)
+            ],
+        ]
+        for person in people
+        if isinstance(person, dict) and isinstance(person.get("orcid"), str)
+    }
+    if set(receipts) != registered_orcids:
+        raise ReviewerError(
+            "mechanical ORCID validation evidence does not exactly match the registered people"
+        )
     # The review half of the record, and not the record. This is where the
     # model's own prose lands, and it lands here having been through
     # `registered_comments` rather than being copied, so it is worth its own
