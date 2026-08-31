@@ -28,12 +28,16 @@ PUSH_PROOF_METHODS = {
     # together, so two colluding accounts could separate the credential that
     # can push from the identity on the record. Weaker than `oauth`, knowingly.
     "tag-and-gist": "separately-attested",
+    # The active Technical Maintainer allowlist authorizes an exceptional
+    # Palomar metadata correction. It deliberately says nothing about write
+    # access to the formalization repository, which the correction cannot move.
+    "technical-team-correction": "active-technical-team-membership",
 }
 
 # Registration is an allowlist. A future relationship may be valid for review
 # without being valid for registration, and must not become registrable merely
 # because a mechanical-report enum was widened elsewhere.
-REGISTRABLE_RELATIONSHIPS = frozenset({"maintainer", "approved"})
+REGISTRABLE_RELATIONSHIPS = frozenset({"maintainer", "approved", "palomar-maintainer"})
 
 
 def document_digest(document: dict[str, Any]) -> str:
@@ -148,7 +152,14 @@ def _validate_registration_standing(
     )
     if relationship not in REGISTRABLE_RELATIONSHIPS:
         raise ReviewerError(f"authorization relationship {relationship!r} is not registrable")
-    if state.get("push_verified") is not True:
+    registry_correction = relationship == "palomar-maintainer"
+    if registry_correction:
+        if state.get("registry_correction_authorized") is not True:
+            raise ReviewerError("the registry correction was not authorized at intake")
+        proof = state.get("push_proof")
+        if not isinstance(proof, dict) or proof.get("method") != "technical-team-correction":
+            raise ReviewerError("the registry correction lacks Technical Maintainer proof")
+    elif state.get("push_verified") is not True:
         raise ReviewerError("the submitter never proved write access to the repository")
     validate_push_proof(state)
     # A positive status, not merely "not withdrawn": a stale consent flag on a
@@ -301,6 +312,14 @@ def validate_registration(
 
     if submission.get("authorization") != state.get("authorization"):
         raise ReviewerError("mechanical report and state disagree on the authorization")
+    reported_correction = submission.get("registry_correction")
+    recorded_correction = state.get("registry_correction")
+    if reported_correction != recorded_correction:
+        raise ReviewerError("mechanical report and state disagree on the registry correction")
+    if (reported_correction is not None) != (
+        submission.get("authorization", {}).get("relationship") == "palomar-maintainer"
+    ):
+        raise ReviewerError("registry correction and authorization are inconsistent")
     if (mechanical.get("existing_id") or None) != (state.get("existing_id") or None):
         raise ReviewerError("mechanical report and state disagree on the update intent")
     _validate_registration_standing(submission_id, review, state)
