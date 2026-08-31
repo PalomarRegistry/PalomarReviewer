@@ -278,6 +278,41 @@ MECHANICAL_REPORT_SCHEMA = {
                 "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
             },
         },
+        "orcid_validation": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["schema_version", "checked_at", "registry", "records"],
+            "properties": {
+                "schema_version": {"const": 1},
+                "checked_at": {"type": "string", "format": "date-time"},
+                "registry": {"const": "https://orcid.org"},
+                "records": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["orcid", "record_url"],
+                        "properties": {
+                            "orcid": {
+                                "type": "string",
+                                "pattern": (
+                                    r"^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$"
+                                ),
+                            },
+                            "record_url": {
+                                "type": "string",
+                                "pattern": (
+                                    r"^https://orcid\.org/"
+                                    r"[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$"
+                                ),
+                            },
+                        },
+                    },
+                },
+            },
+        },
     },
 }
 

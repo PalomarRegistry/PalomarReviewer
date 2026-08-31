@@ -1783,29 +1783,50 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             )
 
     def test_authors_canonicalize_contact_identifiers(self):
+        checked_at = "2026-08-31T12:00:00Z"
+        ada = "0000-0002-0201-310X"
+        emmy = "0000-0002-1694-233X"
         data = {
             "project": {
                 "authors": [
-                    {"name": "Ada", "orcid": "0000-0002-0201-310X"},
+                    {"name": "Ada", "orcid": ada},
                     {
                         "name": "Emmy",
                         "github": " @emmy ",
-                        "orcid": "https://orcid.org/0000-0000-0000-000X/",
+                        "orcid": f"https://orcid.org/{emmy}/",
                     },
                 ]
             }
         }
+        mechanical = {
+            "orcid_validation": {
+                "schema_version": 1,
+                "checked_at": checked_at,
+                "registry": "https://orcid.org",
+                "records": [
+                    {"orcid": ada, "record_url": f"https://orcid.org/{ada}"},
+                    {"orcid": emmy, "record_url": f"https://orcid.org/{emmy}"},
+                ],
+            }
+        }
         self.assertEqual(
-            authors_from_metadata(data, "fallback"),
+            authors_from_metadata(data, mechanical),
             [
-                {"name": "Ada", "orcid": "0000-0002-0201-310X"},
+                {
+                    "name": "Ada",
+                    "orcid": ada,
+                    "orcid_record_checked_at": checked_at,
+                },
                 {
                     "name": "Emmy",
                     "github": "emmy",
-                    "orcid": "0000-0000-0000-000X",
+                    "orcid": emmy,
+                    "orcid_record_checked_at": checked_at,
                 },
             ],
         )
+        with self.assertRaisesRegex(ReviewerError, "has no current-record check"):
+            authors_from_metadata(data, {})
 
     def test_authors_reject_malformed_contact_identifiers(self):
         cases = (
@@ -1820,7 +1841,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             ):
                 authors_from_metadata(
                     {"project": {"authors": [{"name": "Emmy", **contact}]}},
-                    "fallback",
+                    {},
                 )
 
     def test_formalization_metadata_rejects_ambiguous_yaml(self):
@@ -4850,6 +4871,24 @@ class MechanicalReportContractTests(unittest.TestCase):
             authorization={"relationship": "technical-test"}
         ))
 
+    def test_orcid_validation_receipts_are_closed_and_canonical(self):
+        report = ReviewerTests.mechanical_fixture(ReviewerTests())
+        identifier = "0000-0002-1825-0097"
+        report["orcid_validation"] = {
+            "schema_version": 1,
+            "checked_at": "2026-08-31T12:00:00Z",
+            "registry": "https://orcid.org",
+            "records": [{
+                "orcid": identifier,
+                "record_url": f"https://orcid.org/{identifier}",
+            }],
+        }
+        mechanical_evidence.validate_report_schema(report)
+
+        report["orcid_validation"]["records"][0]["record_url"] = "https://example.com/"
+        with self.assertRaisesRegex(ReviewerError, "artifact contract"):
+            mechanical_evidence.validate_report_schema(report)
+
     def test_an_identity_cannot_ride_in_the_archived_report(self):
         for extra in ({"submitter": "someone"}, {"issue": 12}, {"owner": "someone"}):
             with self.subTest(sorted(extra)):
@@ -7763,6 +7802,44 @@ class EntryProvenanceTests(unittest.TestCase):
                 {"name": "Wilhelm Magnus", "role": "problem-proposer"},
                 {"name": "Evgenii Khukhro", "role": "editor"},
             ],
+        )
+
+    def test_provenance_people_carry_their_orcid_record_checks(self):
+        checked_at = "2026-08-31T12:00:00Z"
+        maintainer = "0000-0002-1825-0097"
+        source_author = "0000-0002-1694-233X"
+        report = self.provenance(
+            responsible_maintainers=[{"name": "Maintainer", "orcid": maintainer}],
+            mathematical_sources=[{
+                "title": "A source",
+                "authors": [{"name": "Author", "orcid": source_author}],
+                "relationship": "formalizes",
+            }],
+        )
+        report["orcid_validation"] = {
+            "schema_version": 1,
+            "checked_at": checked_at,
+            "registry": "https://orcid.org",
+            "records": [
+                {"orcid": maintainer, "record_url": f"https://orcid.org/{maintainer}"},
+                {
+                    "orcid": source_author,
+                    "record_url": f"https://orcid.org/{source_author}",
+                },
+            ],
+        }
+
+        result = cli.entry_provenance(report)
+
+        self.assertEqual(
+            result["responsible_maintainers"][0]["orcid_record_checked_at"],
+            checked_at,
+        )
+        self.assertEqual(
+            result["mathematical_sources"][0]["authors"][0][
+                "orcid_record_checked_at"
+            ],
+            checked_at,
         )
 
     def test_free_text_is_canonicalized_only_at_the_public_entry_boundary(self):
