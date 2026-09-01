@@ -4205,6 +4205,15 @@ def registration_database_sparse_patterns(
     return (*DATABASE_SPARSE_PATTERNS, f"/{baseline_path}")
 
 
+def registration_schema_path(database: Path, *, correction: bool) -> Path:
+    """Select the immutable schema generation for the record being built."""
+    name = "schema-v4.json" if correction else "schema-v3.json"
+    path = database / name
+    if path.is_symlink() or not path.is_file():
+        raise ReviewerError(f"PalomarDatabase main does not register {name}")
+    return path
+
+
 def prepare_workspace(
     submission_id: str,
     *,
@@ -6291,9 +6300,9 @@ def register(args: argparse.Namespace) -> int:
     # after clone_at returns. Keep the private credential ephemeral and retain
     # the same no-global-config/no-replace hardening used for the clone.
     database_git_env = registry_git_environment(git_env)
-    schema_path = database / "schema-v3.json"
-    if not schema_path.is_file():
-        raise ReviewerError("PalomarDatabase main does not register schema-v3.json")
+    schema_path = registration_schema_path(
+        database, correction=correction_registration
+    )
     scores_schema_path = database / "scores-v1.json"
     if not scores_schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
