@@ -6281,6 +6281,14 @@ def register(args: argparse.Namespace) -> int:
     if not scores_schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
 
+    if getattr(args, "count_attempt", False) and not args.dry_run:
+        fresh_for_attempt = submission_state(args.submission)
+        if fresh_for_attempt is None:
+            raise ReviewerError(f"submission {args.submission} disappeared before allocation")
+        # Count the attempt before allocation can reject the candidate. The
+        # failure recorder is required to bind its positive attempt count to
+        # this durable field even when allocation itself fails.
+        state = begin_registration(fresh_for_attempt)
     permanent_id, first_registered_on, registered_at, version = registration_attempt_identity(
         database,
         state=state,
@@ -6289,11 +6297,6 @@ def register(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         git_env=database_git_env,
     )
-    if getattr(args, "count_attempt", False) and not args.dry_run:
-        fresh_for_attempt = submission_state(args.submission)
-        if fresh_for_attempt is None:
-            raise ReviewerError(f"submission {args.submission} disappeared after allocation")
-        state = begin_registration(fresh_for_attempt)
     # Everything the registry schema checks about the submission itself is
     # already decided here, and the next line is the first thing that cannot be
     # undone: preservation writes tags naming this identifier into public
