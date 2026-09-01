@@ -4901,6 +4901,70 @@ class MechanicalReportContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "artifact contract"):
             mechanical_evidence.validate_report_schema(report)
 
+    def test_legacy_correction_report_recovers_source_evidence_from_its_baseline(self):
+        identifier = "PALOMAR-2026-08-31-000001"
+        repository = "example/project"
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "Challenge.lean").write_text("theorem challenge : True := trivial\n")
+            (source / "Solution.lean").write_text("theorem solution : True := trivial\n")
+            challenge_sha = cli.sha256_file(source / "Challenge.lean")
+            solution_sha = cli.sha256_file(source / "Solution.lean")
+            baseline = {
+                "id": identifier,
+                "version": 1,
+                "source": {"repository": repository, "commit": commit},
+                "formalization": {
+                    "challenge_path": "Challenge.lean",
+                    "solution_path": "Solution.lean",
+                },
+                "verification": {
+                    "challenge_sha256": challenge_sha,
+                    "solution_sha256": solution_sha,
+                },
+            }
+            raw = json.dumps(baseline, separators=(",", ":")).encode()
+            mechanical = {
+                "submission": {
+                    "registry_correction": {
+                        "based_on": {"id": identifier, "version": 1},
+                        "baseline": {
+                            "path": f"entries/{identifier}-v1.json",
+                            "sha256": hashlib.sha256(raw).hexdigest(),
+                        },
+                    },
+                },
+                "source": {"repository": repository, "commit": commit},
+                "challenge": {"module": "Challenge"},
+                "solution": {"module": "Solution"},
+            }
+            encoded = cli.base64.b64encode(raw).decode()
+            with mock.patch.object(cli, "gh", return_value=encoded):
+                self.assertTrue(cli.apply_registry_correction_source_evidence(mechanical))
+            cli.verify_registry_correction_source_evidence(source, mechanical)
+
+        self.assertEqual(
+            mechanical["challenge"],
+            {"module": "Challenge", "path": "Challenge.lean", "sha256": challenge_sha},
+        )
+        self.assertEqual(
+            mechanical["solution"],
+            {"module": "Solution", "path": "Solution.lean", "sha256": solution_sha},
+        )
+
+    def test_legacy_correction_source_must_still_match_the_registered_digest(self):
+        mechanical = {
+            "challenge": {"path": "Challenge.lean", "sha256": "0" * 64},
+            "solution": {"path": "Solution.lean", "sha256": "0" * 64},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "Challenge.lean").write_text("changed\n")
+            (source / "Solution.lean").write_text("changed\n")
+            with self.assertRaisesRegex(ReviewerError, "registered challenge digest"):
+                cli.verify_registry_correction_source_evidence(source, mechanical)
+
     def test_an_identity_cannot_ride_in_the_archived_report(self):
         for extra in ({"submitter": "someone"}, {"issue": 12}, {"owner": "someone"}):
             with self.subTest(sorted(extra)):
@@ -5510,6 +5574,28 @@ class AutomaticLoopTests(unittest.TestCase):
             cli.ensure_review_renderable({"id": "a1b2c3d4e5f6"}, args)
 
         render.assert_not_called()
+
+    def test_registry_correction_starts_review_without_a_renderability_transition(self):
+        row = self.row(
+            "aaaaaaaaaaaa",
+            status="awaiting-review",
+            registry_correction={"schema_version": 1},
+        )
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check") as begin_gate,
+            mock.patch.object(cli, "ensure_review_renderable") as render,
+            mock.patch.object(cli, "begin_review", side_effect=lambda record: record),
+            mock.patch.object(cli, "record_review_duration"),
+            mock.patch.object(cli, "run_review", return_value=0) as review,
+        ):
+            self.assertEqual(cli.auto(self.opts(max_reviews=1)), 0)
+
+        begin_gate.assert_not_called()
+        render.assert_not_called()
+        self.assertEqual([call.args[0].apply for call in review.call_args_list], [False, True])
 
     def test_chained_state_transitions_use_the_sha_written_by_the_first(self):
         state = {
@@ -6721,6 +6807,92 @@ class RunReviewAccountingTests(unittest.TestCase):
                 with self.assertRaises(cli.SubmitterRenderabilityError):
                     cli.run_review(args)
             execute_engine.assert_not_called()
+
+    def test_registry_correction_dry_run_skips_challenge_rendering(self):
+        args = SimpleNamespace(
+            submission="a1b2c3d4e5f6",
+            work_dir=None,
+            apply=False,
+            policy_ref=None,
+            engine="command",
+            model=None,
+            command="reviewer",
+            reasoning_effort=None,
+        )
+        state = {
+            "id": args.submission,
+            "registry_correction": {"schema_version": 1},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / args.submission
+            work.mkdir()
+            args.work_dir = directory
+            with (
+                mock.patch.object(cli, "queue", return_value=[]),
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    return_value=(work, state, {"status": "pass"}, "a" * 40),
+                ),
+                mock.patch.object(cli, "ensure_challenge_renderable") as render,
+                mock.patch.object(
+                    cli,
+                    "load_json",
+                    side_effect=[
+                        {"steps": [{"id": "literature_notability", "score_keys": []}]},
+                        {},
+                    ],
+                ),
+                mock.patch.object(cli, "validate_current_review_contract"),
+                mock.patch.object(cli, "render_prompt", return_value="review prompt"),
+                mock.patch.object(
+                    engine_execution,
+                    "execute",
+                    side_effect=engine_execution.EngineError("stop after preparation"),
+                ),
+            ):
+                with self.assertRaisesRegex(ReviewerError, "stop after preparation"):
+                    cli.run_review(args)
+
+        render.assert_not_called()
+
+    def test_registry_correction_delivery_has_no_renderability_receipt(self):
+        args = SimpleNamespace(
+            submission="a1b2c3d4e5f6",
+            work_dir=None,
+            apply=True,
+            policy_ref=None,
+            engine="command",
+            model=None,
+            command="reviewer",
+            reasoning_effort=None,
+        )
+        state = {
+            "id": args.submission,
+            "registry_correction": {"schema_version": 1},
+        }
+        stored = {"policy_commit": "a" * 40}
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / args.submission
+            work.mkdir()
+            (work / "review.json").write_text(json.dumps(stored))
+            (work / "mechanical-report-url").write_text("https://example.test/report\n")
+            args.work_dir = directory
+            with (
+                mock.patch.object(cli, "queue", return_value=[]),
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    return_value=(work, state, {"status": "pass"}, "a" * 40),
+                ),
+                mock.patch.object(cli, "ensure_challenge_renderable") as render,
+                mock.patch.object(cli, "validate_stored_review"),
+                mock.patch.object(cli, "deliver_review", return_value=state) as deliver,
+            ):
+                self.assertEqual(cli.run_review(args), 0)
+
+        render.assert_not_called()
+        self.assertIsNone(deliver.call_args.kwargs["renderability"])
 
     def test_a_completed_review_records_and_prints_the_measured_spend(self):
         """Exercise the paid-run tail through the pure accounting call seam."""

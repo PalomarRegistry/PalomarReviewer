@@ -322,7 +322,7 @@ CORRECTION_REPORT_SCHEMA = {
         "schema_version", "status", "stage", "phase", "submission", "source",
         "existing_id", "formalization", "classification", "provenance",
         "orcid_validation", "license", "lean_toolchain", "comparator", "lakefile",
-        "checked_at", "workflow_url",
+        "challenge", "solution", "checked_at", "workflow_url",
     ],
     "properties": {
         "schema_version": {"const": 2},
@@ -362,6 +362,55 @@ CORRECTION_REPORT_SCHEMA = {
         "lean_toolchain": MECHANICAL_REPORT_SCHEMA["properties"]["lean_toolchain"],
         "comparator": MECHANICAL_REPORT_SCHEMA["properties"]["comparator"],
         "lakefile": MECHANICAL_REPORT_SCHEMA["properties"]["lakefile"],
+        # Early correction reports carried only the module. Accept that exact
+        # legacy shape for already-admitted records and close the path-bound
+        # shape emitted by current correction validation.
+        "challenge": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["module"],
+                    "properties": {
+                        "module": MECHANICAL_REPORT_SCHEMA["properties"]["challenge"]
+                        ["properties"]["module"],
+                    },
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["module", "path", "sha256"],
+                    "properties": {
+                        key: MECHANICAL_REPORT_SCHEMA["properties"]["challenge"]
+                        ["properties"][key]
+                        for key in ("module", "path", "sha256")
+                    },
+                },
+            ],
+        },
+        "solution": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["module"],
+                    "properties": {
+                        "module": MECHANICAL_REPORT_SCHEMA["properties"]["solution"]
+                        ["properties"]["module"],
+                    },
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["module", "path", "sha256"],
+                    "properties": {
+                        key: MECHANICAL_REPORT_SCHEMA["properties"]["solution"]
+                        ["properties"][key]
+                        for key in ("module", "path", "sha256")
+                    },
+                },
+            ],
+        },
         "checked_at": MECHANICAL_REPORT_SCHEMA["properties"]["checked_at"],
         "workflow_url": MECHANICAL_REPORT_SCHEMA["properties"]["workflow_url"],
     },
