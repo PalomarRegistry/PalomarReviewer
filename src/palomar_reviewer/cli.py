@@ -4188,6 +4188,23 @@ def verify_registry_correction_source_evidence(
             )
 
 
+def registration_database_sparse_patterns(
+    mechanical: dict[str, Any],
+) -> tuple[str, ...]:
+    """Include only the exact historical entry a correction must inherit."""
+    correction = mechanical.get("submission", {}).get("registry_correction")
+    if not isinstance(correction, dict):
+        return DATABASE_SPARSE_PATTERNS
+    baseline = correction.get("baseline")
+    baseline_path = baseline.get("path") if isinstance(baseline, dict) else None
+    if not isinstance(baseline_path, str) or not re.fullmatch(
+        r"entries/PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-v[1-9][0-9]*\.json",
+        baseline_path,
+    ):
+        raise ReviewerError("registry correction baseline path is malformed")
+    return (*DATABASE_SPARSE_PATTERNS, f"/{baseline_path}")
+
+
 def prepare_workspace(
     submission_id: str,
     *,
@@ -6266,7 +6283,7 @@ def register(args: argparse.Namespace) -> int:
         f"https://github.com/{DATABASE_REPO}",
         resolved,
         database,
-        sparse_patterns=DATABASE_SPARSE_PATTERNS,
+        sparse_patterns=registration_database_sparse_patterns(mechanical),
     )
     if checked_out != resolved:
         raise ReviewerError("PalomarDatabase checkout does not match resolved main")
