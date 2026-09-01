@@ -4040,6 +4040,87 @@ def apply_registry_correction_metadata(mechanical: dict[str, Any]) -> bool:
     return True
 
 
+def apply_registry_correction_source_evidence(mechanical: dict[str, Any]) -> bool:
+    """Recover immutable source paths omitted by early correction reports."""
+    correction = mechanical.get("submission", {}).get("registry_correction")
+    if not isinstance(correction, dict):
+        return False
+    if all(
+        isinstance(mechanical.get(name), dict)
+        and isinstance(mechanical[name].get("path"), str)
+        and isinstance(mechanical[name].get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", mechanical[name]["sha256"])
+        for name in ("challenge", "solution")
+    ):
+        return True
+    baseline_binding = correction.get("baseline")
+    based_on = correction.get("based_on")
+    if not isinstance(baseline_binding, dict) or not isinstance(based_on, dict):
+        raise ReviewerError("registry correction has no valid baseline binding")
+    baseline_path = baseline_binding.get("path")
+    if not isinstance(baseline_path, str) or not re.fullmatch(
+        r"entries/PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-v[1-9][0-9]*\.json",
+        baseline_path,
+    ):
+        raise ReviewerError("registry correction baseline path is malformed")
+    encoded = gh(
+        [
+            "api",
+            f"repos/{DATABASE_REPO}/contents/{baseline_path}?ref=main",
+            "--jq",
+            ".content",
+        ]
+    ).replace("\n", "")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        baseline = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise ReviewerError("registry correction baseline could not be decoded") from error
+    if (
+        hashlib.sha256(raw).hexdigest() != baseline_binding.get("sha256")
+        or not isinstance(baseline, dict)
+        or baseline.get("id") != based_on.get("id")
+        or baseline.get("version") != based_on.get("version")
+        or baseline.get("source", {}).get("repository")
+        != mechanical.get("source", {}).get("repository")
+        or baseline.get("source", {}).get("commit")
+        != mechanical.get("source", {}).get("commit")
+    ):
+        raise ReviewerError("registry correction baseline does not match its source binding")
+    formalization = baseline.get("formalization")
+    verification = baseline.get("verification")
+    if not isinstance(formalization, dict) or not isinstance(verification, dict):
+        raise ReviewerError("registry correction baseline lacks source evidence")
+    for name in ("challenge", "solution"):
+        relative = formalization.get(f"{name}_path")
+        digest = verification.get(f"{name}_sha256")
+        if (
+            not isinstance(relative, str)
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ReviewerError(f"registry correction baseline lacks {name} evidence")
+        mechanical[name].update({"path": relative, "sha256": digest})
+    return True
+
+
+def verify_registry_correction_source_evidence(
+    source: Path, mechanical: dict[str, Any]
+) -> None:
+    """Check the registered baseline hashes against the pinned source clone."""
+    for name in ("challenge", "solution"):
+        record = mechanical[name]
+        path = mechanical_evidence.source_path(
+            source,
+            record["path"],
+            f"registry correction {name} source",
+        )
+        if sha256_file(path) != record["sha256"]:
+            raise ReviewerError(
+                f"registry correction source no longer matches the registered {name} digest"
+            )
+
+
 def prepare_workspace(
     submission_id: str,
     *,
@@ -4058,7 +4139,7 @@ def prepare_workspace(
     work.mkdir(parents=True, exist_ok=True)
     download_root = work / "mechanical-download"
     mechanical, report_url, run_data = mechanical_report(state, download_root)
-    apply_registry_correction_metadata(mechanical)
+    correction_review = apply_registry_correction_metadata(mechanical)
     source_info = mechanical["source"]
     if mechanical["submission"]["submission_id"] != submission_id:
         raise ReviewerError("mechanical report names a different submission")
@@ -4066,6 +4147,9 @@ def prepare_workspace(
     if source_commit != source_info["commit"]:
         raise ReviewerError("source checkout does not match mechanical report")
     source = work / "source"
+    if correction_review:
+        apply_registry_correction_source_evidence(mechanical)
+        verify_registry_correction_source_evidence(source, mechanical)
     formalization_path = mechanical_evidence.source_path(
         source,
         mechanical_evidence.relative_path(mechanical, "formalization_metadata"),
@@ -4640,8 +4724,6 @@ def run_review(args: argparse.Namespace) -> int:
             mechanical_url=mechanical_url,
             policy_commit=policy_commit,
         )
-        render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
-        receipt = renderability_receipt(render_report, mechanical)
         # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
@@ -4673,7 +4755,8 @@ def run_review(args: argparse.Namespace) -> int:
     # side effect. Run the exact trusted rendering path before spending any
     # model review; anonymous compiler-generated declarations selected by the
     # Comparator are rejected here with a submitter-facing diagnostic.
-    ensure_challenge_renderable(work, mechanical)
+    if not state.get("registry_correction"):
+        ensure_challenge_renderable(work, mechanical)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
     validate_current_review_contract(rubric, review_schema)
@@ -5983,6 +6066,7 @@ def register(args: argparse.Namespace) -> int:
     state = load_json(work / "state.json")
     mechanical = load_json(work / "mechanical-report.json")
     apply_registry_correction_metadata(mechanical)
+    apply_registry_correction_source_evidence(mechanical)
     if state.get("id") != args.submission:
         raise ReviewerError("workspace state does not match the requested submission")
     mechanical_evidence.validate_report_schema(mechanical)
@@ -7887,18 +7971,32 @@ def auto(args: argparse.Namespace) -> int:
         print(f"::group::Review {record['id']}", flush=True)
         gate_complete = False
         try:
-            record = begin_renderability_check(record)
-            render_wait = max(1, int(pass_remaining() - REVIEW_RESERVE_SECONDS))
-            ensure_review_renderable(record, args, wait_seconds=render_wait)
-            gate_complete = True
+            if record.get("registry_correction"):
+                # The correction-validation run is the mechanical gate for a
+                # maintainer correction. It deliberately does not build or
+                # render the unchanged source repository, so neither perform
+                # nor advertise the ordinary Challenge renderability check.
+                gate_complete = True
+            else:
+                record = begin_renderability_check(record)
+                render_wait = max(1, int(pass_remaining() - REVIEW_RESERVE_SECONDS))
+                ensure_review_renderable(record, args, wait_seconds=render_wait)
+                gate_complete = True
             if pass_remaining() <= 0:
-                record = advance_state(
-                    record,
-                    "awaiting-review",
-                    "The Challenge renderability check passed; review will start next pass",
-                    renderability_attempts=0,
-                    renderability_error=None,
-                )
+                if record.get("registry_correction"):
+                    record = advance_state(
+                        record,
+                        "awaiting-review",
+                        "The automated review will start in the next pass",
+                    )
+                else:
+                    record = advance_state(
+                        record,
+                        "awaiting-review",
+                        "The Challenge renderability check passed; review will start next pass",
+                        renderability_attempts=0,
+                        renderability_error=None,
+                    )
                 advanced += 1
                 unattempted.append(record)
                 continue
