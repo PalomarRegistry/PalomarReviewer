@@ -290,6 +290,7 @@ def validate_record(
 ) -> dict[str, Any]:
     """Bind the branch record to the saved identity, review, source, and State."""
     identifier, first_registered_on, registered_at, version = identity
+    expected_schema_version = 4 if isinstance(state.get("registry_correction"), dict) else 3
     source = record.get("source") if isinstance(record, dict) else None
     submission = record.get("submission") if isinstance(record, dict) else None
     recorded_review = record.get("review") if isinstance(record, dict) else None
@@ -298,7 +299,7 @@ def validate_record(
     if (
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
-        or record["schema_version"] != 3
+        or record["schema_version"] != expected_schema_version
         or record.get("id") != identifier
         or record.get("version") != version
         or record.get("first_registered_on") != first_registered_on
