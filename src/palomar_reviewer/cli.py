@@ -4769,11 +4769,13 @@ def ensure_review_renderable(
 ) -> None:
     """Run the renderability gate before a review attempt is durably counted."""
     root = Path(args.work_dir).expanduser().resolve()
-    work, _state, mechanical, _policy_commit = prepare_workspace(
+    work, state, mechanical, _policy_commit = prepare_workspace(
         record["id"],
         root=root,
         policy_ref=args.policy_ref,
     )
+    if state.get("registry_correction"):
+        return
     ensure_challenge_renderable(work, mechanical, wait_seconds=wait_seconds)
 
 

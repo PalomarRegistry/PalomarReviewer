@@ -5496,6 +5496,21 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(updated["renderability_attempts"], 1)
         self.assertNotIn("review_attempts", updated)
 
+    def test_registry_correction_skips_the_pre_review_renderability_gate(self):
+        args = self.opts()
+        state = {"registry_correction": {"schema_version": 1}}
+        with (
+            mock.patch.object(
+                cli,
+                "prepare_workspace",
+                return_value=(Path(args.work_dir), state, {}, "a" * 40),
+            ),
+            mock.patch.object(cli, "ensure_challenge_renderable") as render,
+        ):
+            cli.ensure_review_renderable({"id": "a1b2c3d4e5f6"}, args)
+
+        render.assert_not_called()
+
     def test_chained_state_transitions_use_the_sha_written_by_the_first(self):
         state = {
             "id": "a1b2c3d4e5f6",
