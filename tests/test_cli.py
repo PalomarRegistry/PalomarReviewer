@@ -5023,6 +5023,31 @@ class MechanicalReportContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ReviewerError, "registered challenge digest"):
                 cli.verify_registry_correction_source_evidence(source, mechanical)
 
+    def test_correction_database_checkout_includes_only_its_exact_baseline(self):
+        baseline_path = "entries/PALOMAR-2026-08-31-000001-v1.json"
+        mechanical = {
+            "submission": {
+                "registry_correction": {"baseline": {"path": baseline_path}}
+            }
+        }
+        self.assertEqual(
+            cli.registration_database_sparse_patterns(mechanical),
+            (*cli.DATABASE_SPARSE_PATTERNS, f"/{baseline_path}"),
+        )
+        self.assertEqual(
+            cli.registration_database_sparse_patterns({"submission": {}}),
+            cli.DATABASE_SPARSE_PATTERNS,
+        )
+
+    def test_correction_database_checkout_refuses_an_unbounded_baseline_path(self):
+        mechanical = {
+            "submission": {
+                "registry_correction": {"baseline": {"path": "entries/../secrets.json"}}
+            }
+        }
+        with self.assertRaisesRegex(ReviewerError, "baseline path is malformed"):
+            cli.registration_database_sparse_patterns(mechanical)
+
     def test_correction_evidence_contains_only_the_correction_contract(self):
         identifier = "PALOMAR-2026-08-31-000001"
         with tempfile.TemporaryDirectory() as directory:
