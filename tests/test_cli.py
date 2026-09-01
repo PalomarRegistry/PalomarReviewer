@@ -5048,6 +5048,20 @@ class MechanicalReportContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "baseline path is malformed"):
             cli.registration_database_sparse_patterns(mechanical)
 
+    def test_correction_registration_uses_the_additive_schema_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            (database / "schema-v3.json").write_text("{}\n")
+            (database / "schema-v4.json").write_text("{}\n")
+            self.assertEqual(
+                cli.registration_schema_path(database, correction=False).name,
+                "schema-v3.json",
+            )
+            self.assertEqual(
+                cli.registration_schema_path(database, correction=True).name,
+                "schema-v4.json",
+            )
+
     def test_correction_evidence_contains_only_the_correction_contract(self):
         identifier = "PALOMAR-2026-08-31-000001"
         with tempfile.TemporaryDirectory() as directory:
