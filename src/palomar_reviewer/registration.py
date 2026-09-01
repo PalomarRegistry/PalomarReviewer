@@ -674,6 +674,46 @@ def _assert_commit_is_new(
             )
 
 
+def _assert_correction_reuses_current_commit(
+    database: Path,
+    identifier: str,
+    registered: dict[str, Any],
+    mechanical: dict[str, Any],
+    *,
+    git_env: dict[str, str] | None = None,
+) -> None:
+    """Require a correction to preserve the exact active version's source."""
+    submission = mechanical.get("submission")
+    correction = (
+        submission.get("registry_correction") if isinstance(submission, dict) else None
+    )
+    based_on = correction.get("based_on") if isinstance(correction, dict) else None
+    baseline = correction.get("baseline") if isinstance(correction, dict) else None
+    versions = registered.get("versions")
+    if not isinstance(versions, list) or not versions:
+        raise ReviewerError(f"{identifier} has no registered version to correct")
+    current = versions[-1]
+    if (
+        not isinstance(based_on, dict)
+        or based_on.get("id") != identifier
+        or based_on.get("version") != current.get("version")
+        or not isinstance(baseline, dict)
+        or baseline.get("path") != current.get("path")
+    ):
+        raise ReviewerError("registry correction baseline is stale or is not the active version")
+    relative = str(current["path"])
+    entry = _load_projection(database, relative, git_env=git_env)
+    entry_source = entry.get("source") if isinstance(entry, dict) else None
+    source = mechanical.get("source")
+    if (
+        not isinstance(entry_source, dict)
+        or not isinstance(source, dict)
+        or entry_source.get("repository") != source.get("repository")
+        or entry_source.get("commit") != source.get("commit")
+    ):
+        raise ReviewerError("registry correction would move the active version's source")
+
+
 def registration_identity(
     database: Path,
     *,
@@ -726,13 +766,28 @@ def registration_identity(
             raise ReviewerError(
                 f"{identifier} has reached the {MAX_VERSIONS_PER_RESULT}-version limit"
             )
-        _assert_commit_is_new(
-            database,
-            identifier,
-            result,
-            mechanical,
-            git_env=git_env,
+        submission = mechanical.get("submission")
+        correction = (
+            submission.get("registry_correction")
+            if isinstance(submission, dict)
+            else None
         )
+        if isinstance(correction, dict):
+            _assert_correction_reuses_current_commit(
+                database,
+                identifier,
+                result,
+                mechanical,
+                git_env=git_env,
+            )
+        else:
+            _assert_commit_is_new(
+                database,
+                identifier,
+                result,
+                mechanical,
+                git_env=git_env,
+            )
         resolved = (identifier, str(result["first_registered_on"]), registered_at, len(versions) + 1)
         if reserved is not None and reserved != resolved:
             raise ReviewerError("saved registration attempt disagrees with the requested update")
