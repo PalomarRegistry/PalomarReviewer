@@ -327,6 +327,75 @@ class RegistrationProjectionTests(unittest.TestCase):
         )
         self.assertEqual(identity[-1], 2)
 
+    def test_an_ordinary_update_cannot_reuse_a_registered_source_commit(self):
+        repo = self.repo()
+        write_json(repo, registration.result_path(FIRST), result_document())
+        write_json(repo, f"entries/{FIRST}-v1.json", record())
+        write_identity(repo)
+        commit(repo)
+        with self.assertRaisesRegex(ReviewerError, "already has a registered version"):
+            registration.registration_identity(
+                repo,
+                submission_id="newversion12",
+                existing_id=FIRST,
+                reviewed_at="2026-08-09T10:00:00Z",
+                registered_at="2026-08-10T12:00:00Z",
+                mechanical={
+                    "source": {"repository": "example/project", "commit": "1" * 40},
+                    "comparator": {"path": "comparator.json"},
+                },
+            )
+
+    def test_a_registry_correction_must_reuse_the_active_source_commit(self):
+        repo = self.repo()
+        write_json(repo, registration.result_path(FIRST), result_document())
+        write_json(repo, f"entries/{FIRST}-v1.json", record())
+        write_identity(repo)
+        commit(repo)
+        identity = registration.registration_identity(
+            repo,
+            submission_id="correction12",
+            existing_id=FIRST,
+            reviewed_at="2026-08-09T10:00:00Z",
+            registered_at="2026-08-10T12:00:00Z",
+            mechanical={
+                "source": {"repository": "example/project", "commit": "1" * 40},
+                "comparator": {"path": "comparator.json"},
+                "submission": {
+                    "registry_correction": {
+                        "based_on": {"id": FIRST, "version": 1},
+                        "baseline": {"path": f"entries/{FIRST}-v1.json"},
+                    }
+                },
+            },
+        )
+        self.assertEqual(identity, (FIRST, "2026-08-09", "2026-08-10T12:00:00Z", 2))
+
+    def test_a_registry_correction_cannot_name_a_stale_baseline(self):
+        repo = self.repo()
+        write_json(repo, registration.result_path(FIRST), result_document())
+        write_json(repo, f"entries/{FIRST}-v1.json", record())
+        write_identity(repo)
+        commit(repo)
+        with self.assertRaisesRegex(ReviewerError, "baseline is stale"):
+            registration.registration_identity(
+                repo,
+                submission_id="correction12",
+                existing_id=FIRST,
+                reviewed_at="2026-08-09T10:00:00Z",
+                registered_at="2026-08-10T12:00:00Z",
+                mechanical={
+                    "source": {"repository": "example/project", "commit": "1" * 40},
+                    "comparator": {"path": "comparator.json"},
+                    "submission": {
+                        "registry_correction": {
+                            "based_on": {"id": FIRST, "version": 0},
+                            "baseline": {"path": f"entries/{FIRST}-v1.json"},
+                        }
+                    },
+                },
+            )
+
     def test_an_immutable_submission_binding_stops_duplicate_registration(self):
         repo = self.repo()
         write_json(

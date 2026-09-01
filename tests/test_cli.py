@@ -2304,6 +2304,64 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         arguments.update(overrides)
         return registry_record(**arguments)
 
+    def test_registry_correction_inherits_proof_and_changes_only_metadata(self):
+        baseline = self.example_record()
+        baseline_path = f"entries/{baseline['id']}-v1.json"
+        baseline_sha256 = "7" * 64
+        mechanical = self.mechanical_fixture()
+        effective = {
+            "title": "Corrected title",
+            "abstract": baseline["abstract"],
+            "authors": baseline["authors"],
+            "classification": baseline["classification"],
+            "provenance": {
+                key: baseline["provenance"][key]
+                for key in (
+                    "responsible_maintainers",
+                    "mathematical_sources",
+                    "related_formalizations",
+                )
+            },
+        }
+        mechanical["submission"]["registry_correction"] = {
+            "based_on": {"id": baseline["id"], "version": 1},
+            "baseline": {"path": baseline_path, "sha256": baseline_sha256},
+            "metadata": effective,
+            "explanation": "Correct the public title.",
+            "changed_fields": ["title"],
+        }
+        record = cli.registry_correction_record(
+            state={"id": "correction12"},
+            mechanical=mechanical,
+            review={
+                "reviewed_at": "2026-08-02T12:00:00Z",
+                "policy_commit": "9" * 40,
+                "reviewer_models": ["codex:test"],
+                "warnings": [],
+            },
+            baseline=baseline,
+            baseline_path=baseline_path,
+            baseline_sha256=baseline_sha256,
+            registered_at="2026-08-02T13:00:00Z",
+            version=2,
+            correction_evidence={
+                "review_sha256": "8" * 64,
+                "evidence_path": "evidence/correction/",
+                "evidence_tree_sha256": "6" * 64,
+            },
+        )
+        self.assertEqual(record["title"], "Corrected title")
+        self.assertEqual(record["source"], baseline["source"])
+        self.assertEqual(record["formalization"], baseline["formalization"])
+        self.assertEqual(record["verification"], baseline["verification"])
+        self.assertEqual(record["challenge_render"], baseline["challenge_render"])
+        self.assertEqual(record["preservation"], baseline["preservation"])
+        self.assertEqual(record["trust"], baseline["trust"])
+        self.assertEqual(
+            record["registry_correction"]["generated_by"],
+            "Palomar / Registry correction",
+        )
+
     def metadata_gate_arguments(self, **overrides):
         """The inputs `register` has in hand before it preserves anything."""
         mechanical = self.mechanical_fixture()
@@ -4964,6 +5022,47 @@ class MechanicalReportContractTests(unittest.TestCase):
             (source / "Solution.lean").write_text("changed\n")
             with self.assertRaisesRegex(ReviewerError, "registered challenge digest"):
                 cli.verify_registry_correction_source_evidence(source, mechanical)
+
+    def test_correction_evidence_contains_only_the_correction_contract(self):
+        identifier = "PALOMAR-2026-08-31-000001"
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            for name, document in (
+                ("mechanical-report.json", {"stage": "correction-validation"}),
+                ("workflow-run.json", {"run_attempt": 1}),
+                ("review.json", {"outcome": "neutral"}),
+            ):
+                (work / name).write_text(json.dumps(document) + "\n")
+            mechanical = {
+                "submission": {
+                    "registry_correction": {
+                        "based_on": {"id": identifier, "version": 1},
+                        "baseline": {
+                            "path": f"entries/{identifier}-v1.json",
+                            "sha256": "a" * 64,
+                        },
+                    }
+                }
+            }
+            bundle, evidence = cli.build_registry_correction_evidence(work, mechanical)
+            self.assertEqual(
+                {path.name for path in bundle.iterdir()},
+                {
+                    "baseline-reference.json",
+                    "correction-report.json",
+                    "workflow-run.json",
+                    "review.json",
+                    "evidence-manifest.json",
+                },
+            )
+            manifest = json.loads((bundle / "evidence-manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                evidence["review_sha256"], cli.sha256_file(bundle / "review.json")
+            )
+            self.assertEqual(
+                evidence["evidence_tree_sha256"], manifest["evidence_tree_sha256"]
+            )
 
     def test_an_identity_cannot_ride_in_the_archived_report(self):
         for extra in ({"submitter": "someone"}, {"issue": 12}, {"owner": "someone"}):

@@ -1905,6 +1905,73 @@ def build_verification_evidence(work: Path) -> tuple[Path, dict[str, Any]]:
     }
 
 
+def build_registry_correction_evidence(
+    work: Path, mechanical: dict[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    """Build the bounded evidence bundle for one metadata-only correction."""
+    correction = mechanical.get("submission", {}).get("registry_correction")
+    if not isinstance(correction, dict):
+        raise ReviewerError("registry correction evidence requires a correction report")
+    based_on = correction.get("based_on")
+    baseline = correction.get("baseline")
+    if not isinstance(based_on, dict) or not isinstance(baseline, dict):
+        raise ReviewerError("registry correction report has no complete baseline")
+    bundle = work / "correction-evidence"
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    bundle.mkdir()
+    write_json(
+        bundle / "baseline-reference.json",
+        {
+            "schema_version": 1,
+            "id": based_on.get("id"),
+            "version": based_on.get("version"),
+            "path": baseline.get("path"),
+            "sha256": baseline.get("sha256"),
+            "inherited": [
+                "source",
+                "formalization",
+                "verification",
+                "challenge_render",
+                "preservation",
+                "trust",
+            ],
+        },
+    )
+    for source_name, destination_name in (
+        ("mechanical-report.json", "correction-report.json"),
+        ("workflow-run.json", "workflow-run.json"),
+        ("review.json", "review.json"),
+    ):
+        source = work / source_name
+        if source.is_symlink() or not source.is_file():
+            raise ReviewerError(f"registration requires a regular {source_name}")
+        if source.stat().st_size > MAX_EVIDENCE_FILE_BYTES:
+            raise ReviewerError(f"correction evidence file exceeds the size cap: {source_name}")
+        shutil.copyfile(source, bundle / destination_name)
+    files = [
+        {
+            "path": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(bundle.iterdir())
+    ]
+    if sum(int(item["bytes"]) for item in files) > MAX_EVIDENCE_BYTES:
+        raise ReviewerError("registry correction evidence exceeds the total-size cap")
+    canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    tree_hash = hashlib.sha256(canonical).hexdigest()
+    write_json(
+        bundle / "evidence-manifest.json",
+        {"schema_version": 2, "evidence_tree_sha256": tree_hash, "files": files},
+    )
+    review = next(item for item in files if item["path"] == "review.json")
+    return bundle, {
+        "evidence_tree_sha256": tree_hash,
+        "review_sha256": review["sha256"],
+    }
+
+
 def expected_render_source(mechanical: dict[str, Any]) -> dict[str, Any]:
     challenge = mechanical["challenge"]
     return {
@@ -6067,6 +6134,9 @@ def register(args: argparse.Namespace) -> int:
     mechanical = load_json(work / "mechanical-report.json")
     apply_registry_correction_metadata(mechanical)
     apply_registry_correction_source_evidence(mechanical)
+    correction_registration = isinstance(
+        mechanical.get("submission", {}).get("registry_correction"), dict
+    )
     if state.get("id") != args.submission:
         raise ReviewerError("workspace state does not match the requested submission")
     mechanical_evidence.validate_report_schema(mechanical)
@@ -6151,12 +6221,15 @@ def register(args: argparse.Namespace) -> int:
         submission_state(args.submission),
         state_repository=STATE_REPO,
     )
-    try:
-        prior_renderability = validate_renderability_receipt(
-            state.get("renderability"), mechanical
-        )
-    except ReviewerError as error:
-        raise DeterministicRegistrationError(str(error)) from error
+    if correction_registration:
+        prior_renderability = None
+    else:
+        try:
+            prior_renderability = validate_renderability_receipt(
+                state.get("renderability"), mechanical
+            )
+        except ReviewerError as error:
+            raise DeterministicRegistrationError(str(error)) from error
     source = work / "source"
     formalization_path = mechanical_evidence.source_path(
         source,
@@ -6180,9 +6253,13 @@ def register(args: argparse.Namespace) -> int:
     # preservation begins. New reviews already cached this exact check; this
     # remains the fail-closed boundary for older reviews and for a lost
     # workspace cache.
-    render_report, render_bundle = registration_render_result(
-        args, work, mechanical, prior_renderability
-    )
+    if correction_registration:
+        render_report = None
+        render_bundle = None
+    else:
+        render_report, render_bundle = registration_render_result(
+            args, work, mechanical, prior_renderability
+        )
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
     checked_out = clone_at(
@@ -6224,64 +6301,99 @@ def register(args: argparse.Namespace) -> int:
     # schema refuses used to be discovered after that, and after a render run,
     # which is why an identifier that was never registered can still be found
     # in the archive.
-    _refuse_unregistrable_metadata(
-        load_json(schema_path),
-        state=state,
-        permanent_id=permanent_id,
-        mechanical=mechanical,
-        review=review,
-        metadata=metadata,
-        first_registered_on=first_registered_on,
-        registered_at=registered_at,
-        version=version,
-    )
-    preservation_plan = prepare_preservation(
-        work,
-        mechanical,
-        permanent_id=permanent_id,
-        version=version,
-        dry_run=args.dry_run,
-    )
-    preservation = preservation_plan["preservation"]
-    cached_render = work / "render-result"
-    if render_bundle.parent != cached_render:
-        if cached_render.is_dir() and not cached_render.is_symlink():
-            shutil.rmtree(cached_render)
-        elif cached_render.exists() or cached_render.is_symlink():
-            cached_render.unlink()
-        shutil.copytree(render_bundle.parent, cached_render)
-        render_bundle = cached_render / "bundle"
-    tree_hash = render_report["artifact_tree_sha256"]
-    artifact_path = f"renders/{permanent_id}-v{version}/{tree_hash}/"
-    challenge_render = {
-        "format": "verso-html",
-        "artifact_path": artifact_path,
-        "entrypoint": "Challenge/index.html",
-        "artifact_tree_sha256": tree_hash,
-        "verso_commit": render_report["verso_commit"],
-        "renderer_commit": render_report["renderer_commit"],
-        "landrun_commit": render_report["landrun_commit"],
-        "rendered_at": render_report["rendered_at"],
-    }
-    evidence_bundle, verification_evidence = build_verification_evidence(work)
-    if verification_evidence["source_archive_sha256"] != preservation["receipt_sha256"]:
-        raise ReviewerError("source archive receipt changed while building verification evidence")
-    evidence_hash = verification_evidence["evidence_tree_sha256"]
-    evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
-    verification_evidence["evidence_path"] = evidence_path
-    record = registry_record(
-        state=state,
-        permanent_id=permanent_id,
-        mechanical=mechanical,
-        review=review,
-        metadata=metadata,
-        first_registered_on=first_registered_on,
-        registered_at=registered_at,
-        version=version,
-        challenge_render=challenge_render,
-        verification_evidence=verification_evidence,
-        preservation=preservation,
-    )
+    if correction_registration:
+        correction = mechanical["submission"]["registry_correction"]
+        baseline_relative = correction["baseline"]["path"]
+        baseline_path = database / baseline_relative
+        if baseline_path.is_symlink() or not baseline_path.is_file():
+            raise ReviewerError("registry correction baseline is not a regular database entry")
+        baseline_bytes = baseline_path.read_bytes()
+        baseline_sha256 = hashlib.sha256(baseline_bytes).hexdigest()
+        try:
+            baseline = json.loads(baseline_bytes)
+        except json.JSONDecodeError as error:
+            raise ReviewerError("registry correction baseline is not valid JSON") from error
+        evidence_bundle, correction_evidence = build_registry_correction_evidence(
+            work, mechanical
+        )
+        evidence_hash = correction_evidence["evidence_tree_sha256"]
+        evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
+        correction_evidence["evidence_path"] = evidence_path
+        record = registry_correction_record(
+            state=state,
+            mechanical=mechanical,
+            review=review,
+            baseline=baseline,
+            baseline_path=baseline_relative,
+            baseline_sha256=baseline_sha256,
+            registered_at=registered_at,
+            version=version,
+            correction_evidence=correction_evidence,
+        )
+        preservation_plan = None
+        preservation = record["preservation"]
+        artifact_path = None
+        artifact_destination = None
+    else:
+        _refuse_unregistrable_metadata(
+            load_json(schema_path),
+            state=state,
+            permanent_id=permanent_id,
+            mechanical=mechanical,
+            review=review,
+            metadata=metadata,
+            first_registered_on=first_registered_on,
+            registered_at=registered_at,
+            version=version,
+        )
+        preservation_plan = prepare_preservation(
+            work,
+            mechanical,
+            permanent_id=permanent_id,
+            version=version,
+            dry_run=args.dry_run,
+        )
+        preservation = preservation_plan["preservation"]
+        assert render_report is not None and render_bundle is not None
+        cached_render = work / "render-result"
+        if render_bundle.parent != cached_render:
+            if cached_render.is_dir() and not cached_render.is_symlink():
+                shutil.rmtree(cached_render)
+            elif cached_render.exists() or cached_render.is_symlink():
+                cached_render.unlink()
+            shutil.copytree(render_bundle.parent, cached_render)
+            render_bundle = cached_render / "bundle"
+        tree_hash = render_report["artifact_tree_sha256"]
+        artifact_path = f"renders/{permanent_id}-v{version}/{tree_hash}/"
+        challenge_render = {
+            "format": "verso-html",
+            "artifact_path": artifact_path,
+            "entrypoint": "Challenge/index.html",
+            "artifact_tree_sha256": tree_hash,
+            "verso_commit": render_report["verso_commit"],
+            "renderer_commit": render_report["renderer_commit"],
+            "landrun_commit": render_report["landrun_commit"],
+            "rendered_at": render_report["rendered_at"],
+        }
+        evidence_bundle, verification_evidence = build_verification_evidence(work)
+        if verification_evidence["source_archive_sha256"] != preservation["receipt_sha256"]:
+            raise ReviewerError("source archive receipt changed while building verification evidence")
+        evidence_hash = verification_evidence["evidence_tree_sha256"]
+        evidence_path = f"evidence/{permanent_id}-v{version}/{evidence_hash}/"
+        verification_evidence["evidence_path"] = evidence_path
+        record = registry_record(
+            state=state,
+            permanent_id=permanent_id,
+            mechanical=mechanical,
+            review=review,
+            metadata=metadata,
+            first_registered_on=first_registered_on,
+            registered_at=registered_at,
+            version=version,
+            challenge_render=challenge_render,
+            verification_evidence=verification_evidence,
+            preservation=preservation,
+        )
     filename = f"{record['id']}-v{version}.json"
     scores_document = registry_scores(
         permanent_id=record["id"], version=version, review=review
@@ -6304,7 +6416,6 @@ def register(args: argparse.Namespace) -> int:
         scores_document, load_json(scores_schema_path), what="registry scores"
     )
     destination = database / "entries" / filename
-    artifact_destination = None
     if artifact_path is not None:
         assert render_bundle is not None
         artifact_destination = database / artifact_path
@@ -6367,7 +6478,8 @@ def register(args: argparse.Namespace) -> int:
         mechanical=mechanical,
         identity=identity,
     )
-    publish_preservation(preservation_plan)
+    if preservation_plan is not None:
+        publish_preservation(preservation_plan)
     _record_public_identity_published(
         submission_id=args.submission,
         identity=identity,
