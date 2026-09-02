@@ -4777,8 +4777,8 @@ def validate_synthesis_policy(
 
 
 def run_review(args: argparse.Namespace) -> int:
-    candidates = queue()
     if args.submission is None:
+        candidates = queue()
         if not candidates:
             print("No submissions are awaiting review.")
             return 0
@@ -8111,6 +8111,7 @@ def auto(args: argparse.Namespace) -> int:
             continue
         print(f"::group::Review {record['id']}", flush=True)
         gate_complete = False
+        review_begun = False
         try:
             if record.get("registry_correction"):
                 # The correction-validation run is the mechanical gate for a
@@ -8142,7 +8143,8 @@ def auto(args: argparse.Namespace) -> int:
                 unattempted.append(record)
                 continue
             started = time.monotonic()
-            begin_review(record)
+            record = begin_review(record)
+            review_begun = True
             for apply_step in (False, True):
                 step = argparse.Namespace(**vars(args))
                 step.submission = record["id"]
@@ -8173,6 +8175,18 @@ def auto(args: argparse.Namespace) -> int:
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
+            if fresh is None and review_begun:
+                # `begin_review` returned the blob sha written by the transition.
+                # If GitHub then refuses the recovery read, that known identity is
+                # still sufficient for a conditional rollback: a withdrawal or
+                # any other concurrent write makes the PUT return 409 instead of
+                # letting this pass overwrite newer state.
+                fresh = record
+                print(
+                    f"::warning::{record['id']} could not be reread after its review failed; "
+                    "recovering against the review transition's recorded blob",
+                    file=sys.stderr,
+                )
             if fresh is not None and fresh.get("status") not in REVIEWABLE_STATUSES:
                 # The record moved while this pass was running. Its queue entry
                 # drains on the next pass, which is what withdrawal relies on;

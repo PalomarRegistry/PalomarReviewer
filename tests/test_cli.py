@@ -5997,6 +5997,25 @@ class AutomaticLoopTests(unittest.TestCase):
             self.assertEqual(cli.auto(self.opts()), 1)
         self.assertEqual(advanced.call_args.args[1], "awaiting-review")
 
+    def test_a_failed_review_recovers_with_the_written_sha_when_reread_fails(self):
+        live = self.row(
+            "aaaaaaaaaaaa",
+            status="awaiting-review",
+            registry_correction={"schema_version": 1},
+            _blob_sha="selected-sha",
+        )
+        with (
+            mock.patch.object(cli, "open_index", return_value={"open": [live["id"]]}),
+            mock.patch.object(cli, "submission_state", side_effect=[live, None]),
+            mock.patch.object(cli, "put_state", side_effect=["reviewing-sha", "retry-sha"]) as write,
+            mock.patch.object(cli, "run_review", side_effect=ReviewerError("queue read failed")),
+        ):
+            self.assertEqual(cli.auto(self.opts(max_reviews=1)), 1)
+
+        self.assertEqual(write.call_args_list[0].kwargs["blob_sha"], "selected-sha")
+        self.assertEqual(write.call_args_list[1].kwargs["blob_sha"], "reviewing-sha")
+        self.assertEqual(write.call_args_list[1].args[1]["status"], "awaiting-review")
+
     def test_a_database_change_that_is_not_green_is_not_merged(self):
         """The database's own checks are what stand between a review and the registry."""
         rows = [self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True,
@@ -6966,7 +6985,7 @@ class RunReviewAccountingTests(unittest.TestCase):
             work.mkdir()
             args.work_dir = directory
             with (
-                mock.patch.object(cli, "queue", return_value=[]),
+                mock.patch.object(cli, "queue") as queued,
                 mock.patch.object(
                     cli,
                     "prepare_workspace",
@@ -6993,6 +7012,7 @@ class RunReviewAccountingTests(unittest.TestCase):
                     cli.run_review(args)
 
         render.assert_not_called()
+        queued.assert_not_called()
 
     def test_registry_correction_delivery_has_no_renderability_receipt(self):
         args = SimpleNamespace(
