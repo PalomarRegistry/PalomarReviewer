@@ -10172,6 +10172,7 @@ class FailureDiagnosticTests(unittest.TestCase):
         self.assertEqual(advance.call_args.args[1], "changes-required")
         failure = advance.call_args.kwargs["failure"]
         self.assertTrue(failure["diagnostics"][0]["repairable"])
+        self.assertIsNone(advance.call_args.kwargs["operator_alerts"])
 
     def test_submitter_work_remains_actionable_beside_a_provider_failure(self):
         state = self.state()
@@ -10186,9 +10187,23 @@ class FailureDiagnosticTests(unittest.TestCase):
                 mock.patch.object(cli, "validate_workflow_commit_on_main"),
                 mock.patch.object(cli, "download_mechanical_artifact", return_value=artifact),
                 mock.patch.object(cli, "advance_state", return_value={}) as advance,
+                mock.patch.object(cli, "utc_now", return_value="2026-09-03T12:00:00Z"),
             ):
                 cli.ingest_failure_diagnostics(state, Path(directory))
         self.assertEqual(advance.call_args.args[1], "changes-required")
+        alerts = advance.call_args.kwargs["operator_alerts"]
+        self.assertEqual(alerts["schema_version"], 1)
+        self.assertEqual(
+            alerts["items"],
+            [{
+                "key": cli.operator_notifications.alert_key(
+                    state, advance.call_args.kwargs["failure"], 1
+                ),
+                "diagnostic_index": 1,
+                "status": "pending",
+                "queued_at": "2026-09-03T12:00:00Z",
+            }],
+        )
 
     def test_untrusted_artifact_becomes_a_palomar_failure(self):
         state = self.state()
@@ -10207,6 +10222,10 @@ class FailureDiagnosticTests(unittest.TestCase):
         diagnostic = advance.call_args.kwargs["failure"]["diagnostics"][0]
         self.assertEqual(diagnostic["owner"], "palomar")
         self.assertTrue(diagnostic["retryable"])
+        self.assertEqual(
+            advance.call_args.kwargs["operator_alerts"]["items"][0]["diagnostic_index"],
+            0,
+        )
 
     def test_full_preparation_failure_remains_repairable(self):
         state = self.state("verification-reporting")
@@ -10266,6 +10285,159 @@ class FailureDiagnosticTests(unittest.TestCase):
         ):
             with self.subTest(status=status):
                 self.assertTrue(cli.finished_with({"status": status}))
+
+
+class OperatorAlertTests(unittest.TestCase):
+    def pending_state(self):
+        state = {
+            "id": "a1b2c3d4e5f6",
+            "status": "verification-error",
+            "repository": "owner/project",
+            "commit": "a" * 40,
+            "failure": {
+                "schema_version": 1,
+                "mode": "full",
+                "phase": "verification",
+                "run": {
+                    "id": 202,
+                    "url": (
+                        "https://github.com/PalomarRegistry/PalomarSubmission/"
+                        "actions/runs/202"
+                    ),
+                },
+                "profile_version": 1,
+                "diagnostics": [{
+                    "code": "palomar.verifier_error",
+                    "stage": "lean",
+                    "owner": "palomar",
+                    "summary": "Verifier failed @**all**",
+                    "explanation": "Unexpected ``` output",
+                    "next_action": "Inspect the public workflow and retry.",
+                    "retryable": True,
+                    "repairable": False,
+                }],
+            },
+            "events": [],
+            "status_token": "private-token-must-not-leak",
+            "_blob_sha": "state-sha",
+        }
+        state["operator_alerts"] = cli.operator_notifications.queued_alerts(
+            state,
+            state["failure"],
+            queued_at="2026-09-03T12:00:00Z",
+        )
+        return state
+
+    def test_pending_terminal_alert_keeps_submission_open_until_sent(self):
+        state = self.pending_state()
+        self.assertFalse(cli.finished_with(state))
+        item = state["operator_alerts"]["items"][0]
+        item.update({
+            "status": "sent",
+            "sent_at": "2026-09-03T12:01:00Z",
+            "message_id": 321,
+        })
+        self.assertTrue(cli.finished_with(state))
+
+    def test_message_has_actionable_public_context_but_no_private_token(self):
+        state = self.pending_state()
+        item = state["operator_alerts"]["items"][0]
+        message = cli.operator_notifications.alert_message(state, item)
+        self.assertIn("**Palomar must fix this**", message)
+        self.assertIn("owner/project", message)
+        self.assertIn("actions/runs/202", message)
+        self.assertIn("palomar.verifier_error", message)
+        self.assertIn(item["key"][:16], message)
+        self.assertIn("` ` `", message)
+        self.assertNotIn("private-token-must-not-leak", message)
+
+    def test_successful_notification_is_conditionally_acknowledged(self):
+        state = self.pending_state()
+        key = state["operator_alerts"]["items"][0]["key"]
+        with (
+            mock.patch.dict(os.environ, {
+                "PALOMAR_ZULIP_EMAIL": "bot@example.com",
+                "PALOMAR_ZULIP_API_KEY": "secret",
+            }),
+            mock.patch.object(cli, "open_submissions", return_value=[state]),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(
+                cli.operator_notifications, "send_zulip_message", return_value=321
+            ) as send,
+            mock.patch.object(cli, "put_state", return_value="new-sha") as put,
+            mock.patch.object(cli, "utc_now", return_value="2026-09-03T12:01:00Z"),
+        ):
+            self.assertEqual(cli.notify_operator_alerts(SimpleNamespace()), 0)
+        self.assertIn("Palomar must fix this", send.call_args.args[0])
+        written = put.call_args.args[1]
+        sent = written["operator_alerts"]["items"][0]
+        self.assertEqual(sent["key"], key)
+        self.assertEqual(sent["status"], "sent")
+        self.assertEqual(sent["message_id"], 321)
+        self.assertEqual(put.call_args.kwargs["blob_sha"], "state-sha")
+
+    def test_failed_notification_remains_pending(self):
+        state = self.pending_state()
+        with (
+            mock.patch.dict(os.environ, {
+                "PALOMAR_ZULIP_EMAIL": "bot@example.com",
+                "PALOMAR_ZULIP_API_KEY": "secret",
+            }),
+            mock.patch.object(cli, "open_submissions", return_value=[state]),
+            mock.patch.object(cli, "submission_state", return_value=state),
+            mock.patch.object(
+                cli.operator_notifications,
+                "send_zulip_message",
+                side_effect=ReviewerError("Zulip unavailable"),
+            ),
+            mock.patch.object(cli, "put_state") as put,
+        ):
+            self.assertEqual(cli.notify_operator_alerts(SimpleNamespace()), 1)
+        put.assert_not_called()
+
+    def test_missing_credentials_fail_only_when_the_queue_has_an_alert(self):
+        state = self.pending_state()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(cli, "open_submissions", return_value=[state]) as opened,
+        ):
+            with self.assertRaisesRegex(ReviewerError, "PALOMAR_ZULIP_EMAIL"):
+                cli.notify_operator_alerts(SimpleNamespace())
+        opened.assert_called_once_with()
+
+    def test_empty_queue_needs_no_zulip_credentials(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(cli, "open_submissions", return_value=[]),
+        ):
+            self.assertEqual(cli.notify_operator_alerts(SimpleNamespace()), 0)
+
+    def test_zulip_request_uses_bot_auth_and_the_fixed_destination(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "result": "success", "id": 321,
+        }).encode()
+        with mock.patch.object(
+            cli.operator_notifications.urllib.request,
+            "urlopen",
+            return_value=response,
+        ) as urlopen:
+            message_id = cli.operator_notifications.send_zulip_message(
+                "actionable content",
+                email="bot@example.com",
+                api_key="secret",
+            )
+        self.assertEqual(message_id, 321)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, cli.operator_notifications.ZULIP_MESSAGES_URL)
+        fields = cli.operator_notifications.urllib.parse.parse_qs(request.data.decode())
+        self.assertEqual(fields["type"], ["stream"])
+        self.assertEqual(fields["to"], ["Palomar maintainers"])
+        self.assertEqual(fields["topic"], ["operator alerts"])
+        self.assertEqual(fields["content"], ["actionable content"])
+        self.assertTrue(request.headers["Authorization"].startswith("Basic "))
+        self.assertNotIn("secret", request.full_url)
+        self.assertNotIn(b"secret", request.data)
 
 
 class MetadataRepairTests(UsesCapabilities, unittest.TestCase):

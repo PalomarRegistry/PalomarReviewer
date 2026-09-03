@@ -33,6 +33,7 @@ from . import broker as model_broker
 from . import checkpoint as registration_checkpoint
 from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
+from . import operator_alerts as operator_notifications
 from . import registration as registration_authority
 from . import usage as usage_accounting
 from .errors import (
@@ -2978,7 +2979,18 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
     }
     if repair_draft is not None:
         failure["repair_draft"] = repair_draft
-    return advance_state(state, terminal, note, failure=failure)
+    operator_alerts = operator_notifications.queued_alerts(
+        state,
+        failure,
+        queued_at=utc_now(),
+    )
+    return advance_state(
+        state,
+        terminal,
+        note,
+        failure=failure,
+        operator_alerts=operator_alerts,
+    )
 
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
@@ -3591,7 +3603,7 @@ def finished_with(record: dict[str, Any]) -> bool:
     by hand waits for the next rebuild, or deletes the index to have it sooner.
     """
     if record.get("status") in FINISHED_STATUSES:
-        return True
+        return not operator_notifications.has_pending_alerts(record)
     if record.get("registered_entry"):
         return isinstance(record.get("source_star"), dict)
     return False
@@ -6977,6 +6989,93 @@ def ingest_failures(args: argparse.Namespace) -> int:
     return 1 if ingest_reporting_queue(Path(args.work_dir)) else 0
 
 
+def _record_operator_alert_sent(
+    state: dict[str, Any], *, key: str, message_id: int
+) -> dict[str, Any]:
+    """Acknowledge one delivery without overwriting a concurrent state change."""
+    items = operator_notifications.validated_alert_items(state)
+    matching = [item for item in items if item["key"] == key]
+    if len(matching) != 1 or matching[0]["status"] != "pending":
+        raise ReviewerError("operator alert is no longer pending")
+    sent_at = utc_now()
+    updated_items = [
+        {
+            **item,
+            "status": "sent",
+            "sent_at": sent_at,
+            "message_id": message_id,
+        }
+        if item["key"] == key
+        else item
+        for item in items
+    ]
+    updated = {
+        **{field: value for field, value in state.items() if field != "_blob_sha"},
+        "operator_alerts": {"schema_version": 1, "items": updated_items},
+    }
+    written_sha = put_state(
+        f"submissions/{state['id']}/state.json",
+        updated,
+        f"Record maintainer alert {key[:16]} for {state['id']}",
+        blob_sha=state.get("_blob_sha"),
+    )
+    if written_sha:
+        updated["_blob_sha"] = written_sha
+    return updated
+
+
+def notify_operator_alerts(args: argparse.Namespace) -> int:
+    """Deliver durable non-submitter diagnostics to the maintainer channel."""
+    del args
+    pending = [
+        (record, item)
+        for record in open_submissions()
+        for item in operator_notifications.validated_alert_items(record)
+        if item["status"] == "pending"
+    ]
+    if not pending:
+        print("No pending operator alerts.")
+        return 0
+    email = os.environ.get(operator_notifications.ZULIP_EMAIL_ENV, "").strip()
+    api_key = os.environ.get(operator_notifications.ZULIP_API_KEY_ENV, "").strip()
+    if not email:
+        raise ReviewerError(f"{operator_notifications.ZULIP_EMAIL_ENV} is required")
+    if not api_key:
+        raise ReviewerError(f"{operator_notifications.ZULIP_API_KEY_ENV} is required")
+
+    failures = 0
+    for record, queued in pending:
+        key = queued["key"]
+        print(f"::group::Notify maintainers {record['id']} {key[:16]}", flush=True)
+        try:
+            fresh = submission_state(record["id"])
+            if fresh is None:
+                raise ReviewerError("submission state could not be re-read")
+            fresh_items = operator_notifications.validated_alert_items(fresh)
+            matching = [item for item in fresh_items if item["key"] == key]
+            if not matching or matching[0]["status"] != "pending":
+                print("alert is no longer pending")
+                continue
+            content = operator_notifications.alert_message(fresh, matching[0])
+            message_id = operator_notifications.send_zulip_message(
+                content,
+                email=email,
+                api_key=api_key,
+            )
+            _record_operator_alert_sent(fresh, key=key, message_id=message_id)
+            print(f"sent Zulip message {message_id}")
+        except Exception as error:
+            failures += 1
+            print(
+                f"error: notifying maintainers for {record['id']} "
+                f"({key[:16]}) failed: {error}",
+                file=sys.stderr,
+            )
+        finally:
+            print("::endgroup::", flush=True)
+    return 1 if failures else 0
+
+
 def repair_api(
     endpoint: str,
     *,
@@ -8602,6 +8701,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="store actionable diagnostics from completed failed submission runs",
     )
     ingest_parser.set_defaults(func=ingest_failures)
+    notify_parser = commands.add_parser(
+        "notify-operator-alerts",
+        help="post pending Palomar-owned diagnostics to the maintainer Zulip channel",
+    )
+    notify_parser.set_defaults(func=notify_operator_alerts)
     repair_parser = commands.add_parser(
         "repair-queue",
         help="validate queued formalization.yaml edits and open repair pull requests",
