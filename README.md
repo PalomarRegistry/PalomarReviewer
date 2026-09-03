@@ -48,6 +48,22 @@ downloads the exact recorded run's mode-specific artifact, validates its
 submission/source binding, redacts it to the diagnostics-v1 contract, and writes
 the failure together with its terminal status. A missing or untrusted artifact
 becomes an explicit Palomar-owned diagnostic rather than a submitter fault.
+The same atomic write creates a private operator-alert outbox entry for every
+diagnostic whose owner is `palomar` or `provider`, matching the status page's
+"Palomar must fix this" assignment. `notify-operator-alerts` posts each pending
+entry to `Palomar maintainers` / `operator alerts` with the submission, source
+commit, public workflow run, diagnostic, and next action, then conditionally
+records the returned Zulip message id. The status token is never rendered.
+Terminal submissions remain in the open queue until every alert is acknowledged,
+so a missing credential or Zulip outage is retried by a later pass. Delivery is
+at least once: the narrow failure window after Zulip accepts a message but before
+the conditional State write may produce a duplicate carrying the same stable
+alert-key prefix.
+
+The notifier requires a Zulip bot's `PALOMAR_ZULIP_EMAIL` and
+`PALOMAR_ZULIP_API_KEY`. Those secrets belong only in the trusted private State
+workflow; they must never be passed to public submission verification or to a
+candidate-controlled subprocess.
 
 `repair-queue` handles the separate metadata-repair outbox. It accepts only the
 exact versioned profile allowlist, including bounded structured people, source,
@@ -246,6 +262,7 @@ Preview the queue without changing anything:
 ```bash
 palomar-review list
 palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol
+palomar-review notify-operator-alerts
 ```
 
 The second command writes a complete packet and report under

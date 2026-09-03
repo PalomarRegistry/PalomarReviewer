@@ -76,6 +76,7 @@ jobs:
           uv pip check --python "$runtime_env/bin/python"
           "$runtime_env/bin/palomar-review" --help >/dev/null
           "$runtime_env/bin/palomar-review" auto --help >/dev/null
+          "$runtime_env/bin/palomar-review" notify-operator-alerts --help >/dev/null
           "$runtime_env/bin/palomar-review" rebuild-queue --help >/dev/null
           "$runtime_env/bin/palomar-review" doctor --help >/dev/null
           "$runtime_env/bin/palomar-review" star-registered --help >/dev/null

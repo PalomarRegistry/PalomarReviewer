@@ -133,6 +133,7 @@ class RuntimeArtifactTests(unittest.TestCase):
                 "palomar_reviewer/engine.py",
                 "palomar_reviewer/errors.py",
                 "palomar_reviewer/mechanical.py",
+                "palomar_reviewer/operator_alerts.py",
                 "palomar_reviewer/registration.py",
                 "palomar_reviewer/usage.py",
             }
@@ -278,7 +279,10 @@ class RuntimeArtifactTests(unittest.TestCase):
         self.assertIn('codex-cli 0.147.0', workflow)
         self.assertNotIn("npm install --global @openai/codex", workflow)
         self.assertIn("--no-cache --no-config", workflow)
-        for command in ("", "auto", "rebuild-queue", "doctor", "star-registered"):
+        for command in (
+            "", "auto", "notify-operator-alerts", "rebuild-queue", "doctor",
+            "star-registered",
+        ):
             self.assertIn(
                 f'"$runtime_env/bin/palomar-review" {command + " " if command else ""}--help',
                 workflow,
