@@ -7204,10 +7204,7 @@ def _exhausted_review(record: dict[str, Any]) -> bool:
 
 
 def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
-    if (
-        record.get("registry_correction")
-        and record.get("review_schema_version") == REGISTRY_CORRECTION_SCHEMA_VERSION
-    ):
+    if record.get("registry_correction"):
         review = state_json(f"submissions/{record['id']}/review.json")
         return not (
             is_registry_correction_decision(review)
