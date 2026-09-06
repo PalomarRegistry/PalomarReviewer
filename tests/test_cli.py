@@ -5698,6 +5698,28 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual([record["id"] for record in to_review], [row["id"]])
         self.assertEqual((to_register, to_finalize, exhausted), ([], [], []))
 
+    def test_a_delivered_model_review_for_a_correction_is_replaced_by_a_decision(self):
+        row = self.row(
+            "aaaaaaaaaaaa",
+            status="review-ready",
+            registration_consent=False,
+            registry_correction={"kind": "registry-metadata-correction"},
+        )
+        model_review = {
+            "schema_version": cli.REVIEW_SCHEMA_VERSION,
+            "submission_id": row["id"],
+            "outcome": "neutral",
+        }
+        listing, state = self.records(row)
+        with listing, state, mock.patch.object(
+            cli, "state_json", return_value=model_review
+        ):
+            to_review, to_register, to_finalize, exhausted, _ = (
+                cli.submissions_needing_work()
+            )
+        self.assertEqual([record["id"] for record in to_review], [row["id"]])
+        self.assertEqual((to_register, to_finalize, exhausted), ([], [], []))
+
     def test_a_review_that_keeps_failing_is_eventually_given_up_on(self):
         """Every pass reset the clock, so a failing review retried for ever:
         a review's worth of tokens each time, and a submitter told it was
