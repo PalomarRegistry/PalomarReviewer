@@ -2333,19 +2333,14 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         record = cli.registry_correction_record(
             state={"id": "correction12"},
             mechanical=mechanical,
-            review={
-                "reviewed_at": "2026-08-02T12:00:00Z",
-                "policy_commit": "9" * 40,
-                "reviewer_models": ["codex:test"],
-                "warnings": [],
-            },
+            review={"inherited_review": baseline["review"]},
             baseline=baseline,
             baseline_path=baseline_path,
             baseline_sha256=baseline_sha256,
             registered_at="2026-08-02T13:00:00Z",
             version=2,
             correction_evidence={
-                "review_sha256": "8" * 64,
+                "correction_decision_sha256": "8" * 64,
                 "evidence_path": "evidence/correction/",
                 "evidence_tree_sha256": "6" * 64,
             },
@@ -2357,6 +2352,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(record["challenge_render"], baseline["challenge_render"])
         self.assertEqual(record["preservation"], baseline["preservation"])
         self.assertEqual(record["trust"], baseline["trust"])
+        self.assertEqual(record["review"], baseline["review"])
         self.assertEqual(
             record["registry_correction"]["generated_by"],
             "Palomar / Registry correction",
@@ -5032,7 +5028,11 @@ class MechanicalReportContractTests(unittest.TestCase):
         }
         self.assertEqual(
             cli.registration_database_sparse_patterns(mechanical),
-            (*cli.DATABASE_SPARSE_PATTERNS, f"/{baseline_path}"),
+            (
+                *cli.DATABASE_SPARSE_PATTERNS,
+                f"/{baseline_path}",
+                "/scores/PALOMAR-2026-08-31-000001-v1.json",
+            ),
         )
         self.assertEqual(
             cli.registration_database_sparse_patterns({"submission": {}}),
@@ -5090,18 +5090,71 @@ class MechanicalReportContractTests(unittest.TestCase):
                     "baseline-reference.json",
                     "correction-report.json",
                     "workflow-run.json",
-                    "review.json",
+                    "correction-decision.json",
                     "evidence-manifest.json",
                 },
             )
             manifest = json.loads((bundle / "evidence-manifest.json").read_text())
-            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["schema_version"], 3)
             self.assertEqual(
-                evidence["review_sha256"], cli.sha256_file(bundle / "review.json")
+                evidence["correction_decision_sha256"],
+                cli.sha256_file(bundle / "correction-decision.json"),
             )
             self.assertEqual(
                 evidence["evidence_tree_sha256"], manifest["evidence_tree_sha256"]
             )
+
+    def test_correction_decision_inherits_review_and_scores_without_a_model(self):
+        identifier = "PALOMAR-2026-08-31-000001"
+        baseline = {
+            "id": identifier,
+            "version": 1,
+            "review": {
+                "outcome": "neutral",
+                "reviewed_at": "2026-08-31T00:00:00Z",
+                "policy_commit": "b" * 40,
+                "reviewer_models": ["codex:test"],
+                "warnings": ["Inherited warning."],
+                "report": {"sha256": "c" * 64},
+            },
+        }
+        baseline_bytes = b"baseline\n"
+        scores_bytes = b"scores\n"
+        mechanical = {
+            "source": {"repository": "example/project", "commit": "a" * 40},
+            "submission": {"registry_correction": {
+                "baseline": {"path": f"entries/{identifier}-v1.json"},
+                "changed_fields": ["title"],
+            }},
+        }
+        with (
+            mock.patch.object(
+                cli, "registry_correction_baseline", return_value=(baseline, baseline_bytes)
+            ),
+            mock.patch.object(
+                cli,
+                "registry_correction_baseline_scores",
+                return_value=({}, scores_bytes),
+            ),
+            mock.patch.object(cli, "utc_now", return_value="2026-09-06T00:00:00Z"),
+            mock.patch.object(engine_execution, "execute") as execute_engine,
+        ):
+            decision = cli.registry_correction_decision(
+                state={"id": "a1b2c3d4e5f6"},
+                mechanical=mechanical,
+                mechanical_url="https://example.test/report",
+                policy_commit="d" * 40,
+            )
+        execute_engine.assert_not_called()
+        self.assertEqual(decision["inherited_review"], baseline["review"])
+        self.assertEqual(
+            decision["inherited_scores"],
+            {
+                "path": f"scores/{identifier}-v1.json",
+                "sha256": hashlib.sha256(scores_bytes).hexdigest(),
+            },
+        )
+        self.assertIn("No automated editorial review was run", decision["summary"])
 
     def test_an_identity_cannot_ride_in_the_archived_report(self):
         for extra in ({"submitter": "someone"}, {"issue": 12}, {"owner": "someone"}):
@@ -6983,7 +7036,13 @@ class RunReviewAccountingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory) / args.submission
             work.mkdir()
+            (work / "mechanical-report-url").write_text("https://example.test/report\n")
             args.work_dir = directory
+            decision = {
+                "schema_version": 1,
+                "kind": "registry-metadata-correction",
+                "policy_commit": "a" * 40,
+            }
             with (
                 mock.patch.object(cli, "queue") as queued,
                 mock.patch.object(
@@ -6993,25 +7052,16 @@ class RunReviewAccountingTests(unittest.TestCase):
                 ),
                 mock.patch.object(cli, "ensure_challenge_renderable") as render,
                 mock.patch.object(
-                    cli,
-                    "load_json",
-                    side_effect=[
-                        {"steps": [{"id": "literature_notability", "score_keys": []}]},
-                        {},
-                    ],
-                ),
-                mock.patch.object(cli, "validate_current_review_contract"),
-                mock.patch.object(cli, "render_prompt", return_value="review prompt"),
-                mock.patch.object(
-                    engine_execution,
-                    "execute",
-                    side_effect=engine_execution.EngineError("stop after preparation"),
-                ),
+                    cli, "registry_correction_decision", return_value=decision
+                ) as build_decision,
+                mock.patch.object(cli, "validate_registry_correction_decision"),
+                mock.patch.object(engine_execution, "execute") as execute_engine,
             ):
-                with self.assertRaisesRegex(ReviewerError, "stop after preparation"):
-                    cli.run_review(args)
+                self.assertEqual(cli.run_review(args), 0)
 
         render.assert_not_called()
+        execute_engine.assert_not_called()
+        build_decision.assert_called_once()
         queued.assert_not_called()
 
     def test_registry_correction_delivery_has_no_renderability_receipt(self):
@@ -7044,7 +7094,7 @@ class RunReviewAccountingTests(unittest.TestCase):
                     return_value=(work, state, {"status": "pass"}, "a" * 40),
                 ),
                 mock.patch.object(cli, "ensure_challenge_renderable") as render,
-                mock.patch.object(cli, "validate_stored_review"),
+                mock.patch.object(cli, "validate_registry_correction_decision"),
                 mock.patch.object(cli, "deliver_review", return_value=state) as deliver,
             ):
                 self.assertEqual(cli.run_review(args), 0)
@@ -9424,12 +9474,27 @@ class ArchivedReviewTests(unittest.TestCase):
         document gets written there.
         """
         source = Path(cli.__file__).read_text()
-        self.assertIn('served = served_review(review, work / "policy")', source)
+        self.assertIn('else served_review(review, work / "policy")', source)
         self.assertIn('write_json(work / "review.json", served)', source)
         self.assertNotIn('write_json(work / "review.json", review)', source)
         # And checked against the schema for what is published, not the one
         # describing what the submitter was shown.
         self.assertIn("public-review.schema.json", source)
+
+    def test_a_registry_correction_archives_its_decision_without_rewriting_it(self):
+        decision = {
+            "schema_version": 1,
+            "kind": "registry-metadata-correction",
+            "policy_commit": "a" * 40,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory)
+            (policy / "schemas").mkdir()
+            (policy / "schemas" / "registry-correction.schema.json").write_text(
+                json.dumps({"type": "object"})
+            )
+            self.assertEqual(cli.served_registration_decision(decision, policy), decision)
+            self.assertIsNot(cli.served_registration_decision(decision, policy), decision)
 
     def test_the_review_the_submitter_read_is_untouched(self):
         # Consent is to those bytes, and the digest of them is what the

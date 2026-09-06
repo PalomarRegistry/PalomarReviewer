@@ -294,6 +294,13 @@ def validate_record(
     source = record.get("source") if isinstance(record, dict) else None
     submission = record.get("submission") if isinstance(record, dict) else None
     recorded_review = record.get("review") if isinstance(record, dict) else None
+    inherited_review = review.get("inherited_review")
+    expected_review = (
+        inherited_review
+        if isinstance(state.get("registry_correction"), dict)
+        and isinstance(inherited_review, dict)
+        else review
+    )
     verification = record.get("verification") if isinstance(record, dict) else None
     workflow_url = verification.get("workflow_url") if isinstance(verification, dict) else None
     if (
@@ -312,9 +319,10 @@ def validate_record(
         or submission.get("submission_id") != submission_id
         or not isinstance(recorded_review, dict)
         or recorded_review.get("outcome") != "neutral"
-        or recorded_review.get("reviewed_at") != review.get("reviewed_at")
-        or recorded_review.get("policy_commit") != review.get("policy_commit")
-        or recorded_review.get("reviewer_models") != review.get("reviewer_models")
+        or not isinstance(expected_review, dict)
+        or recorded_review.get("reviewed_at") != expected_review.get("reviewed_at")
+        or recorded_review.get("policy_commit") != expected_review.get("policy_commit")
+        or recorded_review.get("reviewer_models") != expected_review.get("reviewer_models")
         or not isinstance(record.get("title"), str)
         or TITLE_RE.fullmatch(record["title"]) is None
         or not isinstance(verification, dict)
