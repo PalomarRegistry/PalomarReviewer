@@ -182,6 +182,8 @@ CURRENT_RUBRIC_VERSION = 10
 SUPPORTED_RUBRIC_VERSIONS = (7, 8, 9, CURRENT_RUBRIC_VERSION)
 REVIEW_SCHEMA_VERSION = 3
 REVIEW_OUTCOMES = ("neutral", "revision_required", "rejected")
+REGISTRY_CORRECTION_SCHEMA_VERSION = 1
+REGISTRY_CORRECTION_KIND = "registry-metadata-correction"
 LEGACY_CHECK_OUTCOMES = {"pass": "neutral", "warn": "warning", "fail": "failure"}
 
 SCORE_SCHEMA = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]}
@@ -481,6 +483,32 @@ def served_review(review: dict[str, Any], policy: Path) -> dict[str, Any]:
         )
     jsonschema.validate(served, load_json(schema), format_checker=jsonschema.FormatChecker())
     return served
+
+
+def served_registration_decision(
+    decision: dict[str, Any], policy: Path
+) -> dict[str, Any]:
+    """Validate the correction decision which is safe to archive as-is."""
+    schema = policy / "schemas" / "registry-correction.schema.json"
+    if not schema.is_file():
+        raise ReviewerError(
+            f"policy commit {decision.get('policy_commit', 'unknown')} has no "
+            "schemas/registry-correction.schema.json"
+        )
+    jsonschema.validate(
+        decision,
+        load_json(schema),
+        format_checker=jsonschema.FormatChecker(),
+    )
+    return copy.deepcopy(decision)
+
+
+def is_registry_correction_decision(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("schema_version") == REGISTRY_CORRECTION_SCHEMA_VERSION
+        and value.get("kind") == REGISTRY_CORRECTION_KIND
+    )
 
 
 def registered_comments(review: dict[str, Any]) -> list[str]:
@@ -1936,13 +1964,15 @@ def build_registry_correction_evidence(
                 "challenge_render",
                 "preservation",
                 "trust",
+                "review",
+                "scores",
             ],
         },
     )
     for source_name, destination_name in (
         ("mechanical-report.json", "correction-report.json"),
         ("workflow-run.json", "workflow-run.json"),
-        ("review.json", "review.json"),
+        ("review.json", "correction-decision.json"),
     ):
         source = work / source_name
         if source.is_symlink() or not source.is_file():
@@ -1964,12 +1994,12 @@ def build_registry_correction_evidence(
     tree_hash = hashlib.sha256(canonical).hexdigest()
     write_json(
         bundle / "evidence-manifest.json",
-        {"schema_version": 2, "evidence_tree_sha256": tree_hash, "files": files},
+        {"schema_version": 3, "evidence_tree_sha256": tree_hash, "files": files},
     )
-    review = next(item for item in files if item["path"] == "review.json")
+    decision = next(item for item in files if item["path"] == "correction-decision.json")
     return bundle, {
         "evidence_tree_sha256": tree_hash,
-        "review_sha256": review["sha256"],
+        "correction_decision_sha256": decision["sha256"],
     }
 
 
@@ -3391,7 +3421,11 @@ def begin_review(state: dict[str, Any]) -> dict[str, Any]:
     return advance_state(
         state,
         "reviewing",
-        "The automated review is running",
+        (
+            "Palomar is preparing the registry correction decision"
+            if state.get("registry_correction")
+            else "The automated review is running"
+        ),
         review_started_at=utc_now(),
         review_attempts=int(state.get("review_attempts") or 0) + 1,
         renderability_attempts=0,
@@ -3587,7 +3621,11 @@ def deliver_review(
     return advance_state(
         state,
         "review-ready",
-        "The editorial review is ready for you",
+        (
+            "The registry correction decision is ready for you"
+            if is_registry_correction_decision(review)
+            else "The editorial review is ready for you"
+        ),
         **fields,
     )
 
@@ -4101,6 +4139,80 @@ def resolve_remote_commit(repository: str, revision: str) -> str:
     return output
 
 
+def database_json_at_main(path: str, label: str) -> tuple[dict[str, Any], bytes]:
+    """Read one path from Database main without trusting a mutable raw URL."""
+    encoded = gh(
+        [
+            "api",
+            f"repos/{DATABASE_REPO}/contents/{path}?ref=main",
+            "--jq",
+            ".content",
+        ]
+    ).replace("\n", "")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        value = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise ReviewerError(f"{label} could not be decoded") from error
+    if not isinstance(value, dict):
+        raise ReviewerError(f"{label} is not a JSON object")
+    return value, raw
+
+
+def registry_correction_baseline(
+    mechanical: dict[str, Any],
+) -> tuple[dict[str, Any], bytes]:
+    """Load the exact active record a correction must inherit."""
+    correction = mechanical.get("submission", {}).get("registry_correction")
+    if not isinstance(correction, dict):
+        raise ReviewerError("registry correction has no correction payload")
+    baseline_binding = correction.get("baseline")
+    based_on = correction.get("based_on")
+    if not isinstance(baseline_binding, dict) or not isinstance(based_on, dict):
+        raise ReviewerError("registry correction has no valid baseline binding")
+    baseline_path = baseline_binding.get("path")
+    if not isinstance(baseline_path, str) or not re.fullmatch(
+        r"entries/PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-v[1-9][0-9]*\.json",
+        baseline_path,
+    ):
+        raise ReviewerError("registry correction baseline path is malformed")
+    baseline, baseline_bytes = database_json_at_main(
+        baseline_path, "registry correction baseline"
+    )
+    if (
+        hashlib.sha256(baseline_bytes).hexdigest() != baseline_binding.get("sha256")
+        or baseline.get("id") != based_on.get("id")
+        or baseline.get("version") != based_on.get("version")
+        or baseline.get("source", {}).get("repository")
+        != mechanical.get("source", {}).get("repository")
+        or baseline.get("source", {}).get("commit")
+        != mechanical.get("source", {}).get("commit")
+    ):
+        raise ReviewerError("registry correction baseline does not match its source binding")
+    return baseline, baseline_bytes
+
+
+def registry_correction_baseline_scores(
+    baseline: dict[str, Any],
+) -> tuple[dict[str, Any], bytes]:
+    """Load and bind the private scores belonging to an inherited review."""
+    review = baseline.get("review")
+    if not isinstance(review, dict) or review.get("outcome") != "neutral":
+        raise ReviewerError("registry correction baseline has no inheritable review")
+    scores_path = f"scores/{baseline['id']}-v{baseline['version']}.json"
+    scores, scores_bytes = database_json_at_main(
+        scores_path, "registry correction baseline scores"
+    )
+    if (
+        scores.get("id") != baseline.get("id")
+        or scores.get("version") != baseline.get("version")
+        or scores.get("reviewed_at") != review.get("reviewed_at")
+        or scores.get("policy_commit") != review.get("policy_commit")
+    ):
+        raise ReviewerError("registry correction baseline scores do not match its review")
+    return scores, scores_bytes
+
+
 def apply_registry_correction_metadata(mechanical: dict[str, Any]) -> bool:
     """Expose corrected effective metadata to every automated review boundary."""
     correction = mechanical.get("submission", {}).get("registry_correction")
@@ -4132,40 +4244,7 @@ def apply_registry_correction_source_evidence(mechanical: dict[str, Any]) -> boo
         for name in ("challenge", "solution")
     ):
         return True
-    baseline_binding = correction.get("baseline")
-    based_on = correction.get("based_on")
-    if not isinstance(baseline_binding, dict) or not isinstance(based_on, dict):
-        raise ReviewerError("registry correction has no valid baseline binding")
-    baseline_path = baseline_binding.get("path")
-    if not isinstance(baseline_path, str) or not re.fullmatch(
-        r"entries/PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-v[1-9][0-9]*\.json",
-        baseline_path,
-    ):
-        raise ReviewerError("registry correction baseline path is malformed")
-    encoded = gh(
-        [
-            "api",
-            f"repos/{DATABASE_REPO}/contents/{baseline_path}?ref=main",
-            "--jq",
-            ".content",
-        ]
-    ).replace("\n", "")
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-        baseline = json.loads(raw)
-    except (ValueError, json.JSONDecodeError) as error:
-        raise ReviewerError("registry correction baseline could not be decoded") from error
-    if (
-        hashlib.sha256(raw).hexdigest() != baseline_binding.get("sha256")
-        or not isinstance(baseline, dict)
-        or baseline.get("id") != based_on.get("id")
-        or baseline.get("version") != based_on.get("version")
-        or baseline.get("source", {}).get("repository")
-        != mechanical.get("source", {}).get("repository")
-        or baseline.get("source", {}).get("commit")
-        != mechanical.get("source", {}).get("commit")
-    ):
-        raise ReviewerError("registry correction baseline does not match its source binding")
+    baseline, _baseline_bytes = registry_correction_baseline(mechanical)
     formalization = baseline.get("formalization")
     verification = baseline.get("verification")
     if not isinstance(formalization, dict) or not isinstance(verification, dict):
@@ -4214,7 +4293,16 @@ def registration_database_sparse_patterns(
         baseline_path,
     ):
         raise ReviewerError("registry correction baseline path is malformed")
-    return (*DATABASE_SPARSE_PATTERNS, f"/{baseline_path}")
+    match = re.fullmatch(
+        r"entries/(?P<name>PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-v[1-9][0-9]*)\.json",
+        baseline_path,
+    )
+    assert match is not None
+    return (
+        *DATABASE_SPARSE_PATTERNS,
+        f"/{baseline_path}",
+        f"/scores/{match.group('name')}.json",
+    )
 
 
 def registration_schema_path(database: Path, *, correction: bool) -> Path:
@@ -4576,6 +4664,103 @@ def validate_stored_review(
     )
 
 
+def registry_correction_decision(
+    *,
+    state: dict[str, Any],
+    mechanical: dict[str, Any],
+    mechanical_url: str,
+    policy_commit: str,
+) -> dict[str, Any]:
+    """Build a deterministic consent artifact without invoking a model."""
+    correction = mechanical["submission"]["registry_correction"]
+    baseline, baseline_bytes = registry_correction_baseline(mechanical)
+    _scores, scores_bytes = registry_correction_baseline_scores(baseline)
+    baseline_path = correction["baseline"]["path"]
+    return {
+        "schema_version": REGISTRY_CORRECTION_SCHEMA_VERSION,
+        "kind": REGISTRY_CORRECTION_KIND,
+        "submission_id": state["id"],
+        "source": {
+            "repository": mechanical["source"]["repository"],
+            "commit": mechanical["source"]["commit"],
+        },
+        "mechanical_report": mechanical_url,
+        "policy_commit": policy_commit,
+        "decided_at": utc_now(),
+        "outcome": "neutral",
+        "summary": (
+            "The proposed registry metadata correction passed mechanical validation. "
+            "No automated editorial review was run; the active baseline review and "
+            "its private scores will be inherited unchanged."
+        ),
+        "based_on": {
+            "id": baseline["id"],
+            "version": baseline["version"],
+            "path": baseline_path,
+            "sha256": hashlib.sha256(baseline_bytes).hexdigest(),
+        },
+        "changed_fields": correction["changed_fields"],
+        "inherited_review": copy.deepcopy(baseline["review"]),
+        "inherited_scores": {
+            "path": f"scores/{baseline['id']}-v{baseline['version']}.json",
+            "sha256": hashlib.sha256(scores_bytes).hexdigest(),
+        },
+    }
+
+
+def validate_registry_correction_decision(
+    decision: dict[str, Any],
+    *,
+    work: Path,
+    state: dict[str, Any],
+    mechanical: dict[str, Any],
+    mechanical_url: str,
+    policy_commit: str,
+) -> None:
+    """Bind an inspected correction decision to current baseline bytes."""
+    schema_path = work / "policy" / "schemas" / "registry-correction.schema.json"
+    if schema_path.is_symlink() or not schema_path.is_file():
+        raise ReviewerError("the reviewed policy has no registry correction contract")
+    jsonschema.validate(
+        decision,
+        load_json(schema_path),
+        format_checker=jsonschema.FormatChecker(),
+    )
+    expected_source = {
+        "repository": mechanical["source"]["repository"],
+        "commit": mechanical["source"]["commit"],
+    }
+    correction = mechanical["submission"].get("registry_correction")
+    if not isinstance(correction, dict) or not state.get("registry_correction"):
+        raise ReviewerError("a correction decision belongs only to a registry correction")
+    if decision.get("submission_id") != state["id"]:
+        raise ReviewerError("stored correction decision belongs to another submission")
+    if decision.get("source") != expected_source:
+        raise ReviewerError("stored correction decision belongs to another source snapshot")
+    if decision.get("mechanical_report") != mechanical_url:
+        raise ReviewerError("stored correction decision names another mechanical report")
+    if decision.get("policy_commit") != policy_commit:
+        raise ReviewerError("stored correction decision uses another policy commit")
+    baseline, baseline_bytes = registry_correction_baseline(mechanical)
+    _scores, scores_bytes = registry_correction_baseline_scores(baseline)
+    if decision.get("based_on") != {
+        "id": baseline["id"],
+        "version": baseline["version"],
+        "path": correction["baseline"]["path"],
+        "sha256": hashlib.sha256(baseline_bytes).hexdigest(),
+    }:
+        raise ReviewerError("stored correction decision names another baseline")
+    if decision.get("changed_fields") != correction.get("changed_fields"):
+        raise ReviewerError("stored correction decision names another metadata delta")
+    if decision.get("inherited_review") != baseline.get("review"):
+        raise ReviewerError("stored correction decision changes the baseline review")
+    if decision.get("inherited_scores") != {
+        "path": f"scores/{baseline['id']}-v{baseline['version']}.json",
+        "sha256": hashlib.sha256(scores_bytes).hexdigest(),
+    }:
+        raise ReviewerError("stored correction decision changes the baseline scores")
+
+
 def pass_scores(passes: list[dict[str, Any]], rubric: dict[str, Any]) -> dict[str, int]:
     by_step = {result["step"]: result for result in passes}
     owners = {
@@ -4821,14 +5006,24 @@ def run_review(args: argparse.Namespace) -> int:
             render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
             receipt = renderability_receipt(render_report, mechanical)
         mechanical_url = (work / "mechanical-report-url").read_text().strip()
-        validate_stored_review(
-            stored,
-            work=work,
-            state=state,
-            mechanical=mechanical,
-            mechanical_url=mechanical_url,
-            policy_commit=policy_commit,
-        )
+        if correction_review:
+            validate_registry_correction_decision(
+                stored,
+                work=work,
+                state=state,
+                mechanical=mechanical,
+                mechanical_url=mechanical_url,
+                policy_commit=policy_commit,
+            )
+        else:
+            validate_stored_review(
+                stored,
+                work=work,
+                state=state,
+                mechanical=mechanical,
+                mechanical_url=mechanical_url,
+                policy_commit=policy_commit,
+            )
         # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
         spend_path = root / args.submission / "spend.json"
@@ -4844,18 +5039,49 @@ def run_review(args: argparse.Namespace) -> int:
         (work / "review-sha256").write_text(
             registration_authorization.document_digest(stored) + "\n"
         )
-        print(f"Delivered the review privately for submission {args.submission}.")
+        noun = "registry correction decision" if correction_review else "review"
+        print(f"Delivered the {noun} privately for submission {args.submission}.")
         return 0
 
-    try:
-        model_id = engine_execution.identity(args.engine, args.model, args.command)
-    except engine_execution.EngineError as error:
-        raise ReviewerError(str(error)) from error
+    model_id = None
+    if args.engine == "command":
+        try:
+            model_id = engine_execution.identity(args.engine, args.model, args.command)
+        except engine_execution.EngineError as error:
+            raise ReviewerError(str(error)) from error
     work, state, mechanical, policy_commit = prepare_workspace(
         args.submission,
         root=root,
         policy_ref=args.policy_ref,
     )
+    if state.get("registry_correction"):
+        mechanical_url = (work / "mechanical-report-url").read_text().strip()
+        decision = registry_correction_decision(
+            state=state,
+            mechanical=mechanical,
+            mechanical_url=mechanical_url,
+            policy_commit=policy_commit,
+        )
+        validate_registry_correction_decision(
+            decision,
+            work=work,
+            state=state,
+            mechanical=mechanical,
+            mechanical_url=mechanical_url,
+            policy_commit=policy_commit,
+        )
+        (work / "review-sha256").unlink(missing_ok=True)
+        write_json(work / "review.json", decision)
+        print(json.dumps(decision, indent=2))
+        print(
+            "\nDry run: GitHub was not changed. Inspect review.json, then re-run with --apply."
+        )
+        return 0
+    if model_id is None:
+        try:
+            model_id = engine_execution.identity(args.engine, args.model, args.command)
+        except engine_execution.EngineError as error:
+            raise ReviewerError(str(error)) from error
     # Rendering is an eligibility condition, not a post-consent registration
     # side effect. Run the exact trusted rendering path before spending any
     # model review; anonymous compiler-generated declarations selected by the
@@ -5462,14 +5688,7 @@ def registry_correction_record(
             "abstract": effective["abstract"],
             "authors": effective["authors"],
             "classification": effective["classification"],
-            "review": {
-                "reviewed_at": review["reviewed_at"],
-                "policy_commit": review["policy_commit"],
-                "outcome": "neutral",
-                "report": {"sha256": correction_evidence["review_sha256"]},
-                "reviewer_models": review["reviewer_models"],
-                "warnings": registered_comments(review),
-            },
+            "review": copy.deepcopy(baseline["review"]),
             "submission": {
                 "submission_id": state["id"],
                 "authorization": {"relationship": "palomar-maintainer"},
@@ -5493,7 +5712,9 @@ def registry_correction_record(
         "responsible_maintainers", "mathematical_sources", "related_formalizations"
     ):
         record["provenance"][key] = effective["provenance"][key]
-    refuse_engine_credential(record["review"], context="the correction review being registered")
+    if review.get("inherited_review") != record["review"]:
+        raise ReviewerError("registry correction decision does not inherit the baseline review")
+    refuse_engine_credential(record["review"], context="the inherited correction review")
     return record
 
 
@@ -5524,6 +5745,45 @@ def registry_scores(
         "reviewed_at": review["reviewed_at"],
         "policy_commit": review["policy_commit"],
         "scores": {key: review["scores"][key] for key in SYNTHESIS_SCORE_KEYS},
+    }
+
+
+def inherited_registry_scores(
+    database: Path,
+    *,
+    baseline: dict[str, Any],
+    decision: dict[str, Any],
+    permanent_id: str,
+    version: int,
+) -> dict[str, Any]:
+    """Project the baseline's exact score evidence onto a correction version."""
+    binding = decision.get("inherited_scores")
+    if not isinstance(binding, dict):
+        raise ReviewerError("registry correction decision has no inherited score binding")
+    path = database / str(binding.get("path", ""))
+    if path.is_symlink() or not path.is_file():
+        raise ReviewerError("registry correction baseline scores are unavailable")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != binding.get("sha256"):
+        raise ReviewerError("registry correction baseline scores changed after the decision")
+    try:
+        scores = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ReviewerError("registry correction baseline scores are invalid JSON") from error
+    inherited_review = decision.get("inherited_review")
+    if (
+        not isinstance(scores, dict)
+        or not isinstance(inherited_review, dict)
+        or scores.get("id") != baseline.get("id")
+        or scores.get("version") != baseline.get("version")
+        or scores.get("reviewed_at") != inherited_review.get("reviewed_at")
+        or scores.get("policy_commit") != inherited_review.get("policy_commit")
+    ):
+        raise ReviewerError("registry correction baseline scores do not bind its review")
+    return {
+        **scores,
+        "id": permanent_id,
+        "version": version,
     }
 
 
@@ -5948,7 +6208,7 @@ def registration_attempt_identity(
         database,
         submission_id=state["id"],
         existing_id=existing_id,
-        reviewed_at=review.get("reviewed_at"),
+        reviewed_at=(review.get("inherited_review") or review).get("reviewed_at"),
         # The reserved instant, or this one. Reading the clock again on a retry
         # would date the record by when the retry happened rather than by when
         # the consent was acted on, and for a first registration would move it
@@ -6163,7 +6423,11 @@ def register(args: argparse.Namespace) -> int:
     #
     # The digest written beside it stays the digest of what the submitter read,
     # because that is what consent was given to.
-    served = served_review(review, work / "policy")
+    served = (
+        served_registration_decision(review, work / "policy")
+        if is_registry_correction_decision(review)
+        else served_review(review, work / "policy")
+    )
     write_json(work / "review.json", served)
     (work / "review-sha256").write_text(
         registration_authorization.document_digest(review) + "\n"
@@ -6232,23 +6496,34 @@ def register(args: argparse.Namespace) -> int:
     ).stdout.strip()
     if policy_head != review.get("policy_commit"):
         raise ReviewerError("registration policy checkout does not match the inspected review")
-    committed_review_schema = git_json_at(
-        policy,
-        policy_head,
-        "schemas/review.schema.json",
-        env=git_env,
-    )
-    committed_rubric = git_json_at(policy, policy_head, "rubric.json", env=git_env)
-    validate_stored_review(
-        review,
-        work=work,
-        state=state,
-        mechanical=mechanical,
-        mechanical_url=mechanical_url,
-        policy_commit=policy_head,
-        review_schema=committed_review_schema,
-        rubric=committed_rubric,
-    )
+    correction_scores = None
+    if correction_registration:
+        validate_registry_correction_decision(
+            review,
+            work=work,
+            state=state,
+            mechanical=mechanical,
+            mechanical_url=mechanical_url,
+            policy_commit=policy_head,
+        )
+    else:
+        committed_review_schema = git_json_at(
+            policy,
+            policy_head,
+            "schemas/review.schema.json",
+            env=git_env,
+        )
+        committed_rubric = git_json_at(policy, policy_head, "rubric.json", env=git_env)
+        validate_stored_review(
+            review,
+            work=work,
+            state=state,
+            mechanical=mechanical,
+            mechanical_url=mechanical_url,
+            policy_commit=policy_head,
+            review_schema=committed_review_schema,
+            rubric=committed_rubric,
+        )
     # Before any registration-time public action. A cache miss may dispatch a
     # public render run, and archive/database writes follow it; consent is
     # revalidated before either can happen.
@@ -6371,6 +6646,13 @@ def register(args: argparse.Namespace) -> int:
             version=version,
             correction_evidence=correction_evidence,
         )
+        correction_scores = inherited_registry_scores(
+            database,
+            baseline=baseline,
+            decision=review,
+            permanent_id=permanent_id,
+            version=version,
+        )
         preservation_plan = None
         preservation = record["preservation"]
         artifact_path = None
@@ -6436,8 +6718,10 @@ def register(args: argparse.Namespace) -> int:
             preservation=preservation,
         )
     filename = f"{record['id']}-v{version}.json"
-    scores_document = registry_scores(
-        permanent_id=record["id"], version=version, review=review
+    scores_document = (
+        correction_scores
+        if correction_scores is not None
+        else registry_scores(permanent_id=record["id"], version=version, review=review)
     )
     projections = registration_authority.projection_changes(
         database,
@@ -6920,6 +7204,16 @@ def _exhausted_review(record: dict[str, Any]) -> bool:
 
 
 def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
+    if (
+        record.get("registry_correction")
+        and record.get("review_schema_version") == REGISTRY_CORRECTION_SCHEMA_VERSION
+    ):
+        review = state_json(f"submissions/{record['id']}/review.json")
+        return not (
+            is_registry_correction_decision(review)
+            and review.get("submission_id") == record["id"]
+            and review.get("outcome") == "neutral"
+        )
     if record.get("review_schema_version") == REVIEW_SCHEMA_VERSION:
         return False
     review = state_json(f"submissions/{record['id']}/review.json")
@@ -8250,7 +8544,8 @@ def auto(args: argparse.Namespace) -> int:
                 step.apply = apply_step
                 step.policy_ref = args.policy_ref
                 run_review(step)
-            record_review_duration(time.monotonic() - started)
+            if not record.get("registry_correction"):
+                record_review_duration(time.monotonic() - started)
             advanced += 1
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
