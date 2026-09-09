@@ -1,3 +1,4 @@
+import ast
 import atexit
 import contextlib
 import datetime as dt
@@ -4452,6 +4453,57 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     cli.registration_render_result(args, work, mechanical, None)
                 with self.assertRaises(cli.DeterministicRegistrationError):
                     cli.registration_render_result(args, work, mechanical, {"schema_version": 1})
+
+
+class RegistrationDurabilityTests(unittest.TestCase):
+    """Where the attempt is counted, relative to what registration then does."""
+
+    def register_call_lines(self):
+        tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+        register = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "register"
+        )
+        lines = {}
+        for node in ast.walk(register):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                lines[node.func.id] = min(
+                    lines.get(node.func.id, node.lineno), node.lineno
+                )
+        return lines
+
+    def test_the_attempt_is_counted_before_registration_acts(self):
+        # Everything below the count can fail, and every failure below it is
+        # recorded by a recorder that must bind a positive attempt count to the
+        # durable field. Counting later produced a failure claiming zero
+        # attempts, which State validation rejects.
+        lines = self.register_call_lines()
+        counted = lines["begin_registration"]
+        for name in (
+            "registration_render_result",
+            "clone_at",
+            "registration_attempt_identity",
+        ):
+            with self.subTest(after=name):
+                self.assertLess(counted, lines[name])
+
+    def test_a_truncated_failure_detail_keeps_the_run_to_open(self):
+        url = "https://github.com/PalomarRegistry/PalomarReviewer/actions/runs/1234567890"
+        detail = cli._failure_detail(
+            cli.ReviewerError(
+                "Challenge rendering failed, and will fail the same way until it "
+                "is fixed: " + "problem; " * 200 + f"({url})"
+            )
+        )
+        self.assertLessEqual(len(detail), cli.FAILURE_DETAIL_LIMIT)
+        self.assertTrue(detail.endswith(f"({url})"), detail[-120:])
+        self.assertIn("Challenge rendering failed", detail)
+
+    def test_a_failure_detail_without_a_run_is_unchanged(self):
+        self.assertEqual(
+            cli._failure_detail(cli.ReviewerError("no run to open")), "no run to open"
+        )
 
 
 if __name__ == "__main__":
