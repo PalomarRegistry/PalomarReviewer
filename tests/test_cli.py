@@ -1230,6 +1230,94 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             allocate_again.assert_not_called()
             write_again.assert_not_called()
 
+    def test_a_lost_attempt_write_hands_the_allocation_back(self):
+        mechanical = self.mechanical_fixture()
+        review = {
+            "submission_id": "a1b2c3d4e5f6",
+            "reviewed_at": "2026-08-01T12:34:56Z",
+        }
+        state = {"id": "a1b2c3d4e5f6", "_blob_sha": "state-blob"}
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(database)], check=True)
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                    "-C", str(database), "commit", "--allow-empty", "-qm", "fixture",
+                ],
+                check=True,
+            )
+            acquired = {
+                "schema_version": 1,
+                "scope": {"kind": "day", "value": "2026-08-11"},
+                "holder": {
+                    "submission_id": "a1b2c3d4e5f6",
+                    "identity": {"id": "PALOMAR-2026-08-11-000001"},
+                    "database_base": "3" * 40,
+                    "acquired_at": "2026-08-11T09:30:00Z",
+                    "status": "acquiring",
+                },
+                "updated_at": "2026-08-11T09:30:00Z",
+                "_blob_sha": "lock-acquired",
+            }
+            writes = []
+
+            def write(path, value, message, blob_sha=None):
+                writes.append((path, message, blob_sha, value))
+                if path == "submissions/a1b2c3d4e5f6/state.json":
+                    raise cli.ReviewerError("state.json does not match state-blob")
+                return "lock-cleared"
+
+            with (
+                mock.patch.object(cli, "utc_now", return_value="2026-08-11T09:30:00Z"),
+                mock.patch.object(
+                    cli, "_acquire_registration_lock",
+                    return_value=("index/registration-locks/day-2026-08-11.json", acquired),
+                ),
+                mock.patch.object(cli, "_hold_registration_lock") as hold,
+                mock.patch.object(cli, "put_state", side_effect=write),
+                self.assertRaisesRegex(cli.ReviewerError, "does not match"),
+            ):
+                registration_attempt_identity(
+                    database,
+                    state=state,
+                    mechanical=mechanical,
+                    review=review,
+                    dry_run=False,
+                )
+
+        hold.assert_not_called()
+        discard = next(
+            entry for entry in writes
+            if entry[1].startswith("Discard registration allocation")
+        )
+        path, _, blob_sha, value = discard
+        self.assertEqual(path, "index/registration-locks/day-2026-08-11.json")
+        # Conditional on the blob this pass wrote, so an allocation another
+        # pass has taken since is left alone.
+        self.assertEqual(blob_sha, "lock-acquired")
+        self.assertIsNone(value["holder"])
+        self.assertEqual(value["scope"], {"kind": "day", "value": "2026-08-11"})
+
+    def test_a_held_allocation_is_never_discarded(self):
+        held = {
+            "schema_version": 1,
+            "scope": {"kind": "day", "value": "2026-08-11"},
+            "holder": {
+                "submission_id": "a1b2c3d4e5f6",
+                "identity": {"id": "PALOMAR-2026-08-11-000001"},
+                "database_base": "3" * 40,
+                "acquired_at": "2026-08-11T09:30:00Z",
+                "status": "held",
+            },
+            "updated_at": "2026-08-11T09:30:00Z",
+            "_blob_sha": "lock-held",
+        }
+        with mock.patch.object(cli, "put_state") as write:
+            cli._discard_registration_lock("lock.json", held)
+            cli._discard_registration_lock("lock.json", {"holder": None})
+        write.assert_not_called()
+
     def test_an_attempt_from_the_retired_pre_instant_shape_is_rejected(self):
         mechanical = self.mechanical_fixture()
         review = {"submission_id": "a1b2c3d4e5f6", "reviewed_at": "2026-08-01T12:34:56Z"}

@@ -3283,6 +3283,29 @@ def _acquire_registration_lock(
     return path, acquired
 
 
+def _discard_registration_lock(path: str, lock: dict[str, Any]) -> None:
+    """Hand back an allocation the pass that took it can no longer use.
+
+    Acquiring is not the commitment; holding is. A pass that acquires and then
+    fails before it holds strands the allocation, because the retry re-derives
+    the identity from the clock: once the day has turned that names a
+    different lock file, and nothing ever comes back for this one. Three locks
+    sat in `acquiring` for a fortnight that way, and State validation, which is
+    the only thing that reads them afterwards, failed on all of them.
+
+    The write is conditional on the blob this pass wrote, so an allocation
+    another pass has taken since is left alone.
+    """
+    holder = lock.get("holder")
+    if not isinstance(holder, dict) or holder.get("status") != "acquiring":
+        return
+    _write_lock(
+        path,
+        _empty_lock(lock["scope"], blob_sha=lock.get("_blob_sha")),
+        f"Discard registration allocation for {holder['submission_id']}",
+    )
+
+
 def _hold_registration_lock(path: str, lock: dict[str, Any]) -> dict[str, Any]:
     registration_checkpoint.validate_lock(lock, path=path)
     holder = dict(lock.get("holder") or {})
@@ -6242,12 +6265,23 @@ def registration_attempt_identity(
     if attempt is None:
         updated = dict(state)
         updated["registration_attempt"] = {"schema_version": 3, **identity}
-        written = put_state(
-            f"submissions/{state['id']}/state.json",
-            updated,
-            f"Reserve registration identity for {state['id']}",
-            blob_sha=state.get("_blob_sha"),
-        )
+        try:
+            written = put_state(
+                f"submissions/{state['id']}/state.json",
+                updated,
+                f"Reserve registration identity for {state['id']}",
+                blob_sha=state.get("_blob_sha"),
+            )
+        except Exception:
+            # The conditional write loses this race whenever anything else
+            # touched the submission since it was read, which is ordinary and
+            # is retried. Give the allocation back on the way out; failing to
+            # is what stranded it, not the race.
+            try:
+                _discard_registration_lock(lock_path, lock)
+            except Exception:
+                pass
+            raise
         if written:
             state = {**updated, "_blob_sha": written}
     _hold_registration_lock(lock_path, lock)
