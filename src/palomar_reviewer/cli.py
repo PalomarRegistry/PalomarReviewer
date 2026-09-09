@@ -3471,6 +3471,9 @@ def abandon_review(state: dict[str, Any], reason: str) -> dict[str, Any]:
     )
 
 
+FAILURE_DETAIL_LIMIT = 500
+
+
 def record_renderability_failure(
     state: dict[str, Any], error: SubmitterRenderabilityError
 ) -> dict[str, Any]:
@@ -3514,12 +3517,31 @@ def begin_registration(state: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _failure_detail(error: Exception) -> str:
+    """Keep the run an operator has to open, whatever else is truncated.
+
+    A render failure names its problems and then, last, the workflow run that
+    produced them. Truncating to a fixed budget from the left dropped exactly
+    the part an operator needs, leaving the state carrying the URL of the last
+    render that succeeded and none of the one that failed.
+    """
+    text = str(error).strip()
+    trailing_url = re.search(r"\s*\((https://\S+)\)\s*$", text)
+    if trailing_url is None:
+        return text[:FAILURE_DETAIL_LIMIT]
+    suffix = f" ({trailing_url.group(1)})"
+    room = FAILURE_DETAIL_LIMIT - len(suffix)
+    if room <= 0:
+        return suffix.strip()[:FAILURE_DETAIL_LIMIT]
+    return text[: trailing_url.start()].rstrip()[:room].rstrip() + suffix
+
+
 def record_registration_failure(
     state: dict[str, Any], error: Exception, *, deterministic: bool
 ) -> dict[str, Any]:
     """Back off a transient failure or pause one that needs an operator."""
     attempts = int(state.get("registration_attempts") or 0)
-    detail = str(error).strip()[:500] or error.__class__.__name__
+    detail = _failure_detail(error) or error.__class__.__name__
     category = "deterministic" if deterministic else "transient"
     failure = {
         "schema_version": 1,
@@ -6568,6 +6590,15 @@ def register(args: argparse.Namespace) -> int:
         submission_state(args.submission),
         state_repository=STATE_REPO,
     )
+    if getattr(args, "count_attempt", False) and not args.dry_run:
+        # Count the attempt here, not after the render and the database
+        # checkout. Everything below this line can fail, and every failure
+        # below it is recorded by a failure recorder that is required to bind a
+        # positive attempt count to this durable field. Counting after the
+        # render meant a render that failed produced a failure claiming zero
+        # attempts, which is a shape State validation rejects outright: one
+        # such record stopped every pull request in the State repository.
+        state = begin_registration(state)
     if correction_registration:
         prior_renderability = None
     else:
@@ -6629,13 +6660,13 @@ def register(args: argparse.Namespace) -> int:
         raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
 
     if getattr(args, "count_attempt", False) and not args.dry_run:
-        fresh_for_attempt = submission_state(args.submission)
-        if fresh_for_attempt is None:
+        # The attempt was counted before the render; the render and the
+        # database checkout then took minutes. Read the submission again so the
+        # attempt is reserved against what State holds now rather than against
+        # what it held before all that, which is a write that loses.
+        state = submission_state(args.submission)
+        if state is None:
             raise ReviewerError(f"submission {args.submission} disappeared before allocation")
-        # Count the attempt before allocation can reject the candidate. The
-        # failure recorder is required to bind its positive attempt count to
-        # this durable field even when allocation itself fails.
-        state = begin_registration(fresh_for_attempt)
     permanent_id, first_registered_on, registered_at, version = registration_attempt_identity(
         database,
         state=state,
