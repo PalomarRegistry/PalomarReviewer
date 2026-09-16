@@ -828,3 +828,29 @@ controls reduce accidental instruction following rather than preventing it;
 what the broker adds is that succeeding at it wins nothing that outlives the
 pass. While the private packet remains available, it lets an operator audit the
 review outcome.
+
+
+## Operator alert recovery
+
+`palomar-review reconcile-operator-alerts` previews dispositions across a full
+retained-State snapshot. `--apply` persists versioned immutable alert origins,
+dispositions, and the derived `index/operator-alerts.json`; it also requires
+`PALOMAR_ALLOW_STATE_WRITES=1`. `--apply --deliver` edits original Zulip messages
+using the existing Zulip credential environment variables. It never creates a
+replacement alert for a missing message or a content conflict.
+
+The derived index caches outcomes only after the normal successful mechanical
+artifact, recorded run, workflow lineage, source, configuration and execution
+attempt checks. Each cached outcome carries the workflow commit and canonical
+report digest. Missing or expired artifacts leave an unresolved alert unless
+validated evidence was already retained. Reconciliation prints submission IDs,
+alert keys and dispositions, never private review notes or status tokens.
+
+Deploy the State readers before producing alert schema 2, then promote this
+runtime wheel and its manifest hash. State's daily recovery workflow backfills
+all retained alerts. Completed reviewer passes use `--submission ID` to reconcile
+only that outcome and its indexed alert group, without a full clone or scan.
+A success must postdate the alert; supersession also requires GitHub to confirm
+that the successful commit descends from the failed commit.
+The private operational report counts unresolved, recovered, superseded,
+withdrawn, and delivery-conflict states.

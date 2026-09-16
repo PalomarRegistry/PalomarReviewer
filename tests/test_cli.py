@@ -10419,7 +10419,7 @@ class FailureDiagnosticTests(unittest.TestCase):
                 cli.ingest_failure_diagnostics(state, Path(directory))
         self.assertEqual(advance.call_args.args[1], "changes-required")
         alerts = advance.call_args.kwargs["operator_alerts"]
-        self.assertEqual(alerts["schema_version"], 1)
+        self.assertEqual(alerts["schema_version"], 2)
         self.assertEqual(
             alerts["items"],
             [{
@@ -10429,6 +10429,9 @@ class FailureDiagnosticTests(unittest.TestCase):
                 "diagnostic_index": 1,
                 "status": "pending",
                 "queued_at": "2026-09-03T12:00:00Z",
+                "origin": cli.operator_notifications.alert_origin(
+                    state, advance.call_args.kwargs["failure"]
+                ),
             }],
         )
 
