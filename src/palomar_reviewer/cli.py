@@ -28,6 +28,7 @@ import jsonschema
 import yaml
 from ruamel.yaml import YAML
 
+from . import alert_recovery, workflow_recovery
 from . import authorization as registration_authorization
 from . import broker as model_broker
 from . import checkpoint as registration_checkpoint
@@ -2187,6 +2188,9 @@ def request_render(
             f"lean_toolchain_path={mechanical['lean_toolchain_path']}",
         ]
     )
+    profile = mechanical.get("execution_profile", "palomar-standard-v1")
+    if profile != "palomar-standard-v1":
+        dispatch.extend(["-f", f"execution_profile={profile}"])
     gh(dispatch)
     expected_title = (
         f"Render {mechanical['source']['repository']}@{mechanical['source']['commit']} [{request_id}]"
@@ -2422,6 +2426,7 @@ def validate_trusted_mechanical_artifact(
     report: dict[str, Any], state: dict[str, Any], run_data: dict[str, Any]
 ) -> None:
     """Bind a valid report contract to a workflow commit still on main's lineage."""
+    workflow_recovery.validate_execution_binding(report, state)
     head_sha = mechanical_evidence.validate_report_contract(report, state, run_data)
     validate_workflow_commit_on_main(run_data, head_sha=head_sha)
 
@@ -2452,6 +2457,7 @@ def normalized_submission_run(
     *,
     mode: str = "full",
     conclusion: str | None = "success",
+    execution_attempt: str | None = None,
 ) -> dict[str, Any]:
     """Check every trust property of a run document and put it in run_data shape.
 
@@ -2476,6 +2482,10 @@ def normalized_submission_run(
         if mode == "correction"
         else f"Verify submission {submission_id}"
     )
+    if execution_attempt is not None:
+        if not re.fullmatch(r"[0-9a-f]{32}", execution_attempt):
+            raise ReviewerError("invalid execution attempt identity")
+        title += f" [{execution_attempt}]"
     # Not folded into the exact comparisons below, which are equality: `True`
     # equals 1, so a document saying `"id": true` would answer for run 1.
     returned = document.get("id")
@@ -2588,6 +2598,7 @@ def trusted_submission_run(
         submission_id,
         mode=mode,
         conclusion=conclusion,
+        execution_attempt=(state.get("execution") or {}).get("attempt"),
     )
     if conclusion is None and normalized.get("conclusion") == "success":
         raise ReviewerError(f"recorded failed {mode} run {recorded} unexpectedly succeeded")
@@ -2951,16 +2962,20 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
     mode = "preflight" if reporting == "preflight-reporting" else "full"
     run_data: dict[str, Any] | None = None
     phase = "preparation" if mode == "preflight" else "verification"
+    trusted_metadata = False
     try:
         run_data = trusted_submission_run(state, mode=mode, conclusion=None)
         validate_workflow_commit_on_main(run_data)
+        trusted_metadata = True
         report_path = download_mechanical_artifact(
             run_data["databaseId"],
             state["id"],
             root / state["id"] / f"{mode}-failure",
             mode=mode,
         )
-        validated = validated_failure_report(load_json(report_path), state)
+        failure_report = load_json(report_path)
+        workflow_recovery.validate_execution_binding(failure_report, state)
+        validated = validated_failure_report(failure_report, state)
         diagnostics = validated["diagnostics"]
         profile_version = validated["profile_version"]
         phase = validated.get("phase", phase)
@@ -2969,6 +2984,13 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         repair_draft = validated.get("repair_draft")
     except Exception as error:  # a diagnosis failure must itself be explained
         diagnostics = _diagnostics_unavailable(error)
+        if trusted_metadata:
+            try:
+                jobs = json.loads(gh(["api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/"
+                                     f"{run_data['databaseId']}/attempts/{run_data['attempt']}/jobs?per_page=100"]))
+                diagnostics = [workflow_recovery.metadata_diagnostic(jobs, run_data)]
+            except Exception:
+                pass  # Preserve the bounded unavailable diagnosis if metadata also fails.
         profile_version = None
         repair_draft = None
         phase = "preparation" if mode == "preflight" else "verification"
@@ -3686,7 +3708,12 @@ def finished_with(record: dict[str, Any]) -> bool:
     by hand waits for the next rebuild, or deletes the index to have it sooner.
     """
     if record.get("status") in FINISHED_STATUSES:
-        return not operator_notifications.has_pending_alerts(record)
+        try:
+            return not operator_notifications.has_pending_alerts(record)
+        except ReviewerError:
+            print(f"Malformed operator outbox for {record.get('id')}; retaining it for repair",
+                  file=sys.stderr)
+            return False
     if record.get("registered_entry"):
         return isinstance(record.get("source_star"), dict)
     return False
@@ -7346,10 +7373,10 @@ def ingest_failures(args: argparse.Namespace) -> int:
 
 
 def _record_operator_alert_sent(
-    state: dict[str, Any], *, key: str, message_id: int
+    state: dict[str, Any], *, key: str, message_id: int, content: str
 ) -> dict[str, Any]:
     """Acknowledge one delivery without overwriting a concurrent state change."""
-    items = operator_notifications.validated_alert_items(state)
+    items = operator_notifications.upgrade_alerts(state)["items"]
     matching = [item for item in items if item["key"] == key]
     if len(matching) != 1 or matching[0]["status"] != "pending":
         raise ReviewerError("operator alert is no longer pending")
@@ -7360,6 +7387,7 @@ def _record_operator_alert_sent(
             "status": "sent",
             "sent_at": sent_at,
             "message_id": message_id,
+            "delivered_sha256": operator_notifications.content_hash(content),
         }
         if item["key"] == key
         else item
@@ -7367,7 +7395,10 @@ def _record_operator_alert_sent(
     ]
     updated = {
         **{field: value for field, value in state.items() if field != "_blob_sha"},
-        "operator_alerts": {"schema_version": 1, "items": updated_items},
+        "operator_alerts": {
+            "schema_version": 2,
+            "items": updated_items,
+        },
     }
     written_sha = put_state(
         f"submissions/{state['id']}/state.json",
@@ -7383,15 +7414,21 @@ def _record_operator_alert_sent(
 def notify_operator_alerts(args: argparse.Namespace) -> int:
     """Deliver durable non-submitter diagnostics to the maintainer channel."""
     del args
-    pending = [
-        (record, item)
-        for record in open_submissions()
-        for item in operator_notifications.validated_alert_items(record)
-        if item["status"] == "pending"
-    ]
+    failures = 0
+    pending = []
+    for record in open_submissions():
+        try:
+            pending.extend(
+                (record, item)
+                for item in operator_notifications.validated_alert_items(record)
+                if item["status"] == "pending"
+            )
+        except ReviewerError:
+            failures += 1
+            print(f"Malformed operator outbox for {record['id']}; skipping notification", file=sys.stderr)
     if not pending:
         print("No pending operator alerts.")
-        return 0
+        return 1 if failures else 0
     email = os.environ.get(operator_notifications.ZULIP_EMAIL_ENV, "").strip()
     api_key = os.environ.get(operator_notifications.ZULIP_API_KEY_ENV, "").strip()
     if not email:
@@ -7399,7 +7436,6 @@ def notify_operator_alerts(args: argparse.Namespace) -> int:
     if not api_key:
         raise ReviewerError(f"{operator_notifications.ZULIP_API_KEY_ENV} is required")
 
-    failures = 0
     for record, queued in pending:
         key = queued["key"]
         print(f"::group::Notify maintainers {record['id']} {key[:16]}", flush=True)
@@ -7418,17 +7454,203 @@ def notify_operator_alerts(args: argparse.Namespace) -> int:
                 email=email,
                 api_key=api_key,
             )
-            _record_operator_alert_sent(fresh, key=key, message_id=message_id)
+            _record_operator_alert_sent(fresh, key=key, message_id=message_id, content=content)
             print(f"sent Zulip message {message_id}")
         except Exception as error:
             failures += 1
             print(
-                f"error: notifying maintainers for {record['id']} "
-                f"({key[:16]}) failed: {error}",
+                f"error: notifying maintainers for {record['id']} ({key[:16]}) failed: {error}",
                 file=sys.stderr,
             )
         finally:
             print("::endgroup::", flush=True)
+    return 1 if failures else 0
+
+
+def reconcile_operator_alerts(args: argparse.Namespace) -> int:
+    """Backfill retained alerts from a complete snapshot, with conditional live writes."""
+    if args.deliver and not args.apply:
+        raise ReviewerError("--deliver requires --apply")
+    failures = 0
+    existing_index = state_json("index/operator-alerts.json")
+    try:
+        cached_outcomes = alert_recovery.validated_cached_outcomes(existing_index)
+    except ReviewerError:
+        print("Rebuilding malformed derived alert index from authenticated artifacts")
+        cached_outcomes = {}
+    with tempfile.TemporaryDirectory(prefix="palomar-alert-recovery-") as temporary:
+        requested_id = getattr(args, "submission", None)
+        scoped = bool(requested_id and existing_index and isinstance(existing_index.get("groups"), dict))
+        if scoped:
+            candidate = submission_state(requested_id)
+            if candidate is None:
+                raise ReviewerError("requested outcome submission does not exist")
+            group = operator_notifications.content_hash(
+                json.dumps(alert_recovery.configuration_key(candidate))
+            )
+            ids = existing_index["groups"].get(group) or []
+            if not isinstance(ids, list) or any(
+                not isinstance(identifier, str) or not SUBMISSION_ID_RE.fullmatch(identifier)
+                for identifier in ids
+            ):
+                raise ReviewerError("operator alert group is malformed; run the full rebuild")
+            states = [candidate]
+            for identifier in ids:
+                if identifier != requested_id:
+                    record = submission_state(identifier)
+                    if record is None:
+                        raise ReviewerError("indexed alert submission disappeared; run the full rebuild")
+                    states.append(record)
+        else:
+            checkout = Path(temporary) / "state"
+            run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "clone",
+                    "--depth=1",
+                    "--quiet",
+                    f"https://github.com/{STATE_REPO}.git",
+                    str(checkout),
+                ],
+                env=registry_git_environment(),
+            )
+            states = [load_json(path) for path in sorted((checkout / "submissions").glob("*/state.json"))]
+        alerts = [state for state in states if state.get("operator_alerts")]
+        groups = {alert_recovery.configuration_key(state) for state in alerts}
+        outcomes = (
+            [dict(value, configuration=tuple(value["configuration"])) for value in cached_outcomes.values()]
+            if scoped
+            else []
+        )
+        for candidate in states:
+            if (
+                alert_recovery.configuration_key(candidate) not in groups
+                or (candidate.get("run") or {}).get("conclusion") != "success"
+                or candidate.get("registry_correction")
+            ):
+                continue
+            try:
+                cached = cached_outcomes.get(candidate["id"])
+                binding = {
+                    "configuration": list(alert_recovery.configuration_key(candidate)),
+                    "commit": candidate["commit"],
+                    "run_url": candidate["run"]["url"],
+                    "execution_attempt": (candidate.get("execution") or {}).get("attempt"),
+                }
+                if cached and all(cached.get(key) == value for key, value in binding.items()):
+                    outcomes.append({**cached, "configuration": tuple(cached["configuration"])})
+                    continue
+                mechanical, _url, _run = mechanical_report(
+                    candidate, Path(temporary) / "reports" / candidate["id"]
+                )
+                outcomes.append(
+                    {
+                        **alert_recovery.outcome(candidate, mechanical),
+                        "execution_attempt": binding["execution_attempt"],
+                        "workflow_commit": _run["headSha"],
+                        "report_sha256": hashlib.sha256(
+                            json.dumps(mechanical, sort_keys=True).encode()
+                        ).hexdigest(),
+                    }
+                )
+            except Exception:
+                # Missing/expired artifacts cannot authorize a resolved alert.
+                print(f"No validated retained outcome for {candidate['id']}")
+        if args.apply:
+            index = (
+                {key: value for key, value in existing_index.items() if key != "_blob_sha"}
+                if scoped
+                else alert_recovery.recovery_index(states)
+            )
+            index["outcomes"] = {outcome["submission_id"]: outcome for outcome in outcomes}
+            previous_index = {
+                key: value for key, value in (existing_index or {}).items() if key != "_blob_sha"
+            }
+            if json.dumps(index, sort_keys=True) != json.dumps(previous_index, sort_keys=True):
+                put_state(
+                    "index/operator-alerts.json", index, "Refresh derived operator alert index",
+                    blob_sha=(existing_index or {}).get("_blob_sha"),
+                )
+        email = os.environ.get(operator_notifications.ZULIP_EMAIL_ENV, "").strip()
+        api_key = os.environ.get(operator_notifications.ZULIP_API_KEY_ENV, "").strip()
+        if args.deliver and (not email or not api_key):
+            raise ReviewerError("Zulip credentials are required to deliver disposition edits")
+        successor_cache = {}
+
+        def is_successor(state, outcome):
+            key = (state["repository"], state["commit"], outcome["commit"])
+            if key not in successor_cache:
+                repository, original, successor = key
+                try:
+                    status = gh(
+                        ["api", f"repos/{repository}/compare/{original}...{successor}", "--jq", ".status"]
+                    ).strip()
+                    successor_cache[key] = status == "ahead"
+                except Exception:
+                    successor_cache[key] = False
+            return successor_cache[key]
+
+        for snapshot in alerts:
+            try:
+                fresh = submission_state(snapshot["id"]) if args.apply else snapshot
+                if fresh is None:
+                    raise ReviewerError("alert submission disappeared")
+                desired = alert_recovery.desired_alerts(
+                    fresh, outcomes, at=utc_now(), is_successor=is_successor
+                )
+                staged = {**fresh, "operator_alerts": desired}
+                operator_notifications.validated_alert_items(staged)
+                # Persist the desired disposition before doing external I/O.
+                if args.apply and desired != fresh.get("operator_alerts"):
+                    staged.pop("_blob_sha", None)
+                    sha = put_state(
+                        f"submissions/{fresh['id']}/state.json",
+                        staged,
+                        f"Reconcile operator alerts for {fresh['id']}",
+                        blob_sha=fresh.get("_blob_sha"),
+                    )
+                    staged["_blob_sha"] = sha
+                changed = False
+                for item in desired["items"]:
+                    kind = (item.get("disposition") or {}).get("kind", "unresolved")
+                    print(f"{fresh['id']} {item['key'][:16]} {kind}")
+                    if not args.deliver or item["status"] != "sent" or kind == "unresolved":
+                        continue
+                    content = operator_notifications.alert_message(staged, item)
+                    digest = operator_notifications.content_hash(content)
+                    if item.get("delivered_sha256") == digest:
+                        continue
+                    original_item = {key: value for key, value in item.items() if key != "disposition"}
+                    original_state = {
+                        **staged,
+                        "operator_alerts": {"schema_version": 2, "items": [original_item]},
+                    }
+                    expected = item.get("delivered_sha256") or operator_notifications.content_hash(
+                        operator_notifications.alert_message(original_state, original_item)
+                    )
+                    result = operator_notifications.edit_zulip_message(
+                        item["message_id"], content, expected_hash=expected, email=email, api_key=api_key
+                    )
+                    changed = True
+                    if result == "delivered":
+                        item["delivered_sha256"] = digest
+                        item.pop("edit_error", None)
+                    else:
+                        item["edit_error"] = result
+                        failures += 1
+                if args.apply and changed:
+                    sha = staged.pop("_blob_sha", None)
+                    put_state(
+                        f"submissions/{fresh['id']}/state.json",
+                        staged,
+                        f"Record operator alert edits for {fresh['id']}",
+                        blob_sha=sha,
+                    )
+            except Exception as error:
+                failures += 1
+                print(f"Alert reconciliation failed for {snapshot['id']}: {error}", file=sys.stderr)
     return 1 if failures else 0
 
 
@@ -9063,6 +9285,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="post pending Palomar-owned diagnostics to the maintainer Zulip channel",
     )
     notify_parser.set_defaults(func=notify_operator_alerts)
+    reconcile_alerts = commands.add_parser(
+        "reconcile-operator-alerts", help="reconcile all retained operator alerts"
+    )
+    reconcile_alerts.add_argument(
+        "--apply", action="store_true", help="persist dispositions and derived index"
+    )
+    reconcile_alerts.add_argument("--deliver", action="store_true", help="CAS edit original Zulip messages")
+    reconcile_alerts.add_argument("--submission", help="reconcile one outcome and its indexed alert group")
+    reconcile_alerts.set_defaults(func=reconcile_operator_alerts)
     repair_parser = commands.add_parser(
         "repair-queue",
         help="validate queued formalization.yaml edits and open repair pull requests",

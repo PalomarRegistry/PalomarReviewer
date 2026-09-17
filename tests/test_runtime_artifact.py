@@ -127,6 +127,8 @@ class RuntimeArtifactTests(unittest.TestCase):
             source_members = {
                 "palomar_reviewer/__init__.py",
                 "palomar_reviewer/authorization.py",
+                "palomar_reviewer/alert_recovery.py",
+                "palomar_reviewer/workflow_recovery.py",
                 "palomar_reviewer/broker.py",
                 "palomar_reviewer/checkpoint.py",
                 "palomar_reviewer/cli.py",

@@ -65,7 +65,14 @@ def queued_alerts(
         for index, diagnostic in enumerate(diagnostics)
         if isinstance(diagnostic, dict) and diagnostic.get("owner") != "submitter"
     ]
-    return {"schema_version": 1, "items": items} if items else None
+    previous = upgrade_alerts(state)
+    old = previous["items"] if previous else []
+    origin = alert_origin(state, failure)
+    keys = {item["key"] for item in old}
+    items = old + [{**item, "origin": origin} for item in items if item["key"] not in keys]
+    if len(items) > 50:
+        raise ReviewerError("operator alert history requires archival before another failure")
+    return {"schema_version": 2, "items": items} if items else None
 
 
 def validated_alert_items(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -75,6 +82,8 @@ def validated_alert_items(state: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     if not isinstance(marker, dict) or set(marker) != {"schema_version", "items"}:
         raise ReviewerError("operator alert outbox has an unsupported shape")
+    if type(marker.get("schema_version")) is int and marker["schema_version"] == 2:
+        return validated_v2_items(state, marker)
     if marker.get("schema_version") != 1 or isinstance(marker.get("schema_version"), bool):
         raise ReviewerError("operator alert outbox has an unsupported schema version")
     items = marker.get("items")
@@ -168,6 +177,28 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
     if len(matching) != 1:
         raise ReviewerError("operator alert item is not present in its outbox")
     item = matching[0]
+    if "origin" in item:
+        origin = item["origin"]
+        legacy_item = {key: value for key, value in item.items() if key not in V2_FIELDS}
+        legacy_state = {**origin, "operator_alerts": {"schema_version": 1, "items": [legacy_item]}}
+        original = alert_message(legacy_state, legacy_item)
+        disposition = item.get("disposition")
+        if not disposition or disposition["kind"] == "unresolved":
+            return original
+        kind = disposition["kind"]
+        label = {
+            "recovered": "Recovered: the same commit and configuration verified successfully.",
+            "superseded": "Superseded: a newer commit for this configuration verified successfully. "
+            "This does not establish that the original commit works.",
+            "withdrawn": ("Withdrawn: this submission is no longer active. "
+                          "The original failure is not marked fixed."),
+        }[kind]
+        evidence = disposition.get("evidence")
+        suffix = f"\n\n**Disposition — {label}**"
+        if evidence:
+            suffix += (f"\nEvidence: {evidence['run_url']} (submission `{evidence['submission_id']}`, "
+                       f"commit `{evidence['commit']}`).")
+        return original + suffix
     submission_id = state.get("id")
     repository = state.get("repository")
     commit = state.get("commit")
@@ -194,8 +225,7 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
             f"- Workflow: {run_url}",
             f"- Phase/stage: {_inline_code(failure.get('phase', 'unknown'))} / "
             f"{_inline_code(diagnostic['stage'])}",
-            f"- Diagnostic: {_inline_code(diagnostic['code'])} "
-            f"(owner {_inline_code(diagnostic['owner'])})",
+            f"- Diagnostic: {_inline_code(diagnostic['code'])} (owner {_inline_code(diagnostic['owner'])})",
             f"- Retryable unchanged: `{'yes' if diagnostic['retryable'] else 'no'}`",
             f"- Alert key: `{item['key'][:16]}`",
             "",
@@ -258,3 +288,138 @@ def send_zulip_message(content: str, *, email: str, api_key: str) -> int:
     ):
         raise ReviewerError("Zulip did not acknowledge the operator alert")
     return message_id
+
+
+V2_FIELDS = {"origin", "disposition", "delivered_sha256", "edit_error"}
+
+
+def alert_origin(state: dict, failure: dict) -> dict:
+    import copy
+    return {"id": state["id"], "repository": state["repository"], "commit": state["commit"],
+            "test_submission": state.get("test_submission") is True, "failure": copy.deepcopy(failure)}
+
+
+def upgrade_alerts(state: dict) -> dict | None:
+    items = validated_alert_items(state)
+    if not items:
+        return None
+    if state["operator_alerts"]["schema_version"] == 1:
+        items = [{**item, "origin": alert_origin(state, state["failure"])} for item in items]
+    return {"schema_version": 2, "items": items}
+
+
+def validated_v2_items(state: dict, marker: dict) -> list[dict]:
+    items = marker.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= 50:
+        raise ReviewerError("operator alert outbox must contain between one and 50 items")
+    keys = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReviewerError("operator alert item must be an object")
+        origin = item.get("origin")
+        if not isinstance(origin, dict) or set(origin) != {
+            "id",
+            "repository",
+            "commit",
+            "test_submission",
+            "failure",
+        }:
+            raise ReviewerError("operator alert origin is malformed")
+        if any(origin.get(key) != state.get(key) for key in ("id", "repository", "commit")):
+            raise ReviewerError("operator alert origin belongs to another submission")
+        if (type(origin.get("test_submission")) is not bool
+                or origin["test_submission"] != (state.get("test_submission") is True)):
+            raise ReviewerError("operator alert origin test flag is malformed")
+        legacy = {key: value for key, value in item.items() if key not in V2_FIELDS}
+        validated_alert_items({**origin, "operator_alerts": {"schema_version": 1, "items": [legacy]}})
+        if item["key"] in keys:
+            raise ReviewerError("duplicate operator alert key")
+        keys.add(item["key"])
+        disposition = item.get("disposition")
+        if disposition is not None:
+            if not isinstance(disposition, dict) or disposition.get("kind") not in {
+                "unresolved",
+                "recovered",
+                "superseded",
+                "withdrawn",
+            }:
+                raise ReviewerError("invalid operator alert disposition")
+            expected = {"kind", "at"} | (
+                {"evidence"} if disposition["kind"] in {"recovered", "superseded"} else set()
+            )
+            if set(disposition) != expected or not TIMESTAMP_RE.fullmatch(str(disposition.get("at", ""))):
+                raise ReviewerError("malformed operator alert disposition")
+            if "evidence" in disposition:
+                evidence = disposition["evidence"]
+                if (
+                    not isinstance(evidence, dict)
+                    or set(evidence) != {"submission_id", "commit", "run_url"}
+                    or not SUBMISSION_ID_RE.fullmatch(str(evidence.get("submission_id", "")))
+                    or not COMMIT_RE.fullmatch(str(evidence.get("commit", "")))
+                    or not RUN_URL_RE.fullmatch(str(evidence.get("run_url", "")))
+                ):
+                    raise ReviewerError("invalid operator alert disposition evidence")
+                if (disposition["kind"] == "recovered") != (evidence["commit"] == origin["commit"]):
+                    raise ReviewerError("operator alert disposition does not match the evidence commit")
+        if "delivered_sha256" in item and not SHA256_RE.fullmatch(str(item["delivered_sha256"])):
+            raise ReviewerError("invalid operator alert delivered hash")
+        if "edit_error" in item and item["edit_error"] not in {"conflict", "unavailable"}:
+            raise ReviewerError("invalid operator alert edit error")
+    return [dict(item) for item in items]
+
+
+def content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def edit_zulip_message(message_id: int, content: str, *, expected_hash: str, email: str, api_key: str) -> str:
+    """CAS update. A lost acknowledgment is repaired by matching desired content."""
+    if type(message_id) is not int or message_id < 1 or not SHA256_RE.fullmatch(expected_hash):
+        raise ReviewerError("invalid operator alert edit binding")
+    auth = base64.b64encode(f"{email}:{api_key}".encode()).decode("ascii")
+    headers = {"Authorization": f"Basic {auth}"}
+    url = f"{ZULIP_MESSAGES_URL}/{message_id}"
+
+    def request(method, suffix="", body=None):
+        req = urllib.request.Request(
+            url + suffix,
+            headers=headers,
+            method=method,
+            data=urllib.parse.urlencode(body).encode() if body is not None else None,
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read(131073)
+        if len(raw) > 131072:
+            raise ReviewerError("oversized Zulip message response")
+        result = json.loads(raw)
+        if result.get("result") != "success":
+            raise ReviewerError("Zulip did not acknowledge the alert edit")
+        return result
+
+    try:
+        current = request("GET", "?apply_markdown=false")["message"]["content"]
+        if content_hash(current) == content_hash(content):
+            return "delivered"
+        if content_hash(current) != expected_hash:
+            return "conflict"
+        settings_request = urllib.request.Request(
+            ZULIP_MESSAGES_URL.removesuffix("/messages") + "/server_settings", headers=headers)
+        with urllib.request.urlopen(settings_request, timeout=30) as response:
+            raw = response.read(131073)
+        if len(raw) > 131072:
+            return "unavailable"
+        level = json.loads(raw).get("zulip_feature_level")
+        if type(level) is not int or level < 379:
+            return "unavailable"
+        result = request("PATCH", body={"content": content, "prev_content_sha256": expected_hash})
+        if "prev_content_sha256" in result.get("ignored_parameters_unsupported", []):
+            return "unavailable"
+        return "delivered"
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read(16384))
+        except (ValueError, OSError):
+            detail = {}
+        return "conflict" if detail.get("code") == "EXPECTATION_MISMATCH" else "unavailable"
+    except (urllib.error.URLError, ValueError, KeyError, TypeError, AttributeError, ReviewerError):
+        return "unavailable"
