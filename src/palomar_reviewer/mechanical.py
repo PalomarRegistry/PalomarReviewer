@@ -27,9 +27,9 @@ TOOLCHAIN_PROVENANCE_FIELDS = [
     "toolchain_commit", "tool_digests", "kernels", "protected_config_sha256", "bwrap_source_tag",
 ]
 BUNDLED_TOOLS = ("lake", "lean", "leanexport", "leanchecker", "nanoda_bin", "con-ron", "bwrap")
-# The registry entry schema each report schema produces, for ordinary records
-# and for corrections; schema 5 covers both.
-ENTRY_SCHEMA_FOR_REPORT = {1: {"ordinary": 3, "correction": 4}, 2: {"ordinary": 5, "correction": 5}}
+# The registry entry schema an ordinary record built from each report schema
+# declares. A correction follows its baseline's generation instead.
+ENTRY_SCHEMA_FOR_REPORT = {1: 3, 2: 5}
 # The render result schema a report of each schema must be rendered with:
 # schema-3 render results name the bubblewrap release instead of a landrun commit.
 RENDER_SCHEMA_FOR_REPORT = {1: 2, 2: 3}

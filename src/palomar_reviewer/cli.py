@@ -4397,9 +4397,9 @@ def registration_database_sparse_patterns(
     )
 
 
-def registration_schema_path(database: Path, *, correction: bool) -> Path:
-    """Select the immutable schema generation for the record being built."""
-    name = "schema-v4.json" if correction else "schema-v3.json"
+def registration_schema_path(database: Path, *, schema_version: int) -> Path:
+    """The immutable contract the record being built declares."""
+    name = f"schema-v{schema_version}.json"
     path = database / name
     if path.is_symlink() or not path.is_file():
         raise ReviewerError(f"PalomarDatabase main does not register {name}")
@@ -5616,9 +5616,7 @@ def registry_record(
         mechanical, "lakefile"
     )
     record = {
-        "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[
-            mechanical.get("schema_version", 1)
-        ]["ordinary"],
+        "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)],
         "id": permanent_id,
         "first_registered_on": first_registered_on,
         # The moment this version's registration happened, which is the moment
@@ -5764,6 +5762,9 @@ def registry_correction_record(
         raise ReviewerError("registry correction would move a protected source path")
 
     record = copy.deepcopy(baseline)
+    # A correction keeps its baseline's verification and render provenance, so
+    # its contract follows the baseline's generation, not the new report's.
+    corrected_schema = 5 if baseline.get("schema_version") == 5 else 4
     effective = copy.deepcopy(correction["metadata"])
     receipts = orcid_receipts(mechanical)
     checked_people(effective["authors"], receipts)
@@ -5772,9 +5773,7 @@ def registry_correction_record(
         checked_people(source.get("authors", []), receipts)
     record.update(
         {
-            "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[
-                mechanical.get("schema_version", 1)
-            ]["correction"],
+            "schema_version": corrected_schema,
             "registered_at": registered_at,
             "version": version,
             "title": effective["title"],
@@ -6704,9 +6703,16 @@ def register(args: argparse.Namespace) -> int:
     # after clone_at returns. Keep the private credential ephemeral and retain
     # the same no-global-config/no-replace hardening used for the clone.
     database_git_env = registry_git_environment(git_env)
-    schema_path = registration_schema_path(
-        database, correction=correction_registration
-    )
+    if not correction_registration:
+        # Fail before any work if main does not carry the contract an ordinary
+        # record of this report's generation declares; a correction's contract
+        # follows its baseline and is checked once that is loaded.
+        registration_schema_path(
+            database,
+            schema_version=mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[
+                mechanical.get("schema_version", 1)
+            ],
+        )
     scores_schema_path = database / "scores-v1.json"
     if not scores_schema_path.is_file():
         raise ReviewerError("PalomarDatabase main does not register scores-v1.json")
@@ -6776,7 +6782,9 @@ def register(args: argparse.Namespace) -> int:
         artifact_destination = None
     else:
         _refuse_unregistrable_metadata(
-            load_json(schema_path),
+            load_json(
+                registration_schema_path(database, schema_version=record["schema_version"])
+            ),
             state=state,
             permanent_id=permanent_id,
             mechanical=mechanical,
@@ -6847,7 +6855,9 @@ def register(args: argparse.Namespace) -> int:
         git_env=database_git_env,
     )
     _registration_projection_statuses(projections)
-    schema = load_json(schema_path)
+    schema = load_json(
+        registration_schema_path(database, schema_version=record["schema_version"])
+    )
     # The record is a function of the review and the mechanical report, both of
     # which are fixed by now, so a record the registry schema rejects will be
     # rejected identically by every retry. Saying so is what stops the schedule
