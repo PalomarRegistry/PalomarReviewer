@@ -2133,7 +2133,8 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
             + "; ".join(str(error) for error in errors)
         )
     expected_source = expected_render_source(mechanical)
-    expected_render_version = mechanical_evidence.RENDER_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)]
+    report_schema = mechanical.get("schema_version", 1)
+    expected_render_version = mechanical_evidence.RENDER_SCHEMA_FOR_REPORT[report_schema]
     if report.get("schema_version", 1) != expected_render_version:
         raise ReviewerError("render result has an incompatible schema version")
     if report.get("source") != expected_source:
@@ -5615,7 +5616,9 @@ def registry_record(
         mechanical, "lakefile"
     )
     record = {
-        "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)]["ordinary"],
+        "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[
+            mechanical.get("schema_version", 1)
+        ]["ordinary"],
         "id": permanent_id,
         "first_registered_on": first_registered_on,
         # The moment this version's registration happened, which is the moment
@@ -5769,7 +5772,9 @@ def registry_correction_record(
         checked_people(source.get("authors", []), receipts)
     record.update(
         {
-            "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)]["correction"],
+            "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[
+                mechanical.get("schema_version", 1)
+            ]["correction"],
             "registered_at": registered_at,
             "version": version,
             "title": effective["title"],
