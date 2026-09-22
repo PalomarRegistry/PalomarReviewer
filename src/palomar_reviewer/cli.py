@@ -2020,6 +2020,19 @@ def expected_render_source(mechanical: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+RENDER_FIELD_RE = {
+    "verso_commit": r"[0-9a-f]{40}",
+    "renderer_commit": r"[0-9a-f]{40}",
+    "landrun_commit": r"[0-9a-f]{40}",
+    "bwrap_source_tag": r"v[0-9]+\.[0-9]+\.[0-9]+",
+}
+
+
+def render_sandbox_fields(report: dict[str, Any]) -> tuple[str, ...]:
+    """The sandbox provenance a render result of its schema carries."""
+    return ("bwrap_source_tag",) if report.get("schema_version", 1) >= 3 else ("landrun_commit",)
+
+
 def renderability_receipt(
     report: dict[str, Any], mechanical: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2041,7 +2054,7 @@ def renderability_receipt(
         "artifact_tree_sha256": report["artifact_tree_sha256"],
         "verso_commit": report["verso_commit"],
         "renderer_commit": report["renderer_commit"],
-        "landrun_commit": report["landrun_commit"],
+        **{field: report[field] for field in render_sandbox_fields(report)},
         "rendered_at": report["rendered_at"],
         "workflow_url": report["workflow_url"],
     }
@@ -2055,20 +2068,22 @@ def validate_renderability_receipt(
         return None
     if not isinstance(value, dict):
         raise ReviewerError("saved renderability receipt must be an object")
+    sandbox_field = "bwrap_source_tag" if "bwrap_source_tag" in value else "landrun_commit"
     expected = {
         "schema_version", "source_repository", "source_commit", "challenge_source_sha256",
         "comparator_config_sha256", "declarations_sha256", "artifact_tree_sha256",
-        "verso_commit", "renderer_commit", "landrun_commit", "rendered_at",
+        "verso_commit", "renderer_commit", sandbox_field, "rendered_at",
         "workflow_url",
     }
     if set(value) != expected or value.get("schema_version") != 1:
         raise ReviewerError("saved renderability receipt has an unsupported shape")
     expected_receipt = renderability_receipt(
         {
+            "schema_version": 3 if sandbox_field == "bwrap_source_tag" else 2,
             "artifact_tree_sha256": value.get("artifact_tree_sha256"),
             "verso_commit": value.get("verso_commit"),
             "renderer_commit": value.get("renderer_commit"),
-            "landrun_commit": value.get("landrun_commit"),
+            sandbox_field: value.get(sandbox_field),
             "rendered_at": value.get("rendered_at"),
             "workflow_url": value.get("workflow_url"),
         },
@@ -2080,9 +2095,13 @@ def validate_renderability_receipt(
     ):
         if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
             raise ReviewerError(f"saved renderability receipt has an invalid {field}")
-    for field in ("source_commit", "verso_commit", "renderer_commit", "landrun_commit"):
+    for field in ("source_commit", "verso_commit", "renderer_commit"):
         if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{40}", value[field]):
             raise ReviewerError(f"saved renderability receipt has an invalid {field}")
+    if not isinstance(value.get(sandbox_field), str) or not re.fullmatch(
+        RENDER_FIELD_RE[sandbox_field], value[sandbox_field]
+    ):
+        raise ReviewerError(f"saved renderability receipt has an invalid {sandbox_field}")
     if not isinstance(value.get("rendered_at"), str) or not TIMESTAMP_RE.fullmatch(
         value["rendered_at"]
     ):
@@ -2114,13 +2133,13 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
             + "; ".join(str(error) for error in errors)
         )
     expected_source = expected_render_source(mechanical)
-    expected_render_version = 2
+    expected_render_version = mechanical_evidence.RENDER_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)]
     if report.get("schema_version", 1) != expected_render_version:
         raise ReviewerError("render result has an incompatible schema version")
     if report.get("source") != expected_source:
         raise ReviewerError("render result does not match the reviewed source and Challenge hash")
-    for key in ("verso_commit", "renderer_commit", "landrun_commit"):
-        if not isinstance(report.get(key), str) or not re.fullmatch(r"[0-9a-f]{40}", report[key]):
+    for key in ("verso_commit", "renderer_commit", *render_sandbox_fields(report)):
+        if not isinstance(report.get(key), str) or not re.fullmatch(RENDER_FIELD_RE[key], report[key]):
             raise ReviewerError(f"render result has an invalid {key}")
     if report.get("format") != "verso-html" or report.get("entrypoint") != "Challenge/index.html":
         raise ReviewerError("render result has an unsupported format or entrypoint")
@@ -2890,7 +2909,7 @@ def _bounded_diagnostic(value: Any) -> dict[str, Any]:
 
 
 def validated_failure_report(report: Any, state: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(report, dict) or report.get("schema_version") != 1:
+    if not isinstance(report, dict) or report.get("schema_version") not in (1, 2):
         raise ReviewerError("failure artifact is not a schema-version-1 report")
     if report.get("status") not in {"fail", "error"}:
         raise ReviewerError("failure artifact does not record a failed outcome")
@@ -5596,7 +5615,7 @@ def registry_record(
         mechanical, "lakefile"
     )
     record = {
-        "schema_version": 3,
+        "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)]["ordinary"],
         "id": permanent_id,
         "first_registered_on": first_registered_on,
         # The moment this version's registration happened, which is the moment
@@ -5631,10 +5650,7 @@ def registry_record(
             "evidence_path": verification_evidence["evidence_path"],
             "evidence_tree_sha256": verification_evidence["evidence_tree_sha256"],
             "mechanical_report_sha256": verification_evidence["mechanical_report_sha256"],
-            "comparator_commit": mechanical["comparator_commit"],
-            "lean4export_commit": mechanical["lean4export_commit"],
-            "landrun_commit": mechanical["landrun_commit"],
-            "nanoda_commit": mechanical["nanoda_commit"],
+            **mechanical_evidence.provenance_fields(mechanical),
             "challenge_sha256": challenge["sha256"],
             "solution_sha256": mechanical["solution"]["sha256"],
         },
@@ -5753,7 +5769,7 @@ def registry_correction_record(
         checked_people(source.get("authors", []), receipts)
     record.update(
         {
-            "schema_version": 4,
+            "schema_version": mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[mechanical.get("schema_version", 1)]["correction"],
             "registered_at": registered_at,
             "version": version,
             "title": effective["title"],
@@ -6163,7 +6179,11 @@ def _refuse_unregistrable_metadata(
             "artifact_tree_sha256": placeholder_sha256,
             "verso_commit": "0" * 40,
             "renderer_commit": "0" * 40,
-            "landrun_commit": "0" * 40,
+            **(
+                {"bwrap_source_tag": "v0.0.0"}
+                if mechanical.get("schema_version", 1) == 2
+                else {"landrun_commit": "0" * 40}
+            ),
             "rendered_at": registered_at,
         },
         verification_evidence={
@@ -6787,7 +6807,7 @@ def register(args: argparse.Namespace) -> int:
             "artifact_tree_sha256": tree_hash,
             "verso_commit": render_report["verso_commit"],
             "renderer_commit": render_report["renderer_commit"],
-            "landrun_commit": render_report["landrun_commit"],
+            **{field: render_report[field] for field in render_sandbox_fields(render_report)},
             "rendered_at": render_report["rendered_at"],
         }
         evidence_bundle, verification_evidence = build_verification_evidence(work)

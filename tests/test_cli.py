@@ -2534,6 +2534,85 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 format_checker=jsonschema.FormatChecker(),
             )
 
+    def toolchain_report(self, **overrides):
+        """A schema-2 report: verified by the toolchain's own lake comparator."""
+        mechanical = self.mechanical_fixture(**overrides)
+        for field in ("comparator_commit", "lean4export_commit", "landrun_commit", "nanoda_commit"):
+            del mechanical[field]
+        mechanical.update({
+            "schema_version": 2,
+            "toolchain_commit": "e" * 40,
+            "tool_digests": {
+                name: hashlib.sha256(name.encode()).hexdigest()
+                for name in ("lake", "lean", "leanexport", "leanchecker", "nanoda_bin", "con-ron", "bwrap")
+            },
+            "kernels": [
+                {"name": "nanoda", "argv": ["/toolchain/bin/nanoda_bin"]},
+                {"name": "con-ron", "argv": ["/toolchain/bin/con-ron"]},
+            ],
+            "protected_config_sha256": "f" * 64,
+            "bwrap_source_tag": "v0.12.0",
+        })
+        return mechanical
+
+    def test_a_toolchain_report_registers_a_schema_5_record(self):
+        mechanical = self.toolchain_report()
+        render = {
+            "format": "verso-html",
+            "artifact_path": ("renders/PALOMAR-2026-08-01-000012-v1/" + "a" * 64 + "/"),
+            "entrypoint": "Challenge/index.html",
+            "artifact_tree_sha256": "a" * 64,
+            "verso_commit": "b" * 40,
+            "renderer_commit": "c" * 40,
+            "bwrap_source_tag": "v0.12.0",
+            "rendered_at": "2026-08-01T12:35:00Z",
+        }
+        record = self.example_record(mechanical=mechanical, challenge_render=render)
+        self.assertEqual(record["schema_version"], 5)
+        verification = record["verification"]
+        for field in ("comparator_commit", "lean4export_commit", "landrun_commit", "nanoda_commit"):
+            self.assertNotIn(field, verification)
+        self.assertEqual(verification["toolchain_commit"], "e" * 40)
+        self.assertEqual(verification["tool_digests"], mechanical["tool_digests"])
+        self.assertEqual([kernel["name"] for kernel in verification["kernels"]], ["nanoda", "con-ron"])
+        self.assertEqual(verification["protected_config_sha256"], "f" * 64)
+        self.assertEqual(verification["bwrap_source_tag"], "v0.12.0")
+        self.assertEqual(record["challenge_render"]["bwrap_source_tag"], "v0.12.0")
+        self.assertNotIn("landrun_commit", record["challenge_render"])
+        schema_checkout = self.available("schema")
+        if schema_checkout and (schema_checkout / "schema-v5.json").is_file():
+            jsonschema.validate(
+                record, json.loads((schema_checkout / "schema-v5.json").read_text()),
+                format_checker=jsonschema.FormatChecker(),
+            )
+
+    def test_a_toolchain_report_must_be_rendered_by_the_bubblewrap_renderer(self):
+        mechanical = self.toolchain_report()
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory)
+            (result / "challenge-render.json").write_text(json.dumps({
+                "schema_version": 2, "status": "pass",
+                "source": cli.expected_render_source(mechanical),
+                "verso_commit": "b" * 40, "renderer_commit": "c" * 40, "landrun_commit": "d" * 40,
+                "format": "verso-html", "entrypoint": "Challenge/index.html",
+                "artifact_tree_sha256": "a" * 64, "rendered_at": "2026-08-01T12:35:00Z",
+                "workflow_url": mechanical["workflow_url"],
+            }))
+            with self.assertRaisesRegex(cli.ReviewerError, "incompatible schema version"):
+                cli.validate_render_result(result, mechanical)
+
+    def test_a_schema_2_report_with_the_old_pins_is_rejected(self):
+        mechanical = self.toolchain_report()
+        del mechanical["tool_digests"]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(mechanical, mechanical_evidence.MECHANICAL_REPORT_SCHEMA,
+                                format_checker=jsonschema.FormatChecker())
+        legacy = self.mechanical_fixture()
+        del legacy["nanoda_commit"]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(legacy, mechanical_evidence.MECHANICAL_REPORT_SCHEMA,
+                                format_checker=jsonschema.FormatChecker())
+
     def test_the_record_is_dated_by_its_registration_and_not_by_its_review(self):
         """Every ordering surface in the database reads `registered_at`.
 

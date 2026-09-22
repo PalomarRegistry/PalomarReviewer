@@ -22,6 +22,25 @@ from .errors import ReviewerError
 # verification provenance, so all three consumers share this canonical value.
 SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
 
+TOOL_COMMIT_FIELDS = ["comparator_commit", "lean4export_commit", "landrun_commit", "nanoda_commit"]
+TOOLCHAIN_PROVENANCE_FIELDS = [
+    "toolchain_commit", "tool_digests", "kernels", "protected_config_sha256", "bwrap_source_tag",
+]
+BUNDLED_TOOLS = ("lake", "lean", "leanexport", "leanchecker", "nanoda_bin", "con-ron", "bwrap")
+# The registry entry schema each report schema produces, for ordinary records
+# and for corrections; schema 5 covers both.
+ENTRY_SCHEMA_FOR_REPORT = {1: {"ordinary": 3, "correction": 4}, 2: {"ordinary": 5, "correction": 5}}
+# The render result schema a report of each schema must be rendered with:
+# schema-3 render results name the bubblewrap release instead of a landrun commit.
+RENDER_SCHEMA_FOR_REPORT = {1: 2, 2: 3}
+
+
+def provenance_fields(report: dict) -> dict:
+    """The tool-provenance fields a registry record copies from its report."""
+    names = TOOL_COMMIT_FIELDS if report.get("schema_version") == 1 else TOOLCHAIN_PROVENANCE_FIELDS
+    return {name: report[name] for name in names}
+
+
 MECHANICAL_REPORT_SCHEMA = {
     "type": "object",
     "required": [
@@ -34,10 +53,6 @@ MECHANICAL_REPORT_SCHEMA = {
         "solution",
         "lean_toolchain",
         "comparator",
-        "comparator_commit",
-        "lean4export_commit",
-        "landrun_commit",
-        "nanoda_commit",
         "checked_at",
         "workflow_url",
         "project_dependencies",
@@ -47,8 +62,19 @@ MECHANICAL_REPORT_SCHEMA = {
         "lakefile",
         "lean_toolchain_path",
     ],
+    # Schema 1 reports carry the four separately built tool commits; schema 2
+    # reports carry the Lean toolchain commit and the digests of the tools it
+    # bundles, which is what `lake comparator` verifies with. The conditional
+    # requirement below selects one set or the other.
+    "allOf": [
+        {
+            "if": {"properties": {"schema_version": {"const": 1}}, "required": ["schema_version"]},
+            "then": {"required": TOOL_COMMIT_FIELDS},
+            "else": {"required": TOOLCHAIN_PROVENANCE_FIELDS},
+        }
+    ],
     "properties": {
-        "schema_version": {"const": 1},
+        "schema_version": {"enum": [1, 2]},
         "status": {"const": "pass"},
         "stage": {"const": "complete"},
         "mathlib_cache": {
@@ -223,6 +249,32 @@ MECHANICAL_REPORT_SCHEMA = {
         "lean4export_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "landrun_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "nanoda_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        "toolchain_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        "tool_digests": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(BUNDLED_TOOLS),
+            "properties": {name: {"type": "string", "pattern": r"^[0-9a-f]{64}$"} for name in BUNDLED_TOOLS},
+        },
+        "kernels": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "argv"],
+                "properties": {
+                    "name": {"type": "string", "pattern": r"^[a-z][a-z0-9-]{0,31}$"},
+                    "argv": {
+                        "type": "array", "minItems": 1, "maxItems": 16,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 400},
+                    },
+                },
+            },
+        },
+        "protected_config_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        "bwrap_source_tag": {"type": "string", "pattern": r"^v[0-9]+\.[0-9]+\.[0-9]+$"},
         "checked_at": {"type": "string", "format": "date-time"},
         "workflow_url": {
             "type": "string",
