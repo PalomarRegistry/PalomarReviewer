@@ -147,6 +147,31 @@ class AlertRecoveryTests(unittest.TestCase):
         with self.assertRaises(ReviewerError):
             workflow_recovery.validate_execution_binding({}, {"execution": {"attempt": "b" * 32}})
 
+    def test_an_unset_admission_profile_binds_to_the_verifier_s_resolved_profile(self):
+        bind = workflow_recovery.validate_execution_binding
+        namespace = {"id": "palomar-namespace-16x32-v1"}
+        # The catalogue default resolved to Namespace; the finalizer records it.
+        bind({"execution_profile": "palomar-namespace-16x32-v1", "verification_profile": namespace}, {})
+        # Reports from before the finalizer recorded the resolution carry the placeholder.
+        bind({"execution_profile": "palomar-standard-v1", "verification_profile": namespace}, {})
+        # Anything else is a real mismatch.
+        with self.assertRaisesRegex(ReviewerError, "resource evidence"):
+            bind({"execution_profile": "palomar-other-v1", "verification_profile": namespace}, {})
+        with self.assertRaisesRegex(ReviewerError, "resource evidence"):
+            bind({"execution_profile": "palomar-namespace-16x32-v1", "verification_profile": {"id": "x"}}, {})
+        # An operator's explicit admission profile still binds strictly.
+        with self.assertRaisesRegex(ReviewerError, "admitted State"):
+            bind(
+                {"execution_profile": "palomar-namespace-16x32-v1", "verification_profile": namespace},
+                {"execution": {"profile": "palomar-standard-v1"}},
+            )
+        bind(
+            {"execution_profile": "palomar-namespace-16x32-v1", "verification_profile": namespace},
+            {"execution": {"profile": "palomar-namespace-16x32-v1"}},
+        )
+        with self.assertRaisesRegex(ReviewerError, "requires resource profile evidence"):
+            bind({"execution_profile": "palomar-namespace-16x32-v1"}, {})
+
     def test_success_predating_alert_does_not_hide_a_later_failure(self):
         state = self.state()
         state["operator_alerts"]["items"][0]["queued_at"] = "2026-09-03T00:00:00Z"
