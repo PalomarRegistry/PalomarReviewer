@@ -6707,7 +6707,7 @@ def register(args: argparse.Namespace) -> int:
         # Fail before any work if main does not carry the contract an ordinary
         # record of this report's generation declares; a correction's contract
         # follows its baseline and is checked once that is loaded.
-        registration_schema_path(
+        ordinary_schema_path = registration_schema_path(
             database,
             schema_version=mechanical_evidence.ENTRY_SCHEMA_FOR_REPORT[
                 mechanical.get("schema_version", 1)
@@ -6782,9 +6782,7 @@ def register(args: argparse.Namespace) -> int:
         artifact_destination = None
     else:
         _refuse_unregistrable_metadata(
-            load_json(
-                registration_schema_path(database, schema_version=record["schema_version"])
-            ),
+            load_json(ordinary_schema_path),
             state=state,
             permanent_id=permanent_id,
             mechanical=mechanical,
