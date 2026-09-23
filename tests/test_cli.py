@@ -2601,6 +2601,47 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             with self.assertRaisesRegex(cli.ReviewerError, "incompatible schema version"):
                 cli.validate_render_result(result, mechanical)
 
+    def test_a_legacy_report_rendered_under_bubblewrap_registers_a_schema_3_record(self):
+        # Verified by the standalone comparator, rendered after landrun was
+        # retired: the render result is schema 3 and the record says so.
+        mechanical = self.mechanical_fixture()
+        self.assertEqual(mechanical.get("schema_version", 1), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory)
+            (result / "challenge-render.json").write_text(json.dumps({
+                "schema_version": 3, "status": "pass",
+                "source": cli.expected_render_source(mechanical),
+                "verso_commit": "b" * 40, "renderer_commit": "c" * 40, "bwrap_source_tag": "v0.12.0",
+                "format": "verso-html", "entrypoint": "Challenge/index.html",
+                "artifact_tree_sha256": "a" * 64, "rendered_at": "2026-08-01T12:35:00Z",
+                "workflow_url": mechanical["workflow_url"],
+            }))
+            # Past the schema gate: what fails next is the absent bundle.
+            with self.assertRaises(cli.ReviewerError) as raised:
+                cli.validate_render_result(result, mechanical)
+            self.assertNotIn("incompatible schema version", str(raised.exception))
+        render = {
+            "format": "verso-html",
+            "artifact_path": ("renders/PALOMAR-2026-08-01-000012-v1/" + "a" * 64 + "/"),
+            "entrypoint": "Challenge/index.html",
+            "artifact_tree_sha256": "a" * 64,
+            "verso_commit": "b" * 40,
+            "renderer_commit": "c" * 40,
+            "bwrap_source_tag": "v0.12.0",
+            "rendered_at": "2026-08-01T12:35:00Z",
+        }
+        record = self.example_record(mechanical=mechanical, challenge_render=render)
+        self.assertEqual(record["schema_version"], 3)
+        self.assertEqual(record["challenge_render"]["bwrap_source_tag"], "v0.12.0")
+        self.assertNotIn("landrun_commit", record["challenge_render"])
+        self.assertEqual(record["verification"]["landrun_commit"], mechanical["landrun_commit"])
+        schema_checkout = self.available("schema")
+        if schema_checkout and (schema_checkout / "schema-v3.json").is_file():
+            jsonschema.validate(
+                record, json.loads((schema_checkout / "schema-v3.json").read_text()),
+                format_checker=jsonschema.FormatChecker(),
+            )
+
     def correction_of(self, baseline, mechanical):
         """A metadata correction of `baseline`, verified by `mechanical`."""
         baseline_path = f"entries/{baseline['id']}-v1.json"

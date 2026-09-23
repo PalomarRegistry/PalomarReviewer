@@ -2134,8 +2134,7 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
         )
     expected_source = expected_render_source(mechanical)
     report_schema = mechanical.get("schema_version", 1)
-    expected_render_version = mechanical_evidence.RENDER_SCHEMA_FOR_REPORT[report_schema]
-    if report.get("schema_version", 1) != expected_render_version:
+    if report.get("schema_version", 1) not in mechanical_evidence.RENDER_SCHEMAS_FOR_REPORT[report_schema]:
         raise ReviewerError("render result has an incompatible schema version")
     if report.get("source") != expected_source:
         raise ReviewerError("render result does not match the reviewed source and Challenge hash")
