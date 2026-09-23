@@ -2661,6 +2661,21 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(record["schema_version"], 5)
         self.assertEqual(record["verification"], toolchain_baseline["verification"])
 
+    def test_a_toolchain_report_is_a_verification_and_a_bound_correction_is_a_correction(self):
+        # Both say schema_version 2; the kind is the correction the report binds.
+        mechanical = self.toolchain_report()
+        self.assertFalse(mechanical_evidence.is_correction_report(mechanical))
+        mechanical_evidence.validate_report_schema(mechanical)
+        with mock.patch.object(mechanical_evidence.jsonschema, "validate") as validate:
+            mechanical_evidence.validate_report_schema(mechanical)
+        self.assertIs(validate.call_args.args[1], mechanical_evidence.MECHANICAL_REPORT_SCHEMA)
+        correction = self.toolchain_report()
+        correction["submission"]["registry_correction"] = {"based_on": {"id": "x", "version": 1}}
+        self.assertTrue(mechanical_evidence.is_correction_report(correction))
+        with mock.patch.object(mechanical_evidence.jsonschema, "validate") as validate:
+            mechanical_evidence.validate_report_schema(correction)
+        self.assertIs(validate.call_args.args[1], mechanical_evidence.CORRECTION_REPORT_SCHEMA)
+
     def test_a_schema_2_report_with_the_old_pins_is_rejected(self):
         mechanical = self.toolchain_report()
         del mechanical["tool_digests"]
@@ -4425,6 +4440,12 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
 
 
     def test_missing_publication_anchor_is_a_submitter_renderability_failure(self):
+        # Render results of schema 2 (landrun) and 3 (bubblewrap) bind the same way.
+        for render_schema in (2, 3):
+            with self.subTest(render_schema=render_schema):
+                self.assert_missing_anchor_is_the_submitters(render_schema)
+
+    def assert_missing_anchor_is_the_submitters(self, render_schema):
         request_id = "a" * 32
         run_url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
         renderer_commit = "b" * 40
@@ -4458,7 +4479,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 destination = Path(arguments[arguments.index("--dir") + 1]) / "result"
                 destination.mkdir(parents=True)
                 (destination / "report.json").write_text(json.dumps({
-                    "schema_version": 2,
+                    "schema_version": render_schema,
                     "status": "error",
                     "source": cli.expected_render_source(mechanical),
                     "renderer_commit": renderer_commit,

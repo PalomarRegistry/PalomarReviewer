@@ -469,13 +469,24 @@ CORRECTION_REPORT_SCHEMA = {
 }
 
 
+def is_correction_report(report: dict[str, Any]) -> bool:
+    """Whether a report validated a registry correction rather than a verification.
+
+    Both kinds say `schema_version: 2` (the correction report always has, and
+    an ordinary report has since verification moved to `lake comparator`), so
+    the kind is the correction the report binds, not the number.
+    """
+    submission = report.get("submission")
+    return isinstance(submission, dict) and "registry_correction" in submission
+
+
 def validate_report_schema(report: dict[str, Any]) -> None:
     """Reject a malformed current report before any path is dereferenced."""
     try:
         jsonschema.validate(
             report,
             CORRECTION_REPORT_SCHEMA
-            if report.get("schema_version") == 2
+            if is_correction_report(report)
             else MECHANICAL_REPORT_SCHEMA,
             format_checker=jsonschema.FormatChecker(),
         )
@@ -567,7 +578,7 @@ def validate_report_contract(
             f"mechanical verification did not pass ({report.get('status')}): {problems}"
         )
     validate_report_schema(report)
-    if report.get("schema_version") == 2:
+    if is_correction_report(report):
         source = report["source"]
         if report["submission"]["submission_id"] != state.get("id"):
             raise ReviewerError("correction report names a different submission")

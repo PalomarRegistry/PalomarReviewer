@@ -2279,7 +2279,9 @@ def request_render(
         if failure_report is not None:
             raw_diagnostics = failure_report.get("diagnostics")
             trusted_binding = (
-                failure_report.get("schema_version") == 2
+                # Render results of schema 2 (landrun) and 3 (bubblewrap) fail
+                # the same way and carry the same diagnostics.
+                failure_report.get("schema_version") in {2, 3}
                 and failure_report.get("source") == expected_render_source(mechanical)
                 and failure_report.get("renderer_commit") == run_data.get("headSha")
                 and failure_report.get("workflow_url") == run_data.get("url")
