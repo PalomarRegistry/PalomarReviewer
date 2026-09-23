@@ -30,9 +30,11 @@ BUNDLED_TOOLS = ("lake", "lean", "leanexport", "leanchecker", "nanoda_bin", "con
 # The registry entry schema an ordinary record built from each report schema
 # declares. A correction follows its baseline's generation instead.
 ENTRY_SCHEMA_FOR_REPORT = {1: 3, 2: 5}
-# The render result schema a report of each schema must be rendered with:
-# schema-3 render results name the bubblewrap release instead of a landrun commit.
-RENDER_SCHEMA_FOR_REPORT = {1: 2, 2: 3}
+# The render result schemas a report of each schema may be rendered with:
+# schema-3 render results name the bubblewrap release instead of a landrun
+# commit. A schema-1 report (the standalone comparator) rendered after landrun
+# was retired gets a schema-3 result too, and its record says so.
+RENDER_SCHEMAS_FOR_REPORT = {1: (2, 3), 2: (3,)}
 
 
 def provenance_fields(report: dict) -> dict:
