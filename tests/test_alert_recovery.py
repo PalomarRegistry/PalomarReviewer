@@ -58,6 +58,23 @@ class AlertRecoveryTests(unittest.TestCase):
         with self.assertRaises(ReviewerError):
             operator_alerts.validated_alert_items(corrupt)
 
+    def test_reclassification_requires_bound_report_evidence(self):
+        state = self.state()
+        item = state["operator_alerts"]["items"][0]
+        item["disposition"] = {
+            "kind": "reclassified",
+            "at": "2026-09-24T00:00:00Z",
+            "evidence": {
+                "run_url": state["failure"]["run"]["url"],
+                "report_sha256": "b" * 64,
+                "basis": "mechanical-report",
+            },
+        }
+        self.assertIn("Reclassified:", operator_alerts.alert_message(state, item))
+        item["disposition"]["evidence"]["report_sha256"] = "invalid"
+        with self.assertRaises(ReviewerError):
+            operator_alerts.validated_alert_items(state)
+
     def test_recovery_supersession_withdrawal_and_configuration_isolation(self):
         state = self.state()
         at = "2026-09-03T00:00:00Z"

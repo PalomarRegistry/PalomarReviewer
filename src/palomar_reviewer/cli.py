@@ -7650,7 +7650,9 @@ def reconcile_operator_alerts(args: argparse.Namespace) -> int:
                 for item in desired["items"]:
                     kind = (item.get("disposition") or {}).get("kind", "unresolved")
                     print(f"{fresh['id']} {item['key'][:16]} {kind}")
-                    if not args.deliver or item["status"] != "sent" or kind == "unresolved":
+                    # A maintainer's historical reclassification is recorded in State;
+                    # it does not authorize editing the previously sent Zulip message.
+                    if not args.deliver or item["status"] != "sent" or kind in {"unresolved", "reclassified"}:
                         continue
                     content = operator_notifications.alert_message(staged, item)
                     digest = operator_notifications.content_hash(content)

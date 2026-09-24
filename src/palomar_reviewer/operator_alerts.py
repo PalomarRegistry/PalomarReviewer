@@ -192,10 +192,16 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
             "This does not establish that the original commit works.",
             "withdrawn": ("Withdrawn: this submission is no longer active. "
                           "The original failure is not marked fixed."),
+            "reclassified": ("Reclassified: the original operator alert was reviewed "
+                             "and its failure diagnosis corrected. See the current submission status."),
         }[kind]
         evidence = disposition.get("evidence")
         suffix = f"\n\n**Disposition — {label}**"
-        if evidence:
+        if kind == "reclassified":
+            suffix += (f"\nEvidence: {evidence['run_url']} "
+                       f"(report SHA-256 `{evidence['report_sha256']}`, "
+                       f"basis `{evidence['basis']}`).")
+        elif evidence:
             suffix += (f"\nEvidence: {evidence['run_url']} (submission `{evidence['submission_id']}`, "
                        f"commit `{evidence['commit']}`).")
         return original + suffix
@@ -342,16 +348,27 @@ def validated_v2_items(state: dict, marker: dict) -> list[dict]:
                 "recovered",
                 "superseded",
                 "withdrawn",
+                "reclassified",
             }:
                 raise ReviewerError("invalid operator alert disposition")
             expected = {"kind", "at"} | (
-                {"evidence"} if disposition["kind"] in {"recovered", "superseded"} else set()
+                {"evidence"} if disposition["kind"] in {"recovered", "superseded", "reclassified"} else set()
             )
             if set(disposition) != expected or not TIMESTAMP_RE.fullmatch(str(disposition.get("at", ""))):
                 raise ReviewerError("malformed operator alert disposition")
             if "evidence" in disposition:
                 evidence = disposition["evidence"]
-                if (
+                if disposition["kind"] == "reclassified":
+                    if (
+                        not isinstance(evidence, dict)
+                        or set(evidence) != {"run_url", "report_sha256", "basis"}
+                        or not RUN_URL_RE.fullmatch(str(evidence.get("run_url", "")))
+                        or evidence.get("run_url") != (origin["failure"].get("run") or {}).get("url")
+                        or not SHA256_RE.fullmatch(str(evidence.get("report_sha256", "")))
+                        or evidence.get("basis") not in {"mechanical-report", "maintainer-analysis"}
+                    ):
+                        raise ReviewerError("invalid operator alert reclassification evidence")
+                elif (
                     not isinstance(evidence, dict)
                     or set(evidence) != {"submission_id", "commit", "run_url"}
                     or not SUBMISSION_ID_RE.fullmatch(str(evidence.get("submission_id", "")))
@@ -359,7 +376,7 @@ def validated_v2_items(state: dict, marker: dict) -> list[dict]:
                     or not RUN_URL_RE.fullmatch(str(evidence.get("run_url", "")))
                 ):
                     raise ReviewerError("invalid operator alert disposition evidence")
-                if (disposition["kind"] == "recovered") != (evidence["commit"] == origin["commit"]):
+                elif (disposition["kind"] == "recovered") != (evidence["commit"] == origin["commit"]):
                     raise ReviewerError("operator alert disposition does not match the evidence commit")
         if "delivered_sha256" in item and not SHA256_RE.fullmatch(str(item["delivered_sha256"])):
             raise ReviewerError("invalid operator alert delivered hash")
