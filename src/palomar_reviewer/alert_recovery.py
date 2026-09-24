@@ -24,6 +24,10 @@ def desired_alerts(state: dict, outcomes: list[dict], *, at: str, is_successor=N
     if not alerts:
         return None
     for item in alerts["items"]:
+        # A maintainer's audited correction must not be replaced by a later
+        # automated outcome or trigger an unapproved Zulip disposition edit.
+        if (item.get("disposition") or {}).get("kind") == "reclassified":
+            continue
         disposition: dict[str, Any] | None = None
         if state.get("status") == "withdrawn":
             disposition = {"kind": "withdrawn", "at": at}

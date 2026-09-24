@@ -61,6 +61,7 @@ class AlertRecoveryTests(unittest.TestCase):
     def test_reclassification_requires_bound_report_evidence(self):
         state = self.state()
         item = state["operator_alerts"]["items"][0]
+        item.update(status="sent", sent_at="2026-09-02T00:00:00Z", message_id=1)
         item["disposition"] = {
             "kind": "reclassified",
             "at": "2026-09-24T00:00:00Z",
@@ -71,6 +72,17 @@ class AlertRecoveryTests(unittest.TestCase):
             },
         }
         self.assertIn("Reclassified:", operator_alerts.alert_message(state, item))
+        queued = copy.deepcopy(state)
+        queued_item = queued["operator_alerts"]["items"][0]
+        queued_item["status"] = "pending"
+        queued_item.pop("sent_at")
+        queued_item.pop("message_id")
+        with self.assertRaisesRegex(ReviewerError, "only a sent operator alert"):
+            operator_alerts.validated_alert_items(queued)
+        retained = alert_recovery.desired_alerts(
+            state, [self.outcome(state)], at="2026-09-25T00:00:00Z"
+        )
+        self.assertEqual(retained["items"][0]["disposition"], item["disposition"])
         item["disposition"]["evidence"]["report_sha256"] = "invalid"
         with self.assertRaises(ReviewerError):
             operator_alerts.validated_alert_items(state)
@@ -313,6 +325,35 @@ class AlertRecoveryTests(unittest.TestCase):
                 0,
             )
             write.assert_not_called()
+
+    def test_reclassified_sent_alert_is_not_edited_by_reconciliation(self):
+        from types import SimpleNamespace
+
+        from palomar_reviewer import cli
+
+        state = self.state()
+        item = state["operator_alerts"]["items"][0]
+        item.update(status="sent", sent_at="2026-09-02T00:00:00Z", message_id=1)
+        item["disposition"] = {
+            "kind": "reclassified", "at": "2026-09-24T00:00:00Z",
+            "evidence": {"run_url": state["failure"]["run"]["url"],
+                         "report_sha256": "b" * 64, "basis": "mechanical-report"},
+        }
+        group = operator_alerts.content_hash(json.dumps(alert_recovery.configuration_key(state)))
+        index = {"schema_version": 1, "groups": {group: [state["id"]]}, "outcomes": {}}
+        with (
+            patch.object(cli, "state_json", return_value=index),
+            patch.object(cli, "submission_state", return_value=state),
+            patch.object(cli, "put_state") as write,
+            patch.object(operator_alerts, "edit_zulip_message") as edit,
+            patch.dict("os.environ", {operator_alerts.ZULIP_EMAIL_ENV: "bot@example.org",
+                                   operator_alerts.ZULIP_API_KEY_ENV: "test"}),
+        ):
+            self.assertEqual(cli.reconcile_operator_alerts(
+                SimpleNamespace(apply=True, deliver=True, submission=state["id"])
+            ), 0)
+            write.assert_not_called()
+            edit.assert_not_called()
 
     def test_noncanonical_outcome_timestamp_cannot_poison_the_cache(self):
         with self.assertRaises(ReviewerError):

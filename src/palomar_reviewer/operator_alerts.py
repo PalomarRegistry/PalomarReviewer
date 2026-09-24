@@ -356,6 +356,8 @@ def validated_v2_items(state: dict, marker: dict) -> list[dict]:
             )
             if set(disposition) != expected or not TIMESTAMP_RE.fullmatch(str(disposition.get("at", ""))):
                 raise ReviewerError("malformed operator alert disposition")
+            if disposition["kind"] == "reclassified" and item["status"] != "sent":
+                raise ReviewerError("only a sent operator alert can be reclassified")
             if "evidence" in disposition:
                 evidence = disposition["evidence"]
                 if disposition["kind"] == "reclassified":

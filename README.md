@@ -853,4 +853,9 @@ only that outcome and its indexed alert group, without a full clone or scan.
 A success must postdate the alert; supersession also requires GitHub to confirm
 that the successful commit descends from the failed commit.
 The private operational report counts unresolved, recovered, superseded,
-withdrawn, and delivery-conflict states.
+withdrawn, reclassified, and delivery-conflict states.
+Historical reclassifications require a sent alert, the original run URL, and
+an archived report digest. The validator checks the digest's shape and run
+binding; the maintainer checks the archived report itself before recording it.
+Automated recovery preserves this disposition and does not edit the sent Zulip
+message. Promote this runtime wheel before State records any reclassification.
