@@ -215,6 +215,13 @@ def codex_arguments(
         # which is shorter than the broker waits.
         "-c",
         f"{provider}.stream_idle_timeout_ms={CODEX_STREAM_IDLE_MS}",
+        # Newer model fallbacks in pinned Codex advertise web search and
+        # multi-agent tools even for a custom provider. The broker must keep
+        # refusing hosted tools, so disable them in the client explicitly.
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        "features.multi_agent=false",
     ]
     if reasoning_effort:
         argv.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
