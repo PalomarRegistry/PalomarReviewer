@@ -10,15 +10,34 @@ from __future__ import annotations
 import json
 from typing import Any
 
-# The one model production runs, at the provider's current USD prices per
-# million tokens. These values are deliberately not copied into the durable
-# usage record: that record retains the engine evidence, not a vendor estimate.
+# Current standard short-context USD prices per million tokens. Historical
+# reviews keep their model identity and are priced under that model's schedule.
+# Prices are not copied into durable usage records.
 GPT_5_6_SOL_MODEL = "codex:gpt-5.6-sol"
-GPT_5_6_SOL_INPUT_USD_PER_MTOK = 5.00
-GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK = 0.50
+GPT_5_6_SOL_INPUT_USD_PER_MTOK = 4.00
+GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK = 0.40
 GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK = 1.25 * GPT_5_6_SOL_INPUT_USD_PER_MTOK
-GPT_5_6_SOL_OUTPUT_USD_PER_MTOK = 30.00
+GPT_5_6_SOL_OUTPUT_USD_PER_MTOK = 20.00
 GPT_5_6_SOL_LONG_CONTEXT_INPUT_TOKENS = 272_000
+GPT_6_SOL_MODEL = "codex:gpt-6-sol"
+GPT_6_SOL_INPUT_USD_PER_MTOK = 2.00
+GPT_6_SOL_CACHED_INPUT_USD_PER_MTOK = 0.20
+GPT_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK = 2.50
+GPT_6_SOL_OUTPUT_USD_PER_MTOK = 10.00
+MODEL_PRICES = {
+    GPT_5_6_SOL_MODEL: (
+        GPT_5_6_SOL_INPUT_USD_PER_MTOK,
+        GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK,
+        GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK,
+        GPT_5_6_SOL_OUTPUT_USD_PER_MTOK,
+    ),
+    GPT_6_SOL_MODEL: (
+        GPT_6_SOL_INPUT_USD_PER_MTOK,
+        GPT_6_SOL_CACHED_INPUT_USD_PER_MTOK,
+        GPT_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK,
+        GPT_6_SOL_OUTPUT_USD_PER_MTOK,
+    ),
+}
 CODEX_REQUIRED_USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -77,7 +96,8 @@ def priceable_turn_usage(evidence: dict[str, Any]) -> dict[str, int] | None:
 
 def usage_cost(model: str, evidence: dict[str, Any]) -> float | None:
     """Exact current USD for one provably base-rate turn, otherwise None."""
-    if model != GPT_5_6_SOL_MODEL:
+    prices = MODEL_PRICES.get(model)
+    if prices is None:
         return None
     usage = priceable_turn_usage(evidence)
     if usage is None:
@@ -86,10 +106,10 @@ def usage_cost(model: str, evidence: dict[str, Any]) -> float | None:
     cache_write = usage["cache_write_input_tokens"]
     ordinary = usage["input_tokens"] - cached - cache_write
     total_per_million = (
-        ordinary * GPT_5_6_SOL_INPUT_USD_PER_MTOK
-        + cached * GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK
-        + cache_write * GPT_5_6_SOL_CACHE_WRITE_INPUT_USD_PER_MTOK
-        + usage["output_tokens"] * GPT_5_6_SOL_OUTPUT_USD_PER_MTOK
+        ordinary * prices[0]
+        + cached * prices[1]
+        + cache_write * prices[2]
+        + usage["output_tokens"] * prices[3]
     )
     return total_per_million / 1_000_000
 
@@ -124,21 +144,22 @@ def responses_usage_tokens(usage: Any) -> dict[str, int] | None:
     }
 
 
-def responses_usage_cost(counts: dict[str, int]) -> float:
-    """Estimated USD for one request, always at the production model's prices.
+def responses_usage_cost(counts: dict[str, int], model: str) -> float:
+    """Estimated USD for one request at the broker's pinned model prices.
 
     The broker enforces one model, and the estimate exists to stop a runaway
-    pass rather than to price anything durable. Charging every token at the
-    production list price is therefore the right direction to be wrong in: a
-    cheaper model is refused early rather than late, and no historical USD
-    value derived from this ever reaches the spend document.
+    pass rather than to price anything durable. No estimated USD value derived
+    from this reaches the spend document.
     """
+    # The broker accepts development model IDs too. Keep the prior conservative
+    # 5.6 Sol estimate for an unlisted ID; production uses a listed model.
+    prices = MODEL_PRICES.get(model, MODEL_PRICES[GPT_5_6_SOL_MODEL])
     cached = min(counts["cached_input_tokens"], counts["input_tokens"])
     ordinary = counts["input_tokens"] - cached
     return (
-        ordinary * GPT_5_6_SOL_INPUT_USD_PER_MTOK
-        + cached * GPT_5_6_SOL_CACHED_INPUT_USD_PER_MTOK
-        + counts["output_tokens"] * GPT_5_6_SOL_OUTPUT_USD_PER_MTOK
+        ordinary * prices[0]
+        + cached * prices[1]
+        + counts["output_tokens"] * prices[3]
     ) / 1_000_000
 
 
@@ -220,7 +241,7 @@ def review_cost(accounting: dict[str, Any]) -> float | None:
 
 def review_pricing_problem(accounting: dict[str, Any]) -> str:
     """Explain why the retained evidence cannot produce an exact current price."""
-    if accounting["model"] != GPT_5_6_SOL_MODEL:
+    if accounting["model"] not in MODEL_PRICES:
         return f"no current price is configured for {accounting['model']}"
     if not accounting["passes"]:
         return "no model passes were recorded"

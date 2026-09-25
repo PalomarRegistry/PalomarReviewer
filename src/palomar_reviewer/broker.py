@@ -414,7 +414,9 @@ class Ledger:
             self._cached_input_tokens += counts["cached_input_tokens"]
             self._output_tokens += counts["output_tokens"]
             self._reasoning_output_tokens += counts["reasoning_output_tokens"]
-            self._usd += usage_accounting.responses_usage_cost(counts)
+            self._usd += usage_accounting.responses_usage_cost(
+                counts, f"codex:{self._policy.model}"
+            )
 
     def summary(self) -> dict[str, Any]:
         """The structured record handed back to the reviewer's accounting path."""
