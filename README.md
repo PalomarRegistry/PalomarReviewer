@@ -261,7 +261,7 @@ Preview the queue without changing anything:
 
 ```bash
 palomar-review list
-palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol
+palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-6-sol
 palomar-review notify-operator-alerts
 ```
 
@@ -326,7 +326,7 @@ when the synthesis identifies a specific, realistically correctable gap.
 Deliver that exact review to the submitter:
 
 ```bash
-palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-5.6-sol --apply
+palomar-review run --submission a1b2c3d4e5f6 --engine codex --model gpt-6-sol --apply
 ```
 
 `--apply` never reruns the model. It loads the existing dry-run `review.json`,
@@ -358,12 +358,12 @@ measurement time explicitly and owns persistence of the assembled accounting;
 `palomar_reviewer.engine` derives the durable engine identity, collects the raw
 events, and hands them to that pure accounting boundary.
 
-Production uses `codex:gpt-5.6-sol`. At the current list prices, ordinary input
-is $5.00/M tokens, cached input is $0.50/M, cache-write input is 1.25 times the
-ordinary input rate, and output is $30.00/M. A request with more than 272,000
+Production uses `codex:gpt-6-sol`. At the standard short-context list prices,
+ordinary input is $2.00/M tokens, cached input is $0.20/M, cache-write input
+is $2.50/M, and output is $10.00/M. A request with more than 272,000
 input tokens is charged at 2 times input and 1.5 times output, and that threshold
 applies to each model request—not to the completed-turn aggregate. See the
-[official GPT-5.6 Sol model page](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+[official GPT-6 Sol model page](https://developers.openai.com/api/docs/models/gpt-6-sol).
 
 When a valid turn aggregate has at most 272,000 total input tokens, every
 constituent request is necessarily below the long-context threshold. The
@@ -764,7 +764,7 @@ own reaper is PID 1 inside the namespace and `/proc/1/environ` there is
 whatever it was started with; `--clearenv` answers a different question. What it does not
 buy: this is not network isolation. The namespace still shares the runner's
 network, because the Codex transport has to reach the broker. It covers the
-`codex:gpt-5.6-sol` launch path and no other provider; the Claude engine's own
+`codex:gpt-6-sol` launch path and no other provider; the Claude engine's own
 login is still bound into its namespace, which is why that engine is not a
 production engine. The output credential check remains as a backstop for the
 cases the broker does not cover, and it catches a key copied out in plain text

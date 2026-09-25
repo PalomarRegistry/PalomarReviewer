@@ -71,13 +71,13 @@ class UsageAccountingTests(unittest.TestCase):
             output=10_000,
             reasoning=4_000,
         )
-        # $0.76 ordinary + $0.05 cached + $0.125 cache write + $0.30 output.
+        # Current 5.6 Sol prices, retaining historical model identity.
         self.assertAlmostEqual(
             usage_accounting.usage_cost(
                 usage_accounting.GPT_5_6_SOL_MODEL,
                 self.evidence(turn),
             ),
-            1.235,
+            0.948,
         )
 
     def test_turn_aggregate_above_272000_is_not_exactly_priceable(self):
@@ -99,7 +99,7 @@ class UsageAccountingTests(unittest.TestCase):
                 self.entry("synthesis", self.usage(input_tokens=200_000)),
             ],
         )
-        self.assertAlmostEqual(usage_accounting.review_cost(accounting), 2.0)
+        self.assertAlmostEqual(usage_accounting.review_cost(accounting), 1.6)
         one_turn = self.evidence(self.usage(input_tokens=400_000))
         self.assertIsNone(usage_accounting.usage_cost(usage_accounting.GPT_5_6_SOL_MODEL, one_turn))
 
@@ -163,6 +163,23 @@ class UsageAccountingTests(unittest.TestCase):
         self.assertEqual(accounting["passes"][0]["usage_status"], "recorded")
         self.assertNotIn("usd", accounting)
         self.assertNotIn("usd", accounting["passes"][0])
+
+    def test_gpt_6_sol_prices_each_category_and_broker_uses_pinned_model(self):
+        turn = self.usage(
+            input_tokens=272_000, cached=100_000, cache_write=20_000, output=10_000
+        )
+        # 152k ordinary, 100k cached, 20k writes, 10k output.
+        self.assertAlmostEqual(
+            usage_accounting.usage_cost(
+                usage_accounting.GPT_6_SOL_MODEL, self.evidence(turn)
+            ),
+            0.474,
+        )
+        counts = {"input_tokens": 100_000, "cached_input_tokens": 0, "output_tokens": 10_000}
+        self.assertAlmostEqual(
+            usage_accounting.responses_usage_cost(counts, usage_accounting.GPT_6_SOL_MODEL),
+            0.30,
+        )
 
 
 if __name__ == "__main__":
