@@ -336,6 +336,38 @@ class RegistrationCheckpointRecoveryTests(unittest.TestCase):
             record,
         )
 
+    def test_checkpoint_accepts_schema_v5_for_an_ordinary_registration(self):
+        review, state, record = self.fixtures()
+        record["schema_version"] = 5
+
+        self.assertIs(
+            checkpoint.validate_record(
+                record,
+                submission_id=self.submission_id,
+                review=review,
+                state=state,
+                identity=(self.identifier, "2026-08-09", self.registered_at, 1),
+            ),
+            record,
+        )
+
+    def test_checkpoint_accepts_schema_v5_for_a_registry_correction(self):
+        review, state, record = self.fixtures()
+        state["registry_correction"] = {"schema_version": 1}
+        record["schema_version"] = 5
+        record["registry_correction"] = {"kind": "registry-metadata-correction"}
+
+        self.assertIs(
+            checkpoint.validate_record(
+                record,
+                submission_id=self.submission_id,
+                review=review,
+                state=state,
+                identity=(self.identifier, "2026-08-09", self.registered_at, 1),
+            ),
+            record,
+        )
+
     def test_checkpoint_refuses_schema_v4_for_an_ordinary_registration(self):
         review, state, record = self.fixtures()
         record["schema_version"] = 4
