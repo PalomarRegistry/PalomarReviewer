@@ -290,14 +290,17 @@ def validate_record(
 ) -> dict[str, Any]:
     """Bind the branch record to the saved identity, review, source, and State."""
     identifier, first_registered_on, registered_at, version = identity
-    expected_schema_version = 4 if isinstance(state.get("registry_correction"), dict) else 3
+    is_correction = isinstance(state.get("registry_correction"), dict)
+    # Toolchain reports use the current v5 entry contract; older reports and
+    # correction baselines retain their original v3/v4 contracts.
+    allowed_schema_versions = {4, 5} if is_correction else {3, 5}
     source = record.get("source") if isinstance(record, dict) else None
     submission = record.get("submission") if isinstance(record, dict) else None
     recorded_review = record.get("review") if isinstance(record, dict) else None
     inherited_review = review.get("inherited_review")
     expected_review = (
         inherited_review
-        if isinstance(state.get("registry_correction"), dict)
+        if is_correction
         and isinstance(inherited_review, dict)
         else review
     )
@@ -306,7 +309,8 @@ def validate_record(
     if (
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
-        or record["schema_version"] != expected_schema_version
+        or record["schema_version"] not in allowed_schema_versions
+        or isinstance(record.get("registry_correction"), dict) != is_correction
         or record.get("id") != identifier
         or record.get("version") != version
         or record.get("first_registered_on") != first_registered_on
