@@ -683,10 +683,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return f"this broker serves only reasoning effort {effort}", "unexpected reasoning effort"
         tools = request.get("tools")
         if tools is not None:
-            # Pinned Codex sends no top-level `tools` at all: its own tools
-            # travel inside `input`, and the client runs them. What this
-            # refuses is a hosted tool, which the provider would run on the
-            # requester's behalf, and which is how a process in the namespace
+            # Pinned Codex may send client-run function tools in `tools`.
+            # What this refuses is a hosted tool, which the provider would run
+            # on the requester's behalf, and which is how a process in the namespace
             # would give the reviewer the web research the policy says it does
             # not have. It is one layer and not a proof: a hosted tool smuggled
             # into `input` by a future client shape is not inspected here.
