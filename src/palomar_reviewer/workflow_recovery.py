@@ -31,9 +31,7 @@ SETUP_STEPS = {
 }
 
 
-# The value a report carried for `execution_profile` when the dispatch named
-# no profile, before the verifier started recording the profile it resolved.
-LEGACY_PROFILE_PLACEHOLDER = "palomar-standard-v1"
+HOSTED_PROFILE = "palomar-standard-v1"
 
 
 def validate_execution_binding(report: dict, state: dict) -> None:
@@ -41,7 +39,9 @@ def validate_execution_binding(report: dict, state: dict) -> None:
     evidence = report.get("verification_profile")
     if evidence is not None and not isinstance(evidence, dict):
         raise ReviewerError("mechanical report resource evidence is malformed")
-    reported = report.get("execution_profile", LEGACY_PROFILE_PLACEHOLDER)
+    # A report from before the finalizer recorded a profile ran on the hosted
+    # profile, which is what an absent field means; a present field is bound.
+    reported = report.get("execution_profile", HOSTED_PROFILE)
     if "profile" in execution:
         # An operator chose the profile at admission: the report must have run there.
         profile = execution["profile"]
@@ -49,10 +49,9 @@ def validate_execution_binding(report: dict, state: dict) -> None:
             raise ReviewerError("mechanical report execution profile does not match admitted State")
     elif evidence is not None:
         # Nothing was chosen, so the verifier resolved the catalogue default and
-        # its resource evidence names it. Reports written before the finalizer
-        # recorded that resolution carry the placeholder instead; accept it.
+        # its resource evidence names it; the finalizer records the same name.
         profile = evidence.get("id")
-        if profile not in PROFILES or reported not in {profile, LEGACY_PROFILE_PLACEHOLDER}:
+        if profile not in PROFILES or reported != profile:
             raise ReviewerError("mechanical report execution profile does not match its resource evidence")
     else:
         profile = reported
