@@ -181,11 +181,18 @@ class AlertRecoveryTests(unittest.TestCase):
         namespace = {"id": "palomar-namespace-16x32-v1"}
         # The catalogue default resolved to Namespace; the finalizer records it.
         bind({"execution_profile": "palomar-namespace-16x32-v1", "verification_profile": namespace}, {})
-        # Reports from before the finalizer recorded the resolution carry the placeholder.
-        bind({"execution_profile": "palomar-standard-v1", "verification_profile": namespace}, {})
-        # Anything else is a real mismatch.
+        # The hosted name beside Namespace evidence was tolerated while reports
+        # from before the finalizer recorded the resolution were still in flight;
+        # none remain, and the binding is strict again.
+        with self.assertRaisesRegex(ReviewerError, "resource evidence"):
+            bind({"execution_profile": "palomar-standard-v1", "verification_profile": namespace}, {})
         with self.assertRaisesRegex(ReviewerError, "resource evidence"):
             bind({"execution_profile": "palomar-other-v1", "verification_profile": namespace}, {})
+        # A report with no profile field at all ran on the hosted profile; beside
+        # Namespace evidence that is the same mismatch.
+        with self.assertRaisesRegex(ReviewerError, "resource evidence"):
+            bind({"verification_profile": namespace}, {})
+        bind({}, {})
         with self.assertRaisesRegex(ReviewerError, "resource evidence"):
             bind({"execution_profile": "palomar-namespace-16x32-v1", "verification_profile": {"id": "x"}}, {})
         # An operator's explicit admission profile still binds strictly.
