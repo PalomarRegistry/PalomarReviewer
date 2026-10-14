@@ -799,6 +799,8 @@ workflow-run.json              # normalized run identity, workflow commit, job c
 workflow-run-sha256            # detects provenance drift before registration
 source/                        # detached source commit
 policy/                        # detached policy commit
+libraries/                     # Lean sources of the Challenge's pinned libraries, mounted read-only at /libraries
+libraries.json                 # repository and exact revision of each checked-out library
 prompts/                       # fully rendered prompts
 raw/                           # exact engine final messages
 passes/                        # normalized per-pass JSON

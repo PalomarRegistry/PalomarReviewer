@@ -70,6 +70,9 @@ SANDBOX_SYSTEM_ROOTS = (
 # exists to stop. It has no broker of its own yet, so it is not a production
 # engine, and running it has to be a decision somebody made on purpose.
 UNBROKERED_CLAUDE_ENV = "PALOMAR_ALLOW_UNBROKERED_CLAUDE"
+# Where Palomar's checkout of the Challenge's pinned library sources appears
+# inside the namespace, beside rather than within the submitted `/workspace`.
+LIBRARIES_MOUNT = "/libraries"
 
 
 def validate_config(engine: str, command: str | None) -> None:
@@ -361,12 +364,21 @@ def isolated_command(
     cwd: Path,
     output_dir: Path,
     secret_args_fd: int | None = None,
+    libraries: Path | None = None,
 ) -> list[str]:
-    """Build a fail-closed Linux namespace with no ambient operator home."""
+    """Build a fail-closed Linux namespace with no ambient operator home.
+
+    `libraries`, when given, is Palomar's own read-only checkout of the pinned
+    library sources the Challenge imports. It is bound beside the submitted
+    repository rather than inside it, so nothing the submitter commits can
+    occupy or shadow that path.
+    """
     bwrap = shutil.which("bwrap")
     if not bwrap:
         raise EngineError("bubblewrap is required to isolate untrusted editorial evidence")
     cwd = cwd.resolve(strict=True)
+    if libraries is not None:
+        libraries = libraries.resolve(strict=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = output_dir.resolve(strict=True)
     host_home = Path.home().resolve()
@@ -402,6 +414,7 @@ def isolated_command(
         "--bind",
         str(output_dir),
         "/output",
+        *(["--ro-bind", str(libraries), LIBRARIES_MOUNT] if libraries is not None else []),
         "--setenv",
         "HOME",
         "/home/reviewer",
@@ -590,6 +603,7 @@ def _run_brokered_codex(
     engine_output: Path,
     schema_name: str,
     output_name: str,
+    libraries: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """One Codex pass, authenticated only by a broker that outlives nothing.
 
@@ -632,6 +646,7 @@ def _run_brokered_codex(
                         cwd=cwd,
                         output_dir=engine_output,
                         secret_args_fd=read_fd,
+                        libraries=libraries,
                     ),
                     input_text=prompt,
                     timeout=7200,
@@ -666,6 +681,7 @@ def _execute(
     raw_path: Path,
     reasoning_effort: str | None = None,
     allow_network: bool = False,
+    libraries: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Implement one engine pass behind the public operational-error boundary."""
     validate_config(engine, command)
@@ -691,6 +707,7 @@ def _execute(
             engine_output=engine_output,
             schema_name=schema_path.name,
             output_name=output_path.name,
+            libraries=libraries,
         )
         (raw_path.parent / f"{raw_path.stem}.events.jsonl").write_text(
             events, encoding="utf-8"
@@ -706,7 +723,9 @@ def _execute(
     elif engine == "claude":
         argv = claude_arguments(schema=schema, model=model, allow_network=allow_network)
         text = _run(
-            isolated_command("claude", argv, cwd=cwd, output_dir=engine_output),
+            isolated_command(
+                "claude", argv, cwd=cwd, output_dir=engine_output, libraries=libraries
+            ),
             input_text=prompt,
             timeout=7200,
         ).stdout
@@ -717,6 +736,7 @@ def _execute(
                 custom_arguments(command or ""),
                 cwd=cwd,
                 output_dir=engine_output,
+                libraries=libraries,
             ),
             input_text=prompt,
             timeout=7200,
@@ -752,6 +772,7 @@ def execute(
     raw_path: Path,
     reasoning_effort: str | None = None,
     allow_network: bool = False,
+    libraries: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one engine pass, exposing expected operational failures as EngineError."""
     try:
@@ -765,6 +786,7 @@ def execute(
             raw_path=raw_path,
             reasoning_effort=reasoning_effort,
             allow_network=allow_network,
+            libraries=libraries,
         )
     except (OSError, UnicodeError) as error:
         raise EngineError(f"review engine I/O failed: {error}") from error
