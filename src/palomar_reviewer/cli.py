@@ -2208,8 +2208,9 @@ def request_render(
         ]
     )
     profile = mechanical.get("execution_profile", "palomar-standard-v1")
-    if profile != "palomar-standard-v1":
-        dispatch.extend(["-f", f"execution_profile={profile}"])
+    # An omitted dispatch input selects the catalogue's current default,
+    # which can differ from the accepted report's inherited/legacy profile.
+    dispatch.extend(["-f", f"execution_profile={profile}"])
     gh(dispatch)
     expected_title = (
         f"Render {mechanical['source']['repository']}@{mechanical['source']['commit']} [{request_id}]"
