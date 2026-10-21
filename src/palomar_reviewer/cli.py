@@ -2446,7 +2446,9 @@ def restore_reviewed_render(
     ], check=False)
     if downloaded.returncode:
         detail = (downloaded.stderr or downloaded.stdout or "artifact unavailable")[-1500:]
-        if "no artifact matches" in detail.lower() or "no artifacts found" in detail.lower():
+        if any(marker in detail.lower() for marker in (
+            "no artifact matches", "no artifacts found", "no valid artifacts found to download"
+        )):
             print(
                 "Reviewed render artifact has expired; rebuilding the same accepted source.", file=sys.stderr
             )
