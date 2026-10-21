@@ -323,6 +323,35 @@ class EngineExecutionTests(unittest.TestCase):
                     output_dir=root / "other-output",
                     secret_args_fd=9,
                 )
+    def test_library_sources_are_bound_read_only_beside_the_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            libraries = root / "libraries"
+            source.mkdir()
+            libraries.mkdir()
+            with mock.patch.object(
+                engine.shutil,
+                "which",
+                side_effect={"bwrap": "/usr/bin/bwrap", "true": "/usr/bin/true"}.get,
+            ):
+                bound = engine.isolated_command(
+                    "command",
+                    ["true"],
+                    cwd=source,
+                    output_dir=root / "output",
+                    libraries=libraries,
+                )
+                unbound = engine.isolated_command(
+                    "command", ["true"], cwd=source, output_dir=root / "other-output"
+                )
+        mount = bound.index(engine.LIBRARIES_MOUNT)
+        self.assertEqual(
+            bound[mount - 2 : mount + 1],
+            ["--ro-bind", str(libraries.resolve()), engine.LIBRARIES_MOUNT],
+        )
+        self.assertNotIn(engine.LIBRARIES_MOUNT, unbound)
+
     def test_codex_requires_a_regular_final_message(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

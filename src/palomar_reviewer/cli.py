@@ -4109,6 +4109,143 @@ def clone_at(
     return resolved
 
 
+# Lean sources and the manifest that pins each library's own dependencies.
+LIBRARY_SPARSE_PATTERNS = ("*.lean", "/lake-manifest.json")
+LIBRARY_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def _library_repository(url: object) -> str | None:
+    """The `owner/name` of a credential-free HTTPS GitHub URL, or None."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != "github.com"
+        or parsed.username
+        or parsed.password
+        or port
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    path = parsed.path.strip("/").removesuffix(".git")
+    return path if LIBRARY_REPOSITORY_RE.fullmatch(path) else None
+
+
+def materialize_challenge_libraries(work: Path, mechanical: dict[str, Any]) -> list[dict[str, str]]:
+    """Check out the pinned library sources the Challenge's statement rests on.
+
+    The definition audit has to read what Mathlib (or Tau Ceti, or CSLib)
+    actually defines at the revision the verifier built against. The submitted
+    repository carries none of it, and the review namespace has no network, so
+    without this the reviewer can only report that the sources were absent,
+    which no submitter can remedy.
+
+    The libraries are the Challenge's allowlisted roots, as the mechanical
+    report records them, together with every package each root's own manifest
+    pins at that revision: Mathlib's statements are stated partly in Batteries.
+    Each is fetched from its canonical GitHub repository at the exact revision
+    the verifier authenticated, never from a URL the submitter wrote, and only
+    its Lean sources are checked out. They live beside the submitted checkout,
+    in a directory the submission cannot name.
+    """
+    root = work / "libraries"
+    if root.exists():
+        shutil.rmtree(root)
+    challenge = mechanical.get("challenge") or {}
+    roots = [
+        item["repository"]
+        for item in challenge.get("dependencies") or []
+        if isinstance(item, dict)
+        and item.get("provenance") == "allowlisted"
+        and isinstance(item.get("repository"), str)
+    ]
+    if not roots:
+        return []
+    pinned: dict[str, dict[str, str]] = {}
+    for item in mechanical.get("project_dependencies") or []:
+        if isinstance(item, dict) and "path" not in item:
+            pinned[str(item["name"])] = item
+
+    libraries: dict[str, dict[str, str]] = {}
+
+    def checkout(repository: str, revision: str) -> Path:
+        if not LIBRARY_REPOSITORY_RE.fullmatch(repository):
+            raise ReviewerError(f"library repository is malformed: {repository!r}")
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ReviewerError(f"library {repository} has no exact pinned revision")
+        key = repository.casefold()
+        if key in libraries:
+            if libraries[key]["revision"] != revision:
+                raise ReviewerError(f"library {repository} is pinned at two revisions")
+            return work / libraries[key]["path"]
+        relative = f"libraries/{repository}"
+        destination = work / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        resolved = clone_at(
+            f"https://github.com/{repository}",
+            revision,
+            destination,
+            sparse_patterns=LIBRARY_SPARSE_PATTERNS,
+        )
+        if resolved != revision:
+            raise ReviewerError(f"library checkout of {repository} does not match its pin")
+        # The engine reads these through a read-only bind; Git metadata is
+        # neither evidence nor needed there.
+        shutil.rmtree(destination / ".git")
+        libraries[key] = {"repository": repository, "revision": revision, "path": relative}
+        return destination
+
+    for repository in roots:
+        package = next(
+            (
+                item
+                for item in pinned.values()
+                if str(item.get("repository", "")).casefold() == repository.casefold()
+            ),
+            None,
+        )
+        if package is None:
+            raise ReviewerError(
+                f"the Challenge imports {repository}, but the mechanical report pins no revision for it"
+            )
+        directory = checkout(repository, str(package["revision"]))
+        manifest_path = directory / "lake-manifest.json"
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ReviewerError(f"{repository} has an unreadable lake-manifest.json") from error
+        for entry in manifest.get("packages") or []:
+            if not isinstance(entry, dict) or entry.get("type") != "git":
+                continue
+            dependency = _library_repository(entry.get("url"))
+            revision = entry.get("rev")
+            if dependency is None or not isinstance(revision, str):
+                raise ReviewerError(
+                    f"{repository} pins {entry.get('name')!r} at a location Palomar cannot fetch"
+                )
+            # The library's own manifest names the repository and revision; the
+            # project must have built exactly that, or the verifier would not
+            # have accepted the closure.
+            project = pinned.get(str(entry.get("name")))
+            if project is None or project.get("revision") != revision:
+                raise ReviewerError(
+                    f"the project does not build {repository}'s pinned {entry.get('name')!r}"
+                )
+            checkout(dependency, revision)
+
+    recorded = sorted(libraries.values(), key=lambda item: item["repository"].casefold())
+    write_json(work / "libraries.json", recorded)
+    return recorded
+
+
 def complete_database_history_for_push(database: Path) -> None:
     """Remove the shallow boundary immediately before a production push.
 
@@ -4546,6 +4683,29 @@ def render_prompt(
         f"\nSource: `{mechanical['source']['repository']}@{mechanical['source']['commit']}`",
         f"\nProject directory: `{mechanical['source'].get('project_path') or 'repository root'}`",
     ]
+    libraries_path = work / "libraries.json"
+    if libraries_path.is_file():
+        libraries = load_json(libraries_path)
+        if libraries:
+            sections.extend(
+                [
+                    "\n# Pinned library sources",
+                    (
+                        "Palomar checked out the Lean sources of the libraries this Challenge "
+                        "imports, at the exact revisions mechanical verification built against. "
+                        "They are fetched from each library's canonical repository, not from the "
+                        "submission, and are mounted read-only at "
+                        f"`{engine_execution.LIBRARIES_MOUNT}/<owner>/<repository>`. Read imported "
+                        "definitions there, and cite a file you read in `sources_checked` as "
+                        "`<owner>/<repository>@<revision>:<path>`."
+                    ),
+                    *(
+                        f"\n- `{item['repository']}@{item['revision']}` at "
+                        f"`{engine_execution.LIBRARIES_MOUNT}/{item['repository']}`"
+                        for item in libraries
+                    ),
+                ]
+            )
     for name in step.get("inputs", []):
         if not name.startswith("policy:"):
             continue
@@ -5181,6 +5341,7 @@ def run_review(args: argparse.Namespace) -> int:
     # Comparator are rejected here with a submitter-facing diagnostic.
     if not state.get("registry_correction"):
         ensure_challenge_renderable(work, mechanical)
+    libraries = materialize_challenge_libraries(work, mechanical)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
     validate_current_review_contract(rubric, review_schema)
@@ -5217,6 +5378,7 @@ def run_review(args: argparse.Namespace) -> int:
                 raw_path=work / "raw" / f"{step['id']}.txt",
                 allow_network=step["id"] == "literature_notability",
                 reasoning_effort=args.reasoning_effort,
+                libraries=(work / "libraries") if libraries else None,
             )
         except engine_execution.EngineError as error:
             # ReviewerError is the CLI's single operational failure contract;
