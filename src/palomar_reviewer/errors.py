@@ -4,6 +4,8 @@
 class ReviewerError(RuntimeError):
     """An expected reviewer input, trust, or operational failure."""
 
+    render_request_finished = False
+
 
 class DeterministicRegistrationError(ReviewerError):
     """A registration failure that unchanged inputs cannot fix by retrying."""
@@ -11,6 +13,16 @@ class DeterministicRegistrationError(ReviewerError):
 
 class RegistrationDeferred(ReviewerError):
     """A registration is safe but another durable allocation must finish first."""
+
+
+class RenderPending(ReviewerError):
+    """A durable render request is still running or awaiting dispatch discovery."""
+
+
+class RenderRequestError(ReviewerError):
+    """A rendering request itself cannot be resumed safely."""
+
+    render_request_finished = True
 
 
 class SubmitterRenderabilityError(DeterministicRegistrationError):
