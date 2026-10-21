@@ -2253,10 +2253,30 @@ def request_render(
             "--repo",
             mechanical_evidence.SUBMISSION_REPO,
             "--exit-status",
+            "--interval",
+            "120",
         ],
         check=False,
         timeout=wait_seconds,
     )
+    if watched.returncode:
+        # The monitor can fail (for example on API quota) while the workflow
+        # continues. Its exit status is not a rendering verdict. Reconcile one
+        # authoritative run snapshot before looking for a failure artifact.
+        observed = json.loads(gh([
+            "run", "view", run_id, "--repo", mechanical_evidence.SUBMISSION_REPO,
+            "--json", "status,conclusion,headSha,url",
+        ]))
+        if observed.get("headSha") != run_data.get("headSha") or observed.get("url") != run_data.get("url"):
+            raise ReviewerError("render monitor reconciliation returned a different workflow identity")
+        if observed.get("status") != "completed":
+            detail = (watched.stderr or watched.stdout or "monitor stopped without a verdict")[-1500:]
+            raise ReviewerError(
+                f"Render workflow remains {observed.get('status')}; its monitor failed, "
+                f"not the rendering. Inspect {run_data['url']}. Monitor detail: {detail}"
+            )
+        if observed.get("conclusion") == "success":
+            watched = subprocess.CompletedProcess(watched.args, 0, watched.stdout, watched.stderr)
     if watched.returncode:
         failure_report = render_failure_report(work, run_id, request_id)
         reported_errors = failure_report.get("errors") if failure_report is not None else None
@@ -5626,9 +5646,15 @@ def validated_classification(mechanical: dict[str, Any], metadata: dict[str, Any
     except (KeyError, TypeError) as error:
         raise ReviewerError("mechanical report has no valid classification") from error
     submitted = metadata.get("classification")
-    if not isinstance(submitted, dict) or any(not isinstance(submitted.get(key), list) for key in result):
+    if not isinstance(submitted, dict):
         raise ReviewerError("formalization.yaml has no valid classification")
-    if result != {key: submitted[key] for key in result}:
+    # Intake permits an omitted MSC list and records it as empty. Registration
+    # must normalize that same omission without accepting null or malformed
+    # values, or dropping any codes the mechanical report actually verified.
+    normalized = {"arxiv": submitted.get("arxiv"), "msc2020": submitted.get("msc2020", [])}
+    if any(not isinstance(value, list) for value in normalized.values()):
+        raise ReviewerError("formalization.yaml has no valid classification")
+    if result != normalized:
         raise ReviewerError("formalization.yaml classification disagrees with the mechanical report")
     return result
 
