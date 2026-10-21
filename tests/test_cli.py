@@ -6822,6 +6822,30 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(started, {(2, 1): False, (2, 3): True,
                                    (20, 19): False, (20, 21): True})
 
+    def test_ready_registration_precedes_a_render_that_spends_the_pass_budget(self):
+        review = self.row("aaaaaaaaaaaa", status="awaiting-review")
+        registration = self.row("bbbbbbbbbbbb", status="review-ready", registration_consent=True)
+        listing, state = self.records(review, registration)
+        clock = [0.0]
+        calls = []
+
+        def render(*_args, **_kwargs):
+            calls.append("render")
+            clock[0] = 100_000.0
+
+        with (
+            listing, state,
+            mock.patch.object(cli.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(cli, "register", side_effect=lambda _: calls.append("register")),
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda row: row),
+            mock.patch.object(cli, "ensure_review_renderable", side_effect=render),
+            mock.patch.object(cli, "advance_state", side_effect=lambda row, *_a, **_kw: row),
+            mock.patch.object(cli, "begin_review") as began,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 0)
+        self.assertEqual(calls, ["register", "render"])
+        began.assert_not_called()
+
     def test_only_one_registration_is_started_per_pass(self):
         """A registration already waits on a render run and now waits on the
         database too, so two in one pass can outlive the job carrying them."""
@@ -8599,6 +8623,62 @@ class StateWriteGuardTests(unittest.TestCase):
             written = cli.put_state("submissions/a1b2c3d4e5f6/state.json", {"id": "x"}, "yes")
         self.assertEqual(written, "sha-after-write")
         self.assertIn(".content.sha", api.call_args.args[0])
+
+    @staticmethod
+    def branch_conflict():
+        return ReviewerError(
+            "gh api --method failed (1): gh: is at " + "a" * 40
+            + " but expected " + "b" * 40 + " (HTTP 409)"
+        )
+
+    def test_branch_race_retries_the_identical_conditional_write(self):
+        for original_sha in (None, "original-content-sha"):
+            with (
+                self.subTest(original_sha=original_sha),
+                mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+                mock.patch.object(cli, "gh", side_effect=[self.branch_conflict(), "new-sha\n"]) as api,
+                mock.patch.object(cli.time, "sleep") as sleep,
+                mock.patch.object(cli, "state_json") as reread,
+            ):
+                self.assertEqual(cli.put_state("locks/day.json", {"holder": "x"}, "lock",
+                                               blob_sha=original_sha), "new-sha")
+                self.assertEqual(api.call_count, 2)
+                self.assertEqual(api.call_args_list[0], api.call_args_list[1])
+                command = api.call_args.args[0]
+                self.assertEqual(f"sha={original_sha}" in command, original_sha is not None)
+                reread.assert_not_called()
+                sleep.assert_called_once_with(0.25)
+
+    def test_branch_race_retries_are_bounded(self):
+        with (
+            mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+            mock.patch.object(cli, "gh", side_effect=self.branch_conflict()) as api,
+            mock.patch.object(cli.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(ReviewerError, "HTTP 409"):
+                cli.put_state("locks/day.json", {}, "lock", blob_sha="original")
+        self.assertEqual(api.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5, 1.0])
+
+    def test_other_failures_and_a_concurrent_file_change_are_not_retried(self):
+        for detail in (
+            "gh: sha does not match current content (HTTP 409)",
+            "gh: conflict (HTTP 409)",
+            "gh: is at " + "a" * 40 + " but expected " + "b" * 40 + " (HTTP 403)",
+            "connection reset after sending PUT",
+        ):
+            for prior in ([], [self.branch_conflict()]):
+                with (
+                    self.subTest(detail=detail, branch_raced=bool(prior)),
+                    mock.patch.dict(os.environ, {"PALOMAR_ALLOW_STATE_WRITES": "1"}),
+                    mock.patch.object(cli, "gh", side_effect=[*prior, ReviewerError(detail)]) as api,
+                    mock.patch.object(cli.time, "sleep"),
+                ):
+                    with self.assertRaises(ReviewerError):
+                        cli.put_state("submissions/a1b2c3d4e5f6/state.json", {}, "update",
+                                      blob_sha="original")
+                    self.assertEqual(api.call_count, len(prior) + 1)
+
 
 
 class VocabularyTests(unittest.TestCase):
