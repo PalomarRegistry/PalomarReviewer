@@ -3304,11 +3304,28 @@ def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) 
     ]
     if blob_sha:
         fields += ["-f", f"sha={blob_sha}"]
-    written = gh(
-        ["api", "--method", "PUT", f"repos/{STATE_REPO}/contents/{path}", *fields,
-         "--jq", ".content.sha"]
-    )
-    return written.strip() or None
+    command = [
+        "api", "--method", "PUT", f"repos/{STATE_REPO}/contents/{path}", *fields,
+        "--jq", ".content.sha",
+    ]
+    # GitHub can reject an unchanged file when a write to an unrelated file
+    # advances the branch during its internal commit. Repeat only this exact
+    # rejected request, retaining the caller's original blob precondition.
+    # A content-SHA mismatch, ambiguous network failure, or other 409 must
+    # escape: rereading a new SHA here would overwrite concurrent consent or
+    # withdrawal rather than detecting it.
+    for attempt in range(4):
+        try:
+            written = gh(command)
+            return written.strip() or None
+        except ReviewerError as error:
+            branch_conflict = re.search(
+                r"is at [0-9a-f]{40} but expected [0-9a-f]{40} \(HTTP 409\)", str(error)
+            )
+            if branch_conflict is None or attempt == 3:
+                raise
+            time.sleep(0.25 * 2**attempt)
+    raise AssertionError("state write retry limit was not enforced")
 
 
 def advance_state(
@@ -9078,6 +9095,71 @@ def auto(args: argparse.Namespace) -> int:
             failures += 1
             print(f"error: finalizing {record['id']} failed: {error}", file=sys.stderr)
 
+    # Ready, consented registrations must not wait behind a new render's
+    # runner queue. Keep the one-registration bound, then use the remaining
+    # pass budget for reviews; completed registrations are still finalized first.
+    if len(to_register) > REGISTRATIONS_PER_PASS:
+        deferred = [record["id"] for record in to_register[REGISTRATIONS_PER_PASS:]]
+        print(f"deferring {len(deferred)} registration(s) to a later pass: {', '.join(deferred)}")
+        unattempted.extend(to_register[REGISTRATIONS_PER_PASS:])
+    for record in to_register[:REGISTRATIONS_PER_PASS]:
+        if pass_remaining() <= REGISTRATION_WAIT_SECONDS:
+            # A registration waits on a render run and then on the database. It
+            # needs most of a pass, so it starts at the beginning of one.
+            print(f"pass budget too short to register {record['id']}; leaving it")
+            unattempted.append(record)
+            continue
+        print(f"::group::Register {record['id']}", flush=True)
+        try:
+            register(argparse.Namespace(
+                submission=record["id"],
+                work_dir=args.work_dir,
+                render_result=None,
+                dry_run=False,
+                count_attempt=True,
+            ))
+            # The change the registration just opened is the only thing between
+            # the submitter and a registered record, and until now the only
+            # thing that noticed was the next scheduled pass. Finishing it here
+            # is what lets the schedule be a backstop rather than the clock; the
+            # recovery arm below still picks it up if this job dies first.
+            advanced += 1
+            fresh = submission_state(record["id"])
+            if fresh is not None and fresh.get("registration_pr"):
+                advance_registration(fresh, min(pass_remaining(), REGISTRATION_WAIT_SECONDS))
+        except RegistrationDeferred as error:
+            print(f"registration deferred for {record['id']}: {error}")
+            unattempted.append(record)
+        except SubmitterRenderabilityError as error:
+            print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if (
+                fresh is not None
+                and fresh.get("status") == "review-ready"
+                and fresh.get("registration_consent") is True
+                and not fresh.get("registration_pr")
+            ):
+                record_renderability_failure(fresh, error)
+                advanced += 1
+        except Exception as error:
+            failures += 1
+            print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if (
+                fresh is not None
+                and fresh.get("status") == "review-ready"
+                and fresh.get("registration_consent") is True
+                and not fresh.get("registration_pr")
+            ):
+                record_registration_failure(
+                    fresh,
+                    error,
+                    deterministic=isinstance(error, DeterministicRegistrationError),
+                )
+                advanced += 1
+        finally:
+            print("::endgroup::", flush=True)
+
     for record in to_review[: args.max_reviews]:
         if pass_remaining() <= REVIEW_RESERVE_SECONDS:
             # Starting a review here would run past the job's own timeout and
@@ -9201,68 +9283,6 @@ def auto(args: argparse.Namespace) -> int:
                             else utc_after(REVIEW_RETRY_BACKOFF_SECONDS)
                         ),
                     )
-        finally:
-            print("::endgroup::", flush=True)
-
-    if len(to_register) > REGISTRATIONS_PER_PASS:
-        deferred = [record["id"] for record in to_register[REGISTRATIONS_PER_PASS:]]
-        print(f"deferring {len(deferred)} registration(s) to a later pass: {', '.join(deferred)}")
-        unattempted.extend(to_register[REGISTRATIONS_PER_PASS:])
-    for record in to_register[:REGISTRATIONS_PER_PASS]:
-        if pass_remaining() <= REGISTRATION_WAIT_SECONDS:
-            # A registration waits on a render run and then on the database. It
-            # needs most of a pass, so it starts at the beginning of one.
-            print(f"pass budget too short to register {record['id']}; leaving it")
-            unattempted.append(record)
-            continue
-        print(f"::group::Register {record['id']}", flush=True)
-        try:
-            register(argparse.Namespace(
-                submission=record["id"],
-                work_dir=args.work_dir,
-                render_result=None,
-                dry_run=False,
-                count_attempt=True,
-            ))
-            # The change the registration just opened is the only thing between
-            # the submitter and a registered record, and until now the only
-            # thing that noticed was the next scheduled pass. Finishing it here
-            # is what lets the schedule be a backstop rather than the clock; the
-            # recovery arm below still picks it up if this job dies first.
-            advanced += 1
-            fresh = submission_state(record["id"])
-            if fresh is not None and fresh.get("registration_pr"):
-                advance_registration(fresh, min(pass_remaining(), REGISTRATION_WAIT_SECONDS))
-        except RegistrationDeferred as error:
-            print(f"registration deferred for {record['id']}: {error}")
-            unattempted.append(record)
-        except SubmitterRenderabilityError as error:
-            print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
-            fresh = submission_state(record["id"])
-            if (
-                fresh is not None
-                and fresh.get("status") == "review-ready"
-                and fresh.get("registration_consent") is True
-                and not fresh.get("registration_pr")
-            ):
-                record_renderability_failure(fresh, error)
-                advanced += 1
-        except Exception as error:
-            failures += 1
-            print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
-            fresh = submission_state(record["id"])
-            if (
-                fresh is not None
-                and fresh.get("status") == "review-ready"
-                and fresh.get("registration_consent") is True
-                and not fresh.get("registration_pr")
-            ):
-                record_registration_failure(
-                    fresh,
-                    error,
-                    deterministic=isinstance(error, DeterministicRegistrationError),
-                )
-                advanced += 1
         finally:
             print("::endgroup::", flush=True)
 
