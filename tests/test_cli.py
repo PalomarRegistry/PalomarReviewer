@@ -4585,7 +4585,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             with self.subTest(render_schema=render_schema):
                 self.assert_missing_anchor_is_the_submitters(render_schema)
 
-    def assert_missing_anchor_is_the_submitters(self, render_schema):
+    def test_owned_render_error_keeps_the_underlying_excerpt(self):
+        self.assert_missing_anchor_is_the_submitters(3, palomar_error=True)
+
+    def assert_missing_anchor_is_the_submitters(self, render_schema, *, palomar_error=False):
         request_id = "a" * 32
         run_url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
         renderer_commit = "b" * 40
@@ -4601,6 +4604,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             "repairable": False,
             "field": "comparator.declarations",
         }
+        if palomar_error:
+            diagnostic.update(code="palomar.render_failed", owner="palomar",
+                              explanation="missing data file for module Mathlib")
 
         def fake_gh(arguments, **_kwargs):
             if arguments[:2] == ["run", "view"]:
@@ -4642,6 +4648,10 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 return_value=subprocess.CompletedProcess(["gh"], 1, "", "failed"),
             ),
         ):
+            if palomar_error:
+                with self.assertRaisesRegex(ReviewerError, "missing data file for module Mathlib"):
+                    request_render(Path(directory), mechanical)
+                return
             with self.assertRaises(cli.SubmitterRenderabilityError) as raised:
                 request_render(Path(directory), mechanical)
         self.assertEqual(raised.exception.run_id, 123)
@@ -4751,11 +4761,80 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            with mock.patch.object(cli, "ensure_challenge_renderable", side_effect=error):
+            with (
+                mock.patch.object(cli, "ensure_challenge_renderable", side_effect=error),
+                mock.patch.object(cli, "restore_reviewed_render", return_value=None),
+            ):
                 with self.assertRaises(cli.SubmitterRenderabilityError):
                     cli.registration_render_result(args, work, mechanical, None)
                 with self.assertRaises(cli.DeterministicRegistrationError):
                     cli.registration_render_result(args, work, mechanical, {"schema_version": 1})
+
+    def test_registration_recovers_only_the_exact_reviewed_bundle(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {
+            "schema_version": 3, "artifact_tree_sha256": "1" * 64, "verso_commit": "2" * 40,
+            "renderer_commit": "3" * 40, "bwrap_source_tag": "v0.12.0",
+            "rendered_at": "2026-10-14T00:00:00Z",
+            "workflow_url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123",
+        }
+        receipt = cli.renderability_receipt(report, mechanical)
+        metadata = {
+            "status": "completed", "conclusion": "success", "headSha": report["renderer_commit"],
+            "url": report["workflow_url"],
+            "displayTitle": f"Render {mechanical['source']['repository']}@"
+                            f"{mechanical['source']['commit']} [{'a' * 32}]",
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "gh", side_effect=lambda *_args, **_kwargs: json.dumps(metadata)),
+            mock.patch.object(cli, "run", return_value=subprocess.CompletedProcess(["gh"], 0, "", "")),
+            mock.patch.object(
+                cli, "validate_render_result", return_value=(report, Path(directory) / "bundle")
+            ),
+            mock.patch.object(cli, "ensure_challenge_renderable") as rebuild,
+        ):
+            args = SimpleNamespace(render_result=None, dry_run=False)
+            recovered = cli.registration_render_result(args, Path(directory), mechanical, receipt)
+            self.assertEqual(recovered[0], report)
+            rebuild.assert_not_called()
+            report["artifact_tree_sha256"] = "9" * 64
+            with self.assertRaisesRegex(ReviewerError, "disagrees with its durable receipt"):
+                cli.restore_reviewed_render(Path(directory), mechanical, receipt)
+            report["artifact_tree_sha256"] = receipt["artifact_tree_sha256"]
+            metadata["headSha"] = "f" * 40
+            with self.assertRaisesRegex(ReviewerError, "workflow no longer matches"):
+                cli.restore_reviewed_render(Path(directory), mechanical, receipt)
+
+    def test_reviewed_artifact_expiry_allows_rebuild_but_provider_errors_do_not(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {
+            "schema_version": 3, "artifact_tree_sha256": "1" * 64, "verso_commit": "2" * 40,
+            "renderer_commit": "3" * 40, "bwrap_source_tag": "v0.12.0",
+            "rendered_at": "2026-10-14T00:00:00Z",
+            "workflow_url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123",
+        }
+        receipt = cli.renderability_receipt(report, mechanical)
+        metadata = {
+            "status": "completed", "conclusion": "success", "headSha": report["renderer_commit"],
+            "url": report["workflow_url"],
+            "displayTitle": f"Render {mechanical['source']['repository']}@"
+                            f"{mechanical['source']['commit']} [{'a' * 32}]",
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(cli, "gh", return_value=json.dumps(metadata)),
+        ):
+            for detail, expired in (("no artifact matches any of the names provided", True),
+                                    ("API rate limit exceeded", False)):
+                with mock.patch.object(
+                    cli, "run", return_value=subprocess.CompletedProcess(["gh"], 1, "", detail)
+                ):
+                    if expired:
+                        self.assertIsNone(cli.restore_reviewed_render(Path(directory), mechanical, receipt))
+                    else:
+                        with self.assertRaisesRegex(ReviewerError, "could not recover"):
+                            cli.restore_reviewed_render(Path(directory), mechanical, receipt)
 
 
 class RegistrationDurabilityTests(unittest.TestCase):

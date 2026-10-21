@@ -2330,6 +2330,13 @@ def request_render(
                         run_id=int(run_id),
                         run_url=str(run_data["url"]),
                     )
+                if diagnostics:
+                    message = (
+                        "Palomar could not complete Challenge rendering: "
+                        + "; ".join(item["explanation"] for item in diagnostics)
+                        + f" ({run_data['url']})"
+                    )
+                    deterministic = not any(item["retryable"] for item in diagnostics)
         error_type = DeterministicRegistrationError if deterministic else ReviewerError
         raise error_type(message)
     download = work / "render-download"
@@ -2394,6 +2401,55 @@ def ensure_challenge_renderable(
     return cached_report, cached_bundle
 
 
+def restore_reviewed_render(
+    work: Path, mechanical: dict[str, Any], receipt: dict[str, Any]
+) -> tuple[dict[str, Any], Path] | None:
+    """Recover the exact reviewed artifact before dispatching another render.
+
+    A fresh Actions job has no local cache. The durable receipt authenticates
+    the old artifact's source, declarations, renderer and full bundle digest.
+    An expired artifact permits rebuilding; conflicting evidence fails closed.
+    """
+    checked = validate_renderability_receipt(receipt, mechanical)
+    assert checked is not None
+    run_id = checked["workflow_url"].rsplit("/", 1)[1]
+    metadata = json.loads(gh([
+        "run", "view", run_id, "--repo", mechanical_evidence.SUBMISSION_REPO,
+        "--json", "status,conclusion,headSha,url,displayTitle",
+    ]))
+    title = re.fullmatch(
+        rf"Render {re.escape(mechanical['source']['repository'])}@"
+        rf"{re.escape(mechanical['source']['commit'])} \[([0-9a-f]{{32}})\]",
+        str(metadata.get("displayTitle", "")),
+    )
+    if (
+        metadata.get("status") != "completed" or metadata.get("conclusion") != "success"
+        or metadata.get("headSha") != checked["renderer_commit"]
+        or metadata.get("url") != checked["workflow_url"] or title is None
+    ):
+        raise ReviewerError("reviewed rendering workflow no longer matches its durable receipt")
+    destination = work / "reviewed-render-download"
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    downloaded = run([
+        "gh", "run", "download", run_id, "--repo", mechanical_evidence.SUBMISSION_REPO,
+        "--name", f"challenge-render-{title.group(1)}", "--dir", str(destination),
+    ], check=False)
+    if downloaded.returncode:
+        detail = (downloaded.stderr or downloaded.stdout or "artifact unavailable")[-1500:]
+        if "no artifact matches" in detail.lower() or "no artifacts found" in detail.lower():
+            print(
+                "Reviewed render artifact has expired; rebuilding the same accepted source.", file=sys.stderr
+            )
+            return None
+        raise ReviewerError(f"could not recover the reviewed rendering artifact: {detail}")
+    report, bundle = validate_render_result(destination, mechanical)
+    if renderability_receipt(report, mechanical) != checked:
+        raise ReviewerError("recovered rendering artifact disagrees with its durable receipt")
+    return report, bundle
+
+
 def registration_render_result(
     args: argparse.Namespace,
     work: Path,
@@ -2412,6 +2468,10 @@ def registration_render_result(
                 f"reuse {cached}"
             )
         return validate_render_result(cached, mechanical)
+    if prior_renderability is not None:
+        restored = restore_reviewed_render(work, mechanical, prior_renderability)
+        if restored is not None:
+            return restored
     try:
         return ensure_challenge_renderable(work, mechanical)
     except SubmitterRenderabilityError as error:
