@@ -4847,6 +4847,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             mock.patch.object(cli, "gh", return_value=json.dumps(metadata)),
         ):
             for detail, expired in (("no artifact matches any of the names provided", True),
+                                    ("no valid artifacts found to download", True),
                                     ("API rate limit exceeded", False)):
                 with mock.patch.object(
                     cli, "run", return_value=subprocess.CompletedProcess(["gh"], 1, "", detail)
