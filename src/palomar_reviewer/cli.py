@@ -2375,6 +2375,7 @@ def ensure_challenge_renderable(
     mechanical: dict[str, Any],
     *,
     wait_seconds: int = RENDER_WAIT_SECONDS,
+    prior_renderability: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Require render anchors before review and retain the validated bundle."""
     cached = work / "render-result"
@@ -2385,8 +2386,15 @@ def ensure_challenge_renderable(
             shutil.rmtree(cached)
     elif cached.exists() or cached.is_symlink():
         cached.unlink()
-    candidate = request_render(work, mechanical, wait_seconds=wait_seconds)
-    report, bundle = validate_render_result(candidate, mechanical)
+    restored = (
+        restore_reviewed_render(work, mechanical, prior_renderability)
+        if prior_renderability is not None else None
+    )
+    if restored is not None:
+        report, bundle = restored
+    else:
+        candidate = request_render(work, mechanical, wait_seconds=wait_seconds)
+        report, bundle = validate_render_result(candidate, mechanical)
     temporary = work / "render-result.tmp"
     if temporary.exists() or temporary.is_symlink():
         if temporary.is_dir() and not temporary.is_symlink():
@@ -5336,7 +5344,9 @@ def run_review(args: argparse.Namespace) -> int:
         correction_review = bool(state.get("registry_correction"))
         receipt = None
         if not correction_review:
-            render_report, _render_bundle = ensure_challenge_renderable(work, mechanical)
+            render_report, _render_bundle = ensure_challenge_renderable(
+                work, mechanical, prior_renderability=state.get("renderability")
+            )
             receipt = renderability_receipt(render_report, mechanical)
         mechanical_url = (work / "mechanical-report-url").read_text().strip()
         if correction_review:
@@ -5420,7 +5430,7 @@ def run_review(args: argparse.Namespace) -> int:
     # model review; anonymous compiler-generated declarations selected by the
     # Comparator are rejected here with a submitter-facing diagnostic.
     if not state.get("registry_correction"):
-        ensure_challenge_renderable(work, mechanical)
+        ensure_challenge_renderable(work, mechanical, prior_renderability=state.get("renderability"))
     libraries = materialize_challenge_libraries(work, mechanical)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
@@ -5525,7 +5535,9 @@ def ensure_review_renderable(
     )
     if state.get("registry_correction"):
         return
-    ensure_challenge_renderable(work, mechanical, wait_seconds=wait_seconds)
+    ensure_challenge_renderable(
+        work, mechanical, wait_seconds=wait_seconds, prior_renderability=state.get("renderability")
+    )
 
 
 def metadata_value(data: dict[str, Any], paths: list[tuple[str, ...]]) -> Any:

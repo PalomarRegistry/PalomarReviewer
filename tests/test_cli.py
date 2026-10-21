@@ -4741,6 +4741,27 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                     cli.registration_render_result(args, work, mechanical, None)
         ensure.assert_not_called()
 
+    def test_re_review_restores_its_reviewed_render_before_dispatching(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {"status": "pass", "artifact_tree_sha256": "1" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            result = Path(directory) / "download" / "result"
+            bundle = result / "bundle"
+            bundle.mkdir(parents=True)
+            (result / "challenge-render.json").write_text("{}")
+            (bundle / "marker").write_text("rendered")
+            with (
+                mock.patch.object(cli, "restore_reviewed_render", return_value=(report, bundle)) as restore,
+                mock.patch.object(cli, "validate_render_result", return_value=(report, bundle)),
+                mock.patch.object(cli, "request_render") as dispatch,
+            ):
+                self.assertEqual(cli.ensure_challenge_renderable(
+                    work, mechanical, prior_renderability={"receipt": "verified"}
+                )[0], report)
+                restore.assert_called_once()
+                dispatch.assert_not_called()
+
     def test_registration_reclassifies_only_a_prior_success_contradiction(self):
         mechanical = self.nested_mechanical_fixture()
         args = SimpleNamespace(render_result=None, dry_run=False)
