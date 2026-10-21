@@ -4479,6 +4479,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(result.name, "render-download")
         workflow_call = next(arguments for arguments in calls if arguments[:2] == ["workflow", "run"])
         self.assertIn(f"request_id={request_id}", workflow_call)
+        self.assertIn(
+            f"execution_profile={mechanical.get('execution_profile', 'palomar-standard-v1')}", workflow_call
+        )
         self.assertIn(f"challenge_sha256={mechanical['challenge']['sha256']}", workflow_call)
         self.assertIn(f"project_path={mechanical['source']['project_path']}", workflow_call)
         self.assertIn(f"challenge_path={mechanical['challenge']['path']}", workflow_call)
@@ -4552,6 +4555,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         self.assertEqual(result.name, "render-download")
         workflow_call = next(arguments for arguments in calls if arguments[:2] == ["workflow", "run"])
         self.assertIn(f"request_id={request_id}", workflow_call)
+        self.assertIn(
+            f"execution_profile={mechanical.get('execution_profile', 'palomar-standard-v1')}", workflow_call
+        )
         self.assertIn(f"challenge_sha256={mechanical['challenge']['sha256']}", workflow_call)
         self.assertIn(f"project_path={mechanical['source']['project_path']}", workflow_call)
         self.assertIn(f"challenge_path={mechanical['challenge']['path']}", workflow_call)
