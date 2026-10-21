@@ -3897,6 +3897,19 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "disagrees with the mechanical report"):
             validated_classification(mechanical, metadata)
 
+    def test_registration_accepts_omitted_optional_msc_without_losing_verified_codes(self):
+        mechanical = {"classification": {"arxiv": [{"code": "math.CO"}], "msc2020": []}}
+        metadata = {"classification": {"arxiv": ["math.CO"]}}
+        self.assertEqual(validated_classification(mechanical, metadata),
+                         {"arxiv": ["math.CO"], "msc2020": []})
+        for invalid in (None, "05C10", {}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ReviewerError, "no valid"):
+                validated_classification(mechanical, {"classification": {"arxiv": ["math.CO"],
+                                                                         "msc2020": invalid}})
+        mechanical["classification"]["msc2020"] = [{"code": "05C10"}]
+        with self.assertRaisesRegex(ReviewerError, "disagrees"):
+            validated_classification(mechanical, metadata)
+
     def test_engine_schemas_are_strict(self):
         def assert_strict(schema):
             if schema.get("type") == "object":
@@ -4478,7 +4491,93 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         watched.assert_called_once()
         self.assertEqual(watched.call_args.kwargs["timeout"], 6 * 60 * 60)
         self.assertEqual(cli.PASS_BUDGET_SECONDS, 6 * 60 * 60)
+        self.assertIn("--interval", watched.call_args.args[0])
+        self.assertIn("120", watched.call_args.args[0])
 
+
+    def test_failed_monitor_reconciles_completed_and_unfinished_workflows(self):
+        request_id = "a" * 32
+        run_url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+        renderer_commit = "b" * 40
+        mechanical = self.nested_mechanical_fixture()
+        calls = []
+
+        def fake_gh(arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ["run", "list"]:
+                title = (
+                    f"Render {mechanical['source']['repository']}@"
+                    f"{mechanical['source']['commit']} [{request_id}]"
+                )
+                return json.dumps(
+                    [
+                        {
+                            "databaseId": 123,
+                            "displayTitle": title,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "url": run_url,
+                            "headSha": renderer_commit,
+                        }
+                    ]
+                )
+            if arguments[:2] == ["run", "view"]:
+                return json.dumps({"status": observed_status, "conclusion": "success",
+                                   "headSha": renderer_commit, "url": run_url})
+            if arguments[:2] == ["run", "download"]:
+                destination = Path(arguments[arguments.index("--dir") + 1]) / "result"
+                destination.mkdir(parents=True)
+                (destination / "challenge-render.json").write_text(
+                    json.dumps(
+                        {
+                            "renderer_commit": renderer_commit,
+                            "workflow_url": run_url,
+                        }
+                    )
+                )
+            return ""
+
+        observed_status = "completed"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("palomar_reviewer.cli.uuid.uuid4", return_value=SimpleNamespace(hex=request_id)),
+            mock.patch("palomar_reviewer.cli.gh", side_effect=fake_gh),
+            mock.patch(
+                "palomar_reviewer.cli.run",
+                return_value=subprocess.CompletedProcess(["gh"], 1, "", "API rate limit exceeded"),
+            ) as watched,
+        ):
+            result = request_render(Path(directory), mechanical)
+
+        self.assertEqual(result.name, "render-download")
+        workflow_call = next(arguments for arguments in calls if arguments[:2] == ["workflow", "run"])
+        self.assertIn(f"request_id={request_id}", workflow_call)
+        self.assertIn(f"challenge_sha256={mechanical['challenge']['sha256']}", workflow_call)
+        self.assertIn(f"project_path={mechanical['source']['project_path']}", workflow_call)
+        self.assertIn(f"challenge_path={mechanical['challenge']['path']}", workflow_call)
+        self.assertIn(f"solution_path={mechanical['solution']['path']}", workflow_call)
+        self.assertIn(f"comparator_config_path={mechanical['comparator']['path']}", workflow_call)
+        self.assertIn(f"lakefile_path={mechanical['lakefile']['path']}", workflow_call)
+        self.assertIn(f"lean_toolchain_path={mechanical['lean_toolchain_path']}", workflow_call)
+        download_call = next(arguments for arguments in calls if arguments[:2] == ["run", "download"])
+        self.assertIn(f"challenge-render-{request_id}", download_call)
+        watched.assert_called_once()
+        self.assertEqual(watched.call_args.kwargs["timeout"], 6 * 60 * 60)
+        self.assertEqual(cli.PASS_BUDGET_SECONDS, 6 * 60 * 60)
+        self.assertIn("--interval", watched.call_args.args[0])
+        self.assertIn("120", watched.call_args.args[0])
+
+
+        observed_status = "in_progress"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("palomar_reviewer.cli.uuid.uuid4", return_value=SimpleNamespace(hex=request_id)),
+            mock.patch("palomar_reviewer.cli.gh", side_effect=fake_gh),
+            mock.patch("palomar_reviewer.cli.run",
+                       return_value=subprocess.CompletedProcess(["gh"], 1, "", "API rate limit exceeded")),
+        ):
+            with self.assertRaisesRegex(ReviewerError, "remains in_progress.*monitor failed"):
+                request_render(Path(directory), mechanical)
 
     def test_missing_publication_anchor_is_a_submitter_renderability_failure(self):
         # Render results of schema 2 (landrun) and 3 (bubblewrap) bind the same way.
@@ -4504,6 +4603,9 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         }
 
         def fake_gh(arguments, **_kwargs):
+            if arguments[:2] == ["run", "view"]:
+                return json.dumps({"status": "completed", "conclusion": "failure",
+                                   "headSha": renderer_commit, "url": run_url})
             if arguments[:2] == ["run", "list"]:
                 return json.dumps([{
                     "databaseId": 123,

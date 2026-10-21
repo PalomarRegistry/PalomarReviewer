@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -333,7 +334,7 @@ class EngineExecutionTests(unittest.TestCase):
             with mock.patch.object(
                 engine.shutil,
                 "which",
-                side_effect={"bwrap": "/usr/bin/bwrap", "true": "/usr/bin/true"}.get,
+                side_effect={"bwrap": "/usr/bin/bwrap", "true": shutil.which("true")}.get,
             ):
                 bound = engine.isolated_command(
                     "command",
