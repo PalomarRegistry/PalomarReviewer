@@ -4426,6 +4426,171 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
             with self.assertRaisesRegex(ReviewerError, "no valid challenge-render.json"):
                 validate_render_result(Path(directory), {})
 
+    def pending_render_fixture(self, mechanical, **fields):
+        return {
+            "schema_version": 1, "request_id": "a" * 32,
+            "created_at": "2026-10-21T00:00:00Z",
+            "source": cli.expected_render_source(mechanical),
+            "execution_profile": mechanical.get("execution_profile", "palomar-standard-v1"),
+            "dispatch_attempts": 0, **fields,
+        }
+
+    def test_nonblocking_render_commits_dispatch_intent_before_sending(self):
+        mechanical = self.nested_mechanical_fixture()
+        pending = self.pending_render_fixture(mechanical)
+        calls = []
+
+        def github(arguments):
+            calls.append(arguments[:2])
+            return "[]" if arguments[:2] == ["run", "list"] else ""
+
+        def save(request):
+            calls.append("save")
+            pending.update(request)
+
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(cli, "gh", side_effect=github),
+              mock.patch.object(cli, "run") as watch):
+            with self.assertRaises(cli.RenderPending):
+                request_render(Path(directory), mechanical, pending_render=pending,
+                               save_pending_render=save, wait_seconds=0)
+        self.assertEqual(calls, [["run", "list"], "save", ["workflow", "run"]])
+        self.assertEqual(pending["dispatch_attempts"], 1)
+        watch.assert_not_called()
+        # An immediately restarted worker retains the intent and waits for
+        # dispatch discovery rather than dispatching another render.
+        calls.clear()
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(cli, "gh", side_effect=github)):
+            with self.assertRaises(cli.RenderPending):
+                request_render(Path(directory), mechanical, pending_render=pending,
+                               save_pending_render=save, wait_seconds=0)
+        self.assertEqual(calls, [["run", "list"]])
+
+    def test_pending_render_resumes_its_pinned_run_and_checks_identity(self):
+        mechanical = self.nested_mechanical_fixture()
+        run_url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
+        pending = self.pending_render_fixture(mechanical, run={
+            "id": 123, "url": run_url, "head_sha": "b" * 40,
+        })
+        metadata = {
+            "id": 123, "html_url": run_url, "head_sha": "b" * 40,
+            "display_title": f"Render {mechanical['source']['repository']}@"
+                             f"{mechanical['source']['commit']} [{'a' * 32}]",
+            "path": ".github/workflows/render-challenge.yml", "event": "workflow_dispatch",
+            "status": "queued", "conclusion": None,
+        }
+        for status in ("queued", "in_progress", "completed"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                metadata.update(status=status, conclusion="success" if status == "completed" else None)
+                calls = []
+
+                def github(arguments, calls=calls):
+                    calls.append(arguments)
+                    if arguments[0] == "api":
+                        return json.dumps(metadata)
+                    destination = Path(arguments[arguments.index("--dir") + 1])
+                    (destination / "challenge-render.json").write_text(json.dumps({
+                        "renderer_commit": "b" * 40, "workflow_url": run_url,
+                    }))
+                    return ""
+
+                with (mock.patch.object(cli, "gh", side_effect=github),
+                      mock.patch.object(cli, "run") as watch):
+                    if status == "completed":
+                        request_render(Path(directory), mechanical, pending_render=pending,
+                                       save_pending_render=mock.Mock(), wait_seconds=0)
+                    else:
+                        with self.assertRaises(cli.RenderPending):
+                            request_render(Path(directory), mechanical, pending_render=pending,
+                                           save_pending_render=mock.Mock(), wait_seconds=0)
+                    watch.assert_not_called()
+                self.assertFalse(any(call[:2] == ["workflow", "run"] for call in calls))
+        for field in ("head_sha", "html_url", "display_title", "path", "event", "id"):
+            with self.subTest(mismatched=field), mock.patch.object(cli, "gh", return_value=json.dumps({
+                **metadata, field: "wrong",
+            })) as github:
+                with self.assertRaisesRegex(ReviewerError, "identity changed"):
+                    request_render(Path("."), mechanical, pending_render=pending,
+                                   save_pending_render=mock.Mock(), wait_seconds=0)
+                self.assertEqual(github.call_count, 1)
+
+    def test_render_discovery_recovers_a_lost_dispatch_acknowledgement(self):
+        mechanical = self.nested_mechanical_fixture()
+        pending = self.pending_render_fixture(mechanical)
+        observed = {
+            "databaseId": 123, "url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123",
+            "headSha": "b" * 40, "status": "in_progress",
+            "displayTitle": f"Render {mechanical['source']['repository']}@"
+                            f"{mechanical['source']['commit']} [{'a' * 32}]",
+        }
+        with mock.patch.object(cli, "gh", return_value=json.dumps([observed])) as github:
+            save = mock.Mock()
+            with self.assertRaises(cli.RenderPending):
+                request_render(Path("."), mechanical, pending_render=pending,
+                               save_pending_render=save, wait_seconds=0)
+        self.assertEqual(github.call_count, 1)
+        self.assertEqual(save.call_args.args[0]["run"]["id"], 123)
+
+    def test_render_observation_failure_keeps_the_original_intent(self):
+        mechanical = self.nested_mechanical_fixture()
+        pending = self.pending_render_fixture(mechanical)
+        with mock.patch.object(cli, "gh", side_effect=ReviewerError("API quota")) as github:
+            with self.assertRaises(cli.RenderPending):
+                request_render(Path("."), mechanical, pending_render=pending,
+                               save_pending_render=mock.Mock(), wait_seconds=0)
+        self.assertEqual(github.call_count, 1)
+        self.assertEqual(pending["dispatch_attempts"], 0)
+
+    def test_nonblocking_gate_saves_its_receipt_before_review_and_respects_withdrawal(self):
+        mechanical = self.nested_mechanical_fixture()
+        report = {
+            "schema_version": 3, "artifact_tree_sha256": "1" * 64,
+            "verso_commit": "2" * 40, "renderer_commit": "3" * 40,
+            "bwrap_source_tag": "v0.12.0", "rendered_at": "2026-10-21T00:00:00Z",
+            "workflow_url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123",
+        }
+        for withdraw in (False, True):
+            with self.subTest(withdraw=withdraw), tempfile.TemporaryDirectory() as directory:
+                current = {"id": "aaaaaaaaaaaa", "status": "awaiting-review", "events": [],
+                           "_blob_sha": "before"}
+                writes = []
+
+                def put(path, value, message, *, blob_sha=None, current=current, writes=writes):
+                    self.assertEqual(blob_sha, current["_blob_sha"])
+                    writes.append(value)
+                    current.update(value, _blob_sha=f"after-{len(writes)}")
+                    return current["_blob_sha"]
+
+                def rendered(*args, current=current, withdraw=withdraw, directory=directory, **kwargs):
+                    self.assertEqual(current["renderability_request"], kwargs["pending_render"])
+                    self.assertEqual(
+                        kwargs["pending_render"]["source"], cli.expected_render_source(mechanical)
+                    )
+                    if withdraw:
+                        current["status"] = "withdrawn"
+                    return report, Path(directory)
+
+                with (mock.patch.object(cli, "prepare_workspace", return_value=(
+                        Path(directory), dict(current), mechanical, "4" * 40)),
+                      mock.patch.object(cli, "submission_state",
+                                        side_effect=lambda _, current=current: dict(current)),
+                      mock.patch.object(cli, "put_state", side_effect=put),
+                      mock.patch.object(cli, "ensure_challenge_renderable", side_effect=rendered)):
+                    args = SimpleNamespace(work_dir=directory, policy_ref="main")
+                    if withdraw:
+                        with self.assertRaisesRegex(ReviewerError, "submission changed"):
+                            cli.ensure_review_renderable(dict(current), args, wait_seconds=0)
+                        self.assertEqual(current["status"], "withdrawn")
+                        self.assertEqual(len(writes), 1)
+                    else:
+                        result = cli.ensure_review_renderable(dict(current), args, wait_seconds=0)
+                        self.assertIsNone(result["renderability_request"])
+                        self.assertEqual(
+                            result["renderability"], cli.renderability_receipt(report, mechanical)
+                        )
+                        self.assertEqual(result["_blob_sha"], "after-2")
+
     def test_render_dispatch_is_bound_to_the_exact_workflow_run(self):
         request_id = "a" * 32
         run_url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/123"
@@ -6320,6 +6485,43 @@ class AutomaticLoopTests(unittest.TestCase):
             })
         self.assertEqual(updated["renderability_attempts"], 1)
         self.assertNotIn("review_attempts", updated)
+
+    def test_pending_render_does_not_spend_another_attempt_or_block_the_next_review(self):
+        waiting = self.row("aaaaaaaaaaaa", status="awaiting-review", renderability_attempts=1,
+                           renderability_request={"request_id": "a" * 32})
+        ready = self.row("bbbbbbbbbbbb", status="awaiting-review")
+        listing, state = self.records(waiting, ready)
+
+        def render(record, *args, **kwargs):
+            self.assertEqual(kwargs["wait_seconds"], 0)
+            if record["id"] == waiting["id"]:
+                raise cli.RenderPending("queued")
+
+        with (listing, state,
+              mock.patch.object(cli, "put_state"),
+              mock.patch.object(cli, "ensure_review_renderable", side_effect=render),
+              mock.patch.object(cli, "run_review", return_value=0) as review,
+              mock.patch.object(cli, "record_review_duration")):
+            checked = cli.begin_renderability_check(waiting)
+            self.assertEqual(checked["renderability_attempts"], 1)
+            self.assertEqual(cli.auto(self.opts(max_reviews=1)), 0)
+        self.assertEqual([call.args[0].submission for call in review.call_args_list],
+                         [ready["id"], ready["id"]])
+
+    def test_workspace_failure_retains_pending_render_but_terminal_failure_clears_it(self):
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                request = {"request_id": "a" * 32}
+                row = self.row("aaaaaaaaaaaa", status="awaiting-review", renderability_attempts=1,
+                               renderability_request=request)
+                listing, state = self.records(row)
+                error = cli.RenderRequestError("terminal") if terminal else ReviewerError("clone interrupted")
+                with (listing, state, mock.patch.object(cli, "put_state") as put,
+                      mock.patch.object(cli, "ensure_review_renderable", side_effect=error)):
+                    self.assertEqual(cli.auto(self.opts()), 1)
+                settled = put.call_args.args[1]
+                self.assertEqual(settled["renderability_request"], None if terminal else request)
+                self.assertEqual(settled["renderability_attempts"], 1)
 
     def test_registry_correction_skips_the_pre_review_renderability_gate(self):
         args = self.opts()

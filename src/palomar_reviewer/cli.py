@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -40,6 +41,8 @@ from . import usage as usage_accounting
 from .errors import (
     DeterministicRegistrationError,
     RegistrationDeferred,
+    RenderPending,
+    RenderRequestError,
     ReviewerError,
     SubmitterRenderabilityError,
 )
@@ -81,6 +84,8 @@ REGISTRATION_STALE_SECONDS = 6 * 3600
 # rediscovering it in a later pass, so a shorter command timeout or pass budget
 # here would remain the real rendering ceiling no matter what the child says.
 RENDER_WAIT_SECONDS = 6 * 60 * 60
+RENDER_RECHECK_SECONDS = 10 * 60
+MAX_RENDER_CHECKS_PER_PASS = 20
 PASS_BUDGET_SECONDS = RENDER_WAIT_SECONDS
 REVIEW_RESERVE_SECONDS = 90 * 60
 # The queue, kept as an index rather than rediscovered from scratch.
@@ -2172,9 +2177,26 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
 
 
 def request_render(
-    work: Path, mechanical: dict[str, Any], *, wait_seconds: int = RENDER_WAIT_SECONDS
+    work: Path, mechanical: dict[str, Any], *, wait_seconds: int = RENDER_WAIT_SECONDS,
+    pending_render: dict[str, Any] | None = None,
+    save_pending_render: Callable[[dict[str, Any]], None] | None = None,
 ) -> Path:
-    request_id = uuid.uuid4().hex
+    if pending_render is not None:
+        if (
+            not isinstance(pending_render, dict)
+            or not re.fullmatch(r"[0-9a-f]{32}", str(pending_render.get("request_id", "")))
+            or pending_render.get("source") != expected_render_source(mechanical)
+            or pending_render.get("execution_profile") != mechanical.get(
+                "execution_profile", "palomar-standard-v1"
+            )
+            or save_pending_render is None
+        ):
+            raise RenderRequestError(
+                "pending rendering request does not match the accepted source and profile"
+            )
+        request_id = pending_render["request_id"]
+    else:
+        request_id = uuid.uuid4().hex
     challenge = mechanical["challenge"]
     dispatch = [
         "workflow",
@@ -2211,13 +2233,18 @@ def request_render(
     # An omitted dispatch input selects the catalogue's current default,
     # which can differ from the accepted report's inherited/legacy profile.
     dispatch.extend(["-f", f"execution_profile={profile}"])
-    gh(dispatch)
     expected_title = (
         f"Render {mechanical['source']['repository']}@{mechanical['source']['commit']} [{request_id}]"
     )
     run_data: dict[str, Any] | None = None
+    if pending_render is not None:
+        run_data = resume_render(pending_render, expected_title, dispatch, save_pending_render)
+        if run_data.get("status") != "completed":
+            raise RenderPending(f"Render workflow remains {run_data.get('status')}: {run_data['url']}")
+    else:
+        gh(dispatch)
     deadline = time.monotonic() + 300
-    while time.monotonic() < deadline:
+    while run_data is None and time.monotonic() < deadline:
         runs = json.loads(
             gh(
                 [
@@ -2245,7 +2272,9 @@ def request_render(
             "render workflow dispatch was not visible after five minutes; retry the registration"
         )
     run_id = str(run_data["databaseId"])
-    watched = run(
+    watched = subprocess.CompletedProcess(
+        ["gh"], 0 if run_data.get("conclusion") == "success" else 1, "", ""
+    ) if pending_render is not None else run(
         [
             "gh",
             "run",
@@ -2260,7 +2289,7 @@ def request_render(
         check=False,
         timeout=wait_seconds,
     )
-    if watched.returncode:
+    if watched.returncode and pending_render is None:
         # The monitor can fail (for example on API quota) while the workflow
         # continues. Its exit status is not a rendering verdict. Reconcile one
         # authoritative run snapshot before looking for a failure artifact.
@@ -2325,12 +2354,14 @@ def request_render(
                         + "; ".join(item["summary"] for item in submitter_diagnostics)
                         + f" ({run_data['url']})"
                     )
-                    raise SubmitterRenderabilityError(
+                    error = SubmitterRenderabilityError(
                         message,
                         diagnostics=submitter_diagnostics,
                         run_id=int(run_id),
                         run_url=str(run_data["url"]),
                     )
+                    error.render_request_finished = True
+                    raise error
                 if diagnostics:
                     message = (
                         "Palomar could not complete Challenge rendering: "
@@ -2339,7 +2370,9 @@ def request_render(
                     )
                     deterministic = not any(item["retryable"] for item in diagnostics)
         error_type = DeterministicRegistrationError if deterministic else ReviewerError
-        raise error_type(message)
+        error = error_type(message)
+        error.render_request_finished = True
+        raise error
     download = work / "render-download"
     if download.exists():
         shutil.rmtree(download)
@@ -2361,14 +2394,86 @@ def request_render(
     try:
         report = load_json(report_root / "challenge-render.json")
     except (OSError, json.JSONDecodeError) as error:
-        raise ReviewerError(f"downloaded render result is invalid: {error}") from error
+        raise RenderRequestError(f"downloaded render result is invalid: {error}") from error
     if not isinstance(report, dict):
-        raise ReviewerError("downloaded render report must be a JSON object")
+        raise RenderRequestError("downloaded render report must be a JSON object")
     if report.get("renderer_commit") != run_data.get("headSha"):
-        raise ReviewerError("downloaded render result does not match its workflow commit")
+        raise RenderRequestError("downloaded render result does not match its workflow commit")
     if report.get("workflow_url") != run_data.get("url"):
-        raise ReviewerError("downloaded render result does not match its workflow run")
+        raise RenderRequestError("downloaded render result does not match its workflow run")
     return download
+
+
+def resume_render(
+    pending: dict[str, Any], expected_title: str, dispatch: list[str],
+    save: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Recover a durable dispatch before making any new side effect.
+
+    The intent is committed before dispatch. A lost acknowledgement keeps that
+    intent, so another pass discovers the same request rather than minting one.
+    """
+    pinned = pending.get("run")
+    try:
+        if pinned is not None:
+            if (
+                not isinstance(pinned, dict) or type(pinned.get("id")) is not int
+                or pinned["id"] <= 0
+            ):
+                raise ValueError("pending rendering run is invalid")
+            observed = json.loads(gh([
+                "api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{pinned['id']}",
+            ]))
+            if (
+                observed.get("id") != pinned["id"]
+                or observed.get("html_url") != pinned.get("url")
+                or observed.get("head_sha") != pinned.get("head_sha")
+                or observed.get("display_title") != expected_title
+                or observed.get("event") != "workflow_dispatch"
+                or observed.get("path") != f".github/workflows/{RENDER_WORKFLOW}"
+            ):
+                raise ValueError("pending rendering workflow identity changed")
+            return {
+                "databaseId": observed["id"], "url": observed["html_url"],
+                "headSha": observed["head_sha"], "status": observed.get("status"),
+                "conclusion": observed.get("conclusion"),
+            }
+        runs = json.loads(gh([
+            "run", "list", "--repo", mechanical_evidence.SUBMISSION_REPO,
+            "--workflow", RENDER_WORKFLOW, "--event", "workflow_dispatch",
+            "--limit", "1000", "--created", f">={pending['created_at']}",
+            "--json", "databaseId,displayTitle,status,conclusion,url,headSha",
+        ]))
+    except ReviewerError as error:
+        raise RenderPending(f"Could not observe the durable render request: {error}") from error
+    except (ValueError, KeyError, TypeError) as error:
+        raise RenderRequestError(f"invalid pending rendering metadata: {error}") from error
+    matching = [item for item in runs if item.get("displayTitle") == expected_title]
+    if matching:
+        # Same request after an ambiguous dispatch: keep the earliest run.
+        observed = min(matching, key=lambda item: item["databaseId"])
+        identifier = observed.get("databaseId")
+        if (
+            type(identifier) is not int or identifier <= 0
+            or observed.get("url") != f"https://github.com/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{identifier}"
+            or not re.fullmatch(r"[0-9a-f]{40}", str(observed.get("headSha", "")))
+        ):
+            raise RenderRequestError("discovered rendering workflow identity is invalid")
+        save({**pending, "run": {
+            "id": identifier, "url": observed["url"], "head_sha": observed["headSha"],
+        }})
+        return observed
+    if not _stale_review({"review_started_at": pending.get("dispatch_at")}, limit_seconds=300):
+        raise RenderPending("The durable render dispatch is awaiting discovery")
+    attempts = pending.get("dispatch_attempts", 0)
+    if type(attempts) is not int or not 0 <= attempts < 3:
+        raise RenderRequestError("render dispatch was not discoverable after three attempts")
+    save({**pending, "dispatch_at": utc_now(), "dispatch_attempts": attempts + 1})
+    try:
+        gh(dispatch)
+    except ReviewerError as error:
+        raise RenderPending(f"Render dispatch acknowledgement was unavailable: {error}") from error
+    raise RenderPending("The durable render request was dispatched; other submissions can advance")
 
 
 def ensure_challenge_renderable(
@@ -2377,6 +2482,8 @@ def ensure_challenge_renderable(
     *,
     wait_seconds: int = RENDER_WAIT_SECONDS,
     prior_renderability: dict[str, Any] | None = None,
+    pending_render: dict[str, Any] | None = None,
+    save_pending_render: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Require render anchors before review and retain the validated bundle."""
     cached = work / "render-result"
@@ -2394,8 +2501,16 @@ def ensure_challenge_renderable(
     if restored is not None:
         report, bundle = restored
     else:
-        candidate = request_render(work, mechanical, wait_seconds=wait_seconds)
-        report, bundle = validate_render_result(candidate, mechanical)
+        candidate = request_render(
+            work, mechanical, wait_seconds=wait_seconds,
+            **({"pending_render": pending_render, "save_pending_render": save_pending_render}
+               if pending_render is not None else {}),
+        )
+        try:
+            report, bundle = validate_render_result(candidate, mechanical)
+        except ReviewerError as error:
+            error.render_request_finished = True
+            raise
     temporary = work / "render-result.tmp"
     if temporary.exists() or temporary.is_symlink():
         if temporary.is_dir() and not temporary.is_symlink():
@@ -3579,7 +3694,8 @@ def begin_renderability_check(state: dict[str, Any]) -> dict[str, Any]:
         state,
         "awaiting-review",
         "Palomar is checking that the Challenge can be rendered",
-        renderability_attempts=int(state.get("renderability_attempts") or 0) + 1,
+        renderability_attempts=(int(state.get("renderability_attempts") or 0)
+                               + (0 if state.get("renderability_request") else 1)),
         renderability_started_at=utc_now(),
         renderability_error=None,
     )
@@ -3604,6 +3720,7 @@ def begin_review(state: dict[str, Any]) -> dict[str, Any]:
         review_attempts=int(state.get("review_attempts") or 0) + 1,
         renderability_attempts=0,
         renderability_error=None,
+        renderability_request=None,
     )
 
 
@@ -3646,6 +3763,7 @@ def record_renderability_failure(
         failure=failure,
         review_error=None,
         review_retry_after=None,
+        renderability_request=None,
         registration_error=None,
         registration_failure=None,
         registration_retry_after=None,
@@ -5545,7 +5663,7 @@ def run_review(args: argparse.Namespace) -> int:
 
 def ensure_review_renderable(
     record: dict[str, Any], args: argparse.Namespace, *, wait_seconds: int = RENDER_WAIT_SECONDS
-) -> None:
+) -> dict[str, Any] | None:
     """Run the renderability gate before a review attempt is durably counted."""
     root = Path(args.work_dir).expanduser().resolve()
     work, state, mechanical, _policy_commit = prepare_workspace(
@@ -5555,9 +5673,45 @@ def ensure_review_renderable(
     )
     if state.get("registry_correction"):
         return
-    ensure_challenge_renderable(
-        work, mechanical, wait_seconds=wait_seconds, prior_renderability=state.get("renderability")
+    pending = None
+    save = None
+    if wait_seconds == 0:
+        def save(request):
+            nonlocal state
+            fresh = submission_state(record["id"])
+            if fresh is None or fresh.get("status") not in REVIEWABLE_STATUSES:
+                raise ReviewerError("submission changed while preparing its render request")
+            previous = fresh.get("renderability_request")
+            if previous is not None and previous.get("request_id") != request["request_id"]:
+                raise ReviewerError("a newer rendering request already owns this submission")
+            state = advance_state(
+                fresh, "awaiting-review", "The Challenge rendering request is saved",
+                renderability_request=request,
+            )
+
+        pending = state.get("renderability_request")
+        if pending is None:
+            pending = {
+                "schema_version": 1, "request_id": uuid.uuid4().hex,
+                "created_at": utc_now(), "source": expected_render_source(mechanical),
+                "execution_profile": mechanical.get("execution_profile", "palomar-standard-v1"),
+                "dispatch_attempts": 0,
+            }
+            save(pending)
+    report, _bundle = ensure_challenge_renderable(
+        work, mechanical, wait_seconds=wait_seconds, prior_renderability=state.get("renderability"),
+        **({"pending_render": pending, "save_pending_render": save} if pending is not None else {}),
     )
+    if wait_seconds == 0:
+        fresh = submission_state(record["id"])
+        if fresh is None or fresh.get("status") not in REVIEWABLE_STATUSES:
+            raise ReviewerError("submission changed before its render receipt could be saved")
+        return advance_state(
+            fresh, "awaiting-review", "The Challenge renderability check passed",
+            renderability=renderability_receipt(report, mechanical), renderability_request=None,
+            renderability_error=None, review_retry_after=None,
+        )
+    return None
 
 
 def metadata_value(data: dict[str, Any], paths: list[tuple[str, ...]]) -> Any:
@@ -9160,7 +9314,11 @@ def auto(args: argparse.Namespace) -> int:
         finally:
             print("::endgroup::", flush=True)
 
-    for record in to_review[: args.max_reviews]:
+    reviews_started = 0
+    for position, record in enumerate(to_review):
+        if reviews_started >= args.max_reviews or position >= MAX_RENDER_CHECKS_PER_PASS:
+            unattempted.append(record)
+            continue
         if pass_remaining() <= REVIEW_RESERVE_SECONDS:
             # Starting a review here would run past the job's own timeout and
             # be killed part-way, which costs the attempt and tells nobody why.
@@ -9179,8 +9337,9 @@ def auto(args: argparse.Namespace) -> int:
                 gate_complete = True
             else:
                 record = begin_renderability_check(record)
-                render_wait = max(1, int(pass_remaining() - REVIEW_RESERVE_SECONDS))
-                ensure_review_renderable(record, args, wait_seconds=render_wait)
+                prepared = ensure_review_renderable(record, args, wait_seconds=0)
+                if isinstance(prepared, dict):
+                    record = prepared
                 gate_complete = True
             if pass_remaining() <= 0:
                 if record.get("registry_correction"):
@@ -9203,6 +9362,7 @@ def auto(args: argparse.Namespace) -> int:
             started = time.monotonic()
             record = begin_review(record)
             review_begun = True
+            reviews_started += 1
             for apply_step in (False, True):
                 step = argparse.Namespace(**vars(args))
                 step.submission = record["id"]
@@ -9212,6 +9372,15 @@ def auto(args: argparse.Namespace) -> int:
             if not record.get("registry_correction"):
                 record_review_duration(time.monotonic() - started)
             advanced += 1
+        except RenderPending as error:
+            print(f"rendering deferred for {record['id']}: {error}")
+            fresh = submission_state(record["id"])
+            if fresh is not None and fresh.get("status") in REVIEWABLE_STATUSES:
+                advance_state(
+                    fresh, "awaiting-review", "The Challenge rendering workflow is pending",
+                    review_retry_after=utc_after(RENDER_RECHECK_SECONDS),
+                    renderability_error=None,
+                )
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = submission_state(record["id"])
@@ -9257,7 +9426,18 @@ def auto(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             elif fresh is not None:
-                if gate_complete:
+                if (
+                    not gate_complete and fresh.get("renderability_request")
+                    and not getattr(error, "render_request_finished", False)
+                ):
+                    # Workspace/API failures do not settle the render workflow.
+                    # Retain its identity even if this pass never reached it.
+                    advance_state(
+                        fresh, "awaiting-review", "Palomar will resume the saved Challenge render request",
+                        renderability_error=str(error)[:500],
+                        review_retry_after=utc_after(RENDER_RECHECK_SECONDS),
+                    )
+                elif gate_complete:
                     advance_state(
                         fresh,
                         "awaiting-review",
@@ -9277,6 +9457,7 @@ def auto(args: argparse.Namespace) -> int:
                             else "The Challenge renderability check will be tried again"
                         ),
                         renderability_error=str(error)[:500],
+                        renderability_request=None,
                         review_retry_after=(
                             None
                             if exhausted_gate
@@ -9286,7 +9467,6 @@ def auto(args: argparse.Namespace) -> int:
         finally:
             print("::endgroup::", flush=True)
 
-    unattempted.extend(to_review[args.max_reviews:])
     if unattempted:
         print(f"{len(unattempted)} item(s) left for a later pass: "
               f"{', '.join(record['id'] for record in unattempted)}")

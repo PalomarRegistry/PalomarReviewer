@@ -426,6 +426,15 @@ reserving an identifier when the workspace did not survive. If a later
 renderer contradicts a stored successful receipt, that is a Palomar failure,
 not a new repository eligibility decision.
 
+The automatic review pass saves a source-bound `renderability_request` before
+dispatching. While its workflow is queued or running, the pass advances other
+submissions without spending another render or model attempt. A later pass
+resumes the same request and pinned workflow run, including after a lost dispatch
+acknowledgement. Validated successful render receipts are saved before model
+review starts, so a reviewer interruption does not discard the completed render.
+State's scheduled readiness checks wake a review pass when a pending render can
+advance; the full six-hour recovery pass remains a backstop.
+
 The submission server records the proof method and its GitHub repository and
 principal observations. The reviewer requires schema version 1, validates the
 method's claimed binding, and binds the proof to the reviewed commit and
