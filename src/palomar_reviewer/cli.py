@@ -3924,6 +3924,8 @@ def deliver_review(
     fields: dict[str, Any] = {
         "review_sha256": registration_authorization.document_digest(review),
         "review_schema_version": review["schema_version"],
+        "review_error": None,
+        "review_retry_after": None,
         "registration_consent": False,
         "registration_consent_review_sha256": None,
         "registration_attempt": None,
