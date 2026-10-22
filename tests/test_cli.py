@@ -8434,6 +8434,8 @@ class DeliveredReviewChainTests(unittest.TestCase):
 
     def test_delivery_records_the_digest_and_clears_any_earlier_consent(self):
         state = {"id": "a1b2c3d4e5f6", "status": "awaiting-review", "events": [],
+                 "review_error": "Previous attempt did not complete",
+                 "review_retry_after": "2026-10-10T06:28:20Z",
                  "registration_consent": True,
                  "registration_consent_review_sha256": "0" * 64,
                  "_blob_sha": "blob-1"}
@@ -8459,6 +8461,8 @@ class DeliveredReviewChainTests(unittest.TestCase):
             updated["review_sha256"], registration_authorization.document_digest(review)
         )
         self.assertEqual(updated["review_schema_version"], 3)
+        self.assertIsNone(updated["review_error"])
+        self.assertIsNone(updated["review_retry_after"])
         # A second review must not inherit consent given to the first.
         self.assertIs(updated["registration_consent"], False)
         self.assertIsNone(updated["registration_consent_review_sha256"])
