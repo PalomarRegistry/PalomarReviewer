@@ -129,6 +129,7 @@ class RuntimeArtifactTests(unittest.TestCase):
                 "palomar_reviewer/authorization.py",
                 "palomar_reviewer/alert_recovery.py",
                 "palomar_reviewer/workflow_recovery.py",
+                "palomar_reviewer/resource_failover.py",
                 "palomar_reviewer/broker.py",
                 "palomar_reviewer/checkpoint.py",
                 "palomar_reviewer/cli.py",

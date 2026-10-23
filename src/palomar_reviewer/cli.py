@@ -29,7 +29,7 @@ import jsonschema
 import yaml
 from ruamel.yaml import YAML
 
-from . import alert_recovery, workflow_recovery
+from . import alert_recovery, resource_failover, workflow_recovery
 from . import authorization as registration_authorization
 from . import broker as model_broker
 from . import checkpoint as registration_checkpoint
@@ -3190,6 +3190,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
     run_data: dict[str, Any] | None = None
     phase = "preparation" if mode == "preflight" else "verification"
     trusted_metadata = False
+    resource_failure = None
     try:
         run_data = trusted_submission_run(state, mode=mode, conclusion=None)
         validate_workflow_commit_on_main(run_data)
@@ -3209,6 +3210,30 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         if mode == "preflight" and phase != "preparation":
             raise ReviewerError("preflight failure artifact names a verification phase")
         repair_draft = validated.get("repair_draft")
+        if mode == "full":
+            resource_failure = resource_failover.report_evidence(failure_report, run_data["databaseId"])
+            if (resource_failure is None and phase == "verification"
+                    and len(diagnostics) == 1
+                    and diagnostics[0]["owner"] == "palomar"
+                    and diagnostics[0]["code"] == "palomar.workflow_incomplete"):
+                # An always-run finalizer can upload a synthetic interrupted
+                # report even after a hard job deadline. Authenticate the
+                # timeout from GitHub rather than hiding it behind that report.
+                try:
+                    jobs = json.loads(gh(["api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/"
+                                         f"{run_data['databaseId']}/attempts/{run_data['attempt']}/jobs?per_page=100"]))
+                    metadata = workflow_recovery.metadata_diagnostic(jobs, run_data)
+                    resource_failure = resource_failover.timeout_evidence(jobs, run_data, state)
+                    if resource_failure is not None:
+                        diagnostics = [metadata]
+                except Exception:
+                    pass  # Keep the authenticated synthetic report if metadata is unavailable.
+                if resource_failure is None:
+                    diagnostics[0]["next_action"] = (
+                        "Contact Kim Morrison (@kim-em on GitHub) with the workflow URL "
+                        "to investigate the interruption and request larger-runner access if needed. "
+                        "Cancellation alone cannot authorize an automatic resource retry."
+                    )
     except Exception as error:  # a diagnosis failure must itself be explained
         diagnostics = _diagnostics_unavailable(error)
         if trusted_metadata:
@@ -3216,6 +3241,8 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
                 jobs = json.loads(gh(["api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/"
                                      f"{run_data['databaseId']}/attempts/{run_data['attempt']}/jobs?per_page=100"]))
                 diagnostics = [workflow_recovery.metadata_diagnostic(jobs, run_data)]
+                if mode == "full":
+                    resource_failure = resource_failover.timeout_evidence(jobs, run_data, state)
             except Exception:
                 pass  # Preserve the bounded unavailable diagnosis if metadata also fails.
         profile_version = None
@@ -3258,6 +3285,19 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
     }
     if repair_draft is not None:
         failure["repair_draft"] = repair_draft
+    if resource_failure is not None:
+        failure["resource_failure"] = resource_failure
+        for diagnostic in diagnostics:
+            diagnostic["retryable"] = False
+            diagnostic["next_action"] = (
+                "The larger-runner attempt also reached a resource limit. Contact Kim Morrison "
+                "(@kim-em on GitHub) with the workflow URL for help. "
+                "Automatic escalation stops after one retry."
+                if resource_failure["profile"] == "palomar-namespace-32x64-v1" else
+                "Contact Kim Morrison (@kim-em on GitHub) with the workflow URL "
+                "to request access to larger runners. Automatic resource retries require an "
+                "allowlisted GitHub account; repeatedly submitting the same commit will not grant access."
+            )
     operator_alerts = operator_notifications.queued_alerts(
         state,
         failure,

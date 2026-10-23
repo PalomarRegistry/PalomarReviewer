@@ -6,7 +6,7 @@ from typing import Any
 
 from .errors import ReviewerError
 
-PROFILES = {"palomar-standard-v1", "palomar-namespace-16x32-v1"}
+PROFILES = {"palomar-standard-v1", "palomar-namespace-16x32-v1", "palomar-namespace-32x64-v1"}
 SETUP_STEPS = {
     "Checkout submission pipeline",
     "Set up Python",

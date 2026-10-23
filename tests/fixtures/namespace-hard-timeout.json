@@ -1,0 +1,66 @@
+{
+  "source_run_url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/39894489709",
+  "run": {
+    "databaseId": 39894489709,
+    "attempt": 1,
+    "conclusion": "cancelled"
+  },
+  "jobs": {
+    "total_count": 1,
+    "jobs": [
+      {
+        "run_id": 39894489709,
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "cancelled",
+        "name": "verify",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 1,
+            "started_at": "2026-10-23T03:20:45Z",
+            "completed_at": "2026-10-23T03:20:45Z"
+          },
+          {
+            "name": "Set up runner",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 2,
+            "started_at": "2026-10-23T03:20:45Z",
+            "completed_at": "2026-10-23T03:20:46Z"
+          },
+          {
+            "name": "Deliberately exceed the job time limit",
+            "status": "completed",
+            "conclusion": "cancelled",
+            "number": 3,
+            "started_at": "2026-10-23T03:20:46Z",
+            "completed_at": "2026-10-23T03:21:57Z"
+          },
+          {
+            "name": "Observe finalizer scheduling",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-10-23T03:21:57Z",
+            "completed_at": "2026-10-23T03:21:57Z"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 5,
+            "started_at": "2026-10-23T03:21:57Z",
+            "completed_at": "2026-10-23T03:21:57Z"
+          }
+        ],
+        "labels": [
+          "nscloud-ubuntu-24.04-amd64-16x32-with-features",
+          "namespace-features:container.privileged=true"
+        ]
+      }
+    ]
+  }
+}
