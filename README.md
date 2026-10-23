@@ -60,6 +60,23 @@ at least once: the narrow failure window after Zulip accepts a message but befor
 the conditional State write may produce a duplicate carrying the same stable
 alert-key prefix.
 
+For full verification resource failures, the authenticated diagnostic may also
+carry `resource_failure` with `kind` (`oom` or `timeout`), the approved Namespace
+`profile`, and the recorded `run_id`. An OOM must come from protected supervisor
+telemetry. A hard job timeout without an artifact must instead bind complete
+GitHub job metadata for the exact run attempt and Namespace verify job, with an
+unambiguous `timed_out` conclusion. A synthetic finalizer report does not hide
+that metadata. The real Namespace hard-limit probe currently reports
+`cancelled`, including when its finalizer runs, so cancellation alone remains
+ineligible: it cannot be distinguished from a manual cancellation. The verifier's
+supervised deadline normally supplies eligible timeout evidence before that job
+limit. Unsupervised network/operation timeouts also remain ineligible. Missing
+artifacts, arbitrary exit statuses and log text cannot establish an OOM. The
+public advice directs the submitter to Kim Morrison (@kim-em on GitHub) to
+request larger-runner access. PalomarServer owns the GitHub-user allowlist and
+may queue one 16×32 → 32×64 attempt; Reviewer only authenticates the evidence and
+the admitted attempt/profile, and does not dispatch retries.
+
 The notifier requires a Zulip bot's `PALOMAR_ZULIP_EMAIL` and
 `PALOMAR_ZULIP_API_KEY`. Those secrets belong only in the trusted private State
 workflow; they must never be passed to public submission verification or to a
