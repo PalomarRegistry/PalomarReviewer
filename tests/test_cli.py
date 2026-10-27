@@ -7214,6 +7214,66 @@ class AutomaticLoopTests(unittest.TestCase):
         self.assertEqual(recorded.call_args.args[1], "verification-error")
         self.assertIsNone(recorded.call_args.kwargs["review_retry_after"])
 
+    def test_a_deterministic_render_failure_is_not_rendered_again(self):
+        row = self.row("aaaaaaaaaaaa", status="awaiting-review", renderability_attempts=1)
+        failure = cli.DeterministicRegistrationError(
+            "Palomar could not complete Challenge rendering: Verso could not generate the "
+            "Challenge HTML (1)\n\nDuplicate document ID: /PalomarChallenge/#X "
+            "(https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/1)"
+        )
+        failure.render_request_finished = True
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(cli, "ensure_review_renderable", side_effect=failure),
+            mock.patch.object(cli, "begin_review") as began,
+            mock.patch.object(cli, "advance_state", return_value=row) as recorded,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        began.assert_not_called()
+        self.assertEqual(recorded.call_args.args[1], "verification-error")
+        self.assertIsNone(recorded.call_args.kwargs["review_retry_after"])
+        self.assertIn("Duplicate document ID", recorded.call_args.kwargs["renderability_error"])
+
+    def test_a_deterministic_failure_before_the_render_finished_is_still_retried(self):
+        row = self.row("aaaaaaaaaaaa", status="awaiting-review", renderability_attempts=1)
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(
+                cli, "ensure_review_renderable",
+                side_effect=cli.DeterministicRegistrationError("render request was refused"),
+            ),
+            mock.patch.object(cli, "begin_review"),
+            mock.patch.object(cli, "advance_state", return_value=row) as recorded,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        self.assertEqual(recorded.call_args.args[1], "awaiting-review")
+
+    def test_a_long_render_error_keeps_the_run_to_inspect(self):
+        row = self.row("aaaaaaaaaaaa", status="awaiting-review", renderability_attempts=1)
+        url = "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/39968844483"
+        listing, state = self.records(row)
+        with (
+            listing,
+            state,
+            mock.patch.object(cli, "begin_renderability_check", side_effect=lambda r: r),
+            mock.patch.object(
+                cli, "ensure_review_renderable",
+                side_effect=ReviewerError("warning: manifest out of date\n" * 40 + f" ({url})"),
+            ),
+            mock.patch.object(cli, "begin_review"),
+            mock.patch.object(cli, "advance_state", return_value=row) as recorded,
+        ):
+            self.assertEqual(cli.auto(self.opts()), 1)
+        stored = recorded.call_args.kwargs["renderability_error"]
+        self.assertLessEqual(len(stored), cli.FAILURE_DETAIL_LIMIT)
+        self.assertTrue(stored.endswith(f"({url})"))
+
     def test_a_failure_after_the_database_pr_exists_stays_on_finalization_recovery(self):
         before = self.row("aaaaaaaaaaaa", status="review-ready", registration_consent=True)
         after = {**before, "registration_pr": 7}

@@ -9476,7 +9476,7 @@ def auto(args: argparse.Namespace) -> int:
                     # Retain its identity even if this pass never reached it.
                     advance_state(
                         fresh, "awaiting-review", "Palomar will resume the saved Challenge render request",
-                        renderability_error=str(error)[:500],
+                        renderability_error=_failure_detail(error),
                         review_retry_after=utc_after(RENDER_RECHECK_SECONDS),
                     )
                 elif gate_complete:
@@ -9489,7 +9489,13 @@ def auto(args: argparse.Namespace) -> int:
                     )
                 else:
                     attempts = int(fresh.get("renderability_attempts") or 0)
-                    exhausted_gate = attempts >= RENDERABILITY_ATTEMPT_LIMIT
+                    # A finished render that the renderer itself says will fail
+                    # the same way again only re-renders the same failure, while
+                    # the submitter waits hours to be shown it.
+                    exhausted_gate = attempts >= RENDERABILITY_ATTEMPT_LIMIT or (
+                        isinstance(error, DeterministicRegistrationError)
+                        and getattr(error, "render_request_finished", False)
+                    )
                     advance_state(
                         fresh,
                         "verification-error" if exhausted_gate else "awaiting-review",
@@ -9498,7 +9504,7 @@ def auto(args: argparse.Namespace) -> int:
                             if exhausted_gate
                             else "The Challenge renderability check will be tried again"
                         ),
-                        renderability_error=str(error)[:500],
+                        renderability_error=_failure_detail(error),
                         renderability_request=None,
                         review_retry_after=(
                             None
