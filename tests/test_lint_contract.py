@@ -4,7 +4,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LINT_COMMAND = (
-    "uv run --isolated --python 3.11.10 --locked --only-group dev ruff check ."
+    "uv run --isolated --python 3.11.18 --locked --only-group dev ruff check ."
 )
 
 

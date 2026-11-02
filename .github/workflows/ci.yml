@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned until the bwrap/AppArmor namespace test is validated on 26.04.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,14 +50,14 @@ jobs:
           path: palomar-policy
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11.10"
+          python-version: "3.11.18"
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.12.1"
           enable-cache: false
       - name: Lint
         working-directory: reviewer
-        run: uv run --isolated --python 3.11.10 --locked --only-group dev ruff check .
+        run: uv run --isolated --python 3.11.18 --locked --only-group dev ruff check .
       - name: Reproduce the promoted runtime artifact
         working-directory: reviewer
         run: python3 tools/runtime_artifact.py --check
@@ -66,7 +67,7 @@ jobs:
           set -euo pipefail
           runtime_env="$RUNNER_TEMP/palomar-reviewer-runtime"
           codex_runtime="$RUNNER_TEMP/palomar-codex-runtime"
-          uv venv --no-project --python 3.11.10 --no-managed-python "$runtime_env"
+          uv venv --no-project --python 3.11.18 --no-managed-python "$runtime_env"
           (cd runtime && sha256sum --check SHA256SUMS)
           (cd runtime && uv pip install --python "$runtime_env/bin/python" \
             --require-hashes --no-deps --only-binary :all: \
