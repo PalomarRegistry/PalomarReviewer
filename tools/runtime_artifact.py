@@ -19,7 +19,7 @@ REQUIREMENTS_NAME = "requirements.txt"
 CODEX_PACKAGE_NAME = "codex-package.json"
 CODEX_LOCK_NAME = "codex-package-lock.json"
 SUMS_NAME = "SHA256SUMS"
-PYTHON_VERSION = "3.11.10"
+PYTHON_VERSION = "3.11.18"
 UV_VERSION = "0.12.1"
 # ZIP cannot represent an earlier timestamp. A fixed epoch makes identical
 # source and build inputs produce identical wheel bytes on every promotion.
