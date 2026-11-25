@@ -48,6 +48,9 @@ from .errors import (
 )
 
 STATE_REPO = "PalomarRegistry/PalomarSubmissionState"
+# Records read per GraphQL request. A record is at most a few tens of kilobytes.
+STATE_BATCH_SIZE = 50
+STATE_READ_RETRY_SECONDS = (2, 5)
 POLICY_REPO = "PalomarRegistry/PalomarPolicy"
 DATABASE_REPO = "PalomarRegistry/PalomarDatabase"
 ARCHIVE_OWNER = "PalomarArchive"
@@ -3402,19 +3405,41 @@ def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _state_read(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run one read of the state repository, retrying only a server's own failure.
+
+    A 5xx says nothing about the record and usually clears in seconds. A refusal
+    (a spent quota, an expired token) does not, so it is answered at once.
+    """
+    for delay in (*STATE_READ_RETRY_SECONDS, None):
+        raw = run(command, check=False)
+        if delay is None or raw.returncode == 0 or not re.search(r"HTTP 5\d\d", raw.stderr or ""):
+            break
+        time.sleep(delay)
+    return raw
+
+
 def state_json(path: str) -> dict[str, Any] | None:
     """Read a JSON file from the private submission state repository.
 
     The blob sha of what was read is carried along, so a later write can refuse
     to clobber a change the submitter made in between: withdrawing, or
     revoking consent, must not be silently overwritten.
+
+    None means the file does not exist, and only that. A rate limit or an
+    expired token is not evidence about the file, and answering None to it let
+    a pass skip every submission it could not read and report success.
     """
-    raw = run(
+    raw = _state_read(
         ["gh", "api", f"repos/{STATE_REPO}/contents/{path}", "--jq", ".content + \" \" + .sha"],
-        check=False,
     )
-    if raw.returncode != 0 or not raw.stdout.strip():
-        return None
+    if raw.returncode != 0:
+        detail = (raw.stderr or raw.stdout or "").strip()
+        if "HTTP 404" in detail:
+            return None
+        raise ReviewerError(f"could not read {path} from {STATE_REPO}: {detail[-1000:]}")
+    if not raw.stdout.strip():
+        raise ReviewerError(f"could not read {path} from {STATE_REPO}: empty response")
     content, _, blob_sha = raw.stdout.strip().rpartition(" ")
     value = json.loads(base64.b64decode(content))
     value["_blob_sha"] = blob_sha
@@ -3426,6 +3451,70 @@ def submission_state(submission_id: str) -> dict[str, Any] | None:
     if not SUBMISSION_ID_RE.fullmatch(submission_id):
         raise ReviewerError("submission id is malformed")
     return state_json(f"submissions/{submission_id}/state.json")
+
+
+def submission_states(submission_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+    """The private records for many submissions, at one request per batch.
+
+    Every step of a pass scans the open queue. Reading it one record at a time
+    cost a REST call per open submission per step, most of them for submissions
+    waiting on their author, and that alone exhausted the credential's hourly
+    quota. The blob oid GraphQL reports is the sha the contents API reports, so
+    these records carry the same precondition for a conditional write.
+
+    As with `submission_state`, None means the record does not exist. A batch
+    that could not be read raises.
+    """
+    for submission_id in submission_ids:
+        if not SUBMISSION_ID_RE.fullmatch(submission_id):
+            raise ReviewerError("submission id is malformed")
+    owner, name = STATE_REPO.split("/", 1)
+    records: dict[str, dict[str, Any] | None] = {}
+    for start in range(0, len(submission_ids), STATE_BATCH_SIZE):
+        batch = submission_ids[start:start + STATE_BATCH_SIZE]
+        blobs = " ".join(
+            f's{position}: object(expression: "HEAD:submissions/{submission_id}/state.json") '
+            "{ ... on Blob { oid text isTruncated } }"
+            for position, submission_id in enumerate(batch)
+        )
+        query = f'query {{ repository(owner: "{owner}", name: "{name}") {{ {blobs} }} }}'
+        raw = _state_read(["gh", "api", "graphql", "-f", f"query={query}"])
+        try:
+            answer = json.loads(raw.stdout) if raw.returncode == 0 else {}
+        except ValueError:
+            answer = {}
+        repository = (answer.get("data") or {}).get("repository")
+        if answer.get("errors") or not isinstance(repository, dict) or any(
+            f"s{position}" not in repository for position in range(len(batch))
+        ):
+            detail = (raw.stderr or raw.stdout or "").strip()[-1000:]
+            raise ReviewerError(f"could not read {len(batch)} record(s) from {STATE_REPO}: {detail}")
+        for position, submission_id in enumerate(batch):
+            blob = repository[f"s{position}"]
+            if blob is None:
+                records[submission_id] = None
+            elif blob.get("isTruncated") or blob.get("text") is None or not blob.get("oid"):
+                # Too large, or not text: the contents API still answers whole.
+                records[submission_id] = submission_state(submission_id)
+            else:
+                value = json.loads(blob["text"])
+                value["_blob_sha"] = blob["oid"]
+                records[submission_id] = value
+    return records
+
+
+def recovery_state(submission_id: str) -> dict[str, Any] | None:
+    """Reread a record while settling a failure, or None if it cannot be read.
+
+    For use inside error handlers only. Raising there would abandon every
+    submission behind the one that failed; a handler that gets None leaves the
+    record as it stands for a later pass.
+    """
+    try:
+        return submission_state(submission_id)
+    except ReviewerError as error:
+        print(f"::warning::{submission_id} could not be reread: {error}", file=sys.stderr)
+        return None
 
 
 def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) -> str | None:
@@ -4222,7 +4311,8 @@ def open_submissions() -> list[dict[str, Any]]:
 
     Reading `submissions/` instead cost an API call per submission per pass
     however few of them were moving, so the price of one pass was the size of
-    the registry rather than the size of the queue.
+    the registry rather than the size of the queue. The queue is itself mostly
+    reviews waiting on their authors, so it is read in batches.
 
     Submissions the reviewer has finished with are dropped from the index here,
     under the sha it was read at, so an admission that landed while this pass
@@ -4231,16 +4321,14 @@ def open_submissions() -> list[dict[str, Any]]:
     index = open_index()
     records: list[dict[str, Any]] = []
     still_open: list[str] = []
+    states = submission_states(index["open"])
     for submission_id in index["open"]:
-        record = submission_state(submission_id)
+        record = states[submission_id]
         if record is None:
-            # Absent, or unreadable: `state_json` answers None to a rate limit,
-            # an expired token and a genuine 404 alike, and only one of those
-            # means there is nothing left to do. Keeping the id costs one call
-            # a pass and is corrected by the next rebuild; dropping it loses a
-            # submission on a transient failure, silently, in a pass that then
-            # reports success. That is the failure this index exists to avoid,
-            # not one to reintroduce inside it.
+            # Absent. A batch that could not be read raised instead, so this is
+            # not a refused read, but the server lists an id when it admits a
+            # submission and the two writes can be seen out of order. Keeping
+            # the id costs nothing and is corrected by the next rebuild.
             still_open.append(submission_id)
             continue
         records.append(record)
@@ -9328,7 +9416,7 @@ def auto(args: argparse.Namespace) -> int:
             unattempted.append(record)
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
-            fresh = submission_state(record["id"])
+            fresh = recovery_state(record["id"])
             if (
                 fresh is not None
                 and fresh.get("status") == "review-ready"
@@ -9340,7 +9428,7 @@ def auto(args: argparse.Namespace) -> int:
         except Exception as error:
             failures += 1
             print(f"error: registration of {record['id']} failed: {error}", file=sys.stderr)
-            fresh = submission_state(record["id"])
+            fresh = recovery_state(record["id"])
             if (
                 fresh is not None
                 and fresh.get("status") == "review-ready"
@@ -9416,7 +9504,7 @@ def auto(args: argparse.Namespace) -> int:
             advanced += 1
         except RenderPending as error:
             print(f"rendering deferred for {record['id']}: {error}")
-            fresh = submission_state(record["id"])
+            fresh = recovery_state(record["id"])
             if fresh is not None and fresh.get("status") in REVIEWABLE_STATUSES:
                 advance_state(
                     fresh, "awaiting-review", "The Challenge rendering workflow is pending",
@@ -9425,7 +9513,7 @@ def auto(args: argparse.Namespace) -> int:
                 )
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
-            fresh = submission_state(record["id"])
+            fresh = recovery_state(record["id"])
             if fresh is not None and fresh.get("status") in REVIEWABLE_STATUSES:
                 record_renderability_failure(fresh, error)
                 advanced += 1
@@ -9444,7 +9532,7 @@ def auto(args: argparse.Namespace) -> int:
         except Exception as error:  # one bad submission must not stall the queue
             failures += 1
             print(f"error: review of {record['id']} failed: {error}", file=sys.stderr)
-            fresh = submission_state(record["id"])
+            fresh = recovery_state(record["id"])
             if fresh is None and review_begun:
                 # `begin_review` returned the blob sha written by the transition.
                 # If GitHub then refuses the recovery read, that known identity is

@@ -1,5 +1,6 @@
 import ast
 import atexit
+import base64
 import contextlib
 import datetime as dt
 import hashlib
@@ -267,6 +268,23 @@ class UsesCapabilities:
                 "needs " + " and ".join(capability_wanted(name) for name in missing)
             )
         return sources
+
+
+def scan_through_submission_state():
+    """Answer the batched scan from whatever a test stubbed for a single read."""
+    return mock.patch.object(
+        cli,
+        "submission_states",
+        side_effect=lambda ids: {name: cli.submission_state(name) for name in ids},
+    )
+
+
+class ScansThroughSubmissionState:
+    def setUp(self):
+        super().setUp()
+        stub = scan_through_submission_state()
+        stub.start()
+        self.addCleanup(stub.stop)
 
 
 class ReviewerTests(UsesCapabilities, unittest.TestCase):
@@ -635,6 +653,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
         with (
             mock.patch.object(cli, "open_index", return_value={"open": list(by_id)}),
             mock.patch.object(cli, "submission_state", side_effect=by_id.get),
+            scan_through_submission_state(),
             mock.patch.object(cli, "validate_archive_token") as validate_token,
             mock.patch.object(cli, "ensure_repository_star") as ensure_star,
             mock.patch.object(cli, "put_state") as put_state,
@@ -6013,7 +6032,7 @@ def submission_id(number):
     return f"{number:012d}"
 
 
-class SubmissionListingTests(unittest.TestCase):
+class SubmissionListingTests(ScansThroughSubmissionState, unittest.TestCase):
     """An unreadable queue is not an empty queue.
 
     The queue is an index of what still has work outstanding, so the two things
@@ -6328,7 +6347,7 @@ class SubmissionListingTests(unittest.TestCase):
         self.assertEqual(cost[2], cost[20])
 
 
-class AutomaticLoopTests(unittest.TestCase):
+class AutomaticLoopTests(ScansThroughSubmissionState, unittest.TestCase):
     """Each pass advances a submission by one step, and never past consent."""
 
     def records(self, *rows):
@@ -7515,7 +7534,7 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         self.assertIn(cli.DATABASE_VALIDATE_WORKFLOW, api[1])
 
 
-class SelfDispatchTests(unittest.TestCase):
+class SelfDispatchTests(ScansThroughSubmissionState, unittest.TestCase):
     """A pass asks for the next one, and knows when asking would be a loop."""
 
     def records(self, *rows):
@@ -10756,10 +10775,8 @@ class PushProofTests(unittest.TestCase):
 
 class OpenIndexFailureTests(unittest.TestCase):
     def test_a_submission_that_cannot_be_read_keeps_its_place_in_the_queue(self):
-        """`state_json` answers None to a rate limit, an expired token and a
-        genuine 404 alike, and only one of those means there is nothing left to
-        do. Dropping the id on the other two loses a submission silently, in a
-        pass that then reports success."""
+        """An id can be listed before its record is visible. Dropping it would
+        lose a submission silently, in a pass that then reports success."""
         index = {
             "schema_version": cli.OPEN_INDEX_SCHEMA_VERSION,
             "rebuilt_at": "2026-08-07T00:00:00Z",
@@ -10770,7 +10787,11 @@ class OpenIndexFailureTests(unittest.TestCase):
         written = []
         with (
             mock.patch.object(cli, "state_json", return_value=index),
-            mock.patch.object(cli, "submission_state", side_effect=[None, {"status": "awaiting-review"}]),
+            mock.patch.object(
+                cli,
+                "submission_states",
+                return_value={"aaaaaaaaaaaa": None, "bbbbbbbbbbbb": {"status": "awaiting-review"}},
+            ),
             mock.patch.object(cli, "_write_open_index", side_effect=lambda i, blob_sha: written.append(i)),
         ):
             records = cli.open_submissions()
@@ -10778,6 +10799,131 @@ class OpenIndexFailureTests(unittest.TestCase):
         self.assertEqual(len(records), 1, "the readable one came through")
         for entry in written:
             self.assertIn("aaaaaaaaaaaa", entry["open"], "an unreadable submission was dropped")
+
+
+class BatchedStateReadTests(unittest.TestCase):
+    """A pass scans the open queue four times, so a scan must not cost a request
+    per submission, and a read GitHub refused must not look like an absence."""
+
+    RATE_LIMITED = "gh: API rate limit exceeded for user ID 477956. (HTTP 403)"
+
+    def answer(self, stdout="", stderr="", returncode=0):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def blob(self, name, oid="oid"):
+        return {"oid": oid, "text": json.dumps({"id": name}), "isTruncated": False}
+
+    def serve(self, blobs, queries):
+        def fake_run(command, **kwargs):
+            self.assertEqual(command[:3], ["gh", "api", "graphql"])
+            queries.append(command[-1])
+            names = re.findall(r"submissions/([a-z0-9]{12})/state\.json", command[-1])
+            return self.answer(json.dumps({"data": {"repository": {
+                f"s{position}": blobs[name] for position, name in enumerate(names)
+            }}}))
+        return fake_run
+
+    def test_a_scan_costs_one_request_per_batch(self):
+        names = [submission_id(number) for number in range(196)]
+        blobs = {name: self.blob(name, f"oid-{name}") for name in names}
+        queries = []
+        with mock.patch.object(cli, "run", side_effect=self.serve(blobs, queries)):
+            records = cli.submission_states(names)
+        self.assertEqual(len(queries), 4)
+        self.assertEqual(list(records), names)
+        for name, record in records.items():
+            self.assertEqual(record, {"id": name, "_blob_sha": f"oid-{name}"})
+
+    def test_an_empty_queue_costs_nothing(self):
+        with mock.patch.object(cli, "run") as run:
+            self.assertEqual(cli.submission_states([]), {})
+        run.assert_not_called()
+
+    def test_an_absent_record_is_none(self):
+        blobs = {"a" * 12: None, "b" * 12: self.blob("b" * 12)}
+        with mock.patch.object(cli, "run", side_effect=self.serve(blobs, [])):
+            records = cli.submission_states(list(blobs))
+        self.assertIsNone(records["a" * 12])
+        self.assertEqual(records["b" * 12]["id"], "b" * 12)
+
+    def test_a_truncated_record_is_read_whole(self):
+        blobs = {"a" * 12: {"oid": "oid", "text": "{", "isTruncated": True}}
+        with (
+            mock.patch.object(cli, "run", side_effect=self.serve(blobs, [])),
+            mock.patch.object(cli, "submission_state", return_value={"id": "a" * 12}) as whole,
+        ):
+            self.assertEqual(cli.submission_states(["a" * 12]), {"a" * 12: {"id": "a" * 12}})
+        whole.assert_called_once_with("a" * 12)
+
+    def test_a_malformed_id_never_reaches_a_query(self):
+        with mock.patch.object(cli, "run") as run:
+            with self.assertRaisesRegex(ReviewerError, "malformed"):
+                cli.submission_states(['x") { oid } }'])
+        run.assert_not_called()
+
+    def test_a_refused_scan_fails_the_step_and_leaves_the_queue_alone(self):
+        refusals = (
+            self.answer(stderr=self.RATE_LIMITED, returncode=1),
+            self.answer(json.dumps({"errors": [{"type": "RATE_LIMITED"}]})),
+            self.answer(json.dumps({"data": {"repository": None}})),
+            self.answer(json.dumps({"data": {"repository": {}}})),
+            self.answer("not json"),
+        )
+        for refusal in refusals:
+            with (
+                self.subTest(refusal=refusal),
+                mock.patch.object(cli, "open_index", return_value={"open": ["a" * 12]}),
+                mock.patch.object(cli, "run", return_value=refusal) as run,
+                mock.patch.object(cli, "_write_open_index") as write,
+            ):
+                with self.assertRaisesRegex(ReviewerError, "could not read"):
+                    cli.open_submissions()
+                write.assert_not_called()
+                self.assertEqual(run.call_count, 1, "a refusal is not retried")
+
+    def test_only_a_missing_file_is_absent(self):
+        missing = self.answer(stderr="gh: Not Found (HTTP 404)", returncode=1)
+        with mock.patch.object(cli, "run", return_value=missing):
+            self.assertIsNone(cli.state_json("index/open.json"))
+        for stderr in (self.RATE_LIMITED, "gh: Bad credentials (HTTP 401)"):
+            refused = self.answer(stderr=stderr, returncode=1)
+            with self.subTest(stderr=stderr), mock.patch.object(cli, "run", return_value=refused):
+                with self.assertRaisesRegex(ReviewerError, "could not read index/open.json"):
+                    cli.state_json("index/open.json")
+
+    def test_a_refused_index_read_does_not_rebuild_the_queue(self):
+        refused = self.answer(stderr=self.RATE_LIMITED, returncode=1)
+        with (
+            mock.patch.object(cli, "run", return_value=refused),
+            mock.patch.object(cli, "rebuild_open_index") as rebuild,
+        ):
+            with self.assertRaises(ReviewerError):
+                cli.open_index()
+        rebuild.assert_not_called()
+
+    def test_a_refused_review_read_does_not_buy_another_review(self):
+        refused = self.answer(stderr=self.RATE_LIMITED, returncode=1)
+        record = {"id": "a" * 12, "review_schema_version": cli.REVIEW_SCHEMA_VERSION - 1}
+        with mock.patch.object(cli, "run", return_value=refused):
+            with self.assertRaises(ReviewerError):
+                cli._delivered_review_needs_rerun(record)
+
+    def test_a_server_error_is_retried(self):
+        broken = self.answer(stderr="gh: HTTP 502: Bad Gateway", returncode=1)
+        content = base64.b64encode(b'{"open": []}').decode()
+        with (
+            mock.patch.object(cli, "run", side_effect=[broken, self.answer(f"{content} sha")]),
+            mock.patch.object(cli.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                cli.state_json("index/open.json"), {"open": [], "_blob_sha": "sha"}
+            )
+        sleep.assert_called_once()
+
+    def test_settling_a_failure_survives_a_refused_reread(self):
+        refused = self.answer(stderr=self.RATE_LIMITED, returncode=1)
+        with mock.patch.object(cli, "run", return_value=refused):
+            self.assertIsNone(cli.recovery_state("a" * 12))
 
 
 class QueueSweepTests(unittest.TestCase):
@@ -10918,7 +11064,7 @@ class StateBlobIdentityTests(unittest.TestCase):
                 cli._state_blob_sha(cli.OPEN_INDEX_PATH)
 
 
-class StarRaceTests(unittest.TestCase):
+class StarRaceTests(ScansThroughSubmissionState, unittest.TestCase):
     """A star that lost a race is retried, not reported as a failure.
 
     The first record registered through the agent path marked its whole run
