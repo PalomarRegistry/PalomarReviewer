@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 import palomar_reviewer.registration as registration
-from palomar_reviewer.errors import ReviewerError
+from palomar_reviewer.errors import AlreadyRegisteredError, ReviewerError
 
 FIRST = "PALOMAR-2026-08-09-000001"
 
@@ -470,7 +470,7 @@ class RegistrationProjectionTests(unittest.TestCase):
         repo = self.repo()
         write_identity(repo)
         commit(repo)
-        with self.assertRaisesRegex(ReviewerError, f"registered as {FIRST}"):
+        with self.assertRaisesRegex(ReviewerError, f"registered as {FIRST}") as raised:
             registration.registration_identity(
                 repo,
                 submission_id="newresult123",
@@ -482,6 +482,10 @@ class RegistrationProjectionTests(unittest.TestCase):
                     "comparator": {"path": "comparator.json"},
                 },
             )
+        # The submitter, not an operator, is the one who can act on this, so it
+        # must be told apart from an outage and name the result to update.
+        self.assertIsInstance(raised.exception, AlreadyRegisteredError)
+        self.assertEqual(raised.exception.registration_id, FIRST)
 
     def test_a_malformed_submission_binding_is_not_retry_identity(self):
         repo = self.repo()
