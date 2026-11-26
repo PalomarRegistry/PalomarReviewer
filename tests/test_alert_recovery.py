@@ -208,6 +208,19 @@ class AlertRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "requires resource profile evidence"):
             bind({"execution_profile": "palomar-namespace-16x32-v1"}, {})
 
+    def test_the_operator_only_aws_profile_binds_only_to_an_operator_admission(self):
+        bind = workflow_recovery.validate_execution_binding
+        aws = {"id": "palomar-aws-r7i-16xlarge-v1"}
+        report = {"execution_profile": "palomar-aws-r7i-16xlarge-v1", "verification_profile": aws}
+        bind(report, {"execution": {"profile": "palomar-aws-r7i-16xlarge-v1"}})
+        # Never what an unset admission resolves to, with or without evidence.
+        with self.assertRaisesRegex(ReviewerError, "resource evidence"):
+            bind(report, {})
+        with self.assertRaisesRegex(ReviewerError, "admitted State"):
+            bind({"execution_profile": "palomar-aws-r7i-16xlarge-v1"}, {})
+        with self.assertRaisesRegex(ReviewerError, "admitted State"):
+            bind(report, {"execution": {"profile": "palomar-namespace-32x64-v1"}})
+
     def test_success_predating_alert_does_not_hide_a_later_failure(self):
         state = self.state()
         state["operator_alerts"]["items"][0]["queued_at"] = "2026-09-03T00:00:00Z"

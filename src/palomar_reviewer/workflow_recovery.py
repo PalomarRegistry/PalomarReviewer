@@ -6,7 +6,14 @@ from typing import Any
 
 from .errors import ReviewerError
 
-PROFILES = {"palomar-standard-v1", "palomar-namespace-16x32-v1", "palomar-namespace-32x64-v1"}
+# A report may name an operator-only profile only when a Technical Maintainer
+# recorded that profile for the admitted execution: its runner is launched by
+# hand (PalomarSubmission ops/aws-runner) and is never the catalogue default.
+OPERATOR_ONLY_PROFILES = {"palomar-aws-r7i-16xlarge-v1"}
+PROFILES = {
+    "palomar-standard-v1", "palomar-namespace-16x32-v1", "palomar-namespace-32x64-v1",
+    *OPERATOR_ONLY_PROFILES,
+}
 SETUP_STEPS = {
     "Checkout submission pipeline",
     "Set up Python",
@@ -51,11 +58,11 @@ def validate_execution_binding(report: dict, state: dict) -> None:
         # Nothing was chosen, so the verifier resolved the catalogue default and
         # its resource evidence names it; the finalizer records the same name.
         profile = evidence.get("id")
-        if profile not in PROFILES or reported != profile:
+        if profile not in PROFILES - OPERATOR_ONLY_PROFILES or reported != profile:
             raise ReviewerError("mechanical report execution profile does not match its resource evidence")
     else:
         profile = reported
-        if profile not in PROFILES:
+        if profile not in PROFILES - OPERATOR_ONLY_PROFILES:
             raise ReviewerError("mechanical report execution profile does not match admitted State")
     if evidence is not None and evidence.get("id") != profile:
         raise ReviewerError("mechanical report resource evidence names a different execution profile")
