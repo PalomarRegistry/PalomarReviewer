@@ -608,7 +608,21 @@ diagnostic moves to `verification-failed` without reserving an ID. Other render
 failures with a concrete report pause the registration immediately;
 an unexplained operational failure waits 30 minutes and pauses after three
 attempts. Paused work leaves the automatic queue, so it cannot keep the next
-consented submission behind it. After correcting the cause, an operator uses
+consented submission behind it, and pausing gives back an unpublished schema-3
+allocation. A pass looks at the allocation a registration needs before it
+announces or counts the attempt. A lock whose holder is finished (registered,
+withdrawn, paused, or otherwise settled) is reclaimed by the next registration
+that needs it: a registered holder's interrupted release is completed, and an
+unpublished reservation is released. A holder whose record cannot be read, or
+whose identity has been used publicly without being registered, keeps its lock
+and is reported for an operator, because reusing that allocation would assign
+the same identifier twice. A registration whose repository, project, and
+Comparator configuration already belong to a registered result settles at once
+as a submitter-owned `verification-failed` diagnostic naming the result to
+update, rather than pausing for an operator who cannot act on it. A failed
+PalomarDatabase `Validate database` run is rerun with `--failed` until its
+attempt number reaches three, which needs `Actions: write` on the Database for
+the reviewer credential; after that it waits for a person. After correcting the cause, an operator uses
 the State workflow's `retry_registration` input, or runs
 `palomar-review retry-registration --submission ID` with explicit State-write
 authority. That command revalidates the repository, commit, write proof,

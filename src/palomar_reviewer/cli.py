@@ -39,6 +39,7 @@ from . import operator_alerts as operator_notifications
 from . import registration as registration_authority
 from . import usage as usage_accounting
 from .errors import (
+    AlreadyRegisteredError,
     DeterministicRegistrationError,
     RegistrationDeferred,
     RenderPending,
@@ -152,6 +153,12 @@ QUALIFIED_CHALLENGE_REPOSITORY_LABELS = {
 DATABASE_CHECK_POLL_SECONDS = 15
 DATABASE_PR_FIELDS = "state,mergeStateStatus,headRefOid"
 DATABASE_VALIDATE_WORKFLOW = "validate.yml"
+# A database validation that failed is rerun, because the failures seen in
+# production were the runner failing to download its pinned tooling (HTTP 503
+# and 504), not the change being invalid. The bound is on the run's attempt
+# number, which manual reruns advance too, so a change that is genuinely
+# invalid costs at most two extra runs before it is left for a person.
+DATABASE_VALIDATE_ATTEMPT_LIMIT = 3
 MINIMUM_SPARSE_GIT = (2, 34, 0)
 # Registration needs schemas and tools, but no historical record payload or
 # registration projection. A partial clone alone postpones those blobs only
@@ -3632,6 +3639,19 @@ def _acquire_registration_lock(
     if current is not None:
         registration_checkpoint.validate_lock(current, path=path)
         holder = current.get("holder")
+        if isinstance(holder, dict) and holder.get("submission_id") != state["id"]:
+            reclaimed = _reclaim_inactive_registration_lock(path, current)
+            if reclaimed.get("holder") is None:
+                # This identity was derived from a Database checkout taken
+                # while that holder still owned the allocation, and the holder
+                # may have registered the very serial computed here since. A
+                # later pass clones afresh after the reclaim instead.
+                raise RegistrationDeferred(
+                    f"registration allocation {scope['kind']} {scope['value']} was "
+                    "reclaimed from a finished holder; registering in the next pass"
+                )
+            current = reclaimed
+            holder = current.get("holder")
         if isinstance(holder, dict):
             if (
                 holder.get("submission_id") == state["id"]
@@ -3803,6 +3823,194 @@ def _registration_owns_lock(state: dict[str, Any]) -> bool:
     )
 
 
+def _reclaim_inactive_registration_lock(path: str, lock: dict[str, Any]) -> dict[str, Any]:
+    """Free an allocation whose holder will never come back for it.
+
+    A day lock serializes every first version registered that day, so a holder
+    that has stopped working on it stalls the whole queue until midnight. That
+    happened three ways: a registration recorded as registered whose release
+    write then failed, which nothing retried because the submission had left
+    the queue; a paused registration, which leaves the queue by design; and a
+    withdrawn one. None of them will ever release the lock themselves.
+
+    Only positive evidence frees a lock. A holder whose record cannot be read is
+    treated as active, and a holder whose identity has been used publicly
+    without being registered keeps its lock: releasing it would let the next
+    registration take the same identifier, which is the collision the lock
+    exists to prevent. That case is reported for an operator instead.
+
+    Returns the lock as it now stands.
+    """
+    holder = lock.get("holder")
+    if not isinstance(holder, dict):
+        return lock
+    submission_id = holder.get("submission_id")
+    identity = holder.get("identity")
+    if (
+        not isinstance(submission_id, str)
+        or not SUBMISSION_ID_RE.fullmatch(submission_id)
+        or not isinstance(identity, dict)
+    ):
+        return lock
+    state = submission_state(submission_id)
+    if state is None:
+        return lock
+    status = state.get("status")
+    scope = lock["scope"]
+    label = f"{scope['kind']} {scope['value']}"
+    public_use = registration_checkpoint.matching_public_use(state, identity)
+    if status == "registered":
+        entry = f"{identity.get('id')}-v{identity.get('version')}"
+        if (
+            state.get("registered_entry") != entry
+            or public_use is None
+            or public_use.get("phase") != "registered"
+        ):
+            print(f"::error::registration allocation {label} is held by registered "
+                  f"{submission_id} for an identity it did not register; it needs a person")
+            return lock
+        # Finalize records registration before it releases, so this is the
+        # release that failed after that record was written.
+        _release_registration_lock(state, identity)
+        print(f"released registration allocation {label} left by registered {submission_id}")
+    elif status in FINISHED_STATUSES:
+        if public_use is not None:
+            print(f"::error::registration allocation {label} is held by {status} "
+                  f"{submission_id}, whose identity {identity.get('id')} is already public; "
+                  "it needs operator reconciliation before the allocation can be reused")
+            return lock
+        attempt = state.get("registration_attempt")
+        try:
+            saved = _attempt_identity(attempt) if isinstance(attempt, dict) else None
+        except ReviewerError:
+            saved = None
+        if saved == identity:
+            if attempt.get("schema_version") != 3:
+                print(f"::error::registration allocation {label} is held by {status} "
+                      f"{submission_id} with a legacy attempt; it needs a person")
+                return lock
+            _release_unpublished_attempt(state, identity)
+        else:
+            # The holder never saved this identity: an acquisition the pass
+            # that took it did not finish. Fence it first, so a pass still
+            # finishing that acquisition cannot go on to hold it, then look
+            # again, because it may have saved the attempt in the meantime.
+            fenced = _write_lock(
+                path,
+                {**lock, "holder": {**holder, "status": "releasing"}, "updated_at": utc_now()},
+                f"Fence registration allocation from {status} {submission_id}",
+            )
+            again = submission_state(submission_id)
+            attempt = again.get("registration_attempt") if isinstance(again, dict) else None
+            try:
+                saved = _attempt_identity(attempt) if isinstance(attempt, dict) else None
+            except ReviewerError:
+                saved = None
+            if again is None or (saved is not None and saved != identity):
+                print(f"::error::registration allocation {label} was fenced from {submission_id}, "
+                      "whose record then changed; it needs a person")
+                return fenced
+            if saved == identity:
+                if (
+                    attempt.get("schema_version") != 3
+                    or registration_checkpoint.matching_public_use(again, identity) is not None
+                ):
+                    print(f"::error::registration allocation {label} was fenced from "
+                          f"{submission_id}, which saved it meanwhile; it needs a person")
+                    return fenced
+                _release_unpublished_attempt(again, identity)
+            else:
+                _write_lock(
+                    path,
+                    _empty_lock(scope, blob_sha=fenced.get("_blob_sha")),
+                    f"Reclaim registration allocation from {status} {submission_id}",
+                )
+        print(f"released registration allocation {label} left by {status} {submission_id}")
+    else:
+        return lock
+    current = state_json(path)
+    if current is None:
+        return _empty_lock(scope)
+    registration_checkpoint.validate_lock(current, path=path)
+    return current
+
+
+def _registration_lock_scope(state: dict[str, Any]) -> dict[str, str]:
+    """The allocation a registration of this submission would need now."""
+    attempt = state.get("registration_attempt")
+    if isinstance(attempt, dict):
+        try:
+            return registration_checkpoint.lock_scope(_attempt_identity(attempt))
+        except ReviewerError:
+            pass
+    existing_id = state.get("existing_id")
+    if isinstance(existing_id, str) and existing_id:
+        return {"kind": "result", "value": existing_id}
+    return {"kind": "day", "value": utc_now()[:10]}
+
+
+def defer_if_registration_lock_held(state: dict[str, Any]) -> None:
+    """Defer before a registration attempt is announced or counted.
+
+    The allocation is otherwise discovered only after the attempt has been
+    recorded, the source cloned and the Challenge rendered, so each pass
+    behind a held lock told the submitter "Registration is starting" again
+    without registering anything. This look is advisory: acquiring the lock
+    remains the authority, and a registration that crosses midnight while it
+    renders asks for a different day than the one checked here.
+    """
+    scope = _registration_lock_scope(state)
+    path = registration_checkpoint.lock_path(scope)
+    lock = state_json(path)
+    if lock is None:
+        return
+    registration_checkpoint.validate_lock(lock, path=path)
+    holder = lock.get("holder")
+    if not isinstance(holder, dict) or holder.get("submission_id") == state.get("id"):
+        return
+    lock = _reclaim_inactive_registration_lock(path, lock)
+    holder = lock.get("holder")
+    if isinstance(holder, dict) and holder.get("submission_id") != state.get("id"):
+        raise RegistrationDeferred(
+            f"registration allocation {scope['kind']} {scope['value']} is held by "
+            f"{holder.get('submission_id', 'another submission')}"
+        )
+
+
+def _release_paused_allocation(state: dict[str, Any]) -> dict[str, Any]:
+    """Give back an unpublished allocation when registration stops for a person.
+
+    Paused work leaves the queue, so a lock it kept would be released by
+    nothing. Only a schema-3 reservation with no public use is released, which
+    is the same rule `retry-registration` applies; a retry allocates afresh.
+    """
+    attempt = state.get("registration_attempt")
+    if not isinstance(attempt, dict) or attempt.get("schema_version") != 3:
+        return state
+    try:
+        identity = _attempt_identity(attempt)
+        if registration_checkpoint.matching_public_use(state, identity) is not None:
+            return state
+        path = registration_checkpoint.lock_path(registration_checkpoint.lock_scope(identity))
+        lock = state_json(path)
+        holder = lock.get("holder") if isinstance(lock, dict) else None
+        if (
+            not isinstance(holder, dict)
+            or holder.get("submission_id") != state.get("id")
+            or holder.get("identity") != identity
+        ):
+            return state
+        released = _release_unpublished_attempt(state, identity)
+    except ReviewerError as error:
+        # Not fatal: the next registration that needs this allocation reclaims
+        # it from the paused holder.
+        print(f"::warning::could not release the allocation held by paused "
+              f"{state.get('id')}: {error}")
+        return state
+    print(f"released the unpublished allocation held by paused {state.get('id')}")
+    return released
+
+
 # A review that keeps failing must stop being retried. Attempts are counted
 # when they start, not when they fail, so a runner that dies without recording
 # anything is counted too.
@@ -3901,6 +4109,62 @@ def record_renderability_failure(
     )
 
 
+def record_already_registered(
+    state: dict[str, Any], error: AlreadyRegisteredError
+) -> dict[str, Any]:
+    """Settle a registration whose result is already in the registry.
+
+    This was recorded as a transient failure, retried three times and paused
+    for an operator, whose status page then told the submitter that no change
+    was requested of them. Nothing an operator does can register it: the same
+    repository, project and Comparator configuration already belong to a
+    registered result, and only the submitter can send the commit again as an
+    update of that result. So it settles at once, with that as the next action.
+    """
+    registration_id = error.registration_id
+    diagnostic = {
+        "code": "registration.already_registered",
+        "stage": "registration",
+        "owner": "submitter",
+        "summary": f"This result is already registered as {registration_id}",
+        "explanation": (
+            "This repository, project and Comparator configuration already belong to "
+            f"{registration_id}, so registering this submission would create a second "
+            "result for the same formalization. Nothing was published for this submission."
+        ),
+        "next_action": (
+            f"To register this commit as a new version of {registration_id}, submit it "
+            f"again with Existing Palomar ID set to {registration_id}. If this commit is "
+            "already one of that result's versions, nothing more is needed."
+        ),
+        "retryable": False,
+        "repairable": False,
+    }
+    failure = {
+        "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+        "mode": "full",
+        "phase": "registration",
+        "run": None,
+        "profile_version": None,
+        "diagnostics": [_bounded_diagnostic(diagnostic)],
+    }
+    settled = advance_state(
+        state,
+        "verification-failed",
+        f"This result is already registered as {registration_id}; submit an update instead",
+        failure=failure,
+        review_error=None,
+        review_retry_after=None,
+        renderability_request=None,
+        registration_error=None,
+        registration_failure=None,
+        registration_retry_after=None,
+        registration_consent=False,
+        registration_consent_review_sha256=None,
+    )
+    return _release_paused_allocation(settled)
+
+
 def begin_registration(state: dict[str, Any]) -> dict[str, Any]:
     """Durably count a registration attempt before it can perform side effects."""
     return advance_state(
@@ -3949,7 +4213,7 @@ def record_registration_failure(
         "detail": detail,
     }
     if deterministic or attempts >= REGISTRATION_ATTEMPT_LIMIT:
-        return advance_state(
+        paused = advance_state(
             state,
             "registration-paused",
             "Registration needs operator attention",
@@ -3957,6 +4221,7 @@ def record_registration_failure(
             registration_failure=failure,
             registration_retry_after=None,
         )
+        return _release_paused_allocation(paused)
     return advance_state(
         state,
         "review-ready",
@@ -7060,6 +7325,13 @@ def delivered_review(submission_id: str) -> dict[str, Any]:
 def register(args: argparse.Namespace) -> int:
     root = Path(args.work_dir).expanduser().resolve()
     work = root / str(args.submission)
+    if getattr(args, "count_attempt", False) and not args.dry_run:
+        # Before anything is cloned, rendered, counted or announced: a pass
+        # that only finds out at allocation that it cannot have the lock has
+        # already told the submitter registration is starting.
+        current = submission_state(str(args.submission))
+        if current is not None:
+            defer_if_registration_lock_held(current)
     # The review that gets registered is the one the submitter was given, taken
     # from the private record rather than from a locally writable file. An
     # unattended runner has no dry-run workspace to inherit, and even an
@@ -7676,8 +7948,11 @@ def request_another_pass(depth: int, max_reviews: int) -> bool:
     return True
 
 
-def _validation_outcome(head_sha: str) -> str:
+def _validation_run(head_sha: str) -> tuple[str, dict[str, Any] | None]:
     """Whether the database's own validation passed for exactly this commit.
+
+    The run that decided it is returned beside the outcome, so a failed run
+    can be rerun without asking Actions for it a second time.
 
     Asked of Actions rather than of the pull request's check rollup. Reading
     that rollup needs a permission fine-grained tokens do not have under any
@@ -7701,7 +7976,7 @@ def _validation_outcome(head_sha: str) -> str:
             f"{str(error)[:200]} -- the reviewer credential needs Actions: read on "
             f"{DATABASE_REPO}. Refusing to merge without seeing the validation."
         )
-        return "unreadable"
+        return "unreadable", None
     # The query is a filter, not a promise: the endpoint documents no ordering,
     # the workflow also runs on push, and a commit can carry more than one run.
     # So the run is chosen rather than taken, and every field it was filtered on
@@ -7714,7 +7989,7 @@ def _validation_outcome(head_sha: str) -> str:
         and isinstance(run.get("run_number"), int)
     ]
     if not candidates:
-        return "pending"  # Actions has not attached a run to this commit yet
+        return "pending", None  # Actions has not attached a run to this commit yet
     # A new run advances run_number; re-running one keeps the number and
     # advances run_attempt. The newest of both is the one that counts, and an
     # older green attempt must never outrank a newer one that is still going.
@@ -7723,8 +7998,8 @@ def _validation_outcome(head_sha: str) -> str:
         key=lambda run: (run["run_number"], run.get("run_attempt") or 0),
     )
     if latest.get("status") != "completed":
-        return "pending"
-    return "passed" if latest.get("conclusion") == "success" else "failed"
+        return "pending", latest
+    return ("passed" if latest.get("conclusion") == "success" else "failed"), latest
 
 
 def _seconds_since(stamp: str) -> float:
@@ -7749,10 +8024,42 @@ def view_database_pr(pr: int) -> dict[str, Any]:
         gh(["pr", "view", str(pr), "--repo", DATABASE_REPO, "--json", DATABASE_PR_FIELDS])
     )
     head = view.get("headRefOid")
-    view["validation"] = (
-        _validation_outcome(head) if isinstance(head, str) and head else "pending"
+    view["validation"], view["validation_run"] = (
+        _validation_run(head) if isinstance(head, str) and head else ("pending", None)
     )
     return view
+
+
+def rerun_failed_validation(pr: int, failed_run: dict[str, Any] | None) -> bool:
+    """Rerun a failed database validation, within its attempt bound.
+
+    A registration whose validation failed used to wait for a person, holding
+    its day lock, and with it every later first version that day. The failures
+    were the runner failing to fetch pinned tooling, which a rerun of the same
+    commit fixes; a change that is genuinely invalid fails again and is left
+    for a person once the attempts are spent. Returns whether a rerun started.
+    """
+    run_id = failed_run.get("id") if isinstance(failed_run, dict) else None
+    attempt = failed_run.get("run_attempt") if isinstance(failed_run, dict) else None
+    if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+        return False
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        attempt = 1
+    if attempt >= DATABASE_VALIDATE_ATTEMPT_LIMIT:
+        print(f"::warning::database PR #{pr}: validation run {run_id} failed on attempt "
+              f"{attempt} of {DATABASE_VALIDATE_ATTEMPT_LIMIT}; not rerunning it again")
+        return False
+    result = run(
+        ["gh", "run", "rerun", str(run_id), "--failed", "--repo", DATABASE_REPO],
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        print(f"::warning::could not rerun validation run {run_id} for database PR #{pr}: "
+              f"{detail} -- the reviewer credential needs Actions: write on {DATABASE_REPO}")
+        return False
+    print(f"database PR #{pr}: validation run {run_id} failed on attempt {attempt}; rerunning it")
+    return True
 
 
 def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
@@ -7761,18 +8068,37 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
     Returns the last view read; a zero wait is a single look, which is what the
     recovery arm wants. Only some states are worth waiting through, so the two
     that never resolve on their own return at once: a conflict needs a person,
-    and a failed rollup needs a new commit.
+    and so does a failed validation once its bounded reruns are spent.
     """
     deadline = time.monotonic() + max(0.0, wait_seconds)
     updated_branch = False
+    rerun_of: tuple[object, object] | None = None
+    reran_validation = False
     while True:
         view = view_database_pr(pr)
         merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
+        observed = view.get("validation_run") or {}
+        observed_key = (observed.get("id"), observed.get("run_attempt") or 1)
+        if view["validation"] == "failed" and rerun_of is not None and observed_key == rerun_of:
+            # Actions has not shown the rerun yet; this is the attempt it replaces.
+            view["validation"] = "pending"
+        elif (
+            view["validation"] == "failed"
+            and not reran_validation
+            and str(view.get("state") or "").upper() == "OPEN"
+            and merge_state != "DIRTY"
+        ):
+            # One rerun per wait. The rerun keeps the run number and advances
+            # its attempt, so the next look sees it pending and then decided.
+            reran_validation = True
+            if rerun_failed_validation(pr, view.get("validation_run")):
+                rerun_of = observed_key
+                view["validation"] = "pending"
         if (
             str(view.get("state") or "").upper() != "OPEN"
             or merge_state == "DIRTY"
-            # Waiting cannot grant a permission, and a failed validation needs
-            # a new commit rather than more patience.
+            # Waiting cannot grant a permission, and a failed validation that
+            # was not rerun needs a person rather than more patience.
             or view["validation"] in {"failed", "unreadable"}
             or (merge_state == "CLEAN" and view["validation"] == "passed")
         ):
@@ -9414,6 +9740,24 @@ def auto(args: argparse.Namespace) -> int:
         except RegistrationDeferred as error:
             print(f"registration deferred for {record['id']}: {error}")
             unattempted.append(record)
+        except AlreadyRegisteredError as error:
+            print(f"registration refused for {record['id']}: {error}", file=sys.stderr)
+            fresh = submission_state(record["id"])
+            if (
+                fresh is not None
+                and fresh.get("status") == "review-ready"
+                and fresh.get("registration_consent") is True
+                and not fresh.get("registration_pr")
+                and not registration_checkpoint.public_identity_uses(fresh)
+            ):
+                record_already_registered(fresh, error)
+                advanced += 1
+            elif fresh is not None and fresh.get("status") == "review-ready":
+                # Something about this submission is already public, so it is
+                # not simply a duplicate: leave the decision to an operator.
+                failures += 1
+                record_registration_failure(fresh, error, deterministic=True)
+                advanced += 1
         except SubmitterRenderabilityError as error:
             print(f"renderability check failed for {record['id']}: {error}", file=sys.stderr)
             fresh = recovery_state(record["id"])
