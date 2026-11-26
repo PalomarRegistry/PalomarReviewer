@@ -139,6 +139,7 @@ class RuntimeArtifactTests(unittest.TestCase):
                 "palomar_reviewer/mechanical.py",
                 "palomar_reviewer/operator_alerts.py",
                 "palomar_reviewer/registration.py",
+                "palomar_reviewer/snapshot.py",
                 "palomar_reviewer/usage.py",
             }
             metadata_members = {

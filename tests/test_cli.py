@@ -8936,6 +8936,8 @@ class VocabularyTests(unittest.TestCase):
             "cli.py:publishable",
             "cli.py:published",
             "cli.py:unpublished",
+            # The object service's operation name (contract v2 section 3.2).
+            "snapshot.py:publish",
         }
         self.assertEqual(
             set(stray),

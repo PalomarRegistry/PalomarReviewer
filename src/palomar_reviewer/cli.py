@@ -38,6 +38,7 @@ from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
 from . import operator_alerts as operator_notifications
 from . import registration as registration_authority
+from . import snapshot as confidential_snapshot
 from . import usage as usage_accounting
 from .errors import (
     AlreadyRegisteredError,
@@ -2580,7 +2581,69 @@ def ensure_challenge_renderable(
     cached_report, cached_bundle = validate_render_result(cached, mechanical)
     if cached_report != report:
         raise ReviewerError("cached render receipt changed while it was copied")
+    if state is not None and confidential_mode.is_confidential(state):
+        store_confidential_render(state, cached)
     return cached_report, cached_bundle
+
+
+def render_result_archive(result: Path) -> bytes:
+    """A deterministic tar of one validated render result directory."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for path in sorted(result.rglob("*")):
+            if path.is_symlink():
+                raise ReviewerError("render result contains a symbolic link")
+            info = archive.gettarinfo(str(path), arcname=path.relative_to(result).as_posix())
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mtime = 0
+            info.mode = 0o755 if path.is_dir() else 0o644
+            if path.is_dir():
+                archive.addfile(info)
+            else:
+                with path.open("rb") as handle:
+                    archive.addfile(info, handle)
+    return buffer.getvalue()
+
+
+def extract_render_result_archive(data: bytes, destination: Path) -> Path:
+    """Unpack a stored render result, refusing anything but plain files and directories."""
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        for member in archive.getmembers():
+            name = member.name
+            mechanical_evidence.safe_repository_path(name, "stored render result path")
+            if not (member.isfile() or member.isdir()):
+                raise ReviewerError("stored render result contains a non-regular entry")
+        archive.extractall(destination, filter="data")
+    return destination
+
+
+
+def store_confidential_render(state: dict[str, Any], result: Path) -> None:
+    """Put a validated confidential render result in the private bucket; State keeps its digest."""
+    data = render_result_archive(result)
+    digest = confidential_snapshot.sha256_bytes(data)
+    recorded = ((state.get("confidential") or {}).get("evidence") or {}).get("render_result")
+    if recorded is not None and recorded.get("sha256") == digest:
+        return
+    if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
+        return
+    entry = confidential_objects(state, "evidence").put_evidence("render-result", data)
+    record_confidential_evidence(state, "render_result", entry)
+
+
+def stored_confidential_render(
+    work: Path, mechanical: dict[str, Any], state: dict[str, Any]
+) -> tuple[dict[str, Any], Path] | None:
+    recorded = ((state.get("confidential") or {}).get("evidence") or {}).get("render_result")
+    if recorded is None:
+        return None
+    data = confidential_objects(state, "restore").get(recorded["key"], recorded["sha256"])
+    destination = extract_render_result_archive(data, work / "stored-render")
+    return validate_render_result(destination, mechanical)
 
 
 def restore_reviewed_render(
@@ -2597,10 +2660,12 @@ def restore_reviewed_render(
     assert checked is not None
     origin = render_origin(mechanical)
     if origin.confidential:
-        # Confidential evidence is never read back from Actions or State. Until
-        # it is kept in Palomar's private object store, the render is rebuilt
-        # in the private caller from the same accepted source.
-        return None
+        # Confidential evidence is read only from the private bucket, never
+        # from Actions; with no stored copy the render is rebuilt privately.
+        stored = stored_confidential_render(work, mechanical, state) if state is not None else None
+        if stored is not None and renderability_receipt(stored[0], mechanical) != checked:
+            raise ReviewerError("stored confidential render disagrees with its durable receipt")
+        return stored
     run_id = checked["workflow_url"].rsplit("/", 1)[1]
     metadata = json.loads(gh([
         "run", "view", run_id, "--repo", origin.repository,
@@ -2986,7 +3051,79 @@ def mechanical_report(
     if not isinstance(report, dict):
         raise ReviewerError("trusted mechanical report artifact must be a JSON object")
     validate_trusted_mechanical_artifact(report, state, run_data)
+    if confidential_mode.is_confidential(state):
+        ingest_confidential_report(state, report, report_path.read_bytes(), run_data)
     return report, str(run_data["url"]), run_data
+
+
+def confidential_objects(state: dict[str, Any], operation: str) -> confidential_snapshot.ObjectClient:
+    """This submission's capability-scoped object client. Tests replace it."""
+    return confidential_snapshot.ObjectClient(state["id"], operation)
+
+
+def confidential_descriptor(state: dict[str, Any], client: Any) -> dict[str, Any]:
+    snapshot_sha256 = confidential_snapshot.recorded_snapshot(state)
+    data = client.get(
+        f"{confidential_snapshot.snapshot_prefix(state['id'])}snapshot/descriptor.json", snapshot_sha256
+    )
+    try:
+        descriptor = json.loads(data)
+    except ValueError as error:
+        raise ReviewerError("snapshot descriptor is not JSON") from error
+    return confidential_snapshot.validate_descriptor(descriptor, state, snapshot_sha256=snapshot_sha256)
+
+
+def ingest_confidential_report(
+    state: dict[str, Any], report: dict[str, Any], report_bytes: bytes, run_data: dict[str, Any]
+) -> None:
+    """Bind a trusted confidential report to the recorded snapshot and store it privately.
+
+    The report must name the snapshot finalized before verification began and
+    come from the run attempt that snapshot recorded. Its bytes and run
+    provenance then go to the private bucket; State keeps only key and digest.
+    """
+    client = confidential_objects(state, "evidence")
+    descriptor = confidential_descriptor(state, client)
+    confidential_snapshot.bind_report_to_snapshot(
+        report, run_data, descriptor, confidential_snapshot.recorded_snapshot(state)
+    )
+    recorded = ((state.get("confidential") or {}).get("evidence") or {}).get("mechanical_report")
+    digest = confidential_snapshot.sha256_bytes(report_bytes)
+    if recorded is not None:
+        if recorded.get("sha256") != digest:
+            raise ReviewerError("mechanical report differs from the confidential evidence already recorded")
+        return
+    if os.environ.get("PALOMAR_ALLOW_STATE_WRITES") != "1":
+        return
+    entry = client.put_evidence("mechanical-report", report_bytes)
+    record_confidential_evidence(state, "mechanical_report", entry, caller_workflow={
+        "commit": run_data["headSha"],
+        "template_sha256": run_data["callerTemplateSha256"],
+        "pipeline_commit": run_data["pipelineCommit"],
+    })
+
+
+def record_confidential_evidence(
+    state: dict[str, Any], kind: str, entry: dict[str, str], **extra: Any
+) -> None:
+    """Record one evidence pointer (key and digest only) in the State record."""
+    fresh = submission_state(state["id"])
+    if fresh is None:
+        raise ReviewerError(f"submission {state['id']} disappeared while its evidence was stored")
+    block = dict(fresh.get("confidential") or {})
+    evidence = dict(block.get("evidence") or {})
+    if kind in evidence and evidence[kind] != entry:
+        raise ReviewerError(f"confidential {kind} evidence is already recorded with another digest")
+    evidence[kind] = entry
+    evidence.update(extra)
+    block["evidence"] = evidence
+    written = put_state(
+        f"submissions/{state['id']}/state.json", {**fresh, "confidential": block},
+        f"Record confidential evidence ({state['id']})", blob_sha=fresh.get("_blob_sha"),
+    )
+    state["confidential"] = block
+    if isinstance(written, str) and written:
+        state["_blob_sha"] = written
 
 
 DIAGNOSTICS_SCHEMA_VERSION = 1
@@ -4423,13 +4560,20 @@ def deliver_review(
                 "the prior review has a retained registration identity; reconcile it "
                 "before delivering a replacement review"
             )
-    existing = state_json(f"submissions/{state['id']}/review.json")
-    put_state(
-        f"submissions/{state['id']}/review.json",
-        review,
-        f"Deliver review for {state['id']}",
-        blob_sha=(existing or {}).get("_blob_sha"),
-    )
+    if confidential_mode.is_confidential(state):
+        # Review prose is content-bearing: it goes to the private bucket, and
+        # State keeps only its key and digest (contract v2 section 3.4).
+        review_bytes = confidential_snapshot.canonical_bytes(review)
+        entry = confidential_objects(state, "evidence").put_evidence("review", review_bytes)
+        record_confidential_evidence(state, "review", entry)
+    else:
+        existing = state_json(f"submissions/{state['id']}/review.json")
+        put_state(
+            f"submissions/{state['id']}/review.json",
+            review,
+            f"Deliver review for {state['id']}",
+            blob_sha=(existing or {}).get("_blob_sha"),
+        )
     # Raw operational usage, not editorial content: it is kept with the private
     # record and never enters the registered one. Reviews are cumulative because
     # a redelivered review consumed model tokens twice. When the evidence is
@@ -5317,7 +5461,15 @@ def prepare_workspace(
     source_info = mechanical["source"]
     if mechanical["submission"]["submission_id"] != submission_id:
         raise ReviewerError("mechanical report names a different submission")
-    source_commit = clone_at(source_info["repository_url"], source_info["commit"], work / "source")
+    if confidential_mode.is_confidential(state):
+        # Only from the recorded snapshot's bundle. The upstream may be gone,
+        # rewritten or private to everyone but its author; it is never read.
+        confidential_snapshot.restore_source(
+            confidential_objects(state, "restore"), state, work / "source"
+        )
+        source_commit = source_info["commit"]
+    else:
+        source_commit = clone_at(source_info["repository_url"], source_info["commit"], work / "source")
     if source_commit != source_info["commit"]:
         raise ReviewerError("source checkout does not match mechanical report")
     source = work / "source"
@@ -7449,6 +7601,23 @@ def _record_public_identity_published(
     )
 
 
+def read_delivered_review(record: dict[str, Any]) -> dict[str, Any] | None:
+    """The delivered review, from the private bucket for a confidential record."""
+    if not confidential_mode.is_confidential(record):
+        return state_json(f"submissions/{record['id']}/review.json")
+    entry = ((record.get("confidential") or {}).get("evidence") or {}).get("review")
+    if entry is None:
+        return None
+    data = confidential_objects(record, "restore").get(entry["key"], entry["sha256"])
+    try:
+        review = json.loads(data)
+    except ValueError as error:
+        raise ReviewerError("stored confidential review is not JSON") from error
+    if not isinstance(review, dict) or confidential_snapshot.canonical_bytes(review) != data:
+        raise ReviewerError("stored confidential review is not canonical JSON")
+    return review
+
+
 def delivered_review(submission_id: str) -> dict[str, Any]:
     """The exact review the submitter was shown."""
     review = state_json(f"submissions/{submission_id}/review.json")
@@ -8375,7 +8544,7 @@ def _delivered_review_needs_rerun(record: dict[str, Any]) -> bool:
         )
     if record.get("review_schema_version") == REVIEW_SCHEMA_VERSION:
         return False
-    review = state_json(f"submissions/{record['id']}/review.json")
+    review = read_delivered_review(record)
     return not (
         isinstance(review, dict)
         and review.get("schema_version") == REVIEW_SCHEMA_VERSION
