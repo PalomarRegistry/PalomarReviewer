@@ -4369,6 +4369,7 @@ class ReviewerTests(UsesCapabilities, unittest.TestCase):
                 "formalization": {"path": "formalization.yaml"},
                 "lakefile": {"path": "lakefile.toml"},
                 "lean_toolchain_path": "lean-toolchain",
+                "workflow_url": "https://github.com/PalomarRegistry/PalomarSubmission/actions/runs/1",
             }
             report["source"] = {
                 **source,
