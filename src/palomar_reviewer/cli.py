@@ -3640,7 +3640,17 @@ def _acquire_registration_lock(
         registration_checkpoint.validate_lock(current, path=path)
         holder = current.get("holder")
         if isinstance(holder, dict) and holder.get("submission_id") != state["id"]:
-            current = _reclaim_inactive_registration_lock(path, current)
+            reclaimed = _reclaim_inactive_registration_lock(path, current)
+            if reclaimed.get("holder") is None:
+                # This identity was derived from a Database checkout taken
+                # while that holder still owned the allocation, and the holder
+                # may have registered the very serial computed here since. A
+                # later pass clones afresh after the reclaim instead.
+                raise RegistrationDeferred(
+                    f"registration allocation {scope['kind']} {scope['value']} was "
+                    "reclaimed from a finished holder; registering in the next pass"
+                )
+            current = reclaimed
             holder = current.get("holder")
         if isinstance(holder, dict):
             if (
@@ -3881,13 +3891,40 @@ def _reclaim_inactive_registration_lock(path: str, lock: dict[str, Any]) -> dict
                 return lock
             _release_unpublished_attempt(state, identity)
         else:
-            # The holder never saved this identity, so nothing anywhere names
-            # it: an acquisition the pass that took it did not finish.
-            _write_lock(
+            # The holder never saved this identity: an acquisition the pass
+            # that took it did not finish. Fence it first, so a pass still
+            # finishing that acquisition cannot go on to hold it, then look
+            # again, because it may have saved the attempt in the meantime.
+            fenced = _write_lock(
                 path,
-                _empty_lock(scope, blob_sha=lock.get("_blob_sha")),
-                f"Reclaim registration allocation from {status} {submission_id}",
+                {**lock, "holder": {**holder, "status": "releasing"}, "updated_at": utc_now()},
+                f"Fence registration allocation from {status} {submission_id}",
             )
+            again = submission_state(submission_id)
+            attempt = again.get("registration_attempt") if isinstance(again, dict) else None
+            try:
+                saved = _attempt_identity(attempt) if isinstance(attempt, dict) else None
+            except ReviewerError:
+                saved = None
+            if again is None or (saved is not None and saved != identity):
+                print(f"::error::registration allocation {label} was fenced from {submission_id}, "
+                      "whose record then changed; it needs a person")
+                return fenced
+            if saved == identity:
+                if (
+                    attempt.get("schema_version") != 3
+                    or registration_checkpoint.matching_public_use(again, identity) is not None
+                ):
+                    print(f"::error::registration allocation {label} was fenced from "
+                          f"{submission_id}, which saved it meanwhile; it needs a person")
+                    return fenced
+                _release_unpublished_attempt(again, identity)
+            else:
+                _write_lock(
+                    path,
+                    _empty_lock(scope, blob_sha=fenced.get("_blob_sha")),
+                    f"Reclaim registration allocation from {status} {submission_id}",
+                )
         print(f"released registration allocation {label} left by {status} {submission_id}")
     else:
         return lock
@@ -4098,8 +4135,7 @@ def record_already_registered(
         "next_action": (
             f"To register this commit as a new version of {registration_id}, submit it "
             f"again with Existing Palomar ID set to {registration_id}. If this commit is "
-            "already one of that result's versions, nothing more is needed; you can "
-            "withdraw this submission."
+            "already one of that result's versions, nothing more is needed."
         ),
         "retryable": False,
         "repairable": False,
@@ -8036,11 +8072,17 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
     """
     deadline = time.monotonic() + max(0.0, wait_seconds)
     updated_branch = False
+    rerun_of: tuple[object, object] | None = None
     reran_validation = False
     while True:
         view = view_database_pr(pr)
         merge_state = str(view.get("mergeStateStatus") or "UNKNOWN").upper()
-        if (
+        observed = view.get("validation_run") or {}
+        observed_key = (observed.get("id"), observed.get("run_attempt") or 1)
+        if view["validation"] == "failed" and rerun_of is not None and observed_key == rerun_of:
+            # Actions has not shown the rerun yet; this is the attempt it replaces.
+            view["validation"] = "pending"
+        elif (
             view["validation"] == "failed"
             and not reran_validation
             and str(view.get("state") or "").upper() == "OPEN"
@@ -8050,6 +8092,7 @@ def await_database_checks(pr: int, wait_seconds: float) -> dict[str, Any]:
             # its attempt, so the next look sees it pending and then decided.
             reran_validation = True
             if rerun_failed_validation(pr, view.get("validation_run")):
+                rerun_of = observed_key
                 view["validation"] = "pending"
         if (
             str(view.get("state") or "").upper() != "OPEN"

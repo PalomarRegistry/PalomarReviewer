@@ -229,7 +229,9 @@ class ReclaimTests(unittest.TestCase):
             cli.defer_if_registration_lock_held(waiting())
         self.assertEqual(store.writes, [])
 
-    def test_acquisition_reclaims_an_inactive_holder_and_takes_the_lock(self):
+    def test_acquisition_reclaims_an_inactive_holder_but_takes_it_next_pass(self):
+        """The identity was computed from a Database checkout taken while the
+        holder still owned the allocation, so it is not used."""
         held = identity()
         store = self.store(submission(
             HOLDER, "registered",
@@ -238,14 +240,44 @@ class ReclaimTests(unittest.TestCase):
             public_identity_uses=[public_use("registered", held)],
         ))
         mine = identity(serial=2, submission=WAITING)
-        with store.installed():
+        with store.installed(), self.assertRaisesRegex(cli.RegistrationDeferred, "next pass"):
             cli._acquire_registration_lock(
                 state=store.read(f"submissions/{WAITING}/state.json"),
                 identity=mine,
                 database_base="3" * 40,
             )
-        self.assertEqual(store.lock()["holder"]["submission_id"], WAITING)
-        self.assertEqual(store.lock()["holder"]["status"], "acquiring")
+        self.assertIsNone(store.lock()["holder"])
+
+    def test_an_unsaved_acquisition_is_fenced_before_it_is_cleared(self):
+        store = self.store(submission(HOLDER, "withdrawn"), lock_status="acquiring")
+        with store.installed():
+            cli.defer_if_registration_lock_held(waiting())
+        self.assertEqual(
+            [message.split(" from ")[0] for _, message in store.writes],
+            ["Fence registration allocation", "Reclaim registration allocation"],
+        )
+
+    def test_an_acquisition_saved_while_it_was_being_fenced_is_released_with_its_attempt(self):
+        held = identity()
+        state_path = f"submissions/{HOLDER}/state.json"
+        store = self.store(submission(HOLDER, "withdrawn"), lock_status="acquiring")
+        reads = {"count": 0}
+        original = store.read
+
+        def read(path):
+            if path == state_path:
+                reads["count"] += 1
+                if reads["count"] == 2:
+                    # The holder's pass saved its attempt after the first look.
+                    store.files[state_path]["registration_attempt"] = {
+                        "schema_version": 3, **held,
+                    }
+            return original(path)
+
+        with store.installed(), mock.patch.object(cli, "state_json", side_effect=read):
+            cli.defer_if_registration_lock_held(waiting())
+        self.assertIsNone(store.lock()["holder"])
+        self.assertIsNone(store.files[state_path]["registration_attempt"])
 
 
 class PauseReleaseTests(unittest.TestCase):
@@ -454,6 +486,23 @@ class ValidationRerunTests(unittest.TestCase):
             ran.call_args.args[0],
             ["gh", "run", "rerun", "99", "--failed", "--repo", cli.DATABASE_REPO],
         )
+
+    def test_the_attempt_a_rerun_replaces_is_not_its_verdict(self):
+        """Actions may still show the failed attempt just after the rerun."""
+        answer = self.github([
+            [run_answer(self.HEAD, "failure", 1)],
+            [run_answer(self.HEAD, "failure", 1)],
+            [run_answer(self.HEAD, "success", 2)],
+        ])
+        reran = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(cli, "gh", side_effect=answer),
+            mock.patch.object(cli, "run", return_value=reran) as ran,
+            mock.patch.object(cli.time, "sleep"),
+        ):
+            view = cli.await_database_checks(7, 3600)
+        self.assertEqual(view["validation"], "passed")
+        ran.assert_called_once()
 
     def test_a_validation_that_keeps_failing_is_left_for_a_person(self):
         answer = self.github([[run_answer(self.HEAD, "failure", cli.DATABASE_VALIDATE_ATTEMPT_LIMIT)]])
