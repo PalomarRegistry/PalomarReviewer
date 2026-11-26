@@ -7338,10 +7338,12 @@ class DatabaseChangeWaitTests(unittest.TestCase):
         self.assertEqual(slept, [])
 
     def test_a_failed_validation_is_not_waited_for(self):
-        """A failed validation needs a new commit, not more patience."""
+        """A validation that failed past its reruns needs a person, not patience."""
         answer, _ = self.gh(
             [{"state": "OPEN", "mergeStateStatus": "UNSTABLE", "headRefOid": "f" * 40}],
-            [validation_run("f" * 40, "failure")],
+            [validation_run(
+                "f" * 40, "failure", id=7, run_attempt=cli.DATABASE_VALIDATE_ATTEMPT_LIMIT,
+            )],
         )
         slept = []
         with (

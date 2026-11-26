@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import ReviewerError
+from .errors import AlreadyRegisteredError, ReviewerError
 
 SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 3
@@ -757,9 +757,10 @@ def registration_identity(
                 f"requested existing ID has no stable identity binding: {identifier}"
             )
         if identity_binding["registration_id"] != identifier:
-            raise ReviewerError(
+            raise AlreadyRegisteredError(
                 "this repository, project, and Comparator configuration already belong "
-                f"to {identity_binding['registration_id']}"
+                f"to {identity_binding['registration_id']}",
+                registration_id=str(identity_binding["registration_id"]),
             )
         versions = result["versions"]
         if len(versions) >= MAX_VERSIONS_PER_RESULT:
@@ -797,10 +798,11 @@ def registration_identity(
         database, submitted_identity, git_env=git_env
     )
     if identity_binding is not None:
-        raise ReviewerError(
+        raise AlreadyRegisteredError(
             "this repository, project, and Comparator configuration are already "
             f"registered as {identity_binding['registration_id']}; submit an update "
-            "using that Palomar ID"
+            "using that Palomar ID",
+            registration_id=str(identity_binding["registration_id"]),
         )
 
     try:
