@@ -27,6 +27,7 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 DIAGNOSTIC_CODE_RE = re.compile(r"[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+\Z")
 # Both run origins: a confidential submission's runs are in the private caller.
 RUN_URL_RE = confidential.RUN_URL_RE
+REDACTED_DIAGNOSTIC_FIELDS = ("summary", "explanation", "next_action", "location", "field")
 DISPOSITION_LABELS = {
     "recovered": "Recovered: the same commit and configuration verified successfully.",
     "superseded": "Superseded: a newer commit for this configuration verified successfully. "
@@ -137,11 +138,13 @@ def validated_alert_items(state: dict[str, Any]) -> list[dict[str, Any]]:
         code = diagnostic.get("code")
         if not isinstance(code, str) or not DIAGNOSTIC_CODE_RE.fullmatch(code):
             raise ReviewerError("operator alert diagnostic code is malformed")
+        # A confidential submission's diagnostics keep no prose in State (it is
+        # in the private bucket), so a diagnostic with none of the three prose
+        # fields is the redacted shape; it can only be rendered confidentially.
+        redacted = not any(name in diagnostic for name in REDACTED_DIAGNOSTIC_FIELDS)
         for field, maximum in (
             ("stage", 500),
-            ("summary", 500),
-            ("explanation", 2_000),
-            ("next_action", 2_000),
+            *(() if redacted else (("summary", 500), ("explanation", 2_000), ("next_action", 2_000))),
         ):
             value = diagnostic.get(field)
             if not isinstance(value, str) or not value or len(value) > maximum:
@@ -215,6 +218,12 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
             suffix += (f"\nEvidence: {evidence['run_url']} (submission `{evidence['submission_id']}`, "
                        f"commit `{evidence['commit']}`).")
         return original + suffix
+    if any(
+        "summary" not in diagnostic
+        for diagnostic in (state.get("failure") or {}).get("diagnostics", [])
+        if isinstance(diagnostic, dict)
+    ):
+        raise ReviewerError("a redacted diagnostic has only the confidential alert form")
     submission_id = state.get("id")
     repository = state.get("repository")
     commit = state.get("commit")

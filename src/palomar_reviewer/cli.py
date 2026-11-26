@@ -3592,6 +3592,8 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
                 "to request access to larger runners. Automatic resource retries require an "
                 "allowlisted GitHub account; repeatedly submitting the same commit will not grant access."
             )
+    if confidential_mode.is_confidential(state):
+        failure = redacted_confidential_failure(state, failure)
     operator_alerts = operator_notifications.queued_alerts(
         state,
         failure,
@@ -3604,6 +3606,60 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         failure=failure,
         operator_alerts=operator_alerts,
     )
+
+
+CONFIDENTIAL_ERROR_FIELDS = ("review_error", "registration_error", "renderability_error")
+
+
+def store_confidential_text(state: dict[str, Any], text: dict[str, Any]) -> dict[str, str]:
+    """Put one bundle of content-bearing failure text in the private bucket."""
+    data = confidential_snapshot.canonical_bytes(text)
+    return confidential_objects(state, "evidence").put_evidence("failure-text", data)
+
+
+def redacted_confidential_failure(state: dict[str, Any], failure: dict[str, Any]) -> dict[str, Any]:
+    """A confidential failure as State keeps it: codes and flags, never prose.
+
+    The full diagnostics (summaries, explanations, next actions, locations)
+    go to the private bucket, where the status page reads them; State keeps
+    phase, stage, code, owner and retryable, and the object's key and digest.
+    No repair draft is offered: a repair would be public.
+    """
+    redacted = copy.deepcopy(failure)
+    redacted.pop("repair_draft", None)
+    diagnostics = redacted.get("diagnostics") or []
+    redacted["diagnostics"] = [
+        {key: value for key, value in item.items()
+         if key not in operator_notifications.REDACTED_DIAGNOSTIC_FIELDS}
+        if isinstance(item, dict) else item
+        for item in diagnostics
+    ]
+    redacted["text"] = store_confidential_text(state, {"failure": failure})
+    return redacted
+
+
+def redacted_confidential_fields(state: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+    """Move error strings out of a confidential State write.
+
+    `review_error`, `registration_error` and `renderability_error` are free
+    text built from exceptions, which can quote paths, declarations and
+    renderer output. They go to the private bucket and are written as null,
+    with the object recorded as `confidential.error_text`.
+    """
+    text = {field: fields[field] for field in CONFIDENTIAL_ERROR_FIELDS if fields.get(field)}
+    failure = fields.get("registration_failure")
+    if isinstance(failure, dict) and failure.get("detail"):
+        text["registration_failure_detail"] = failure["detail"]
+        fields = {**fields, "registration_failure": {k: v for k, v in failure.items() if k != "detail"}}
+    if not text:
+        return fields
+    pointer = store_confidential_text(state, text)
+    block = {**(fields.get("confidential") or state.get("confidential") or {}), "error_text": pointer}
+    return {
+        **fields,
+        **{field: None for field in CONFIDENTIAL_ERROR_FIELDS if field in text},
+        "confidential": block,
+    }
 
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
@@ -3876,6 +3932,8 @@ def advance_state(
     state: dict[str, Any], status: str, note: str, **fields: Any
 ) -> dict[str, Any]:
     """Record a transition the submitter will see on their status page."""
+    if confidential_mode.is_confidential(state):
+        fields = redacted_confidential_fields(state, fields)
     updated = dict(state)
     updated.update(fields)
     updated["status"] = status
@@ -5468,6 +5526,25 @@ def registration_schema_path(database: Path, *, schema_version: int) -> Path:
     return path
 
 
+def confidential_workspace_root() -> Path:
+    """Where a confidential review's prompts and model output live during the job.
+
+    Never under the work directory State uploads as the review-packet
+    artifact: a confidential packet is content-bearing (contract v2 3.4).
+    """
+    return Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "palomar-confidential-reviews"
+
+
+def submission_workspace(root: Path, submission_id: str, state: dict[str, Any] | None = None) -> Path:
+    """The submission's workspace, outside `root` for a confidential one."""
+    if not SUBMISSION_ID_RE.fullmatch(submission_id):
+        raise ReviewerError("submission id is malformed")
+    private = confidential_workspace_root() / submission_id
+    if state is not None:
+        return private if confidential_mode.is_confidential(state) else root / submission_id
+    return private if private.is_dir() else root / submission_id
+
+
 def prepare_workspace(
     submission_id: str,
     *,
@@ -5482,7 +5559,7 @@ def prepare_workspace(
             f"submission {submission_id} is {state.get('status')}, so there is nothing to review "
             "or register"
         )
-    work = root / submission_id
+    work = submission_workspace(root, submission_id, state)
     work.mkdir(parents=True, exist_ok=True)
     download_root = work / "mechanical-download"
     mechanical, report_url, run_data = mechanical_report(state, download_root)
@@ -6170,7 +6247,7 @@ def run_review(args: argparse.Namespace) -> int:
         )["id"]
     root = Path(args.work_dir).expanduser().resolve()
     if args.apply:
-        stored_path = root / args.submission / "review.json"
+        stored_path = submission_workspace(root, args.submission) / "review.json"
         if not stored_path.is_file():
             raise ReviewerError(
                 "no inspected dry-run review exists; run without --apply and inspect review.json first"
@@ -6213,7 +6290,7 @@ def run_review(args: argparse.Namespace) -> int:
             )
         # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
-        spend_path = root / args.submission / "spend.json"
+        spend_path = submission_workspace(root, args.submission) / "spend.json"
         spend = load_json(spend_path) if spend_path.is_file() else None
         state = deliver_review(
             state,

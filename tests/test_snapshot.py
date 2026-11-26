@@ -306,5 +306,115 @@ class EvidencePlacementTests(unittest.TestCase):
         self.assertIsNot(evidence, cli.confidential_objects(record, "restore"))
 
 
+RUNS_URL = "https://github.com/PalomarRegistry/PalomarConfidentialRuns/actions/runs/202"
+
+
+class ContentFreeStateTests(unittest.TestCase):
+    """Failure prose, error strings and packets never reach State or its artifacts."""
+
+    CANARY = "canary/secret-path/Main.lean: theorem private_lemma"
+
+    def setUp(self):
+        cli._OBJECT_CLIENTS.clear()
+        self.client = mock.Mock()
+        self.client.put_evidence.side_effect = lambda kind, data: {
+            "key": snapshot.evidence_key(SUBMISSION, kind, data), "sha256": snapshot.sha256_bytes(data)
+        }
+        patcher = mock.patch.object(cli, "confidential_objects", return_value=self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def record(self):
+        return {**state("a" * 64), "status": "verification-reporting", "_blob_sha": "b1",
+                "run": {"id": 202}}
+
+    def public_record(self):
+        private = {"visibility", "confidential"}
+        return {key: value for key, value in self.record().items() if key not in private}
+
+    def failure(self):
+        return {
+            "phase": "verification",
+            "run": {"id": 202, "url": RUNS_URL},
+            "repair_draft": {"x": self.CANARY},
+            "diagnostics": [{
+                "owner": "palomar", "code": "palomar.workflow_incomplete", "stage": "build",
+                "summary": self.CANARY, "explanation": self.CANARY, "next_action": self.CANARY,
+                "location": self.CANARY, "retryable": True,
+            }],
+        }
+
+    def test_a_confidential_failure_keeps_only_codes_and_its_alert_still_renders(self):
+        record = self.record()
+        failure = cli.redacted_confidential_failure(record, self.failure())
+        self.assertNotIn(self.CANARY, json.dumps(failure))
+        self.assertNotIn("repair_draft", failure)
+        self.assertEqual(failure["diagnostics"][0], {
+            "owner": "palomar", "code": "palomar.workflow_incomplete", "stage": "build", "retryable": True,
+        })
+        kind, data = self.client.put_evidence.call_args.args
+        self.assertEqual(kind, "failure-text")
+        self.assertIn(self.CANARY, data.decode())
+        self.assertEqual(failure["text"]["sha256"], snapshot.sha256_bytes(data))
+        outbox = cli.operator_notifications.queued_alerts(record, failure, queued_at="2026-11-20T10:00:00Z")
+        stored = {**record, "failure": failure, "operator_alerts": outbox}
+        message = cli.operator_notifications.alert_message(stored, outbox["items"][0])
+        self.assertIn("palomar.workflow_incomplete", message)
+        self.assertNotIn(self.CANARY, message)
+
+    def test_a_redacted_diagnostic_is_never_given_the_public_alert(self):
+        failure = cli.redacted_confidential_failure(self.record(), self.failure())
+        public = self.public_record()
+        outbox = cli.operator_notifications.queued_alerts(public, failure, queued_at="2026-11-20T10:00:00Z")
+        with self.assertRaisesRegex(ReviewerError, "only the confidential alert form"):
+            cli.operator_notifications.alert_message(
+                {**public, "failure": failure, "operator_alerts": outbox}, outbox["items"][0]
+            )
+
+    def test_error_strings_are_written_as_null_with_a_private_pointer(self):
+        writes = []
+        def put_state(_path, value, *_args, **_kwargs):
+            writes.append(value)
+
+        with mock.patch.object(cli, "put_state", side_effect=put_state):
+            cli.advance_state(
+                self.record(), "awaiting-review", "The automated review did not complete",
+                review_error=self.CANARY, renderability_error=self.CANARY,
+                registration_failure={"category": "transient", "detail": self.CANARY},
+            )
+        written = writes[-1]
+        self.assertNotIn(self.CANARY, json.dumps(written))
+        self.assertIsNone(written["review_error"])
+        self.assertIsNone(written["renderability_error"])
+        self.assertNotIn("detail", written["registration_failure"])
+        self.assertTrue(written["confidential"]["error_text"]["key"].startswith(
+            f"v2/{SUBMISSION}/evidence/failure-text/"
+        ))
+
+    def test_public_error_strings_are_unchanged(self):
+        record = self.public_record()
+        writes = []
+        def put_state(_path, value, *_args, **_kwargs):
+            writes.append(value)
+
+        with mock.patch.object(cli, "put_state", side_effect=put_state):
+            cli.advance_state(record, "awaiting-review", "note", review_error="plain text")
+        self.assertEqual(writes[-1]["review_error"], "plain text")
+        self.client.put_evidence.assert_not_called()
+
+    def test_a_confidential_workspace_is_outside_the_uploaded_packet_directory(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"RUNNER_TEMP": directory}
+        ):
+            root = Path(directory) / ".palomar-reviews"
+            work = cli.submission_workspace(root, SUBMISSION, self.record())
+            self.assertFalse(work.is_relative_to(root))
+            work.mkdir(parents=True)
+            self.assertEqual(cli.submission_workspace(root, SUBMISSION), work)
+            public = {key: value for key, value in self.record().items()
+                      if key not in {"visibility", "confidential"}}
+            self.assertEqual(cli.submission_workspace(root, SUBMISSION, public), root / SUBMISSION)
+
+
 if __name__ == "__main__":
     unittest.main()
