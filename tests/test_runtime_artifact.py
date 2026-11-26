@@ -134,6 +134,7 @@ class RuntimeArtifactTests(unittest.TestCase):
                 "palomar_reviewer/checkpoint.py",
                 "palomar_reviewer/cli.py",
                 "palomar_reviewer/confidential.py",
+                "palomar_reviewer/private_bucket.py",
                 "palomar_reviewer/engine.py",
                 "palomar_reviewer/errors.py",
                 "palomar_reviewer/mechanical.py",
