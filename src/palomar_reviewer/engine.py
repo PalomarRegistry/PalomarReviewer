@@ -83,6 +83,21 @@ def validate_config(engine: str, command: str | None) -> None:
         raise EngineError("--command is required with --engine command")
 
 
+def refuse_web_tools(engine: str, *, confidential: bool) -> None:
+    """Refuse any engine that could expose web tools to a confidential submission.
+
+    A web search sends its query, which can quote the submission, to a search
+    provider Palomar does not disclose as a processor. Codex is invoked with
+    `web_search="disabled"` on every pass; the Claude engine's literature pass
+    has WebSearch and WebFetch, and a custom command's tools are unknown.
+    """
+    if confidential and engine != "codex":
+        raise EngineError(
+            f"the {engine} engine may expose web tools, which a confidential submission refuses; "
+            "use the codex engine"
+        )
+
+
 def parse_json(text: str) -> dict[str, Any]:
     """Require the complete stripped engine output to be one JSON object."""
     try:

@@ -15,12 +15,14 @@ from urllib.parse import quote
 
 import jsonschema
 
+from . import confidential
 from .errors import ReviewerError
 
-# This producer identity is part of both the report schema and the CLI's trusted
-# workflow queries. The current database schema also pins it in registered
-# verification provenance, so all three consumers share this canonical value.
-SUBMISSION_REPO = "PalomarRegistry/PalomarSubmission"
+# The public producer identity. A confidential submission's runs come from the
+# private caller repository instead (confidential.RUNS_REPO), which calls this
+# repository's workflows; which of the two a submission's runs must come from is
+# decided by its State record, never by the run (confidential.run_origin).
+SUBMISSION_REPO = confidential.SUBMISSION_REPO
 
 TOOL_COMMIT_FIELDS = ["comparator_commit", "lean4export_commit", "landrun_commit", "nanoda_commit"]
 TOOLCHAIN_PROVENANCE_FIELDS = [
@@ -280,12 +282,19 @@ MECHANICAL_REPORT_SCHEMA = {
         "checked_at": {"type": "string", "format": "date-time"},
         "workflow_url": {
             "type": "string",
-            "pattern": rf"^https://github\.com/{re.escape(SUBMISSION_REPO)}/actions/runs/[1-9][0-9]*$",
+            "pattern": (
+                r"^https://github\.com/PalomarRegistry/"
+                r"(?:PalomarSubmission|PalomarConfidentialRuns)/actions/runs/[1-9][0-9]*$"
+            ),
         },
         "existing_id": {
             "type": ["string", "null"],
             "pattern": r"^PALOMAR-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$",
         },
+        # Where the run happened and which PalomarSubmission commit it executed.
+        # Required of a confidential report, checked whenever present.
+        "run_repository": {"enum": [SUBMISSION_REPO, confidential.RUNS_REPO]},
+        "pipeline_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "project_dependencies": {
             "type": "array",
             "items": {
@@ -667,6 +676,12 @@ def validate_report_contract(
         raise ReviewerError("mechanical report names a different submission")
     if report["workflow_url"] != run_data.get("url"):
         raise ReviewerError("mechanical report does not name its trusted workflow run")
+    origin = confidential.run_origin(state)
+    if confidential.origin_for_url(report["workflow_url"]) != origin:
+        raise ReviewerError(
+            "mechanical report comes from a run repository this submission's visibility "
+            "does not allow"
+        )
     source = report["source"]
     if source["repository_url"] != f"https://github.com/{source['repository']}":
         raise ReviewerError("mechanical report source repository URL is inconsistent")
@@ -718,5 +733,24 @@ def validate_report_contract(
         raise ReviewerError(
             f"verification run was triggered by {run_data.get('event')!r}, not a dispatch"
         )
-
+    if "run_repository" in report and report["run_repository"] != origin.repository:
+        raise ReviewerError("mechanical report names a different run repository than its run")
+    if origin.confidential:
+        # The caller's own commit says nothing about the verifier. What ran is
+        # the PalomarSubmission commit the caller called, which the run
+        # normalization already bound to the reviewed caller template. The
+        # report must say it executed exactly that commit: the caller's pin
+        # fixes only the workflow file, and `pipeline_commit` the scripts.
+        pipeline_commit = run_data.get("pipelineCommit")
+        if not isinstance(pipeline_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", pipeline_commit):
+            raise ReviewerError("confidential verification run has no trusted pipeline commit")
+        if report.get("run_repository") != origin.repository:
+            raise ReviewerError("confidential mechanical report does not name its run repository")
+        if report.get("pipeline_commit") != pipeline_commit:
+            raise ReviewerError(
+                "confidential mechanical report did not execute the pipeline commit its run called"
+            )
+        return pipeline_commit
+    if "pipeline_commit" in report and report["pipeline_commit"] != head_sha:
+        raise ReviewerError("mechanical report did not execute its run's workflow commit")
     return head_sha

@@ -1,0 +1,80 @@
+name: Render challenge
+# Request id only: nothing here names the source repository or commit.
+run-name: Render challenge [${{ inputs.request_id }}]
+
+# Generated from templates/render.yml by substituting one PalomarSubmission
+# commit. Palomar's reviewer accepts a run only if this file is byte-for-byte
+# that substitution, so edit the template, never this file.
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: GitHub repository in owner/name form
+        required: true
+        type: string
+      commit:
+        description: Accepted 40-character source commit
+        required: true
+        type: string
+      challenge_sha256:
+        description: Accepted Challenge source SHA-256
+        required: true
+        type: string
+      request_id:
+        description: Unique lowercase hexadecimal publication request ID
+        required: true
+        type: string
+      execution_profile:
+        description: Approved execution profile inherited from verification (blank selects the catalogue default)
+        required: false
+        default: ""
+        type: string
+      project_path:
+        description: Accepted repository-relative project directory (blank means root)
+        required: false
+        default: ""
+        type: string
+      challenge_path:
+        description: Accepted repository-relative Challenge source path
+        required: true
+        type: string
+      solution_path:
+        description: Accepted repository-relative Solution source path
+        required: true
+        type: string
+      comparator_config_path:
+        description: Accepted repository-relative Comparator configuration path
+        required: true
+        type: string
+      lakefile_path:
+        description: Accepted repository-relative Lakefile path
+        required: true
+        type: string
+      lean_toolchain_path:
+        description: Accepted repository-relative lean-toolchain path
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    permissions:
+      contents: read
+    # The uses pin fixes the workflow file; pipeline_commit fixes the scripts
+    # it checks out and runs. They are the same commit.
+    uses: PalomarRegistry/PalomarSubmission/.github/workflows/render-challenge.yml@<pipeline-commit>
+    with:
+      repository: ${{ inputs.repository }}
+      commit: ${{ inputs.commit }}
+      pipeline_commit: <pipeline-commit>
+      challenge_sha256: ${{ inputs.challenge_sha256 }}
+      request_id: ${{ inputs.request_id }}
+      execution_profile: ${{ inputs.execution_profile }}
+      project_path: ${{ inputs.project_path }}
+      challenge_path: ${{ inputs.challenge_path }}
+      solution_path: ${{ inputs.solution_path }}
+      comparator_config_path: ${{ inputs.comparator_config_path }}
+      lakefile_path: ${{ inputs.lakefile_path }}
+      lean_toolchain_path: ${{ inputs.lean_toolchain_path }}

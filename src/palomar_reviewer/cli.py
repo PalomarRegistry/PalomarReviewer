@@ -33,6 +33,7 @@ from . import alert_recovery, resource_failover, workflow_recovery
 from . import authorization as registration_authorization
 from . import broker as model_broker
 from . import checkpoint as registration_checkpoint
+from . import confidential as confidential_mode
 from . import engine as engine_execution
 from . import mechanical as mechanical_evidence
 from . import operator_alerts as operator_notifications
@@ -2122,9 +2123,7 @@ def validate_renderability_receipt(
     ):
         raise ReviewerError("saved renderability receipt has an invalid rendered_at")
     if not isinstance(value.get("workflow_url"), str) or not re.fullmatch(
-        rf"https://github\.com/{re.escape(mechanical_evidence.SUBMISSION_REPO)}"
-        r"/actions/runs/[1-9][0-9]*",
-        value["workflow_url"],
+        render_origin(mechanical).run_url_pattern(), value["workflow_url"],
     ):
         raise ReviewerError("saved renderability receipt has an invalid workflow_url")
     if value != expected_receipt:
@@ -2178,12 +2177,46 @@ def validate_render_result(result: Path, mechanical: dict[str, Any]) -> tuple[di
         raise ReviewerError("render result has no valid rendered_at timestamp")
     workflow_url = report.get("workflow_url")
     if not isinstance(workflow_url, str) or not re.fullmatch(
-        rf"https://github\.com/{re.escape(mechanical_evidence.SUBMISSION_REPO)}"
-        r"/actions/runs/[1-9][0-9]*",
-        workflow_url,
+        render_origin(mechanical).run_url_pattern(), workflow_url,
     ):
-        raise ReviewerError("render result has no valid PalomarSubmission workflow URL")
+        raise ReviewerError("render result has no valid workflow URL for this submission's runs")
+    if "run_repository" in report and report["run_repository"] != render_origin(mechanical).repository:
+        raise ReviewerError("render result names a different run repository than its run")
     return report, bundle
+
+
+def render_origin(mechanical: dict[str, Any]) -> confidential_mode.RunOrigin:
+    """A Challenge is rendered where it was verified.
+
+    The mechanical report's run was already bound to the submission's
+    visibility, so its repository decides where the render must run too.
+    """
+    return confidential_mode.origin_for_url(mechanical.get("workflow_url"))
+
+
+def confidential_render_pipeline_commit(run_id: int | str) -> str:
+    """The PalomarSubmission commit a confidential render run called, after checking its caller."""
+    document = json.loads(gh(["api", f"repos/{confidential_mode.RUNS_REPO}/actions/runs/{run_id}"]))
+    if not isinstance(document, dict) or document.get("event") != "workflow_dispatch":
+        raise RenderRequestError("confidential render run was not workflow-dispatched")
+    caller = confidential_mode.validate_caller_run(
+        document, confidential_mode.CONFIDENTIAL_ORIGIN.render_workflow, confidential_caller_file,
+        confidential_template_sums, dict(os.environ),
+    )
+    validate_workflow_commit_on_main({}, head_sha=caller.pipeline_commit)
+    return caller.pipeline_commit
+
+
+def render_commit_for(run_data: dict[str, Any], origin: confidential_mode.RunOrigin) -> str:
+    """The renderer commit a run's result must name.
+
+    A public render runs PalomarSubmission itself, so that is the run's head.
+    A confidential caller's head is its own commit; the renderer is the
+    PalomarSubmission commit it called.
+    """
+    if origin.confidential:
+        return confidential_render_pipeline_commit(run_data["databaseId"])
+    return run_data.get("headSha")
 
 
 def request_render(
@@ -2208,12 +2241,13 @@ def request_render(
     else:
         request_id = uuid.uuid4().hex
     challenge = mechanical["challenge"]
+    origin = render_origin(mechanical)
     dispatch = [
         "workflow",
         "run",
-        RENDER_WORKFLOW,
+        origin.render_workflow,
         "--repo",
-        mechanical_evidence.SUBMISSION_REPO,
+        origin.repository,
         "-f",
         f"repository={mechanical['source']['repository']}",
         "-f",
@@ -2243,12 +2277,12 @@ def request_render(
     # An omitted dispatch input selects the catalogue's current default,
     # which can differ from the accepted report's inherited/legacy profile.
     dispatch.extend(["-f", f"execution_profile={profile}"])
-    expected_title = (
-        f"Render {mechanical['source']['repository']}@{mechanical['source']['commit']} [{request_id}]"
-    )
+    expected_titles = origin.render_titles(mechanical, request_id)
     run_data: dict[str, Any] | None = None
     if pending_render is not None:
-        run_data = resume_render(pending_render, expected_title, dispatch, save_pending_render)
+        run_data = resume_render(
+            pending_render, expected_titles, dispatch, save_pending_render, origin=origin
+        )
         if run_data.get("status") != "completed":
             raise RenderPending(f"Render workflow remains {run_data.get('status')}: {run_data['url']}")
     else:
@@ -2261,9 +2295,9 @@ def request_render(
                     "run",
                     "list",
                     "--repo",
-                    mechanical_evidence.SUBMISSION_REPO,
+                    origin.repository,
                     "--workflow",
-                    RENDER_WORKFLOW,
+                    origin.render_workflow,
                     "--event",
                     "workflow_dispatch",
                     "--limit",
@@ -2273,7 +2307,9 @@ def request_render(
                 ]
             )
         )
-        run_data = next((item for item in runs if item.get("displayTitle") == expected_title), None)
+        run_data = next(
+            (item for item in runs if item.get("displayTitle") in expected_titles), None
+        )
         if run_data is not None:
             break
         time.sleep(5)
@@ -2291,7 +2327,7 @@ def request_render(
             "watch",
             run_id,
             "--repo",
-            mechanical_evidence.SUBMISSION_REPO,
+            origin.repository,
             "--exit-status",
             "--interval",
             "120",
@@ -2304,7 +2340,7 @@ def request_render(
         # continues. Its exit status is not a rendering verdict. Reconcile one
         # authoritative run snapshot before looking for a failure artifact.
         observed = json.loads(gh([
-            "run", "view", run_id, "--repo", mechanical_evidence.SUBMISSION_REPO,
+            "run", "view", run_id, "--repo", origin.repository,
             "--json", "status,conclusion,headSha,url",
         ]))
         if observed.get("headSha") != run_data.get("headSha") or observed.get("url") != run_data.get("url"):
@@ -2318,7 +2354,9 @@ def request_render(
         if observed.get("conclusion") == "success":
             watched = subprocess.CompletedProcess(watched.args, 0, watched.stdout, watched.stderr)
     if watched.returncode:
-        failure_report = render_failure_report(work, run_id, request_id)
+        failure_report = render_failure_report(
+            work, run_id, request_id, repository=origin.repository
+        )
         reported_errors = failure_report.get("errors") if failure_report is not None else None
         problems = reported_errors if isinstance(reported_errors, list) else []
         if problems:
@@ -2337,12 +2375,17 @@ def request_render(
             deterministic = False
         if failure_report is not None:
             raw_diagnostics = failure_report.get("diagnostics")
+            try:
+                expected_renderer = render_commit_for(run_data, origin)
+            except (ReviewerError, ValueError):
+                expected_renderer = None
             trusted_binding = (
                 # Render results of schema 2 (landrun) and 3 (bubblewrap) fail
                 # the same way and carry the same diagnostics.
-                failure_report.get("schema_version") in {2, 3}
+                expected_renderer is not None
+                and failure_report.get("schema_version") in {2, 3}
                 and failure_report.get("source") == expected_render_source(mechanical)
-                and failure_report.get("renderer_commit") == run_data.get("headSha")
+                and failure_report.get("renderer_commit") == expected_renderer
                 and failure_report.get("workflow_url") == run_data.get("url")
                 and failure_report.get("diagnostics_schema_version") == DIAGNOSTICS_SCHEMA_VERSION
             )
@@ -2393,7 +2436,7 @@ def request_render(
             "download",
             run_id,
             "--repo",
-            mechanical_evidence.SUBMISSION_REPO,
+            origin.repository,
             "--name",
             f"challenge-render-{request_id}",
             "--dir",
@@ -2407,7 +2450,7 @@ def request_render(
         raise RenderRequestError(f"downloaded render result is invalid: {error}") from error
     if not isinstance(report, dict):
         raise RenderRequestError("downloaded render report must be a JSON object")
-    if report.get("renderer_commit") != run_data.get("headSha"):
+    if report.get("renderer_commit") != render_commit_for(run_data, origin):
         raise RenderRequestError("downloaded render result does not match its workflow commit")
     if report.get("workflow_url") != run_data.get("url"):
         raise RenderRequestError("downloaded render result does not match its workflow run")
@@ -2415,8 +2458,9 @@ def request_render(
 
 
 def resume_render(
-    pending: dict[str, Any], expected_title: str, dispatch: list[str],
+    pending: dict[str, Any], expected_titles: tuple[str, ...], dispatch: list[str],
     save: Callable[[dict[str, Any]], None],
+    *, origin: confidential_mode.RunOrigin = confidential_mode.PUBLIC_ORIGIN,
 ) -> dict[str, Any]:
     """Recover a durable dispatch before making any new side effect.
 
@@ -2432,15 +2476,15 @@ def resume_render(
             ):
                 raise ValueError("pending rendering run is invalid")
             observed = json.loads(gh([
-                "api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{pinned['id']}",
+                "api", f"repos/{origin.repository}/actions/runs/{pinned['id']}",
             ]))
             if (
                 observed.get("id") != pinned["id"]
                 or observed.get("html_url") != pinned.get("url")
                 or observed.get("head_sha") != pinned.get("head_sha")
-                or observed.get("display_title") != expected_title
+                or observed.get("display_title") not in expected_titles
                 or observed.get("event") != "workflow_dispatch"
-                or observed.get("path") != f".github/workflows/{RENDER_WORKFLOW}"
+                or observed.get("path") != f".github/workflows/{origin.render_workflow}"
             ):
                 raise ValueError("pending rendering workflow identity changed")
             return {
@@ -2449,8 +2493,8 @@ def resume_render(
                 "conclusion": observed.get("conclusion"),
             }
         runs = json.loads(gh([
-            "run", "list", "--repo", mechanical_evidence.SUBMISSION_REPO,
-            "--workflow", RENDER_WORKFLOW, "--event", "workflow_dispatch",
+            "run", "list", "--repo", origin.repository,
+            "--workflow", origin.render_workflow, "--event", "workflow_dispatch",
             "--limit", "1000", "--created", f">={pending['created_at']}",
             "--json", "databaseId,displayTitle,status,conclusion,url,headSha",
         ]))
@@ -2458,14 +2502,14 @@ def resume_render(
         raise RenderPending(f"Could not observe the durable render request: {error}") from error
     except (ValueError, KeyError, TypeError) as error:
         raise RenderRequestError(f"invalid pending rendering metadata: {error}") from error
-    matching = [item for item in runs if item.get("displayTitle") == expected_title]
+    matching = [item for item in runs if item.get("displayTitle") in expected_titles]
     if matching:
         # Same request after an ambiguous dispatch: keep the earliest run.
         observed = min(matching, key=lambda item: item["databaseId"])
         identifier = observed.get("databaseId")
         if (
             type(identifier) is not int or identifier <= 0
-            or observed.get("url") != f"https://github.com/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{identifier}"
+            or observed.get("url") != origin.run_url(identifier)
             or not re.fullmatch(r"[0-9a-f]{40}", str(observed.get("headSha", "")))
         ):
             raise RenderRequestError("discovered rendering workflow identity is invalid")
@@ -2494,8 +2538,12 @@ def ensure_challenge_renderable(
     prior_renderability: dict[str, Any] | None = None,
     pending_render: dict[str, Any] | None = None,
     save_pending_render: Callable[[dict[str, Any]], None] | None = None,
+    state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    """Require render anchors before review and retain the validated bundle."""
+    """Require render anchors before review and retain the validated bundle.
+
+    ``state`` lets a confidential submission refuse any public render path.
+    """
     cached = work / "render-result"
     if cached.is_dir() and not cached.is_symlink():
         try:
@@ -2505,7 +2553,7 @@ def ensure_challenge_renderable(
     elif cached.exists() or cached.is_symlink():
         cached.unlink()
     restored = (
-        restore_reviewed_render(work, mechanical, prior_renderability)
+        restore_reviewed_render(work, mechanical, prior_renderability, state=state)
         if prior_renderability is not None else None
     )
     if restored is not None:
@@ -2536,7 +2584,8 @@ def ensure_challenge_renderable(
 
 
 def restore_reviewed_render(
-    work: Path, mechanical: dict[str, Any], receipt: dict[str, Any]
+    work: Path, mechanical: dict[str, Any], receipt: dict[str, Any],
+    *, state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path] | None:
     """Recover the exact reviewed artifact before dispatching another render.
 
@@ -2546,14 +2595,22 @@ def restore_reviewed_render(
     """
     checked = validate_renderability_receipt(receipt, mechanical)
     assert checked is not None
+    origin = render_origin(mechanical)
+    if origin.confidential:
+        # Confidential evidence is never read back from Actions or State. Until
+        # it is kept in Palomar's private object store, the render is rebuilt
+        # in the private caller from the same accepted source.
+        return None
     run_id = checked["workflow_url"].rsplit("/", 1)[1]
     metadata = json.loads(gh([
-        "run", "view", run_id, "--repo", mechanical_evidence.SUBMISSION_REPO,
+        "run", "view", run_id, "--repo", origin.repository,
         "--json", "status,conclusion,headSha,url,displayTitle",
     ]))
+    # PalomarSubmission's render run name no longer names the source; a
+    # receipt from before that change carries the old title.
     title = re.fullmatch(
-        rf"Render {re.escape(mechanical['source']['repository'])}@"
-        rf"{re.escape(mechanical['source']['commit'])} \[([0-9a-f]{{32}})\]",
+        rf"Render (?:challenge|{re.escape(mechanical['source']['repository'])}@"
+        rf"{re.escape(mechanical['source']['commit'])}) \[([0-9a-f]{{32}})\]",
         str(metadata.get("displayTitle", "")),
     )
     if (
@@ -2567,7 +2624,7 @@ def restore_reviewed_render(
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
     downloaded = run([
-        "gh", "run", "download", run_id, "--repo", mechanical_evidence.SUBMISSION_REPO,
+        "gh", "run", "download", run_id, "--repo", origin.repository,
         "--name", f"challenge-render-{title.group(1)}", "--dir", str(destination),
     ], check=False)
     if downloaded.returncode:
@@ -2591,8 +2648,13 @@ def registration_render_result(
     work: Path,
     mechanical: dict[str, Any],
     prior_renderability: dict[str, Any] | None,
+    *,
+    state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    """Select registration render evidence without violating dry-run purity."""
+    """Select registration render evidence without violating dry-run purity.
+
+    A confidential submission never restores a render from Actions.
+    """
     if args.render_result:
         candidate = Path(args.render_result).expanduser().resolve()
         return validate_render_result(candidate, mechanical)
@@ -2605,11 +2667,11 @@ def registration_render_result(
             )
         return validate_render_result(cached, mechanical)
     if prior_renderability is not None:
-        restored = restore_reviewed_render(work, mechanical, prior_renderability)
+        restored = restore_reviewed_render(work, mechanical, prior_renderability, state=state)
         if restored is not None:
             return restored
     try:
-        return ensure_challenge_renderable(work, mechanical)
+        return ensure_challenge_renderable(work, mechanical, state=state)
     except SubmitterRenderabilityError as error:
         if prior_renderability is None:
             raise
@@ -2626,6 +2688,7 @@ def download_mechanical_artifact(
     destination: Path,
     *,
     mode: str = "full",
+    repository: str = mechanical_evidence.SUBMISSION_REPO,
 ) -> Path:
     if destination.exists():
         shutil.rmtree(destination)
@@ -2644,7 +2707,7 @@ def download_mechanical_artifact(
             "download",
             str(run_id),
             "--repo",
-            mechanical_evidence.SUBMISSION_REPO,
+            repository,
             "--name",
             f"{artifact}-{submission_id}",
             "--dir",
@@ -2671,8 +2734,12 @@ def validate_trusted_mechanical_artifact(
 def validate_workflow_commit_on_main(
     run_data: dict[str, Any], *, head_sha: str | None = None
 ) -> None:
-    """Require a recorded Submission workflow commit to remain on main's lineage."""
-    workflow_commit = head_sha or run_data.get("headSha")
+    """Require a recorded Submission workflow commit to remain on main's lineage.
+
+    For a confidential run that is the PalomarSubmission commit its caller
+    called, not the caller's own commit.
+    """
+    workflow_commit = head_sha or run_data.get("pipelineCommit") or run_data.get("headSha")
     if not isinstance(workflow_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", workflow_commit):
         raise ReviewerError("verification run has no valid workflow commit")
     comparison = gh(
@@ -2695,6 +2762,7 @@ def normalized_submission_run(
     mode: str = "full",
     conclusion: str | None = "success",
     execution_attempt: str | None = None,
+    origin: confidential_mode.RunOrigin = confidential_mode.PUBLIC_ORIGIN,
 ) -> dict[str, Any]:
     """Check every trust property of a run document and put it in run_data shape.
 
@@ -2712,13 +2780,7 @@ def normalized_submission_run(
     # submission <id>" here, and the workflow's identity comes from the path.
     if mode not in {"preflight", "full", "correction"}:
         raise ReviewerError(f"submission run mode {mode!r} is not recognized")
-    title = (
-        f"Preflight submission {submission_id}"
-        if mode == "preflight"
-        else f"Validate registry correction {submission_id}"
-        if mode == "correction"
-        else f"Verify submission {submission_id}"
-    )
+    title = origin.verify_title(submission_id, mode)
     if execution_attempt is not None:
         if not re.fullmatch(r"[0-9a-f]{32}", execution_attempt):
             raise ReviewerError("invalid execution attempt identity")
@@ -2729,7 +2791,7 @@ def normalized_submission_run(
     if not isinstance(returned, int) or isinstance(returned, bool) or returned != recorded:
         raise ReviewerError(f"{refusal} has id {returned!r}, not {recorded!r}")
     expected = {
-        "path": f".github/workflows/{VERIFY_WORKFLOW}",
+        "path": f".github/workflows/{origin.verify_workflow}",
         "name": title,
         "display_title": title,
         "head_branch": "main",
@@ -2756,9 +2818,20 @@ def normalized_submission_run(
             raise ReviewerError(f"{refusal} has no {field} timestamp")
     # Derived rather than trusted: everything downstream binds the report and
     # the record to this string, so it has to be the run that was asked for.
-    url = f"https://github.com/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{recorded}"
+    url = origin.run_url(recorded)
     if document.get("html_url") != url:
         raise ReviewerError(f"{refusal} does not carry its own run URL")
+    confidential_fields: dict[str, Any] = {}
+    if origin.confidential:
+        caller = confidential_mode.validate_caller_run(
+            document, origin.verify_workflow, confidential_caller_file,
+            confidential_template_sums, dict(os.environ),
+        )
+        confidential_fields = {
+            "repository": origin.repository,
+            "pipelineCommit": caller.pipeline_commit,
+            "callerTemplateSha256": caller.template_sha256,
+        }
     return {
         "databaseId": recorded,
         "displayTitle": document["display_title"],
@@ -2775,7 +2848,47 @@ def normalized_submission_run(
         "url": url,
         "createdAt": document["created_at"],
         "updatedAt": document["updated_at"],
+        **confidential_fields,
     }
+
+
+def confidential_repository(state: dict[str, Any]) -> dict[str, str]:
+    """The download keyword for a confidential run; public runs keep the default."""
+    origin = confidential_mode.run_origin(state)
+    return {"repository": origin.repository} if origin.confidential else {}
+
+
+def confidential_caller_file(path: str, ref: str) -> str:
+    """The private caller repository's workflow file at one commit."""
+    if not re.fullmatch(r"\.github/workflows/[a-z]+\.yml", path) or not re.fullmatch(
+        r"[0-9a-f]{40}", ref
+    ):
+        raise ReviewerError("confidential caller file request is malformed")
+    encoded = gh([
+        "api", f"repos/{confidential_mode.RUNS_REPO}/contents/{path}?ref={ref}",
+        "--jq", ".content",
+    ])
+    try:
+        return base64.b64decode(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ReviewerError("confidential caller file is not UTF-8 text") from error
+
+
+def confidential_template_sums(pipeline_commit: str) -> dict[str, str]:
+    """PalomarSubmission's canonical caller-template digests at the pipeline commit."""
+    if not re.fullmatch(r"[0-9a-f]{40}", pipeline_commit):
+        raise ReviewerError("pipeline commit is malformed")
+    encoded = gh([
+        "api",
+        f"repos/{mechanical_evidence.SUBMISSION_REPO}/contents/"
+        f"{confidential_mode.TEMPLATE_DIRECTORY}/SHA256SUMS?ref={pipeline_commit}",
+        "--jq", ".content",
+    ])
+    try:
+        text = base64.b64decode(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ReviewerError("caller template SHA256SUMS is not UTF-8 text") from error
+    return confidential_mode.parse_sha256sums(text)
 
 
 def normalized_verification_run(document: Any, recorded: int, submission_id: str) -> dict[str, Any]:
@@ -2801,6 +2914,7 @@ def trusted_submission_run(
     for it again bought no trust and could only lose the run.
     """
     submission_id = state["id"]
+    origin = confidential_mode.run_origin(state)
     run_field = "preflight_run" if mode == "preflight" else "run"
     recorded = (state.get(run_field) or {}).get("id")
     if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 1:
@@ -2812,7 +2926,7 @@ def trusted_submission_run(
         [
             "gh",
             "api",
-            f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/{recorded}",
+            f"repos/{origin.repository}/actions/runs/{recorded}",
         ],
         check=False,
     )
@@ -2820,7 +2934,7 @@ def trusted_submission_run(
         detail = (proc.stderr or proc.stdout).strip()[-2000:] or "no detail reported"
         raise ReviewerError(
             f"run {recorded}, which the server recorded for {submission_id}, could not be "
-            f"read from {mechanical_evidence.SUBMISSION_REPO}: {detail}"
+            f"read from {origin.repository}: {detail}"
         )
     try:
         document = json.loads(proc.stdout)
@@ -2836,6 +2950,7 @@ def trusted_submission_run(
         mode=mode,
         conclusion=conclusion,
         execution_attempt=(state.get("execution") or {}).get("attempt"),
+        origin=origin,
     )
     if conclusion is None and normalized.get("conclusion") == "success":
         raise ReviewerError(f"recorded failed {mode} run {recorded} unexpectedly succeeded")
@@ -2861,7 +2976,8 @@ def mechanical_report(
         # this wrapper to audit full-verification ancestry and artifact trust.
         run_data = trusted_verification_run(state)
         report_path = download_mechanical_artifact(
-            run_data["databaseId"], submission_id, download_root
+            run_data["databaseId"], submission_id, download_root,
+            **confidential_repository(state),
         )
     try:
         report = load_json(report_path)
@@ -3197,6 +3313,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
     if reporting not in {"preflight-reporting", "verification-reporting"}:
         return state
     mode = "preflight" if reporting == "preflight-reporting" else "full"
+    run_repository = confidential_mode.run_origin(state).repository
     run_data: dict[str, Any] | None = None
     phase = "preparation" if mode == "preflight" else "verification"
     trusted_metadata = False
@@ -3210,6 +3327,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
             state["id"],
             root / state["id"] / f"{mode}-failure",
             mode=mode,
+            **confidential_repository(state),
         )
         failure_report = load_json(report_path)
         workflow_recovery.validate_execution_binding(failure_report, state)
@@ -3230,7 +3348,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
                 # report even after a hard job deadline. Authenticate the
                 # timeout from GitHub rather than hiding it behind that report.
                 try:
-                    jobs = json.loads(gh(["api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/"
+                    jobs = json.loads(gh(["api", f"repos/{run_repository}/actions/runs/"
                                          f"{run_data['databaseId']}/attempts/{run_data['attempt']}/jobs?per_page=100"]))
                     metadata = workflow_recovery.metadata_diagnostic(jobs, run_data)
                     resource_failure = resource_failover.timeout_evidence(jobs, run_data, state)
@@ -3248,7 +3366,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         diagnostics = _diagnostics_unavailable(error)
         if trusted_metadata:
             try:
-                jobs = json.loads(gh(["api", f"repos/{mechanical_evidence.SUBMISSION_REPO}/actions/runs/"
+                jobs = json.loads(gh(["api", f"repos/{run_repository}/actions/runs/"
                                      f"{run_data['databaseId']}/attempts/{run_data['attempt']}/jobs?per_page=100"]))
                 diagnostics = [workflow_recovery.metadata_diagnostic(jobs, run_data)]
                 if mode == "full":
@@ -3293,7 +3411,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         "profile_version": profile_version,
         "diagnostics": diagnostics,
     }
-    if repair_draft is not None:
+    if repair_draft is not None and not confidential_mode.is_confidential(state):
         failure["repair_draft"] = repair_draft
     if resource_failure is not None:
         failure["resource_failure"] = resource_failure
@@ -3324,6 +3442,9 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
     """Capture stable run and job metadata while GitHub still retains the run."""
+    origin = confidential_mode.origin_for_url(run_data.get("url"))
+    if origin.repository != run_data.get("repository", mechanical_evidence.SUBMISSION_REPO):
+        raise ReviewerError("verification run names a different repository than its URL")
     run_id = run_data.get("databaseId")
     attempt = run_data.get("attempt")
     if (
@@ -3343,7 +3464,7 @@ def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
                     "view",
                     str(run_id),
                     "--repo",
-                    mechanical_evidence.SUBMISSION_REPO,
+                    origin.repository,
                     "--json",
                     "attempt,jobs",
                 ]
@@ -3395,12 +3516,12 @@ def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
         raise ReviewerError(
             f"verification run was triggered by {run_data.get('event')!r}, not a dispatch"
         )
-    return {
+    provenance = {
         "schema_version": 1,
-        "repository": mechanical_evidence.SUBMISSION_REPO,
+        "repository": origin.repository,
         "run_id": run_id,
         "run_attempt": attempt,
-        "workflow_path": f".github/workflows/{VERIFY_WORKFLOW}",
+        "workflow_path": f".github/workflows/{origin.verify_workflow}",
         "workflow_commit": head_sha,
         "workflow_url": run_data["url"],
         "event": run_data["event"],
@@ -3410,6 +3531,12 @@ def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
         "updated_at": run_data["updatedAt"],
         "jobs": jobs,
     }
+    if origin.confidential:
+        pipeline_commit = run_data.get("pipelineCommit")
+        if not isinstance(pipeline_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", pipeline_commit):
+            raise ReviewerError("confidential verification run has no trusted pipeline commit")
+        provenance["called_workflow_commit"] = pipeline_commit
+    return provenance
 
 
 def _state_read(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -4931,7 +5058,10 @@ def push_registration_branch(database: Path, branch: str) -> None:
     run([*remote, f"HEAD:refs/heads/{branch}"], cwd=database, env=git_env)
 
 
-def render_failure_report(work: Path, run_id: str, request_id: str) -> dict[str, Any] | None:
+def render_failure_report(
+    work: Path, run_id: str, request_id: str,
+    *, repository: str = mechanical_evidence.SUBMISSION_REPO,
+) -> dict[str, Any] | None:
     """Download the trusted renderer's bounded failure report, if it has one."""
     report = work / "render-failure"
     if report.exists():
@@ -4940,7 +5070,7 @@ def render_failure_report(work: Path, run_id: str, request_id: str) -> dict[str,
     try:
         gh([
             "run", "download", run_id,
-            "--repo", mechanical_evidence.SUBMISSION_REPO,
+            "--repo", repository,
             "--name", f"challenge-render-{request_id}", "--dir", str(report),
         ])
         found = next(report.rglob("report.json"), None)
@@ -5878,7 +6008,7 @@ def run_review(args: argparse.Namespace) -> int:
         receipt = None
         if not correction_review:
             render_report, _render_bundle = ensure_challenge_renderable(
-                work, mechanical, prior_renderability=state.get("renderability")
+                work, mechanical, prior_renderability=state.get("renderability"), state=state
             )
             receipt = renderability_receipt(render_report, mechanical)
         mechanical_url = (work / "mechanical-report-url").read_text().strip()
@@ -5963,7 +6093,9 @@ def run_review(args: argparse.Namespace) -> int:
     # model review; anonymous compiler-generated declarations selected by the
     # Comparator are rejected here with a submitter-facing diagnostic.
     if not state.get("registry_correction"):
-        ensure_challenge_renderable(work, mechanical, prior_renderability=state.get("renderability"))
+        ensure_challenge_renderable(
+            work, mechanical, prior_renderability=state.get("renderability"), state=state
+        )
     libraries = materialize_challenge_libraries(work, mechanical)
     rubric = load_json(work / "policy" / "rubric.json")
     review_schema = load_json(work / "policy" / "schemas" / "review.schema.json")
@@ -5971,6 +6103,12 @@ def run_review(args: argparse.Namespace) -> int:
     passes: list[dict[str, Any]] = []
     spend: list[dict[str, Any]] = []
     synthesis: dict[str, Any] | None = None
+    try:
+        engine_execution.refuse_web_tools(
+            args.engine, confidential=confidential_mode.is_confidential(state)
+        )
+    except engine_execution.EngineError as error:
+        raise ReviewerError(str(error)) from error
     for step in rubric["steps"]:
         if step["id"] == "proof_account" and not has_proof_account(work / "source", mechanical):
             continue
@@ -6095,6 +6233,7 @@ def ensure_review_renderable(
             save(pending)
     report, _bundle = ensure_challenge_renderable(
         work, mechanical, wait_seconds=wait_seconds, prior_renderability=state.get("renderability"),
+        state=state,
         **({"pending_render": pending, "save_pending_render": save} if pending is not None else {}),
     )
     if wait_seconds == 0:
@@ -7385,6 +7524,13 @@ def register(args: argparse.Namespace) -> int:
     )
     if state.get("id") != args.submission:
         raise ReviewerError("workspace state does not match the requested submission")
+    if confidential_mode.is_confidential(state):
+        # Release (hold, the confidential record block and preservation from
+        # Palomar's snapshot) is not implemented yet. Registering through the
+        # ordinary path would register a record claiming a public run.
+        raise DeterministicRegistrationError(
+            "a confidential submission cannot be registered until confidential release exists"
+        )
     mechanical_evidence.validate_report_schema(mechanical)
     mechanical_url_path = work / "mechanical-report-url"
     mechanical_digest_path = work / "mechanical-report-sha256"
@@ -7524,7 +7670,7 @@ def register(args: argparse.Namespace) -> int:
         render_bundle = None
     else:
         render_report, render_bundle = registration_render_result(
-            args, work, mechanical, prior_renderability
+            args, work, mechanical, prior_renderability, state=state
         )
     database = work / "database"
     resolved = resolve_remote_commit(DATABASE_REPO, "main")
@@ -8691,6 +8837,10 @@ def _record_repair(repair: dict[str, Any], status: str, explanation: str, **fiel
 
 
 def _validate_repair(repair: dict[str, Any], state: dict[str, Any]) -> None:
+    if confidential_mode.is_confidential(state):
+        # A repair creates a public fork in PalomarRepairs and opens a pull
+        # request on the submitted repository, both public.
+        raise ReviewerError("metadata repair is not available for a confidential submission")
     schema_version = repair.get("schema_version")
     if schema_version not in {1, 2, 3, 4} or repair.get("submission_id") != state.get("id"):
         raise ReviewerError("repair request does not match its submission")
@@ -9396,6 +9546,8 @@ def _prepare_repair(repair: dict[str, Any], state: dict[str, Any], root: Path) -
                 patch=patch,
             )
             return "needs-input"
+        if confidential_mode.is_confidential(state):
+            raise ReviewerError("metadata repair is not available for a confidential submission")
         fork = _ensure_repair_fork(source["repository"])
         branch = f"palomar/repair-{state['id']}-{repair['revision']}"
         run(["git", "remote", "add", "repair", f"https://github.com/{fork}.git"], cwd=checkout)

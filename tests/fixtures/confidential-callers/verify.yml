@@ -1,0 +1,65 @@
+name: Verify
+# Request id only: the Server finds the run by this title, and nothing here
+# names the source repository or commit.
+run-name: Verify ${{ inputs.request_id }}${{ inputs.execution_attempt && format(' [{0}]', inputs.execution_attempt) || '' }}
+
+# Generated from templates/verify.yml by substituting one PalomarSubmission
+# commit. Palomar's reviewer accepts a run only if this file is byte-for-byte
+# that substitution, so edit the template, never this file.
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: GitHub repository in owner/name form
+        required: true
+        type: string
+      commit:
+        description: Full 40-character commit to verify
+        required: true
+        type: string
+      request_id:
+        description: Opaque submission id from the submission server
+        required: true
+        type: string
+      mode:
+        description: Run shared preparation only, or the complete verifier
+        required: false
+        default: full
+        type: choice
+        options:
+          - preflight
+          - full
+          - correction
+      execution_profile:
+        description: Approved operator-selected execution profile (blank selects the catalogue default)
+        required: false
+        default: ""
+        type: string
+      execution_attempt:
+        description: Audited operator attempt identifier
+        required: false
+        type: string
+      options:
+        description: Submission settings JSON
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+    # The uses pin fixes the workflow file; pipeline_commit fixes the scripts
+    # it checks out and runs. They are the same commit.
+    uses: PalomarRegistry/PalomarSubmission/.github/workflows/submission.yml@<pipeline-commit>
+    with:
+      repository: ${{ inputs.repository }}
+      commit: ${{ inputs.commit }}
+      pipeline_commit: <pipeline-commit>
+      request_id: ${{ inputs.request_id }}
+      mode: ${{ inputs.mode }}
+      execution_profile: ${{ inputs.execution_profile }}
+      execution_attempt: ${{ inputs.execution_attempt }}
+      options: ${{ inputs.options }}
