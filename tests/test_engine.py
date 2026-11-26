@@ -300,6 +300,8 @@ class EngineExecutionTests(unittest.TestCase):
                     ["codex", "exec"],
                     cwd=source,
                     output_dir=root / "output",
+                    broker_socket_dir=source.parent,
+                    relay_dir=source.parent,
                     secret_args_fd=9,
                 )
 
@@ -322,6 +324,8 @@ class EngineExecutionTests(unittest.TestCase):
                     ["codex", "exec"],
                     cwd=source,
                     output_dir=root / "other-output",
+                    broker_socket_dir=source.parent,
+                    relay_dir=source.parent,
                     secret_args_fd=9,
                 )
     def test_library_sources_are_bound_read_only_beside_the_workspace(self):

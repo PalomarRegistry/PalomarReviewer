@@ -46,10 +46,10 @@ The contract, exactly:
   usage summary.
 * Nothing here logs, returns, or records either credential.
 
-What this does not do: it is not general network isolation. The namespace still
-shares the runner's network because the Codex transport has to reach this
-listener, and a custom provider other than the pinned Codex path is out of
-scope. Nor is `store: false` the same as no provider-side state: it keeps the
+Network isolation is the engine's: the Codex namespace has a private network
+namespace with only loopback, and reaches this listener solely through a Unix
+socket that a host-side relay connects here (`engine.UnixSocketRelay`). A
+custom provider other than the pinned Codex path is out of scope. Nor is `store: false` the same as no provider-side state: it keeps the
 provider from retaining a retrievable Response object, but not from holding,
 say, a prompt cache for around a day, and zero application state would take
 organizational zero-data-retention controls on the account rather than anything
