@@ -2548,7 +2548,16 @@ def ensure_challenge_renderable(
     cached = work / "render-result"
     if cached.is_dir() and not cached.is_symlink():
         try:
-            return validate_render_result(cached, mechanical)
+            cached_hit = validate_render_result(cached, mechanical)
+            if state is not None and confidential_mode.is_confidential(state):
+                # A local cache is not evidence: it must be the recorded one, or
+                # become it, before a confidential review relies on it.
+                recorded = ((state.get("confidential") or {}).get("evidence") or {}).get("render_result")
+                digest = confidential_snapshot.sha256_bytes(render_result_archive(cached))
+                if recorded is not None and recorded.get("sha256") != digest:
+                    raise ReviewerError("cached render is not the recorded confidential render")
+                store_confidential_render(state, cached)
+            return cached_hit
         except ReviewerError:
             shutil.rmtree(cached)
     elif cached.exists() or cached.is_symlink():
@@ -2641,7 +2650,7 @@ def stored_confidential_render(
     recorded = ((state.get("confidential") or {}).get("evidence") or {}).get("render_result")
     if recorded is None:
         return None
-    data = confidential_objects(state, "restore").get(recorded["key"], recorded["sha256"])
+    data = confidential_objects(state, "evidence").get(recorded["key"], recorded["sha256"])
     destination = extract_render_result_archive(data, work / "stored-render")
     return validate_render_result(destination, mechanical)
 
@@ -3056,9 +3065,19 @@ def mechanical_report(
     return report, str(run_data["url"]), run_data
 
 
+_OBJECT_CLIENTS: dict[tuple[str, str], confidential_snapshot.ObjectClient] = {}
+
+
 def confidential_objects(state: dict[str, Any], operation: str) -> confidential_snapshot.ObjectClient:
-    """This submission's capability-scoped object client. Tests replace it."""
-    return confidential_snapshot.ObjectClient(state["id"], operation)
+    """This submission's capability-scoped object client, one per operation per job.
+
+    Reused so that one job spends one capability mint per operation: the
+    actor allows only three per binding. Tests replace it.
+    """
+    key = (state["id"], operation)
+    if key not in _OBJECT_CLIENTS:
+        _OBJECT_CLIENTS[key] = confidential_snapshot.ObjectClient(state["id"], operation)
+    return _OBJECT_CLIENTS[key]
 
 
 def confidential_descriptor(state: dict[str, Any], client: Any) -> dict[str, Any]:
@@ -3082,14 +3101,15 @@ def ingest_confidential_report(
     come from the run attempt that snapshot recorded. Its bytes and run
     provenance then go to the private bucket; State keeps only key and digest.
     """
+    descriptor = confidential_descriptor(state, confidential_objects(state, "evidence"))
     client = confidential_objects(state, "evidence")
-    descriptor = confidential_descriptor(state, client)
     confidential_snapshot.bind_report_to_snapshot(
         report, run_data, descriptor, confidential_snapshot.recorded_snapshot(state)
     )
     recorded = ((state.get("confidential") or {}).get("evidence") or {}).get("mechanical_report")
     digest = confidential_snapshot.sha256_bytes(report_bytes)
     if recorded is not None:
+        # One run, one report: a different one is not a replacement but a conflict.
         if recorded.get("sha256") != digest:
             raise ReviewerError("mechanical report differs from the confidential evidence already recorded")
         return
@@ -3103,23 +3123,32 @@ def ingest_confidential_report(
     })
 
 
+REPLACEABLE_EVIDENCE = frozenset({"review", "render_result"})
+
+
 def record_confidential_evidence(
     state: dict[str, Any], kind: str, entry: dict[str, str], **extra: Any
 ) -> None:
-    """Record one evidence pointer (key and digest only) in the State record."""
-    fresh = submission_state(state["id"])
-    if fresh is None:
-        raise ReviewerError(f"submission {state['id']} disappeared while its evidence was stored")
-    block = dict(fresh.get("confidential") or {})
+    """Record one evidence pointer (key and digest only) in the State record.
+
+    Written against the caller's own read of the record, never a fresher one:
+    if anything changed meanwhile (a withdrawal, say), the write is refused
+    and the pass stops, rather than handing a stale caller a new precondition
+    it could then use to overwrite that change. A new review or render
+    replaces its pointer; the mechanical report of a run never changes.
+    """
+    block = dict(state.get("confidential") or {})
     evidence = dict(block.get("evidence") or {})
-    if kind in evidence and evidence[kind] != entry:
+    if kind in evidence and evidence[kind] != entry and kind not in REPLACEABLE_EVIDENCE:
         raise ReviewerError(f"confidential {kind} evidence is already recorded with another digest")
     evidence[kind] = entry
     evidence.update(extra)
     block["evidence"] = evidence
+    if not state.get("_blob_sha"):
+        raise ReviewerError("confidential evidence can only be recorded against a read State record")
     written = put_state(
-        f"submissions/{state['id']}/state.json", {**fresh, "confidential": block},
-        f"Record confidential evidence ({state['id']})", blob_sha=fresh.get("_blob_sha"),
+        f"submissions/{state['id']}/state.json", {**state, "confidential": block},
+        f"Record confidential evidence ({state['id']})", blob_sha=state["_blob_sha"],
     )
     state["confidential"] = block
     if isinstance(written, str) and written:
@@ -7608,7 +7637,7 @@ def read_delivered_review(record: dict[str, Any]) -> dict[str, Any] | None:
     entry = ((record.get("confidential") or {}).get("evidence") or {}).get("review")
     if entry is None:
         return None
-    data = confidential_objects(record, "restore").get(entry["key"], entry["sha256"])
+    data = confidential_objects(record, "evidence").get(entry["key"], entry["sha256"])
     try:
         review = json.loads(data)
     except ValueError as error:

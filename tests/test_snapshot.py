@@ -239,26 +239,71 @@ class ObjectClientTests(unittest.TestCase):
 
 
 class EvidencePlacementTests(unittest.TestCase):
+    def setUp(self):
+        cli._OBJECT_CLIENTS.clear()
+
     def test_a_confidential_review_never_reaches_state_git(self):
-        record = state("a" * 64)
+        record = {**state("a" * 64), "status": "reviewing", "_blob_sha": "blob-1"}
         review = {"schema_version": 3, "outcome": "neutral", "summary": "canary prose"}
         client = mock.Mock()
         client.put_evidence.return_value = {"key": "k", "sha256": "s"}
+        writes = []
+
+        def put_state(path, value, message, blob_sha=None):
+            writes.append((path, value, blob_sha))
+            return f"blob-{len(writes) + 1}"
+
         with mock.patch.object(cli, "confidential_objects", return_value=client), mock.patch.object(
-            cli, "record_confidential_evidence"
-        ) as recorded, mock.patch.object(cli, "put_state") as put_state, mock.patch.object(
-            cli, "state_json", return_value=None
+            cli, "put_state", side_effect=put_state
+        ), mock.patch.object(cli, "state_json", return_value=None), mock.patch.object(
+            cli, "refuse_engine_credential"
         ):
             try:
                 cli.deliver_review(record, review, None, mechanical={}, renderability=None)
-            except Exception:  # noqa: BLE001 - only where the prose went matters here
+            except (KeyError, TypeError, ReviewerError):
+                # Later delivery bookkeeping needs a full review; where the
+                # prose went is decided before it.
                 pass
-        client.put_evidence.assert_called_once()
         self.assertEqual(client.put_evidence.call_args.args[0], "review")
-        recorded.assert_called_once()
-        for call in put_state.call_args_list:
-            self.assertNotIn("review.json", call.args[0])
-            self.assertNotIn("canary prose", json.dumps(call.args[1]))
+        self.assertTrue(writes, "the evidence pointer was recorded")
+        self.assertEqual(writes[0][2], "blob-1")
+        for path, value, _blob in writes:
+            self.assertNotIn("review.json", path)
+            self.assertNotIn("canary prose", json.dumps(value))
+        self.assertEqual(writes[0][1]["confidential"]["evidence"]["review"], {"key": "k", "sha256": "s"})
+
+    def test_a_withdrawal_is_never_overwritten_by_a_stale_evidence_write(self):
+        stale = {**state("a" * 64), "status": "reviewing", "_blob_sha": "before-withdrawal"}
+
+        def refuse(path, value, message, blob_sha=None):
+            self.assertEqual(blob_sha, "before-withdrawal")
+            raise ReviewerError("HTTP 409: sha does not match")
+
+        with mock.patch.object(cli, "put_state", side_effect=refuse):
+            with self.assertRaises(ReviewerError):
+                cli.record_confidential_evidence(stale, "review", {"key": "k", "sha256": "s"})
+        self.assertEqual(stale["_blob_sha"], "before-withdrawal")
+
+    def test_a_new_review_replaces_its_pointer_but_a_report_never_does(self):
+        record = {**state("a" * 64), "_blob_sha": "b"}
+        record["confidential"]["evidence"] = {
+            "review": {"key": "k1", "sha256": "s1"}, "mechanical_report": {"key": "m1", "sha256": "t1"},
+        }
+        with mock.patch.object(cli, "put_state", return_value="b2"):
+            cli.record_confidential_evidence(record, "review", {"key": "k2", "sha256": "s2"})
+            with self.assertRaisesRegex(ReviewerError, "already recorded"):
+                cli.record_confidential_evidence(record, "mechanical_report", {"key": "m2", "sha256": "t2"})
+
+    def test_each_operation_reads_only_its_own_area(self):
+        client = snapshot.ObjectClient(SUBMISSION, "restore", token=lambda: "jwt", transport=Transport())
+        with self.assertRaisesRegex(ReviewerError, "may not touch"):
+            client.get(f"v2/{SUBMISSION}/evidence/review/" + "0" * 64, "0" * 64)
+
+    def test_one_job_reuses_one_client_per_operation(self):
+        record = state("a" * 64)
+        evidence = cli.confidential_objects(record, "evidence")
+        self.assertIs(evidence, cli.confidential_objects(record, "evidence"))
+        self.assertIsNot(evidence, cli.confidential_objects(record, "restore"))
 
 
 if __name__ == "__main__":

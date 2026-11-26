@@ -177,9 +177,18 @@ class ObjectClient:
             "Content-Type": "application/octet-stream",
         }
 
-    def _url(self, key: str) -> str:
-        if not key.startswith(snapshot_prefix(self.submission_id)) or ".." in key.split("/"):
+    # What each State operation may read (contract v2 section 3.2), checked
+    # here as well as by the Worker so a wrong request never leaves the job.
+    READABLE = {"restore": ("snapshot/",), "evidence": ("snapshot/", "evidence/"), "publish": ("",)}
+
+    def _url(self, key: str, *, write: bool = False) -> str:
+        prefix = snapshot_prefix(self.submission_id)
+        if not key.startswith(prefix) or ".." in key.split("/"):
             raise ReviewerError("object key is outside this submission's prefix")
+        rest = key[len(prefix):]
+        allowed = ("evidence/",) if write else self.READABLE.get(self.operation, ())
+        if not any(rest.startswith(area) for area in allowed):
+            raise ReviewerError(f"the {self.operation} operation may not touch {rest}")
         return f"{SERVER}/api/confidential/objects/{urllib.parse.quote(key, safe='/')}"
 
     def get(self, key: str, sha256: str) -> bytes:
@@ -203,7 +212,7 @@ class ObjectClient:
             raise ReviewerError("only an evidence capability may write evidence")
         key = evidence_key(self.submission_id, kind, data)
         headers = {**self._object_headers(), "X-Palomar-Sha256": sha256_bytes(data)}
-        status, _headers, _body = self.transport("PUT", self._url(key), headers, data)
+        status, _headers, _body = self.transport("PUT", self._url(key, write=True), headers, data)
         if status not in {200, 201}:
             raise ReviewerError(f"could not store confidential evidence {kind} (HTTP {status})")
         return {"key": key, "sha256": sha256_bytes(data)}
