@@ -162,7 +162,7 @@ Production does not use that source-install command. `runtime/` holds the
 promoted Reviewer wheel, its complete hash-locked Python requirements, the
 reviewed Codex npm package and platform-binary lock, and a `SHA256SUMS`
 manifest. State workflows independently pin both the Git commit containing the
-files and the digest of `SHA256SUMS`, then use Python 3.11.10. They install the
+files and the digest of `SHA256SUMS`, then use Python 3.11.18. They install the
 third-party Python wheels under
 `--require-hashes --no-deps --only-binary :all:` before installing the verified
 local Reviewer wheel with `--no-deps --no-index`. There is no package-version
@@ -179,7 +179,7 @@ python3 tools/runtime_artifact.py --write
 python3 tools/runtime_artifact.py --check
 ```
 
-The build uses Python 3.11.10, a hash-locked Hatchling build graph, and a fixed
+The build uses Python 3.11.18, a hash-locked Hatchling build graph, and a fixed
 ZIP epoch; CI reproduces the wheel byte-for-byte and performs a cold install.
 The current `runtime/` metadata and Reviewer wheel are about 137 KiB; npm still
 downloads the 116 MiB compressed Codex Linux artifact on each run. Any commit that changes the
@@ -234,7 +234,7 @@ engine: see [Engines](#engines).
 
 ```bash
 python -m unittest discover -s tests
-uv run --isolated --python 3.11.10 --locked --only-group dev ruff check .
+uv run --isolated --python 3.11.18 --locked --only-group dev ruff check .
 ```
 
 The lint command uses the exact Ruff release and artifact hashes recorded in

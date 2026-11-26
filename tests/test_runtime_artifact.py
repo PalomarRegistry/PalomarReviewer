@@ -270,7 +270,7 @@ class RuntimeArtifactTests(unittest.TestCase):
         workflow = CI.read_text(encoding="utf-8")
         self.assertIn("python3 tools/runtime_artifact.py --check", workflow)
         self.assertNotIn("python3 tools/runtime_artifact.py --write", workflow)
-        self.assertIn("uv venv --no-project --python 3.11.10 --no-managed-python", workflow)
+        self.assertIn("uv venv --no-project --python 3.11.18 --no-managed-python", workflow)
         self.assertIn("sha256sum --check SHA256SUMS", workflow)
         self.assertIn("(cd runtime && uv pip install", workflow)
         self.assertIn("--require-hashes --no-deps --only-binary :all:", workflow)
