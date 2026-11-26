@@ -25,6 +25,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from test_cli import UsesCapabilities
@@ -887,13 +888,22 @@ class EnginePassTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            seen: dict[str, str] = {}
+            seen: dict[str, Any] = {}
+            real_relay = engine.UnixSocketRelay
+
+            def recording_relay(broker_port):
+                seen["base"] = f"http://127.0.0.1:{broker_port}"
+                seen["relay"] = real_relay(broker_port)
+                return seen["relay"]
 
             def timed_out(command, **kwargs):
                 configured = next(
                     argument for argument in command if "base_url=" in argument
                 )
-                seen["base"] = configured.split('base_url="', 1)[1].removesuffix('/v1"')
+                # Codex is given the namespace's own loopback, never the host port.
+                self.assertIn(f"127.0.0.1:{engine.NAMESPACE_BROKER_PORT}", configured)
+                # The real broker is alive while the pass runs.
+                seen["alive"] = request(seen["base"], capability="anything", timeout=5)
                 raise engine.EngineError("codex exec timed out after 7200 seconds")
 
             with (
@@ -909,6 +919,7 @@ class EnginePassTests(unittest.TestCase):
                 ),
                 mock.patch.object(engine, "_run", side_effect=timed_out),
                 mock.patch.object(engine, "require_pinned_codex"),
+                mock.patch.object(engine, "UnixSocketRelay", side_effect=recording_relay),
             ):
                 with self.assertRaisesRegex(engine.EngineError, "timed out"):
                     engine.execute(
@@ -921,9 +932,10 @@ class EnginePassTests(unittest.TestCase):
                         raw_path=root / "raw" / "result.txt",
                     )
 
-        self.assertTrue(seen["base"].startswith("http://127.0.0.1:"))
+        self.assertIsNotNone(seen.get("alive"))
         with self.assertRaises(OSError):
             request(seen["base"], capability="anything", timeout=5)
+        self.assertFalse(seen["relay"].directory.exists())
 
 
 class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):

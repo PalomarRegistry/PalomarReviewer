@@ -87,15 +87,16 @@ BROKER_SOCKET_NAME = "broker.sock"
 NAMESPACE_BROKER_PORT = 47100
 RELAY_MOUNT = "/relay"
 RELAY_SOURCE = """\
-import socket, subprocess, sys, threading
+import os, signal, socket, subprocess, sys, threading
 
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 if sys.argv[4] != "--":
     sys.exit("relay: malformed arguments")
+slots = threading.BoundedSemaphore(32)
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind((host, port))
-listener.listen(16)
+listener.listen(32)
 
 
 def pump(source, sink):
@@ -105,9 +106,8 @@ def pump(source, sink):
             if not data:
                 break
             sink.sendall(data)
+        sink.shutdown(socket.SHUT_WR)
     except OSError:
-        pass
-    finally:
         for end in (source, sink):
             try:
                 end.shutdown(socket.SHUT_RDWR)
@@ -115,22 +115,43 @@ def pump(source, sink):
                 pass
 
 
+def connection(client):
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        upstream.connect(path)
+        for end in (client, upstream):
+            end.settimeout(900)
+        reverse = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+        reverse.start()
+        pump(client, upstream)
+        reverse.join()
+    except OSError:
+        pass
+    finally:
+        client.close()
+        upstream.close()
+        slots.release()
+
+
 def serve():
     while True:
         client, _ = listener.accept()
-        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            upstream.connect(path)
-        except OSError:
+        if not slots.acquire(blocking=False):
             client.close()
-            upstream.close()
             continue
-        threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
-        threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
+        try:
+            threading.Thread(target=connection, args=(client,), daemon=True).start()
+        except RuntimeError:
+            client.close()
+            slots.release()
 
 
 threading.Thread(target=serve, daemon=True).start()
-sys.exit(subprocess.call(sys.argv[5:]))
+status = subprocess.call(sys.argv[5:])
+if status < 0:
+    signal.signal(-status, signal.SIG_DFL)
+    os.kill(os.getpid(), -status)
+sys.exit(status)
 """
 
 
@@ -678,12 +699,18 @@ def isolated_intake_command(
     return [*command, "--", *argv]
 
 
+RELAY_MAX_CONNECTIONS = 32
+RELAY_IDLE_SECONDS = 900
+
+
 class UnixSocketRelay:
     """Host side of the namespace's only exit: a Unix socket to the loopback broker.
 
     The socket lives in a fresh 0700 directory. Every connection is forwarded
     to the broker's TCP port and nowhere else, so the namespace can reach the
-    broker and nothing on the runner's network.
+    broker and nothing on the runner's network. At most as many connections
+    as the broker admits are relayed at once, a stalled one is dropped after
+    an idle timeout, and every relayed connection is closed when the pass ends.
     """
 
     def __init__(self, broker_port: int):
@@ -698,8 +725,12 @@ class UnixSocketRelay:
         self.socket_dir.mkdir(mode=0o700)
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._listener.bind(str(self.socket_dir / BROKER_SOCKET_NAME))
-        self._listener.listen(16)
+        self._listener.listen(RELAY_MAX_CONNECTIONS)
         self._closed = threading.Event()
+        self._slots = threading.BoundedSemaphore(RELAY_MAX_CONNECTIONS)
+        self._lock = threading.Lock()
+        self._open: set[socket.socket] = set()
+        self._workers: set[threading.Thread] = set()
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
     def __enter__(self) -> UnixSocketRelay:
@@ -708,12 +739,17 @@ class UnixSocketRelay:
 
     def __exit__(self, *_exc: object) -> None:
         self._closed.set()
-        try:
-            self._listener.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        for end in [self._listener, *self._snapshot()]:
+            _shutdown(end)
         self._listener.close()
+        self._thread.join(timeout=5)
+        for worker in list(self._workers):
+            worker.join(timeout=5)
         self._directory.cleanup()
+
+    def _snapshot(self) -> list[socket.socket]:
+        with self._lock:
+            return list(self._open)
 
     def _serve(self) -> None:
         while not self._closed.is_set():
@@ -721,31 +757,68 @@ class UnixSocketRelay:
                 client, _ = self._listener.accept()
             except OSError:
                 return
-            try:
-                upstream = socket.create_connection(("127.0.0.1", self.broker_port), timeout=30)
-                upstream.settimeout(None)
-            except OSError:
+            if not self._slots.acquire(blocking=False):
                 client.close()
                 continue
-            for source, sink in ((client, upstream), (upstream, client)):
-                threading.Thread(target=_pump, args=(source, sink), daemon=True).start()
+            worker = threading.Thread(target=self._connection, args=(client,), daemon=True)
+            self._workers.add(worker)
+            try:
+                worker.start()
+            except RuntimeError:
+                self._workers.discard(worker)
+                client.close()
+                self._slots.release()
+
+    def _connection(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            upstream = socket.create_connection(("127.0.0.1", self.broker_port), timeout=30)
+            ends = (client, upstream)
+            with self._lock:
+                # Under the same lock as teardown's snapshot: either teardown
+                # sees these ends, or this sees that teardown has begun.
+                self._open.update(ends)
+                if self._closed.is_set():
+                    return
+            for end in ends:
+                end.settimeout(RELAY_IDLE_SECONDS)
+            reverse = threading.Thread(target=_pump, args=(upstream, client), daemon=True)
+            reverse.start()
+            _pump(client, upstream)
+            reverse.join()
+        except (OSError, RuntimeError):
+            pass
+        finally:
+            with self._lock:
+                self._open.discard(client)
+                if upstream is not None:
+                    self._open.discard(upstream)
+            client.close()
+            if upstream is not None:
+                upstream.close()
+            self._slots.release()
+            self._workers.discard(threading.current_thread())
+
+
+def _shutdown(end: socket.socket) -> None:
+    try:
+        end.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
 
 
 def _pump(source: socket.socket, sink: socket.socket) -> None:
+    """Copy one direction; a clean end of stream half-closes, anything else closes both."""
     try:
         while True:
             data = source.recv(65536)
             if not data:
                 break
             sink.sendall(data)
+        sink.shutdown(socket.SHUT_WR)
     except OSError:
-        pass
-    finally:
-        for end in (source, sink):
-            try:
-                end.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        _shutdown(source)
+        _shutdown(sink)
 
 
 def namespace_broker_url(broker_base_url: str) -> str:
