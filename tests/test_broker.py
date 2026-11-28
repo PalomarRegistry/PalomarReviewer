@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import http.server
 import io
 import json
 import os
@@ -24,6 +25,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from test_cli import UsesCapabilities
@@ -886,13 +888,22 @@ class EnginePassTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            seen: dict[str, str] = {}
+            seen: dict[str, Any] = {}
+            real_relay = engine.UnixSocketRelay
+
+            def recording_relay(broker_port):
+                seen["base"] = f"http://127.0.0.1:{broker_port}"
+                seen["relay"] = real_relay(broker_port)
+                return seen["relay"]
 
             def timed_out(command, **kwargs):
                 configured = next(
                     argument for argument in command if "base_url=" in argument
                 )
-                seen["base"] = configured.split('base_url="', 1)[1].removesuffix('/v1"')
+                # Codex is given the namespace's own loopback, never the host port.
+                self.assertIn(f"127.0.0.1:{engine.NAMESPACE_BROKER_PORT}", configured)
+                # The real broker is alive while the pass runs.
+                seen["alive"] = request(seen["base"], capability="anything", timeout=5)
                 raise engine.EngineError("codex exec timed out after 7200 seconds")
 
             with (
@@ -908,6 +919,7 @@ class EnginePassTests(unittest.TestCase):
                 ),
                 mock.patch.object(engine, "_run", side_effect=timed_out),
                 mock.patch.object(engine, "require_pinned_codex"),
+                mock.patch.object(engine, "UnixSocketRelay", side_effect=recording_relay),
             ):
                 with self.assertRaisesRegex(engine.EngineError, "timed out"):
                     engine.execute(
@@ -920,9 +932,10 @@ class EnginePassTests(unittest.TestCase):
                         raw_path=root / "raw" / "result.txt",
                     )
 
-        self.assertTrue(seen["base"].startswith("http://127.0.0.1:"))
+        self.assertIsNotNone(seen.get("alive"))
         with self.assertRaises(OSError):
             request(seen["base"], capability="anything", timeout=5)
+        self.assertFalse(seen["relay"].directory.exists())
 
 
 class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
@@ -980,6 +993,8 @@ class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
                         ),
                         cwd=source,
                         output_dir=output,
+                        broker_socket_dir=source.parent,
+                        relay_dir=source.parent,
                         secret_args_fd=read_fd,
                     )
                     # Everything about the namespace, with the engine replaced
@@ -1027,6 +1042,8 @@ class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
                     ),
                     cwd=source,
                     output_dir=root / "output",
+                    broker_socket_dir=source.parent,
+                    relay_dir=source.parent,
                     secret_args_fd=9,
                 )
         rendered = " ".join(command)
@@ -1036,6 +1053,63 @@ class NamespaceCredentialTests(UsesCapabilities, unittest.TestCase):
         self.assertIn("--clearenv", command)
         self.assertEqual(command[command.index("--args") + 1], "9")
         self.assertLess(command.index("--clearenv"), command.index("--args"))
+
+    def test_the_codex_namespace_reaches_only_the_broker(self):
+        """A prompt-injected shell gets the broker and nothing else: no network, no DNS."""
+        self.require("sandbox", "codex")
+
+        class Broker(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"broker-reached")
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Broker)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        probe = (
+            "import socket, urllib.request\n"
+            f"print(urllib.request.urlopen('http://127.0.0.1:{engine.NAMESPACE_BROKER_PORT}/v1', "
+            "timeout=10).read().decode())\n"
+            f"for target in (('1.1.1.1', 443), ('127.0.0.1', {server.server_address[1]})):\n"
+            "    try:\n"
+            "        socket.create_connection(target, timeout=3)\n"
+            "        print('reached', target)\n"
+            "    except OSError:\n"
+            "        print('blocked', target)\n"
+            "try:\n"
+            "    socket.getaddrinfo('api.openai.com', 443)\n"
+            "    print('dns-resolved')\n"
+            "except OSError:\n"
+            "    print('dns-failed')\n"
+        )
+        with tempfile.TemporaryDirectory() as directory, engine.UnixSocketRelay(
+            server.server_address[1]
+        ) as relay:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            command = engine.isolated_command(
+                "codex", ["codex", "exec"], cwd=source, output_dir=root / "output",
+                secret_args_fd=9, broker_socket_dir=relay.socket_dir, relay_dir=relay.relay_dir,
+            )
+            # The real namespace and relay, with Codex replaced by the probe and
+            # no capability channel, since the probe needs none.
+            arguments = command.index("--args")
+            del command[arguments : arguments + 2]
+            bwrap_end = command.index("--")
+            interpreter = command[bwrap_end + 1]
+            relay_end = command.index("--", bwrap_end + 1)
+            probe_command = [*command[: relay_end + 1], interpreter, "-I", "-c", probe]
+            output = engine._run(probe_command, timeout=120).stdout
+        self.assertNotIn("--share-net", command)
+        self.assertIn("broker-reached", output)
+        self.assertIn("blocked ('1.1.1.1', 443)", output)
+        self.assertIn(f"blocked ('127.0.0.1', {server.server_address[1]})", output)
+        self.assertIn("dns-failed", output)
 
     def test_codex_refuses_to_start_without_the_broker_capability_channel(self):
         self.require("sandbox", "codex")

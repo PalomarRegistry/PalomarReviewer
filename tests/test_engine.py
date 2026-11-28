@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -300,6 +301,8 @@ class EngineExecutionTests(unittest.TestCase):
                     ["codex", "exec"],
                     cwd=source,
                     output_dir=root / "output",
+                    broker_socket_dir=source.parent,
+                    relay_dir=source.parent,
                     secret_args_fd=9,
                 )
 
@@ -322,6 +325,8 @@ class EngineExecutionTests(unittest.TestCase):
                     ["codex", "exec"],
                     cwd=source,
                     output_dir=root / "other-output",
+                    broker_socket_dir=source.parent,
+                    relay_dir=source.parent,
                     secret_args_fd=9,
                 )
     def test_library_sources_are_bound_read_only_beside_the_workspace(self):
@@ -793,3 +798,86 @@ class EngineExecutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrokerRelayTests(unittest.TestCase):
+    """The namespace's only exit: half-close, bounds and the wrapper's exit status."""
+
+    def broker(self, reply_bytes):
+        import socket as socket_module
+        import threading as threading_module
+
+        server = socket_module.create_server(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+
+        def serve():
+            while True:
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    return
+                with connection:
+                    received = b""
+                    while chunk := connection.recv(65536):
+                        received += chunk
+                    connection.sendall(b"x" * reply_bytes)
+
+        threading_module.Thread(target=serve, daemon=True).start()
+        return server.getsockname()[1]
+
+    def test_a_half_closed_request_still_gets_its_whole_response(self):
+        import socket as socket_module
+
+        with engine.UnixSocketRelay(self.broker(300_000)) as relay:
+            client = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+            client.settimeout(10)
+            client.connect(str(relay.socket_dir / engine.BROKER_SOCKET_NAME))
+            client.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            client.shutdown(socket_module.SHUT_WR)
+            received = b""
+            while chunk := client.recv(65536):
+                received += chunk
+            client.close()
+        self.assertEqual(len(received), 300_000)
+
+    def test_connections_beyond_the_cap_are_refused_and_teardown_closes_the_rest(self):
+        import socket as socket_module
+
+        with mock.patch.object(engine, "RELAY_MAX_CONNECTIONS", 2):
+            relay = engine.UnixSocketRelay(self.broker(1))
+        with relay:
+            path = str(relay.socket_dir / engine.BROKER_SOCKET_NAME)
+            held = []
+            for _ in range(2):
+                stalled = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+                stalled.connect(path)
+                held.append(stalled)
+            extra = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+            extra.settimeout(10)
+            extra.connect(path)
+            self.assertEqual(extra.recv(1), b"")
+        for stalled in held:
+            stalled.settimeout(10)
+            self.assertEqual(stalled.recv(1), b"")
+            stalled.close()
+        self.assertFalse(relay.directory.exists())
+
+    def run_wrapper(self, child, *, input_text=""):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "relay.py"
+            script.write_text(engine.RELAY_SOURCE, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, "-I", "-S", str(script), "127.0.0.1", "0",
+                 str(Path(directory) / "absent.sock"), "--", sys.executable, "-I", "-c", child],
+                input=input_text, capture_output=True, text=True, timeout=60,
+            )
+
+    def test_the_wrapper_passes_stdin_and_exit_status_through(self):
+        done = self.run_wrapper(
+            "import sys; print(sys.stdin.read().upper()); sys.exit(3)", input_text="prompt"
+        )
+        self.assertEqual((done.returncode, done.stdout.strip()), (3, "PROMPT"))
+
+    def test_the_wrapper_dies_of_the_signal_its_child_died_of(self):
+        done = self.run_wrapper("import os, signal; os.kill(os.getpid(), signal.SIGTERM)")
+        self.assertEqual(done.returncode, -15)

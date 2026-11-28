@@ -23,8 +23,12 @@ import os
 import platform
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -73,6 +77,82 @@ UNBROKERED_CLAUDE_ENV = "PALOMAR_ALLOW_UNBROKERED_CLAUDE"
 # Where Palomar's checkout of the Challenge's pinned library sources appears
 # inside the namespace, beside rather than within the submitted `/workspace`.
 LIBRARIES_MOUNT = "/libraries"
+# The Codex namespace has its own network namespace with nothing but loopback.
+# Its only way out is one Unix socket, bound in at BROKER_SOCKET_MOUNT, that a
+# host-side relay connects to the loopback model broker. Inside, a small relay
+# listens on the namespace's own loopback at this port and forwards to that
+# socket, because Codex speaks HTTP to a TCP address. DNS has nothing to ask.
+BROKER_SOCKET_MOUNT = "/broker"
+BROKER_SOCKET_NAME = "broker.sock"
+NAMESPACE_BROKER_PORT = 47100
+RELAY_MOUNT = "/relay"
+RELAY_SOURCE = """\
+import os, signal, socket, subprocess, sys, threading
+
+host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+if sys.argv[4] != "--":
+    sys.exit("relay: malformed arguments")
+slots = threading.BoundedSemaphore(32)
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((host, port))
+listener.listen(32)
+
+
+def pump(source, sink):
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            sink.sendall(data)
+        sink.shutdown(socket.SHUT_WR)
+    except OSError:
+        for end in (source, sink):
+            try:
+                end.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def connection(client):
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        upstream.connect(path)
+        for end in (client, upstream):
+            end.settimeout(900)
+        reverse = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+        reverse.start()
+        pump(client, upstream)
+        reverse.join()
+    except OSError:
+        pass
+    finally:
+        client.close()
+        upstream.close()
+        slots.release()
+
+
+def serve():
+    while True:
+        client, _ = listener.accept()
+        if not slots.acquire(blocking=False):
+            client.close()
+            continue
+        try:
+            threading.Thread(target=connection, args=(client,), daemon=True).start()
+        except RuntimeError:
+            client.close()
+            slots.release()
+
+
+threading.Thread(target=serve, daemon=True).start()
+status = subprocess.call(sys.argv[5:])
+if status < 0:
+    signal.signal(-status, signal.SIG_DFL)
+    os.kill(os.getpid(), -status)
+sys.exit(status)
+"""
 
 
 def validate_config(engine: str, command: str | None) -> None:
@@ -365,8 +445,15 @@ def isolated_command(
     output_dir: Path,
     secret_args_fd: int | None = None,
     libraries: Path | None = None,
+    broker_socket_dir: Path | None = None,
+    relay_dir: Path | None = None,
 ) -> list[str]:
     """Build a fail-closed Linux namespace with no ambient operator home.
+
+    The Codex namespace does not share the runner's network: it has only its
+    own loopback, and `broker_socket_dir` (holding the host relay's Unix
+    socket) and `relay_dir` (holding the in-namespace relay) are required for
+    it. The other engines are not production engines and still share it.
 
     `libraries`, when given, is Palomar's own read-only checkout of the pinned
     library sources the Challenge imports. It is bound beside the submitted
@@ -387,10 +474,10 @@ def isolated_command(
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
-        # The CLI transport must reach its model API. Per-pass browsing is
-        # controlled by the engine tool list; a private netns would also cut
-        # the transport and make every non-literature pass non-functional.
-        "--share-net",
+        # Codex reaches its model only through the brokered Unix socket, so its
+        # network namespace stays private. The Claude and custom engines'
+        # transports need the runner's network; neither is a production engine.
+        *([] if engine == "codex" else ["--share-net"]),
         "--clearenv",
         "--tmpfs",
         "/home",
@@ -432,8 +519,9 @@ def isolated_command(
     ]
     for path in SANDBOX_SYSTEM_ROOTS:
         _bind_if_present(command, path, str(path))
-    for path in SYSTEM_RESOLUTION_PATHS:
-        _bind_if_present(command, path, str(path))
+    if engine != "codex":
+        for path in SYSTEM_RESOLUTION_PATHS:
+            _bind_if_present(command, path, str(path))
 
     if engine == "codex":
         codex = shutil.which("codex")
@@ -470,7 +558,24 @@ def isolated_command(
         # out of it, and `--ignore-user-config` means no config.toml is read
         # from it, so nothing an earlier run or the host left behind applies.
         command.extend(["--setenv", "CODEX_HOME", "/home/reviewer/.codex"])
-        argv = [str(Path(node).resolve(strict=True)), "/engine/codex/bin/codex.js", *argv[1:]]
+        if broker_socket_dir is None or relay_dir is None:
+            raise EngineError(
+                "the Codex engine runs only in a private network namespace, and no broker "
+                "socket was supplied"
+            )
+        interpreter = Path(sys.executable).resolve(strict=True)
+        base = Path(sys.base_prefix).resolve(strict=True)
+        if not any(base.is_relative_to(root) for root in SANDBOX_SYSTEM_ROOTS):
+            _bind_if_present(command, base, str(base))
+        command.extend([
+            "--ro-bind", str(broker_socket_dir.resolve(strict=True)), BROKER_SOCKET_MOUNT,
+            "--ro-bind", str(relay_dir.resolve(strict=True)), RELAY_MOUNT,
+        ])
+        argv = [
+            str(interpreter), "-I", "-S", f"{RELAY_MOUNT}/relay.py",
+            "127.0.0.1", str(NAMESPACE_BROKER_PORT), f"{BROKER_SOCKET_MOUNT}/{BROKER_SOCKET_NAME}", "--",
+            str(Path(node).resolve(strict=True)), "/engine/codex/bin/codex.js", *argv[1:],
+        ]
     elif engine == "claude":
         if os.environ.get(UNBROKERED_CLAUDE_ENV, "").strip() != "1":
             raise EngineError(
@@ -594,6 +699,134 @@ def isolated_intake_command(
     return [*command, "--", *argv]
 
 
+RELAY_MAX_CONNECTIONS = 32
+RELAY_IDLE_SECONDS = 900
+
+
+class UnixSocketRelay:
+    """Host side of the namespace's only exit: a Unix socket to the loopback broker.
+
+    The socket lives in a fresh 0700 directory. Every connection is forwarded
+    to the broker's TCP port and nowhere else, so the namespace can reach the
+    broker and nothing on the runner's network. At most as many connections
+    as the broker admits are relayed at once, a stalled one is dropped after
+    an idle timeout, and every relayed connection is closed when the pass ends.
+    """
+
+    def __init__(self, broker_port: int):
+        self.broker_port = broker_port
+        self._directory = tempfile.TemporaryDirectory(prefix="palomar-broker-")
+        self.directory = Path(self._directory.name)
+        os.chmod(self.directory, 0o700)
+        self.relay_dir = self.directory / "relay"
+        self.relay_dir.mkdir()
+        (self.relay_dir / "relay.py").write_text(RELAY_SOURCE, encoding="utf-8")
+        self.socket_dir = self.directory / "socket"
+        self.socket_dir.mkdir(mode=0o700)
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._listener.bind(str(self.socket_dir / BROKER_SOCKET_NAME))
+        self._listener.listen(RELAY_MAX_CONNECTIONS)
+        self._closed = threading.Event()
+        self._slots = threading.BoundedSemaphore(RELAY_MAX_CONNECTIONS)
+        self._lock = threading.Lock()
+        self._open: set[socket.socket] = set()
+        self._workers: set[threading.Thread] = set()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self) -> UnixSocketRelay:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._closed.set()
+        for end in [self._listener, *self._snapshot()]:
+            _shutdown(end)
+        self._listener.close()
+        self._thread.join(timeout=5)
+        for worker in list(self._workers):
+            worker.join(timeout=5)
+        self._directory.cleanup()
+
+    def _snapshot(self) -> list[socket.socket]:
+        with self._lock:
+            return list(self._open)
+
+    def _serve(self) -> None:
+        while not self._closed.is_set():
+            try:
+                client, _ = self._listener.accept()
+            except OSError:
+                return
+            if not self._slots.acquire(blocking=False):
+                client.close()
+                continue
+            worker = threading.Thread(target=self._connection, args=(client,), daemon=True)
+            self._workers.add(worker)
+            try:
+                worker.start()
+            except RuntimeError:
+                self._workers.discard(worker)
+                client.close()
+                self._slots.release()
+
+    def _connection(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            upstream = socket.create_connection(("127.0.0.1", self.broker_port), timeout=30)
+            ends = (client, upstream)
+            with self._lock:
+                # Under the same lock as teardown's snapshot: either teardown
+                # sees these ends, or this sees that teardown has begun.
+                self._open.update(ends)
+                if self._closed.is_set():
+                    return
+            for end in ends:
+                end.settimeout(RELAY_IDLE_SECONDS)
+            reverse = threading.Thread(target=_pump, args=(upstream, client), daemon=True)
+            reverse.start()
+            _pump(client, upstream)
+            reverse.join()
+        except (OSError, RuntimeError):
+            pass
+        finally:
+            with self._lock:
+                self._open.discard(client)
+                if upstream is not None:
+                    self._open.discard(upstream)
+            client.close()
+            if upstream is not None:
+                upstream.close()
+            self._slots.release()
+            self._workers.discard(threading.current_thread())
+
+
+def _shutdown(end: socket.socket) -> None:
+    try:
+        end.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _pump(source: socket.socket, sink: socket.socket) -> None:
+    """Copy one direction; a clean end of stream half-closes, anything else closes both."""
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            sink.sendall(data)
+        sink.shutdown(socket.SHUT_WR)
+    except OSError:
+        _shutdown(source)
+        _shutdown(sink)
+
+
+def namespace_broker_url(broker_base_url: str) -> str:
+    """The broker as Codex sees it: the namespace's own loopback, same path."""
+    path = urllib.parse.urlsplit(broker_base_url).path
+    return f"http://127.0.0.1:{NAMESPACE_BROKER_PORT}{path}"
+
+
 def _run_brokered_codex(
     prompt: str,
     *,
@@ -625,13 +858,15 @@ def _run_brokered_codex(
     )
     upstream_key = os.environ.get(model_broker.UPSTREAM_KEY_ENV, "").strip()
     try:
-        with model_broker.started_broker(policy=policy, upstream_key=upstream_key) as broker:
+        with model_broker.started_broker(
+            policy=policy, upstream_key=upstream_key
+        ) as broker, UnixSocketRelay(urllib.parse.urlsplit(broker.base_url).port or 0) as relay:
             argv = codex_arguments(
                 schema_name=schema_name,
                 output_name=output_name,
                 model=model or "",
                 reasoning_effort=reasoning_effort,
-                broker_base_url=broker.base_url,
+                broker_base_url=namespace_broker_url(broker.base_url),
             )
             payload = sandbox_environment_args({model_broker.CAPABILITY_ENV: broker.capability})
             read_fd, write_fd = os.pipe()
@@ -647,6 +882,8 @@ def _run_brokered_codex(
                         output_dir=engine_output,
                         secret_args_fd=read_fd,
                         libraries=libraries,
+                        broker_socket_dir=relay.socket_dir,
+                        relay_dir=relay.relay_dir,
                     ),
                     input_text=prompt,
                     timeout=7200,
