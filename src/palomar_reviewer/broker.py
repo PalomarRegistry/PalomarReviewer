@@ -971,6 +971,10 @@ class BrokerProcess:
         # client retry with a fabricated review.
         try:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Lets the port be bound again once this pass is over, though the
+            # killed child's connections may linger on it. It never lets a
+            # second socket bind while this one is listening.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((LOOPBACK_HOST, 0))
             listener.listen(MAX_CONNECTIONS)
             listener.set_inheritable(True)

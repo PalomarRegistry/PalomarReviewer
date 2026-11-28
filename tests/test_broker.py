@@ -831,8 +831,12 @@ class BrokerProcessTests(unittest.TestCase):
             self.assertIsNone(running.close())
             self.assertNotEqual(running.exit_status, 0)
 
-        # Once the pass is over the port is released like any other.
+        # Once the pass is over the port is released like any other. The killed
+        # broker's connection can leave the port in TIME_WAIT, which only
+        # SO_REUSEADDR binds through; it still cannot bind over a listener, so
+        # this checks the same thing as the forger above, the other way round.
         released = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        released.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.addCleanup(released.close)
         released.bind(("127.0.0.1", port))
 
