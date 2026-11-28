@@ -295,6 +295,9 @@ MECHANICAL_REPORT_SCHEMA = {
         # Required of a confidential report, checked whenever present.
         "run_repository": {"enum": [SUBMISSION_REPO, confidential.RUNS_REPO]},
         "pipeline_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        # The SHA-256 of the private source tarball a confidential run checked
+        # before unpacking it. Required of a confidential report.
+        "source_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
         "project_dependencies": {
             "type": "array",
             "items": {
@@ -750,7 +753,11 @@ def validate_report_contract(
             raise ReviewerError(
                 "confidential mechanical report did not execute the pipeline commit its run called"
             )
+        if report.get("source_sha256") != (state.get("confidential") or {}).get("source_sha256"):
+            raise ReviewerError("confidential mechanical report verified a different source tarball")
         return pipeline_commit
+    if "source_sha256" in report:
+        raise ReviewerError("a public mechanical report cannot name a private source tarball")
     if "pipeline_commit" in report and report["pipeline_commit"] != head_sha:
         raise ReviewerError("mechanical report did not execute its run's workflow commit")
     return head_sha

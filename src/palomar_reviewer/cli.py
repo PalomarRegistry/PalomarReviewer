@@ -2276,6 +2276,8 @@ def request_render(
     # An omitted dispatch input selects the catalogue's current default,
     # which can differ from the accepted report's inherited/legacy profile.
     dispatch.extend(["-f", f"execution_profile={profile}"])
+    if origin.confidential:
+        dispatch.extend(confidential_render_inputs(mechanical))
     expected_titles = origin.render_titles(mechanical, request_id)
     run_data: dict[str, Any] | None = None
     if pending_render is not None:
@@ -2454,6 +2456,38 @@ def request_render(
     if report.get("workflow_url") != run_data.get("url"):
         raise RenderRequestError("downloaded render result does not match its workflow run")
     return download
+
+
+CONFIDENTIAL_SOURCE_URL_SECONDS = 86400
+CONFIDENTIAL_TOMBSTONE_URL_SECONDS = 604800
+
+
+def confidential_render_inputs(mechanical: dict[str, Any]) -> list[str]:
+    """What a confidential render reads instead of the repository.
+
+    A 24-hour presigned read of the Server's tarball (runs can queue) and its
+    digest, and a seven-day presigned read of the tombstone (SigV4's maximum,
+    so it outlives the longest job), which the run checks before it starts and
+    before each upload (404 means not withdrawn). The Server passes the same
+    three to verify.yml (part 11.4). The repository
+    and commit are still passed, as identity only.
+    """
+    submission_id = mechanical["submission"]["submission_id"]
+    digest = mechanical.get("source_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise RenderRequestError("confidential mechanical report names no source tarball digest")
+    bucket = confidential_bucket()
+    if bucket.withdrawn(submission_id):
+        raise RenderRequestError(f"confidential submission {submission_id} has been withdrawn")
+    return [
+        "-f", "source_url=" + bucket.presign(
+            private_bucket.source_key(submission_id), CONFIDENTIAL_SOURCE_URL_SECONDS
+        ),
+        "-f", f"source_sha256={digest}",
+        "-f", "tombstone_url=" + bucket.presign(
+            private_bucket.tombstone_key(submission_id), CONFIDENTIAL_TOMBSTONE_URL_SECONDS
+        ),
+    ]
 
 
 def resume_render(
@@ -4829,6 +4863,53 @@ def registry_git_environment(base: dict[str, str] | None = None) -> dict[str, st
     return environment
 
 
+def confidential_source_sha256(state: dict[str, Any], mechanical: dict[str, Any]) -> str:
+    """The tarball digest the Server recorded at intake, which the run must have verified."""
+    expected = (state.get("confidential") or {}).get("source_sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ReviewerError("confidential submission records no source tarball digest")
+    if mechanical.get("source_sha256") != expected:
+        raise ReviewerError("confidential mechanical report verified a different source tarball")
+    return expected
+
+
+def restore_confidential_source(
+    state: dict[str, Any], mechanical: dict[str, Any], destination: Path
+) -> None:
+    """Unpack the Server's tarball of the verified commit; the repository is never read.
+
+    GitHub's tarball holds one top-level directory, which becomes the
+    checkout. Extraction uses the `data` filter, which refuses absolute paths,
+    `..`, links that leave the tree and special files.
+    """
+    expected = confidential_source_sha256(state, mechanical)
+    if destination.exists():
+        shutil.rmtree(destination)
+    archive = destination.with_name("source.tar.gz")
+    confidential_bucket().download(private_bucket.source_key(state["id"]), archive)
+    try:
+        if sha256_file(archive) != expected:
+            raise ReviewerError("confidential source tarball does not match its recorded digest")
+        unpacked = destination.with_name("source-unpacked")
+        if unpacked.exists():
+            shutil.rmtree(unpacked)
+        unpacked.mkdir()
+        try:
+            with tarfile.open(archive, "r:gz") as bundle:
+                members = bundle.getmembers()
+                tops = {member.name.split("/", 1)[0] for member in members}
+                if len(tops) != 1 or not any(member.isdir() and "/" not in member.name.rstrip("/")
+                                             for member in members):
+                    raise ReviewerError("confidential source tarball must hold exactly one top directory")
+                bundle.extractall(unpacked, filter="data")
+        except (tarfile.TarError, OSError) as error:
+            raise ReviewerError(f"confidential source tarball could not be unpacked: {error}") from error
+        (unpacked / tops.pop()).rename(destination)
+        shutil.rmtree(unpacked)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
 def clone_at(
     repository_url: str,
     revision: str,
@@ -5408,9 +5489,12 @@ def prepare_workspace(
     source_info = mechanical["source"]
     if mechanical["submission"]["submission_id"] != submission_id:
         raise ReviewerError("mechanical report names a different submission")
-    source_commit = clone_at(source_info["repository_url"], source_info["commit"], work / "source")
-    if source_commit != source_info["commit"]:
-        raise ReviewerError("source checkout does not match mechanical report")
+    if confidential_mode.is_confidential(state):
+        restore_confidential_source(state, mechanical, work / "source")
+    else:
+        source_commit = clone_at(source_info["repository_url"], source_info["commit"], work / "source")
+        if source_commit != source_info["commit"]:
+            raise ReviewerError("source checkout does not match mechanical report")
     source = work / "source"
     if correction_review:
         apply_registry_correction_source_evidence(mechanical)
