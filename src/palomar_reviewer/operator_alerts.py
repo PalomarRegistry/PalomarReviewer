@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from . import confidential
 from .errors import ReviewerError
 
 ZULIP_MESSAGES_URL = "https://leanprover.zulipchat.com/api/v1/messages"
@@ -24,9 +25,17 @@ REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 DIAGNOSTIC_CODE_RE = re.compile(r"[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+\Z")
-RUN_URL_RE = re.compile(
-    r"https://github\.com/PalomarRegistry/PalomarSubmission/actions/runs/[1-9][0-9]*\Z"
-)
+# Both run origins: a confidential submission's runs are in the private caller.
+RUN_URL_RE = confidential.RUN_URL_RE
+DISPOSITION_LABELS = {
+    "recovered": "Recovered: the same commit and configuration verified successfully.",
+    "superseded": "Superseded: a newer commit for this configuration verified successfully. "
+    "This does not establish that the original commit works.",
+    "withdrawn": ("Withdrawn: this submission is no longer active. "
+                  "The original failure is not marked fixed."),
+    "reclassified": ("Reclassified: the original operator alert was reviewed "
+                     "and its failure diagnosis corrected. See the current submission status."),
+}
 
 
 def alert_key(state: dict[str, Any], failure: dict[str, Any], index: int) -> str:
@@ -177,6 +186,15 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
     if len(matching) != 1:
         raise ReviewerError("operator alert item is not present in its outbox")
     item = matching[0]
+    if confidential.is_confidential(state):
+        # Never the ordinary renderer: its source link, summary, detail and
+        # next action can carry repository names, paths and declarations.
+        origin = item.get("origin") or {
+            "id": state.get("id"), "test_submission": state.get("test_submission") is True,
+            "failure": state.get("failure"),
+        }
+        disposition = (item.get("disposition") or {}).get("kind")
+        return confidential_alert_message(origin, item["key"], item["diagnostic_index"], disposition)
     if "origin" in item:
         origin = item["origin"]
         legacy_item = {key: value for key, value in item.items() if key not in V2_FIELDS}
@@ -186,15 +204,7 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
         if not disposition or disposition["kind"] == "unresolved":
             return original
         kind = disposition["kind"]
-        label = {
-            "recovered": "Recovered: the same commit and configuration verified successfully.",
-            "superseded": "Superseded: a newer commit for this configuration verified successfully. "
-            "This does not establish that the original commit works.",
-            "withdrawn": ("Withdrawn: this submission is no longer active. "
-                          "The original failure is not marked fixed."),
-            "reclassified": ("Reclassified: the original operator alert was reviewed "
-                             "and its failure diagnosis corrected. See the current submission status."),
-        }[kind]
+        label = DISPOSITION_LABELS[kind]
         evidence = disposition.get("evidence")
         suffix = f"\n\n**Disposition — {label}**"
         if kind == "reclassified":
@@ -245,6 +255,48 @@ def alert_message(state: dict[str, Any], item: dict[str, Any]) -> str:
             _plain_code_block(diagnostic["next_action"]),
         ]
     )
+
+
+def confidential_alert_message(
+    origin: dict[str, Any], key: str, diagnostic_index: int, disposition: str | None = None
+) -> str:
+    """The pinned operator alert for a confidential submission (contract v3.1, C4).
+
+    The id, the private run number, phase and stage, diagnostic code and
+    owner, and the alert key, and nothing else: no repository, commit, path,
+    declaration, summary, detail, next action or log excerpt. A disposition
+    adds only its label. PalomarSubmissionState validates `delivered_sha256`
+    against this same text, rendered by its twin `confidential_alert_message`
+    in `tools/state_validation/confidential.py`, so the two change together.
+    `tests/test_confidential.py` (`AlertTests.PINNED`) pins the text here.
+    """
+    submission_id = origin.get("id")
+    if not isinstance(submission_id, str) or not SUBMISSION_ID_RE.fullmatch(submission_id):
+        raise ReviewerError("operator alert submission id is malformed")
+    failure = origin["failure"]
+    diagnostic = failure["diagnostics"][diagnostic_index]
+    run = failure.get("run")
+    run_id = run.get("id") if isinstance(run, dict) else None
+    if type(run_id) is not int or run_id < 1 or not RUN_URL_RE.fullmatch(str(run.get("url", ""))):
+        raise ReviewerError("operator alert workflow run is malformed")
+    if run["url"] != confidential.CONFIDENTIAL_ORIGIN.run_url(run_id):
+        raise ReviewerError("a confidential alert must name a private run")
+    test_label = " **[technical test]**" if origin.get("test_submission") is True else ""
+    message = "\n".join([
+        f"**Palomar must fix this** [confidential]{test_label}",
+        "",
+        f"- Submission: `{submission_id}`",
+        f"- Source: withheld (confidential; see State submissions/{submission_id}/state.json)",
+        f"- Workflow: private run {run_id} in PalomarConfidentialRuns",
+        f"- Phase/stage: {_inline_code(failure.get('phase', 'unknown'))} / "
+        f"{_inline_code(diagnostic['stage'])}",
+        f"- Diagnostic: {_inline_code(diagnostic['code'])} (owner {_inline_code(diagnostic['owner'])})",
+        f"- Retryable unchanged: `{'yes' if diagnostic['retryable'] else 'no'}`",
+        f"- Alert key: `{key[:16]}`",
+    ])
+    if disposition is not None and disposition != "unresolved":
+        message += f"\n\n**Disposition: {DISPOSITION_LABELS[disposition]}**"
+    return message
 
 
 def send_zulip_message(content: str, *, email: str, api_key: str) -> int:
