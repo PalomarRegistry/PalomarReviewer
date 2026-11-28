@@ -135,7 +135,9 @@ class ContentFreeStateTests(BucketCase):
         self.assertEqual(failure["diagnostics"][0], {
             "owner": "palomar", "code": "palomar.workflow_incomplete", "stage": "build", "retryable": True,
         })
-        self.assertIn(CANARY, self.r2.objects[failure["text"]["key"]].decode())
+        stored = self.r2.objects[failure["text"]["key"]]
+        self.assertIn(CANARY, stored.decode())
+        self.assertEqual(failure["text"]["sha256"], hashlib.sha256(stored).hexdigest())
         outbox = cli.operator_notifications.queued_alerts(record, failure, queued_at="2026-11-20T10:00:00Z")
         stored = {**record, "failure": failure, "operator_alerts": outbox}
         message = cli.operator_notifications.alert_message(stored, outbox["items"][0])
@@ -167,7 +169,11 @@ class ContentFreeStateTests(BucketCase):
         self.assertNotIn("detail", written["registration_failure"])
         self.assertEqual(written["confidential"]["source_sha256"], "e" * 64)
         pointer = written["confidential"]["error_text"]
-        self.assertEqual(json.loads(self.r2.objects[pointer["key"]])["review_error"], CANARY)
+        stored = self.r2.objects[pointer["key"]]
+        # The status page trusts the pointer only if it hashes the stored bytes exactly.
+        self.assertEqual(pointer["sha256"], hashlib.sha256(stored).hexdigest())
+        self.assertEqual(pointer["key"], f"conf/{SUBMISSION}/text/{pointer['sha256']}.json")
+        self.assertEqual(json.loads(stored)["review_error"], CANARY)
 
     def test_an_ingested_confidential_failure_writes_no_prose_to_state(self):
         """The whole ingest path, with the run's failure report quoting the source."""
