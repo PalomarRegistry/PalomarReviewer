@@ -108,6 +108,7 @@ def mechanical_report(workflow_url=RUNS_URL):
         "workflow_url": workflow_url,
         "run_repository": "/".join(workflow_url.split("/")[3:5]),
         "pipeline_commit": PIPELINE,
+        "source_sha256": "e" * 64,
         "project_dependencies": [],
     }
 
@@ -295,9 +296,12 @@ class ConfidentialRenderTests(unittest.TestCase):
             return "[]" if args[:2] == ["run", "list"] else ""
 
         clock = iter([0, 0, 10_000])
+        bucket = mock.Mock(withdrawn=mock.Mock(return_value=False), presign=mock.Mock(return_value="https://r2/x"))
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cli, "gh", side_effect=gh
-        ), mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)):
+        ), mock.patch.object(cli.time, "monotonic", side_effect=lambda: next(clock)), mock.patch.object(
+            cli, "confidential_bucket", return_value=bucket
+        ):
             with self.assertRaisesRegex(ReviewerError, "not visible"):
                 cli.request_render(Path(directory), mechanical)
         dispatch = calls[0]
