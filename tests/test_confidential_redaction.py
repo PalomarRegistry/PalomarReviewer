@@ -232,6 +232,34 @@ class PacketTests(BucketCase):
         self.assertEqual(Path(args.work_dir).name, ".palomar-reviews")
 
 
+class LogTests(unittest.TestCase):
+    def setUp(self):
+        cli.confidential_mode._MASKED.clear()
+        self.addCleanup(cli.confidential_mode._MASKED.clear)
+
+    def test_a_confidential_records_source_is_masked_in_the_actions_log_once(self):
+        masked = []
+        record = confidential_record()
+        for _ in range(2):
+            cli.confidential_mode.withhold_from_logs(record, emit=masked.append)
+        self.assertEqual(sorted(masked), sorted({
+            "canary-owner/canary-repo", "canary-owner-canary-repo", "3" * 40, "3" * 12, "3" * 7,
+        }))
+        cli.confidential_mode.withhold_from_logs(public_record(), emit=masked.append)
+        self.assertEqual(len(masked), 5)
+
+    def test_reading_a_record_masks_it_before_anything_can_print_it(self):
+        import contextlib
+        import io
+
+        output = io.StringIO()
+        with mock.patch.object(cli, "state_json", return_value=confidential_record()), \
+                contextlib.redirect_stdout(output):
+            cli.submission_state(SUBMISSION)
+        self.assertIn("::add-mask::canary-owner/canary-repo\n", output.getvalue())
+        self.assertIn("::add-mask::" + "3" * 40 + "\n", output.getvalue())
+
+
 class WithdrawalTests(BucketCase):
     def test_a_withdrawn_submission_is_left_out_of_the_pass_but_kept_queued(self):
         self.withdraw()

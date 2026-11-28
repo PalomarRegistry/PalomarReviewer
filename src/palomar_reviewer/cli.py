@@ -3631,7 +3631,9 @@ def submission_state(submission_id: str) -> dict[str, Any] | None:
     """The private record for a submission, or None if the server never made one."""
     if not SUBMISSION_ID_RE.fullmatch(submission_id):
         raise ReviewerError("submission id is malformed")
-    return state_json(f"submissions/{submission_id}/state.json")
+    record = state_json(f"submissions/{submission_id}/state.json")
+    confidential_mode.withhold_from_logs(record)
+    return record
 
 
 def submission_states(submission_ids: list[str]) -> dict[str, dict[str, Any] | None]:
@@ -3681,6 +3683,8 @@ def submission_states(submission_ids: list[str]) -> dict[str, dict[str, Any] | N
                 value = json.loads(blob["text"])
                 value["_blob_sha"] = blob["oid"]
                 records[submission_id] = value
+    for record in records.values():
+        confidential_mode.withhold_from_logs(record)
     return records
 
 

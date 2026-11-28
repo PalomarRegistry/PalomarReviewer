@@ -30,6 +30,7 @@ the other origin is refused.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -161,3 +162,33 @@ def validate_caller_run(document: dict[str, Any], caller: str) -> CallerRun:
     if document.get("path") != path:
         raise ReviewerError(f"confidential run has path {document.get('path')!r}, not {path!r}")
     return CallerRun(referenced_pipeline_commit(document, caller))
+
+
+_MASKED: set[str] = set()
+
+
+def withhold_from_logs(state: Any, *, emit: Any = None) -> None:
+    """Mask a confidential record's repository and commit in the Actions log.
+
+    State's Actions logs are shared with public passes and kept, so these must
+    never appear there, whichever error message, progress line or subprocess
+    happens to quote one. `::add-mask::` makes the runner replace them in
+    every later line of the job, including child processes' output, and the
+    command itself is not shown.
+    """
+    if not isinstance(state, dict) or state.get("visibility") != "confidential":
+        return
+    values: set[str] = set()
+    repository, commit = state.get("repository"), state.get("commit")
+    if isinstance(repository, str) and "/" in repository:
+        values.update({repository, repository.replace("/", "-")})
+    if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):
+        values.update({commit, commit[:12], commit[:7]})
+    for value in sorted(values - _MASKED):
+        (emit or _print_mask)(value)
+        _MASKED.add(value)
+
+
+def _print_mask(value: str) -> None:
+    sys.stdout.write(f"::add-mask::{value}\n")
+    sys.stdout.flush()
