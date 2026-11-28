@@ -29,7 +29,7 @@ import jsonschema
 import yaml
 from ruamel.yaml import YAML
 
-from . import alert_recovery, resource_failover, workflow_recovery
+from . import alert_recovery, private_bucket, resource_failover, workflow_recovery
 from . import authorization as registration_authorization
 from . import broker as model_broker
 from . import checkpoint as registration_checkpoint
@@ -3287,7 +3287,7 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         report_path = download_mechanical_artifact(
             run_data["databaseId"],
             state["id"],
-            root / state["id"] / f"{mode}-failure",
+            submission_workspace(root, state["id"], state) / f"{mode}-failure",
             mode=mode,
             **confidential_repository(state),
         )
@@ -3388,6 +3388,8 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
                 "to request access to larger runners. Automatic resource retries require an "
                 "allowlisted GitHub account; repeatedly submitting the same commit will not grant access."
             )
+    if confidential_mode.is_confidential(state):
+        failure = redacted_confidential_failure(state, failure)
     operator_alerts = operator_notifications.queued_alerts(
         state,
         failure,
@@ -3400,6 +3402,89 @@ def ingest_failure_diagnostics(state: dict[str, Any], root: Path) -> dict[str, A
         failure=failure,
         operator_alerts=operator_alerts,
     )
+
+
+CONFIDENTIAL_ERROR_FIELDS = ("review_error", "registration_error", "renderability_error")
+
+
+_BUCKET: list[private_bucket.Bucket] = []
+
+
+def confidential_bucket() -> private_bucket.Bucket:
+    """The private bucket, configured once per process."""
+    if not _BUCKET:
+        _BUCKET.append(private_bucket.Bucket())
+    return _BUCKET[0]
+
+
+def confidential_withdrawn(state: dict[str, Any]) -> bool:
+    """Whether this is a confidential submission its author has withdrawn.
+
+    A withdrawal writes the tombstone before anything else, and the cleanup
+    job waits for reviewer passes that started earlier, so a pass that sees
+    no tombstone here may still act, and one that sees it must not.
+    """
+    if not confidential_mode.is_confidential(state):
+        return False
+    return confidential_bucket().withdrawn(state["id"])
+
+
+def require_not_withdrawn(state: dict[str, Any]) -> None:
+    if confidential_withdrawn(state):
+        raise ReviewerError(
+            f"confidential submission {state['id']} has been withdrawn; nothing more is written for it"
+        )
+
+
+def store_confidential_text(state: dict[str, Any], text: dict[str, Any]) -> dict[str, str]:
+    """Put one bundle of content-bearing failure text in the private bucket."""
+    require_not_withdrawn(state)
+    return confidential_bucket().store_text(state["id"], text)
+
+
+def redacted_confidential_failure(state: dict[str, Any], failure: dict[str, Any]) -> dict[str, Any]:
+    """A confidential failure as State keeps it: codes and flags, never prose.
+
+    The full diagnostics (summaries, explanations, next actions, locations)
+    go to the private bucket, where the status page reads them; State keeps
+    phase, stage, code, owner and retryable, and the object's key and digest.
+    No repair draft is offered: a repair would be public.
+    """
+    redacted = copy.deepcopy(failure)
+    redacted.pop("repair_draft", None)
+    diagnostics = redacted.get("diagnostics") or []
+    redacted["diagnostics"] = [
+        {key: value for key, value in item.items()
+         if key not in operator_notifications.REDACTED_DIAGNOSTIC_FIELDS}
+        if isinstance(item, dict) else item
+        for item in diagnostics
+    ]
+    redacted["text"] = store_confidential_text(state, {"failure": failure})
+    return redacted
+
+
+def redacted_confidential_fields(state: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+    """Move error strings out of a confidential State write.
+
+    `review_error`, `registration_error` and `renderability_error` are free
+    text built from exceptions, which can quote paths, declarations and
+    renderer output. They go to the private bucket and are written as null,
+    with the object recorded as `confidential.error_text`.
+    """
+    text = {field: fields[field] for field in CONFIDENTIAL_ERROR_FIELDS if fields.get(field)}
+    failure = fields.get("registration_failure")
+    if isinstance(failure, dict) and failure.get("detail"):
+        text["registration_failure_detail"] = failure["detail"]
+        fields = {**fields, "registration_failure": {k: v for k, v in failure.items() if k != "detail"}}
+    if not text:
+        return fields
+    pointer = store_confidential_text(state, text)
+    block = {**(fields.get("confidential") or state.get("confidential") or {}), "error_text": pointer}
+    return {
+        **fields,
+        **{field: None for field in CONFIDENTIAL_ERROR_FIELDS if field in text},
+        "confidential": block,
+    }
 
 
 def verification_run_provenance(run_data: dict[str, Any]) -> dict[str, Any]:
@@ -3546,7 +3631,9 @@ def submission_state(submission_id: str) -> dict[str, Any] | None:
     """The private record for a submission, or None if the server never made one."""
     if not SUBMISSION_ID_RE.fullmatch(submission_id):
         raise ReviewerError("submission id is malformed")
-    return state_json(f"submissions/{submission_id}/state.json")
+    record = state_json(f"submissions/{submission_id}/state.json")
+    confidential_mode.withhold_from_logs(record)
+    return record
 
 
 def submission_states(submission_ids: list[str]) -> dict[str, dict[str, Any] | None]:
@@ -3596,6 +3683,8 @@ def submission_states(submission_ids: list[str]) -> dict[str, dict[str, Any] | N
                 value = json.loads(blob["text"])
                 value["_blob_sha"] = blob["oid"]
                 records[submission_id] = value
+    for record in records.values():
+        confidential_mode.withhold_from_logs(record)
     return records
 
 
@@ -3635,6 +3724,8 @@ def put_state(path: str, value: Any, message: str, blob_sha: str | None = None) 
     same pass has to be conditional on what this one left behind rather than on
     what it replaced.
     """
+    if isinstance(value, dict) and value.get("visibility") == "confidential":
+        require_not_withdrawn(value)
     body = json.dumps({k: v for k, v in value.items() if k != "_blob_sha"}, indent=2) + "\n"
     fields = [
         "-f",
@@ -3672,6 +3763,8 @@ def advance_state(
     state: dict[str, Any], status: str, note: str, **fields: Any
 ) -> dict[str, Any]:
     """Record a transition the submitter will see on their status page."""
+    if confidential_mode.is_confidential(state):
+        fields = redacted_confidential_fields(state, fields)
     updated = dict(state)
     updated.update(fields)
     updated["status"] = status
@@ -4386,6 +4479,7 @@ def deliver_review(
                 "before delivering a replacement review"
             )
     existing = state_json(f"submissions/{state['id']}/review.json")
+    require_not_withdrawn(state)
     put_state(
         f"submissions/{state['id']}/review.json",
         review,
@@ -4683,6 +4777,18 @@ def open_submissions() -> list[dict[str, Any]]:
             # not a refused read, but the server lists an id when it admits a
             # submission and the two writes can be seen out of order. Keeping
             # the id costs nothing and is corrected by the next rebuild.
+            still_open.append(submission_id)
+            continue
+        try:
+            withdrawn = confidential_withdrawn(record)
+        except ReviewerError as error:
+            # Fail closed for this submission only: a workflow without the
+            # bucket credential, or a bucket outage, must not stop public work.
+            print(f"::warning::skipping confidential submission {submission_id}: {error}", flush=True)
+            withdrawn = True
+        if withdrawn:
+            # Withdrawn: the cleanup job deletes the record and its queue
+            # entry, and nothing in this pass may act on it meanwhile.
             still_open.append(submission_id)
             continue
         records.append(record)
@@ -5257,6 +5363,28 @@ def registration_schema_path(database: Path, *, schema_version: int) -> Path:
     return path
 
 
+def confidential_workspace_root() -> Path:
+    """Where a confidential review's prompts and model output live during the job.
+
+    Never under the work directory State uploads as the review-packet
+    artifact: confidential review packets are never uploaded as State Actions
+    artifacts (contract v3.1, C4).
+    """
+    return Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "palomar-confidential-reviews"
+
+
+def submission_workspace(root: Path, submission_id: str, state: dict[str, Any] | None = None) -> Path:
+    """The submission's workspace, outside `root` for a confidential one."""
+    if not SUBMISSION_ID_RE.fullmatch(submission_id):
+        raise ReviewerError("submission id is malformed")
+    private = confidential_workspace_root() / submission_id
+    if private.resolve().is_relative_to(root.resolve()):
+        raise ReviewerError("the confidential workspace must be outside the uploaded work directory")
+    if state is not None:
+        return private if confidential_mode.is_confidential(state) else root / submission_id
+    return private if private.is_dir() else root / submission_id
+
+
 def prepare_workspace(
     submission_id: str,
     *,
@@ -5271,7 +5399,8 @@ def prepare_workspace(
             f"submission {submission_id} is {state.get('status')}, so there is nothing to review "
             "or register"
         )
-    work = root / submission_id
+    require_not_withdrawn(state)
+    work = submission_workspace(root, submission_id, state)
     work.mkdir(parents=True, exist_ok=True)
     download_root = work / "mechanical-download"
     mechanical, report_url, run_data = mechanical_report(state, download_root)
@@ -5951,7 +6080,7 @@ def run_review(args: argparse.Namespace) -> int:
         )["id"]
     root = Path(args.work_dir).expanduser().resolve()
     if args.apply:
-        stored_path = root / args.submission / "review.json"
+        stored_path = submission_workspace(root, args.submission) / "review.json"
         if not stored_path.is_file():
             raise ReviewerError(
                 "no inspected dry-run review exists; run without --apply and inspect review.json first"
@@ -5994,7 +6123,7 @@ def run_review(args: argparse.Namespace) -> int:
             )
         # The review goes to the submitter alone. Nothing about the outcome is
         # public unless they choose to register it.
-        spend_path = root / args.submission / "spend.json"
+        spend_path = submission_workspace(root, args.submission) / "spend.json"
         spend = load_json(spend_path) if spend_path.is_file() else None
         state = deliver_review(
             state,
@@ -9642,7 +9771,8 @@ def _eligible_legacy_repair_failure(state: dict[str, Any]) -> bool:
     failure = state.get("failure")
     diagnostics = failure.get("diagnostics") if isinstance(failure, dict) else None
     return (
-        state.get("status") == "changes-required"
+        state.get("visibility") != "confidential"
+        and state.get("status") == "changes-required"
         and not state.get("repair")
         and failure.get("profile_version") == 1
         and isinstance(diagnostics, list)
